@@ -162,6 +162,10 @@ void AGXAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
 ///     attribute "agx-hidden"="perctamemory:<size>", which the launch sets to
 ///     the address of a region of size bytes per threadgroup of the grid
 ///     (PTX's per-CTA global memory, .minperctamemory).
+///     9, half: the 64-bit kernel argument with the parameter attribute
+///     "agx-hidden"="address32-base", the base the 32-bit addresses of a
+///     module of PTX's .address_size 32 are offsets from, which the driver
+///     sets below its data allocations.
 ///
 /// Argument values are packed little-endian from their first half in 32-bit
 /// words (16-bit arguments in one half).
@@ -278,6 +282,8 @@ void AGXAsmPrinter::recordKernel() {
     uint32_t Size = 0;
     if (V.consume_front("perctamemory:") && !V.getAsInteger(10, Size))
       R.append({8, Half(A.getArgNo()), Size});
+    else if (V == "address32-base")
+      R.append({9, Half(A.getArgNo())});
   }
   Kernels.push_back({std::string(getSymbol(&F)->getName()), std::move(R)});
 }

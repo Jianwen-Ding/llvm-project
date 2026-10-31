@@ -525,6 +525,13 @@ The extensions are:
   ``c = x + nx * (y + ny * z)`` having the bytes from ``c * size`` (PTX's
   per-CTA global memory, ``.minperctamemory``). The contents are not
   preserved from one launch to the next.
+* ``9, half``: the first half of the 64-bit kernel argument with the
+  parameter attribute ``"agx-hidden"="address32-base"``, which is not a
+  source argument: the base that the 32-bit addresses of a module of PTX's
+  ``.address_size 32`` are offsets from. The driver sets it below its data
+  allocations, which the module reaches within 4 GiB of it (its generic
+  addresses within 1 GiB: bits 31 and 30 of a 32-bit generic address tag
+  the shared and local windows).
 
 Each kernel ends with ``stop`` followed by eight ``trap`` instructions, since
 the instruction prefetcher reads past the end of the program.
