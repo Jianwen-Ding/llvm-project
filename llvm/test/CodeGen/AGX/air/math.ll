@@ -1,6 +1,7 @@
 ; The AIR math functions become the LLVM intrinsics the AIR target made them
 ; from (AIRIntrinsicMappings.td, inverted): precise functions keep their
-; flags, fast_ ones take afn, signed and unsigned integer functions become
+; flags, fast_ ones take afn (fast sin and cos then become llvm.agx.sin and
+; llvm.agx.cos of the same argument, which LLVM does not fold), signed and unsigned integer functions become
 ; their intrinsics and llvm.abs gets back its is_int_min_poison operand.
 ; RUN: llc -mtriple=air -air-portable %s -o %t.air.ll
 ; RUN: opt -mtriple=agx -passes=agx-lower-air -S %t.air.ll | FileCheck %s
@@ -8,7 +9,7 @@
 
 ; CHECK-LABEL: define agx_kernel void @k(
 ; CHECK: %a = call float @llvm.sqrt.f32(float %x)
-; CHECK: %b = call afn float @llvm.sin.f32(float %a)
+; CHECK: %b = call float @llvm.agx.sin.f32(float %a)
 ; CHECK: %c = call float @llvm.fma.f32(float %a, float %b, float %x)
 ; CHECK: %d = call nnan float @llvm.minnum.f32(float %c, float %x)
 ; CHECK: %e = call <2 x half> @llvm.exp2.v2f16(<2 x half>
