@@ -518,6 +518,13 @@ The extensions are:
   Invariant Integers using Multiplication", PLDI 1994), in place of a
   reciprocal estimate and two corrections. As with extension 6, a driver
   that does not set them must not use the option.
+* ``8, half, size``: the first half of the 64-bit kernel argument with the
+  parameter attribute ``"agx-hidden"="perctamemory:<size>"``, which is not a
+  source argument: the driver sets it to the address of a region of ``size``
+  bytes (a multiple of 1024) per CTA of the grid, 1024-byte aligned, CTA
+  ``c = x + nx * (y + ny * z)`` having the bytes from ``c * size`` (PTX's
+  per-CTA global memory, ``.minperctamemory``). The contents are not
+  preserved from one launch to the next.
 
 Each kernel ends with ``stop`` followed by eight ``trap`` instructions, since
 the instruction prefetcher reads past the end of the program.

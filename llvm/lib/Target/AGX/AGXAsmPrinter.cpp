@@ -158,6 +158,10 @@ void AGXAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
 ///     driver computes from the 32-bit argument word at source half and
 ///     puts in the uniforms from half (llvm.agx.launch.value, whose last
 ///     operand is the kind; -agx-launch-divisors).
+///     8, half, size: the 64-bit kernel argument with the parameter
+///     attribute "agx-hidden"="perctamemory:<size>", which the launch sets to
+///     the address of a region of size bytes per threadgroup of the grid
+///     (PTX's per-CTA global memory, .minperctamemory).
 ///
 /// Argument values are packed little-endian from their first half in 32-bit
 /// words (16-bit arguments in one half).
@@ -265,6 +269,15 @@ void AGXAsmPrinter::recordKernel() {
     R.append({7, uint32_t(MFI->LaunchValues.size())});
     for (const auto &V : MFI->LaunchValues)
       R.append({V.Half, Half(V.Arg) + 2 * V.Word, V.Kind});
+  }
+  for (const Argument &A : F.args()) {
+    Attribute Role = F.getAttributes().getParamAttr(A.getArgNo(), "agx-hidden");
+    if (!Role.isValid())
+      continue;
+    StringRef V = Role.getValueAsString();
+    uint32_t Size = 0;
+    if (V.consume_front("perctamemory:") && !V.getAsInteger(10, Size))
+      R.append({8, Half(A.getArgNo()), Size});
   }
   Kernels.push_back({std::string(getSymbol(&F)->getName()), std::move(R)});
 }
