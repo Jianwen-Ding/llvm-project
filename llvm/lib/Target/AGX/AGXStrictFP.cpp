@@ -1115,6 +1115,14 @@ static constexpr const char *IEEETag = "agx.ieee";
 static constexpr const char *KeepDenormalsTag = "agx.keep-denormals";
 
 /// Division and square root, which the hardware only approximates.
+// With ieee-fp32, only the correctly rounded division and square root, every
+// function's float denormals flushed: the part of the IEEE binary32 cost that
+// is not denormals (agx-bench, EXPERIMENTS.md).
+static cl::opt<bool> IEEEFP32NoDenormals(
+    "agx-ieee-fp32-no-denormals", cl::Hidden, cl::init(false),
+    cl::desc("With ieee-fp32, flush float denormals in every function (only "
+             "division and square root correctly rounded)"));
+
 static bool isCorrectlyRounded(const Instruction &I) {
   if (!isF32(&I) || (isa<FPMathOperator>(I) &&
                      (I.hasApproxFunc() || I.hasAllowReciprocal())))
@@ -1222,7 +1230,8 @@ bool AGXStrictFP::runOnFunction(Function &F) {
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool FunctionIEEE = F.getDenormalMode(APFloat::IEEEsingle()).Output ==
-                      DenormalMode::IEEE;
+                          DenormalMode::IEEE &&
+                      !IEEEFP32NoDenormals;
   bool CanonicalNaN = ST.hasCanonicalNaN();
   bool KeepDenormals = any_of(instructions(F), [](const Instruction &I) {
     return I.hasMetadata(KeepDenormalsTag);

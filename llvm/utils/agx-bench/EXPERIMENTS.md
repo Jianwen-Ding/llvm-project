@@ -170,7 +170,14 @@ flushes subnormals and its division and square root are approximations. ZLUDA's 
 `zoc --strict-fp` (the `ieee-fp32` feature, through `air.ieee-fp32` on the AIR route) follows PTX. The suite costed
 with `llc -mattr=+ieee-fp32` against the default (G14, `agx_cost`): `tput` 4.8x the default's (geometric mean over
 36 kernels; 10 unchanged, without affected f32 arithmetic), up to 42x (`sgemm_reg4x4`; `layernorm_f16` 39x,
-`reduce_shfl` 35x, `saxpy` 19.6x). Kept as the opt-in strict mode, not the default.
+`reduce_shfl` 35x, `saxpy` 19.6x). Split with `-agx-ieee-fp32-no-denormals` (ieee-fp32 with every function's
+float denormals flushed): correctly rounded division and square root alone 1.22x (7 kernels change, up to 5.05x),
+denormals the rest, 3.95x. Kept as the opt-in strict mode, not the default.
+
+Policy (the user's): anything that costs performance goes into strict floating point (`zoc --strict-fp`, the
+`ieee-fp32` feature), the default stays the hardware's. So the cos reduction that meets PTX's 2^-20.4 on
+[-2pi, 2pi] (a compare and select) is ieee-fp32 only, and sin(-0) = -0 comes from AGXStrictFP's small-argument
+path, not from a select in the default lowering (llvm/test/CodeGen/AGX/trig-strict.ll).
 
 ## Research sources (policy)
 

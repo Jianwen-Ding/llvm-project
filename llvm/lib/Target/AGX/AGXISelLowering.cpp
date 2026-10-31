@@ -1821,18 +1821,24 @@ SDValue AGXTargetLowering::lowerFREM(SDValue Op, SelectionDAG &DAG) const {
 SDValue AGXTargetLowering::lowerTrig(SDValue Op, SelectionDAG &DAG) const {
   // The hardware evaluates sin(x * pi / 2) for x in [0, 4): reduce the
   // argument to turns, take the fraction and scale to quadrants. cos(x) is
-  // sin(x + pi / 2), a quadrant ahead, added to the quadrants q rather than
-  // the turns (whose sum rounds to 2^-24 turns past 1, which took cos.approx
-  // over PTX's 2^-20.4 on [-2pi, 2pi]): q + 1, or q - 3 (exact) past 3.
+  // sin(x + pi / 2), a quarter turn ahead. With ieee-fp32 (strict floating
+  // point, which takes what costs time) the quadrant is added to the
+  // quadrants q rather than the turns, whose sum rounds to 2^-24 turns past 1
+  // and took cos.approx over PTX's 2^-20.4 on [-2pi, 2pi]: q + 1, or q - 3
+  // (exact) past 3. (sin(-0) = -0 there too: AGXStrictFP returns arguments
+  // below 2^-12.)
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
   auto K = [&](double V) { return DAG.getConstantFP(V, DL, VT); };
+  bool Precise = DAG.getSubtarget<AGXSubtarget>().hasIEEEFP32();
   SDValue Turns =
       DAG.getNode(ISD::FMUL, DL, VT, Op.getOperand(0), K(0.5 * M_1_PI));
+  if (Op.getOpcode() == ISD::FCOS && !Precise)
+    Turns = DAG.getNode(ISD::FADD, DL, VT, Turns, K(0.25));
   SDValue Frac = DAG.getNode(ISD::FSUB, DL, VT, Turns,
                              DAG.getNode(ISD::FFLOOR, DL, VT, Turns));
   SDValue Quadrants = DAG.getNode(ISD::FMUL, DL, VT, Frac, K(4.0));
-  if (Op.getOpcode() == ISD::FCOS) {
+  if (Op.getOpcode() == ISD::FCOS && Precise) {
     EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
     SDValue Past3 = DAG.getSetCC(DL, CCVT, Quadrants, K(3.0), ISD::SETOGE);
     Quadrants =
@@ -1840,16 +1846,7 @@ SDValue AGXTargetLowering::lowerTrig(SDValue Op, SelectionDAG &DAG) const {
                       DAG.getNode(ISD::FSUB, DL, VT, Quadrants, K(3.0)),
                       DAG.getNode(ISD::FADD, DL, VT, Quadrants, K(1.0)));
   }
-  SDValue R = DAG.getNode(AGXISD::SIN_QUADRANTS, DL, VT, Quadrants);
-  // sin(-0) is -0 (PTX ISA 9.7.3.18's table, IEEE 754): the reduction gives
-  // the hardware +0.
-  if (Op.getOpcode() == ISD::FSIN) {
-    EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
-    SDValue X = Op.getOperand(0);
-    R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, X, K(0.0), ISD::SETOEQ),
-                      X, R);
-  }
-  return R;
+  return DAG.getNode(AGXISD::SIN_QUADRANTS, DL, VT, Quadrants);
 }
 
 SDValue AGXTargetLowering::lowerExpLog(SDValue Op, SelectionDAG &DAG) const {
