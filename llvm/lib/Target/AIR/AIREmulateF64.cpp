@@ -33,6 +33,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Analysis/ValueTracking.h"
 #include "AIREmulateF64.h"
 #include "AIR.h"
 #include "llvm/ADT/StringExtras.h"
@@ -841,7 +842,9 @@ static StringRef ieeeF32Op(const Instruction &I) {
     case Instruction::FMul:
       return "mul";
     case Instruction::FDiv:
-      return "div";
+      // (an approximate division, afn or arcp, keeps the hardware's
+      // reciprocal where no denormal is involved: PTX's div.approx, rcp.approx)
+      return BO->hasApproxFunc() || BO->hasAllowReciprocal() ? "div.approx" : "div";
     default:
       return "";
     }
@@ -923,6 +926,26 @@ Function *EmulateF64::emulation(StringRef Key, FunctionType *FT) {
   F = Function::Create(FT, GlobalValue::ExternalLinkage, Name, &M);
   F->addFnAttr(EmulationAttr, Key);
   return F;
+}
+
+/// The integer operand of a conversion to double, as i32 when it is wider and
+/// value tracking proves it fits (signed or unsigned as the conversion reads
+/// it): the emulation of a 32-bit conversion is exact and inline, the 64-bit
+/// one a soft-f64 library call (the texture sampler's channels and sizes are
+/// int64_t that hold 32 bits).
+static Value *narrowIntToDouble(Value *X, bool Signed, Instruction *Before) {
+  auto *IT = dyn_cast<IntegerType>(X->getType());
+  if (!IT || IT->getBitWidth() <= 32)
+    return X;
+  const DataLayout &DL = Before->getModule()->getDataLayout();
+  unsigned W = IT->getBitWidth();
+  bool Fits = Signed ? ComputeNumSignBits(X, DL, nullptr, Before) > W - 32
+                     : computeKnownBits(X, DL, nullptr, Before)
+                               .countMinLeadingZeros() >= W - 32;
+  if (!Fits)
+    return X;
+  return new TruncInst(X, Type::getInt32Ty(X->getContext()), "",
+                       Before->getIterator());
 }
 
 void EmulateF64::replaceWithEmulation(Instruction &I, StringRef Key,
@@ -1210,6 +1233,19 @@ void EmulateF64::replaceOperations(Function &F) {
         Args.push_back(A);
         Tys.push_back(A->getType());
       }
+      if ((Name.starts_with("llvm.experimental.constrained.sitofp") ||
+           Name.starts_with("llvm.experimental.constrained.uitofp")) &&
+          CI->getType()->getScalarType()->isDoubleTy() && !Args.empty()) {
+        Args[0] = narrowIntToDouble(
+            Args[0], Name.starts_with("llvm.experimental.constrained.sitofp"),
+            CI);
+        Tys[0] = Args[0]->getType();
+        // (the intrinsic's name is overloaded on the source type)
+        if (Tys[0]->isIntegerTy(32))
+          Name = Name.starts_with("llvm.experimental.constrained.sitofp")
+                     ? "llvm.experimental.constrained.sitofp.f64.i32"
+                     : "llvm.experimental.constrained.uitofp.f64.i32";
+      }
       std::string Key =
           ("call:" + Name + "|" + doubleMask(CI->getType(), Tys) + MD).str();
       // bfloat is computed in float where the function keeps float
@@ -1246,6 +1282,8 @@ void EmulateF64::replaceOperations(Function &F) {
     if (isDoubleOp(I)) {
       // "inst:<opcode>[:<predicate>]|<double mask>"
       SmallVector<Value *, 3> Ops(I.operands());
+      if (isa<SIToFPInst>(I) || isa<UIToFPInst>(I))
+        Ops[0] = narrowIntToDouble(Ops[0], isa<SIToFPInst>(I), &I);
       SmallVector<Type *, 3> Tys;
       for (Value *O : Ops)
         Tys.push_back(O->getType());
@@ -1470,6 +1508,12 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
       Fast = B.CreateFMul(A[0], A[1]);
     else if (Name == "div")
       Fast = B.CreateFDiv(A[0], A[1]);
+    else if (Name == "div.approx") {
+      FastMathFlags FMF;
+      FMF.setApproxFunc();
+      FMF.setAllowReciprocal();
+      Fast = B.CreateFDivFMF(A[0], A[1], FMF);
+    }
     else if (Name == "fma")
       Fast = B.CreateIntrinsic(Intrinsic::fma, {F32}, {A[0], A[1], A[2]});
     else if (Name == "sqrt")
@@ -1489,15 +1533,46 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
     Value *Ok = B.CreateAnd(
         B.CreateICmpNE(B.CreateAnd(Bits(Fast), 0x7f800000), B.getInt32(0)),
         B.CreateICmpUGE(Least, B.getInt32(0x7fffff)));
+    BasicBlock *Zero = BasicBlock::Create(Ctx, "ieee32.zero", &F);
     BasicBlock *Slow = BasicBlock::Create(Ctx, "ieee32.slow", &F);
     BasicBlock *Done = BasicBlock::Create(Ctx, "ieee32.done", &F);
     BasicBlock *FastEnd = B.GetInsertBlock();
-    B.CreateCondBr(Ok, Done, Slow);
+    B.CreateCondBr(Ok, Done, Zero);
+    // A zero result the hardware computed exactly (no denormal operand): a
+    // product with a zero factor, a quotient of zero, the root of zero, or a
+    // sum of operands whose nonzero results would all be normal (exponent
+    // fields of at least 24: their smallest nonzero difference is 2^-126).
+    // Without this test every zero result went to soft-f64, 24-30 times the
+    // hardware's time on the M2 Max (convolutions, padding, ReLU outputs).
+    B.SetInsertPoint(Zero);
+    auto IsZero = [&](Value *X) {
+      return B.CreateICmpEQ(B.CreateAnd(Bits(X), 0x7fffffff), B.getInt32(0));
+    };
+    Value *NoDenormal = B.CreateICmpUGE(Least, B.getInt32(0x7fffff));
+    StringRef Base = Name.split('.').first;
+    Value *Exact;
+    if (Base == "mul" || Base == "fma")
+      Exact = B.CreateOr(IsZero(A[0]), IsZero(A[1]));
+    else if (Base == "div")
+      Exact = B.CreateAnd(IsZero(A[0]), B.CreateNot(IsZero(A[1])));
+    else if (Base == "sqrt")
+      Exact = IsZero(A[0]);
+    else {
+      Exact = B.getTrue();
+      for (Value *X : A) {
+        Value *E = B.CreateLShr(B.CreateAnd(Bits(X), 0x7f800000), 23);
+        Exact = B.CreateAnd(Exact, B.CreateOr(IsZero(X), B.CreateICmpUGE(E, B.getInt32(24))));
+      }
+    }
+    Value *ExactZero =
+        B.CreateAnd(B.CreateAnd(IsZero(Fast), NoDenormal), Exact);
+    B.CreateCondBr(ExactZero, Done, Slow);
     B.SetInsertPoint(Slow);
     SmallVector<Value *, 4> D;
     for (Value *X : A)
       D.push_back(Lib("__air_f64_from_f32", I64, {Bits(X)}));
-    std::string Lname = ("__air_f64_" + Name + "_r").str();
+    // (div.approx: its exact result where a denormal is involved, as div's)
+    std::string Lname = ("__air_f64_" + Name.split('.').first + "_r").str();
     auto Call = [&](Value *Rounding) {
       SmallVector<Value *, 4> Args(D);
       Args.push_back(Rounding);
@@ -1515,8 +1590,9 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
     B.SetInsertPoint(FastEnd->getTerminator());
     Value *FastBits = Bits(Fast);
     B.SetInsertPoint(Done);
-    PHINode *P = B.CreatePHI(I32, 2);
+    PHINode *P = B.CreatePHI(I32, 3);
     P->addIncoming(FastBits, FastEnd);
+    P->addIncoming(FastBits, Zero);
     P->addIncoming(SlowR, SlowEnd);
     return Fin(B.CreateBitCast(P, F32));
   }
@@ -1767,7 +1843,29 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
                A[0]->getType()->getIntegerBitWidth() <= 64) {
       bool Signed = B2 == "sitofp";
       Value *X = Signed ? B.CreateSExt(A[0], I64) : B.CreateZExt(A[0], I64);
-      R = RLib(Signed ? "__air_f64_from_i64" : "__air_f64_from_u64", I64, {X});
+      // An integer of at most 53 bits is a double exactly, in every rounding:
+      // built inline from its leading zeros (sign, exponent 1086 - zeros, the
+      // bits below the leading one) instead of the library's 64-bit
+      // conversion (texel channels and texture sizes in the texture sampler).
+      const DataLayout &DL = B.GetInsertBlock()->getModule()->getDataLayout();
+      bool Fits = Signed ? ComputeNumSignBits(X, DL) >= 12
+                         : computeKnownBits(X, DL).countMinLeadingZeros() >= 11;
+      if (Fits) {
+        Value *Neg = Signed ? B.CreateICmpSLT(X, B.getInt64(0)) : B.getFalse();
+        Value *Mag = Signed ? B.CreateSelect(Neg, B.CreateNeg(X), X) : X;
+        Value *LZ = B.CreateBinaryIntrinsic(Intrinsic::ctlz, Mag, B.getTrue());
+        // the leading one shifted out: (Mag << LZ) << 1, then the top 52 bits
+        Value *Frac = B.CreateLShr(B.CreateShl(B.CreateShl(Mag, LZ), 1), 12);
+        Value *Exp = B.CreateShl(B.CreateSub(B.getInt64(1086), LZ), 52);
+        Value *Bits = B.CreateOr(B.CreateOr(Exp, Frac),
+                                 B.CreateSelect(Neg, B.getInt64(SignBit),
+                                                B.getInt64(0)));
+        R = B.CreateSelect(B.CreateICmpEQ(Mag, B.getInt64(0)), B.getInt64(0),
+                           Bits);
+      } else {
+        R = RLib(Signed ? "__air_f64_from_i64" : "__air_f64_from_u64", I64,
+                 {X});
+      }
     } else if (B2 == "fpext") {
       Value *X = A[0];
       if (X->getType()->isBFloatTy())

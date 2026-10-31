@@ -37,6 +37,7 @@
 #include "AGXTargetMachine.h"
 #include "Utils/AGXBaseInfo.h"
 #include "llvm/ADT/DenseMap.h"
+#include <functional>
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -1646,6 +1647,49 @@ void LowerAIR::recoverAGXOperations(Function &F) {
     return II && (II->getIntrinsicID() == Intrinsic::fma ||
                   II->getIntrinsicID() == Intrinsic::fmuladd);
   };
+  // Whether a float cannot be denormal where the ALU flushes: made by an
+  // operation that flushes, a constant that is not denormal, or a choice
+  // among, sign change or absolute value of such values (selects and phis of
+  // a run of .ftz operations, which strict mode then flushes on the bits).
+  DenseMap<const Value *, bool> NoDenormalMemo;
+  std::function<bool(Value *, unsigned)> NoDenormalAt = [&](Value *V,
+                                                           unsigned Depth) {
+    if (FlushingArith(V))
+      return true;
+    // (a square root, or its reciprocal, of any float is normal, zero,
+    // infinite or NaN: the root of the least denormal is about 2^-74.5)
+    if (match(V, m_Intrinsic<Intrinsic::sqrt>(m_Value())) ||
+        match(V, m_Intrinsic<Intrinsic::agx_rsqrt>(m_Value())))
+      return true;
+    if (auto *C = dyn_cast<ConstantFP>(V))
+      return !C->getValueAPF().isDenormal();
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !I->getType()->isFloatTy() || Depth > 8)
+      return false;
+    if (auto It = NoDenormalMemo.find(I); It != NoDenormalMemo.end())
+      return It->second;
+    // (a cycle through phis is assumed free of denormals while it is checked:
+    // every value entering it is checked)
+    NoDenormalMemo[I] = true;
+    bool R = false;
+    Value *X;
+    if (auto *Sel = dyn_cast<SelectInst>(I))
+      R = NoDenormalAt(Sel->getTrueValue(), Depth + 1) &&
+          NoDenormalAt(Sel->getFalseValue(), Depth + 1);
+    else if (auto *Phi = dyn_cast<PHINode>(I))
+      R = all_of(Phi->incoming_values(),
+                 [&](Value *In) { return NoDenormalAt(In, Depth + 1); });
+    else if (match(I, m_FNeg(m_Value(X))) ||
+             match(I, m_Intrinsic<Intrinsic::fabs>(m_Value(X))))
+      R = NoDenormalAt(X, Depth + 1);
+    // (what was computed while this one was assumed free of denormals may be
+    // wrong when it is not)
+    if (!R)
+      NoDenormalMemo.clear();
+    NoDenormalMemo[I] = R;
+    return R;
+  };
+  auto NoDenormal = [&](Value *V) { return NoDenormalAt(V, 0); };
   for (Instruction &I : make_early_inc_range(instructions(F))) {
     IRBuilder<> B(&I);
     Type *Ty = I.getType();
@@ -1723,12 +1767,73 @@ void LowerAIR::recoverAGXOperations(Function &F) {
           (FlushingArith(A) ||
            (!Sel->use_empty() && all_of(Sel->users(), FlushingArith))))
         R = A;
+    } else if (auto *Sel = dyn_cast<SelectInst>(&I);
+               Sel && Ty->isIntegerTy(32) && HardwareFlush) {
+      // The same flush on the bits (a front end's strict mode tests them:
+      // a flushing GPU compares a denormal as zero):
+      // select((x & 0x7f800000) == 0, x & 0x80000000, x), where x is the bits
+      // of an operation that flushes, also through the canonical NaN select
+      // select((x & 0x7fffffff) > 0x7f800000, 0x7fffffff, x), or every user
+      // reads it back as an operand of one.
+      Value *X = nullptr;
+      if (match(Sel->getCondition(),
+                m_SpecificICmp(ICmpInst::ICMP_EQ,
+                               m_And(m_Value(X), m_SpecificInt(0x7f800000)),
+                               m_Zero())) &&
+          Sel->getFalseValue() == X &&
+          match(Sel->getTrueValue(),
+                m_And(m_Specific(X), m_SpecificInt(0x80000000)))) {
+        Value *Bits = X, *Y;
+        if (match(Bits, m_Select(m_SpecificICmp(ICmpInst::ICMP_UGT,
+                                                m_And(m_Value(Y),
+                                                      m_SpecificInt(0x7fffffff)),
+                                                m_SpecificInt(0x7f800000)),
+                                 m_SpecificInt(0x7fffffff), m_Deferred(Y))) ||
+            // (the ALU's form of it, below)
+            match(Bits, m_Select(m_SpecificICmp(ICmpInst::ICMP_EQ, m_Value(Y),
+                                                m_SpecificInt(0x7fc00000)),
+                                 m_SpecificInt(0x7fffffff), m_Deferred(Y))))
+          Bits = Y;
+        Value *A = nullptr;
+        bool Made = match(Bits, m_BitCast(m_Value(A))) && NoDenormal(A);
+        bool Read = !Sel->use_empty() && all_of(Sel->users(), [&](User *U) {
+          auto *BC = dyn_cast<BitCastInst>(U);
+          return BC && BC->getType()->isFloatTy() && !BC->use_empty() &&
+                 all_of(BC->users(), FlushingArith);
+        });
+        if (Made || Read)
+          R = X;
+      }
+      // A canonical NaN on the bits of an f32 ALU result (fadd32, fmul32,
+      // fmadd32: their NaN is always 0x7fc00000, the operands' payloads and
+      // signs dropped; playground novel-results/2026-10-11-float-semantics)
+      // or of rcp, rsqrt, exp2, log2 (the same NaN: 2026-10-31-special-nan),
+      // select((x & 0x7fffffff) > 0x7f800000, 0x7fffffff, x): one comparison
+      // with that NaN, select(x == 0x7fc00000, 0x7fffffff, x), instead of two
+      // instructions (a front end's strict mode makes one for every result it
+      // lets be seen). On the bits: LLVM may fold a float select of a NaN.
+      Value *Y = nullptr, *A = nullptr;
+      if (!R &&
+          match(Sel, m_Select(m_SpecificICmp(ICmpInst::ICMP_UGT,
+                                             m_And(m_Value(Y),
+                                                   m_SpecificInt(0x7fffffff)),
+                                             m_SpecificInt(0x7f800000)),
+                              m_SpecificInt(0x7fffffff), m_Deferred(Y))) &&
+          match(Y, m_BitCast(m_Value(A))) &&
+          (FlushingArith(A) || match(A, m_Intrinsic<Intrinsic::agx_rcp>()) ||
+           match(A, m_Intrinsic<Intrinsic::agx_rsqrt>()) ||
+           match(A, m_Intrinsic<Intrinsic::agx_exp2>()) ||
+           match(A, m_Intrinsic<Intrinsic::agx_log2>())))
+        R = B.CreateSelect(B.CreateICmpEQ(Y, ConstantInt::get(Ty, 0x7fc00000)),
+                           ConstantInt::get(Ty, 0x7fffffff), Y);
     }
     if (!R)
       continue;
     R->takeName(&I);
     I.replaceAllUsesWith(R);
     RecursivelyDeleteTriviallyDeadInstructions(&I);
+    // (the memo's keys may be among the deleted)
+    NoDenormalMemo.clear();
   }
 }
 
