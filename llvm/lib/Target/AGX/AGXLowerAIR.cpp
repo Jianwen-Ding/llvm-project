@@ -2112,6 +2112,21 @@ bool LowerAIR::run() {
   NamedMDNode *KernelMD = M.getNamedMetadata(air::KernelMD);
   if (!KernelMD)
     return false;
+  // A module that asks for IEEE binary32 arithmetic (air.ieee-fp32: denormals
+  // where a function keeps them, which the f32 ALU flushes) gets AGX's
+  // ieee-fp32 feature in every function, whatever the target machine's
+  // features: the operations the AIR emulations stand for (hints) are
+  // restored as AGX operations, which AGXStrictFP then lowers exactly.
+  if (mdconst::extract_or_null<ConstantInt>(M.getModuleFlag("air.ieee-fp32")))
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      StringRef Old = F.getFnAttribute("target-features").getValueAsString();
+      if (Old.contains("+ieee-fp32"))
+        continue;
+      F.addFnAttr("target-features",
+                  Old.empty() ? "+ieee-fp32" : (Old + ",+ieee-fp32").str());
+    }
   SmallVector<AIRKernel, 4> Kernels;
   parseKernels(*KernelMD, Kernels);
   checkTypes();
