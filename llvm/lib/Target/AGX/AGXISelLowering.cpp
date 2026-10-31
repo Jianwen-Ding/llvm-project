@@ -1821,18 +1821,25 @@ SDValue AGXTargetLowering::lowerFREM(SDValue Op, SelectionDAG &DAG) const {
 SDValue AGXTargetLowering::lowerTrig(SDValue Op, SelectionDAG &DAG) const {
   // The hardware evaluates sin(x * pi / 2) for x in [0, 4): reduce the
   // argument to turns, take the fraction and scale to quadrants. cos(x) is
-  // sin(x + pi / 2), a quarter turn ahead.
+  // sin(x + pi / 2), a quadrant ahead, added to the quadrants q rather than
+  // the turns (whose sum rounds to 2^-24 turns past 1, which took cos.approx
+  // over PTX's 2^-20.4 on [-2pi, 2pi]): q + 1, or q - 3 (exact) past 3.
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
-  SDValue Turns = DAG.getNode(ISD::FMUL, DL, VT, Op.getOperand(0),
-                              DAG.getConstantFP(0.5 * M_1_PI, DL, VT));
-  if (Op.getOpcode() == ISD::FCOS)
-    Turns = DAG.getNode(ISD::FADD, DL, VT, Turns,
-                        DAG.getConstantFP(0.25, DL, VT));
+  auto K = [&](double V) { return DAG.getConstantFP(V, DL, VT); };
+  SDValue Turns =
+      DAG.getNode(ISD::FMUL, DL, VT, Op.getOperand(0), K(0.5 * M_1_PI));
   SDValue Frac = DAG.getNode(ISD::FSUB, DL, VT, Turns,
                              DAG.getNode(ISD::FFLOOR, DL, VT, Turns));
-  SDValue Quadrants =
-      DAG.getNode(ISD::FMUL, DL, VT, Frac, DAG.getConstantFP(4.0, DL, VT));
+  SDValue Quadrants = DAG.getNode(ISD::FMUL, DL, VT, Frac, K(4.0));
+  if (Op.getOpcode() == ISD::FCOS) {
+    EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
+    SDValue Past3 = DAG.getSetCC(DL, CCVT, Quadrants, K(3.0), ISD::SETOGE);
+    Quadrants =
+        DAG.getSelect(DL, VT, Past3,
+                      DAG.getNode(ISD::FSUB, DL, VT, Quadrants, K(3.0)),
+                      DAG.getNode(ISD::FADD, DL, VT, Quadrants, K(1.0)));
+  }
   return DAG.getNode(AGXISD::SIN_QUADRANTS, DL, VT, Quadrants);
 }
 
