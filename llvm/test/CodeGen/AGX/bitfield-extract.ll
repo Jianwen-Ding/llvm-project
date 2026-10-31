@@ -35,3 +35,15 @@ define agx_kernel void @not_a_field(ptr addrspace(1) %p, i32 %x) {
   store i32 %f, ptr addrspace(1) %p
   ret void
 }
+
+; ctlz(x) ^ 31 is not ffs(x): for x = 0, ctlz is 32 and the result 63.
+; CHECK-LABEL: clz_xor_31:
+; CHECK:       ffs
+; CHECK:       isub
+; CHECK:       xor
+define agx_kernel void @clz_xor_31(ptr addrspace(1) %p, i32 %x) {
+  %c = call i32 @llvm.ctlz.i32(i32 %x, i1 false)
+  %r = xor i32 %c, 31
+  store i32 %r, ptr addrspace(1) %p
+  ret void
+}
