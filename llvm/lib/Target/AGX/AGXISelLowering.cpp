@@ -1840,7 +1840,16 @@ SDValue AGXTargetLowering::lowerTrig(SDValue Op, SelectionDAG &DAG) const {
                       DAG.getNode(ISD::FSUB, DL, VT, Quadrants, K(3.0)),
                       DAG.getNode(ISD::FADD, DL, VT, Quadrants, K(1.0)));
   }
-  return DAG.getNode(AGXISD::SIN_QUADRANTS, DL, VT, Quadrants);
+  SDValue R = DAG.getNode(AGXISD::SIN_QUADRANTS, DL, VT, Quadrants);
+  // sin(-0) is -0 (PTX ISA 9.7.3.18's table, IEEE 754): the reduction gives
+  // the hardware +0.
+  if (Op.getOpcode() == ISD::FSIN) {
+    EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
+    SDValue X = Op.getOperand(0);
+    R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, X, K(0.0), ISD::SETOEQ),
+                      X, R);
+  }
+  return R;
 }
 
 SDValue AGXTargetLowering::lowerExpLog(SDValue Op, SelectionDAG &DAG) const {
