@@ -163,6 +163,15 @@ Compile time: `zoc` (debug build) over the 40 largest PTX tests 258.7 s direct v
 `agx-raise-to-air` itself ~1.6 ms per module, the AGX side of the AIR (`agx-lower-air` + codegen) no slower than
 direct.
 
+## Measured: IEEE binary32 in the default mode (`-mattr=+ieee-fp32`)
+
+PTX keeps f32 subnormals without `.ftz` (sm_20+) and rounds `div.rn.f32` / `sqrt.rn.f32` correctly; the AGX f32 ALU
+flushes subnormals and its division and square root are approximations. ZLUDA's default mode follows the hardware;
+`zoc --strict-fp` (the `ieee-fp32` feature, through `air.ieee-fp32` on the AIR route) follows PTX. The suite costed
+with `llc -mattr=+ieee-fp32` against the default (G14, `agx_cost`): `tput` 4.8x the default's (geometric mean over
+36 kernels; 10 unchanged, without affected f32 arithmetic), up to 42x (`sgemm_reg4x4`; `layernorm_f16` 39x,
+`reduce_shfl` 35x, `saxpy` 19.6x). Kept as the opt-in strict mode, not the default.
+
 ## Research sources (policy)
 
 Experiments are based only on publicly published work: open-access papers (arXiv, ACM / IEEE papers with public
