@@ -393,6 +393,49 @@ public:
     return {B.CreateSelect(ZeroProduct, P, adjust(P, Err)), B.CreateOr(Valid, ZeroProduct)};
   }
 
+  /// X * Y + Z rounded in the direction Rounding, using the hardware: the
+  /// fma rounded to nearest even, R, and the sign of its exact error, from
+  /// Boldo and Muller's ErrFma ("Exact and Approximated Error of the FMA",
+  /// IEEE TC 2011): with (U1, U2) = TwoProd(X, Y), (A1, A2) = TwoSum(Z, U2),
+  /// (B1, B2) = TwoSum(U1, A1) and G = RN(RN(B1 - R) + B2), the error is
+  /// G + A2 exactly, and RN(G + A2) has its sign. Valid (every intermediate
+  /// a multiple of 2^-126, so none denormal, and none overflowing) for normal
+  /// X and Y with a product of at least 2^-80 and below 2^123, a Z zero or in
+  /// [2^-102, 2^123), and a finite nonzero R; an exact zero takes the general
+  /// path (its sign).
+  std::pair<Value *, Value *> fastFma(Value *X, Value *Y, Value *Z) {
+    auto TwoSum = [&](Value *A, Value *Bv) {
+      Value *S = B.CreateFAdd(A, Bv);
+      Value *BB = B.CreateFSub(S, A);
+      Value *E = B.CreateFAdd(B.CreateFSub(A, B.CreateFSub(S, BB)), B.CreateFSub(Bv, BB));
+      return std::pair(S, E);
+    };
+    Value *R = fma(X, Y, Z);
+    Value *U1 = B.CreateFMul(X, Y);
+    Value *U2 = fma(X, Y, B.CreateFNeg(U1));
+    auto [A1, A2] = TwoSum(Z, U2);
+    auto [B1, B2] = TwoSum(U1, A1);
+    Value *G = B.CreateFAdd(B.CreateFSub(B1, R), B2);
+    Value *Err = B.CreateFAdd(G, A2);
+    Value *EX = B.CreateAnd(B.CreateLShr(bits(X), 23), c32(0xff));
+    Value *EY = B.CreateAnd(B.CreateLShr(bits(Y), 23), c32(0xff));
+    auto Normal = [&](Value *E) {
+      return B.CreateICmpULT(B.CreateSub(E, c32(1)), c32(254));
+    };
+    // biased exponents adding up to 254 - 80 .. 254 + 121 (the product below 2^123)
+    Value *ES = B.CreateAdd(EX, EY);
+    Value *Valid = B.CreateAnd(B.CreateAnd(Normal(EX), Normal(EY)),
+                               B.CreateICmpULT(B.CreateSub(ES, c32(254 - 80)), c32(80 + 121 + 1)));
+    Value *ZM = B.CreateAnd(bits(Z), c32(0x7fffffff));
+    // Z zero, or in [2^-102, 2^123)
+    Value *ZOk = B.CreateOr(B.CreateICmpEQ(ZM, c32(0)),
+                            B.CreateICmpULT(B.CreateSub(ZM, c32(0x0c800000)), c32(0x7d000000 - 0x0c800000)));
+    Value *RM = B.CreateAnd(bits(R), c32(0x7fffffff));
+    Value *ROk = B.CreateAnd(B.CreateICmpNE(RM, c32(0)), B.CreateICmpULT(RM, c32(0x7f800000)));
+    Valid = B.CreateAnd(Valid, B.CreateAnd(ZOk, ROk));
+    return {adjust(R, Err), Valid};
+  }
+
   /// Division of normal operands with a normal result, using the hardware:
   /// the mantissas (in [1, 2)) are divided with a refined reciprocal, and
   /// the quotient is corrected until the exact remainder shows that it is
@@ -1405,8 +1448,7 @@ static Value *lowerRounded(ConstrainedFPIntrinsic *CI, Value *Rounding,
       break;
     case Intrinsic::experimental_constrained_fma:
     case Intrinsic::experimental_constrained_fmuladd:
-      if (Float)
-        R = SF.roundedFma(Arg(0), Arg(1), Arg(2));
+      // with a fast path below
       break;
     case Intrinsic::experimental_constrained_sitofp:
     case Intrinsic::experimental_constrained_uitofp:
@@ -1431,10 +1473,30 @@ static Value *lowerRounded(ConstrainedFPIntrinsic *CI, Value *Rounding,
   bool AddOrMul = Float && (ID == Intrinsic::experimental_constrained_fadd ||
                             ID == Intrinsic::experimental_constrained_fsub ||
                             ID == Intrinsic::experimental_constrained_fmul);
+  bool Fma = Float && (ID == Intrinsic::experimental_constrained_fma ||
+                       ID == Intrinsic::experimental_constrained_fmuladd);
   bool DivOrSqrt = Float && (ID == Intrinsic::experimental_constrained_fdiv ||
                              ID == Intrinsic::experimental_constrained_sqrt);
-  if (!R && !DivOrSqrt && !AddOrMul)
+  if (!R && !DivOrSqrt && !AddOrMul && !Fma)
     return nullptr;
+  if (Fma) {
+    // Placeholder replaced below by the hardware fma corrected with the sign
+    // of its exact error, or the result of integer arithmetic.
+    Value *X = Arg(0), *Y = Arg(1), *Z = Arg(2);
+    IRBuilder<> B(CI);
+    Instruction *Stub = cast<Instruction>(B.CreateFreeze(X));
+    replaceWithSlowPath<TaggingBuilder>(
+        *Stub,
+        [&](SoftFloat &SF, IRBuilderBase &) {
+          SF.Rounding = Rounding;
+          return SF.fastFma(X, Y, Z);
+        },
+        [&](SoftFloat &SF, IRBuilderBase &) {
+          SF.Rounding = Rounding;
+          return SF.roundedFma(X, Y, Z);
+        });
+    R = &*CI->getParent()->begin();
+  }
   if (AddOrMul) {
     // Placeholder replaced below by the hardware result corrected with its
     // exact error, or the result of integer arithmetic.
