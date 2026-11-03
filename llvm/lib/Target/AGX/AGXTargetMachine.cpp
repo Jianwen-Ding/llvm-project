@@ -402,7 +402,7 @@ bool AGXPassConfig::addInstSelector() {
 }
 
 static cl::opt<bool> AGXSinkRematEnabled(
-    "agx-sink-remat", cl::init(false), cl::Hidden,
+    "agx-enable-sink-remat", cl::init(false), cl::Hidden,
     cl::desc("Give each block that uses a constant from another block its own "
              "move of it, for fewer registers held"));
 

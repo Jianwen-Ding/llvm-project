@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-sink-remat -verify-machineinstrs < %s -o - | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-enable-sink-remat -verify-machineinstrs < %s -o - | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s -o - | FileCheck %s --check-prefix=OFF
 ; A large constant used in a later block gets its own move there, not in the
 ; block before the branch. It stays out of a loop deeper than its definition.
