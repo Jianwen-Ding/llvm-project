@@ -2,23 +2,23 @@ add_llvm_component_group(AGX)
 
 set(LLVM_TARGET_DEFINITIONS AGX.td)
 
-tablegen(LLVM AGXGenAsmMatcher.inc -gen-asm-matcher)
-tablegen(LLVM AGXGenAsmWriter.inc -gen-asm-writer)
-tablegen(LLVM AGXGenCallingConv.inc -gen-callingconv)
-tablegen(LLVM AGXGenDAGISel.inc -gen-dag-isel)
-tablegen(LLVM AGXGenDisassemblerTables.inc -gen-disassembler)
-tablegen(LLVM AGXGenInstrInfo.inc -gen-instr-info)
-tablegen(LLVM AGXGenMCCodeEmitter.inc -gen-emitter)
-tablegen(LLVM AGXGenRegisterInfo.inc -gen-register-info)
-tablegen(LLVM AGXGenSDNodeInfo.inc -gen-sd-node-info)
-tablegen(LLVM AGXGenSearchableTables.inc -gen-searchable-tables)
-tablegen(LLVM AGXGenSubtargetInfo.inc -gen-subtarget)
+llvm_tablegen(AGXGenAsmMatcher.inc -gen-asm-matcher)
+llvm_tablegen(AGXGenAsmWriter.inc -gen-asm-writer)
+llvm_tablegen(AGXGenCallingConv.inc -gen-callingconv)
+llvm_tablegen(AGXGenDAGISel.inc -gen-dag-isel)
+llvm_tablegen(AGXGenDisassemblerTables.inc -gen-disassembler)
+llvm_tablegen(AGXGenInstrInfo.inc -gen-instr-info)
+llvm_tablegen(AGXGenMCCodeEmitter.inc -gen-emitter)
+llvm_tablegen(AGXGenRegisterInfo.inc -gen-register-info)
+llvm_tablegen(AGXGenSDNodeInfo.inc -gen-sd-node-info)
+llvm_tablegen(AGXGenSearchableTables.inc -gen-searchable-tables)
+llvm_tablegen(AGXGenSubtargetInfo.inc -gen-subtarget)
 
 # The AIR target's mapping between LLVM intrinsics and AIR functions, which
 # agx-lower-air inverts. Generated here from the same file, so that the AGX
 # target does not depend on the AIR target being built.
 set(LLVM_TARGET_DEFINITIONS ${CMAKE_CURRENT_SOURCE_DIR}/../AIR/AIRIntrinsicMappings.td)
-tablegen(LLVM AGXGenAIRFunctions.inc -gen-searchable-tables)
+llvm_tablegen(AGXGenAIRFunctions.inc -gen-searchable-tables)
 set(LLVM_TARGET_DEFINITIONS AGX.td)
 
 add_public_tablegen_target(AGXCommonTableGen)

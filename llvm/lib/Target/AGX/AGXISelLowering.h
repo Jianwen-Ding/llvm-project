@@ -114,9 +114,10 @@ public:
 
   bool isFMAFasterThanFMulAndFAdd(const MachineFunction &MF,
                                   EVT VT) const override;
-  bool isFPImmLegal(const APFloat &Imm, EVT VT,
-                    bool ForCodeSize) const override {
-    return VT == MVT::f32 || VT == MVT::f16;
+  FPImmAction getFPImmAction(const APFloat &Imm, EVT VT,
+                             bool ForCodeSize) const override {
+    return VT == MVT::f32 || VT == MVT::f16 ? FPImmAction::Legal
+                                            : FPImmAction::ConstantPool;
   }
   bool isTruncateFree(EVT SrcVT, EVT DstVT) const override;
   bool decomposeMulByConstant(LLVMContext &Context, EVT VT,

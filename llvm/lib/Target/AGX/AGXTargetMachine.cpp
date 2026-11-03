@@ -274,7 +274,7 @@ public:
                             F.getInstructionCount() >
                                 AGXStraightLineSRMaxInstructions))
       return false;
-    PassBuilder PB(TM);
+    PassBuilder PB(F.getContext(), TM);
     LoopAnalysisManager LAM;
     FunctionAnalysisManager FAM;
     CGSCCAnalysisManager CGAM;

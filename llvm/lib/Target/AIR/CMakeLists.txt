@@ -2,10 +2,10 @@ add_llvm_component_group(AIR)
 
 set(LLVM_TARGET_DEFINITIONS AIR.td)
 
-tablegen(LLVM AIRGenSubtargetInfo.inc -gen-subtarget)
-tablegen(LLVM AIRGenInstrInfo.inc -gen-instr-info)
-tablegen(LLVM AIRGenRegisterInfo.inc -gen-register-info)
-tablegen(LLVM AIRGenAIRIntrinsicMappings.inc -gen-searchable-tables)
+llvm_tablegen(AIRGenSubtargetInfo.inc -gen-subtarget)
+llvm_tablegen(AIRGenInstrInfo.inc -gen-instr-info)
+llvm_tablegen(AIRGenRegisterInfo.inc -gen-register-info)
+llvm_tablegen(AIRGenAIRIntrinsicMappings.inc -gen-searchable-tables)
 
 add_public_tablegen_target(AIRCommonTableGen)
 
