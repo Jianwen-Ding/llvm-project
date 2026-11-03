@@ -87,11 +87,19 @@ static cl::opt<bool> NativeF64(
 static cl::opt<bool> NativeF64Arith(
     "agx-air-native-f64-arith", cl::init(true), cl::Hidden,
     cl::desc("Compile AIR's software f64 addition, subtraction, "
-             "multiplication, fused multiply-add, division and square root "
-             "rounded to nearest as double operations, whose "
+             "multiplication, fused multiply-add, division, square root and "
+             "conversions to and from float and 64-bit integers rounded to "
+             "nearest as double operations, whose "
              "AGXSoftF64 lowering has a short path for normal operands and "
              "results (the other functions stay the library's unless "
              "-agx-air-native-f64)"));
+
+static cl::opt<unsigned> NativeF64ConversionsMax(
+    "agx-air-native-f64-conversions-max", cl::init(256), cl::Hidden,
+    cl::desc("Most calls of AIR's software f64 per function for its "
+             "conversions to become double operations (AGXSoftF64's short "
+             "paths stop at as many operations; its general conversions are "
+             "larger code than the library's)"));
 
 namespace {
 // Layout must match the struct emitted by -gen-searchable-tables for the
@@ -1933,17 +1941,38 @@ void LowerAIR::recoverDoubles() {
       for (User *U : make_early_inc_range(Lib->users()))
         if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == Lib)
           recoverAtomicLoop(CI, Name[10] == 's');
+  // the soft-f64 calls of each function, before any is replaced
+  DenseMap<Function *, unsigned> Calls;
+  for (Function &Lib : M)
+    if (Lib.getName().starts_with("__air_f64_"))
+      for (User *U : Lib.users())
+        if (auto *C = dyn_cast<CallInst>(U))
+          ++Calls[C->getFunction()];
   for (Function &Lib : make_early_inc_range(M)) {
     StringRef Name = Lib.getName();
     if (!Name.consume_front("__air_f64_"))
       continue;
     bool Directed = Name.consume_back("_r");
-    if (!NativeF64 && Name != "add" && Name != "sub" && Name != "mul" &&
-        Name != "fma" && Name != "div" && Name != "sqrt")
+    if (!NativeF64 && !is_contained({"add", "sub", "mul", "fma", "div", "sqrt", "from_f32",
+                                     "to_f32", "to_i64", "to_u64", "from_i64", "from_u64"},
+                                    Name))
       continue;
     for (User *U : make_early_inc_range(Lib.users())) {
       auto *CI = dyn_cast<CallInst>(U);
       if (!CI || CI->getCalledFunction() != &Lib)
+        continue;
+      // The library converts floats bit-exactly, denormals kept; as fpext /
+      // fptrunc they would follow a function's flushing of float denormals
+      // (the emulation of a subnormal-preserving float atomic in a flushing
+      // function relies on them).
+      bool Conversion = Name.starts_with("from_") || Name.starts_with("to_");
+      if (!NativeF64 && Conversion) {
+        if (Calls.lookup(CI->getFunction()) > NativeF64ConversionsMax)
+          continue;
+      }
+      if (!NativeF64 && (Name == "from_f32" || Name == "to_f32") &&
+          CI->getFunction()->getDenormalMode(APFloat::IEEEsingle()) !=
+              DenormalMode::getIEEE())
         continue;
       unsigned NArgs = CI->arg_size() - Directed;
       if (Directed) {

@@ -6,9 +6,10 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14g -passes=agx-lower-air -agx-air-native-f64=0 -agx-air-native-f64-arith=0 -S %t.air.ll \
 ; RUN:   | FileCheck %s --check-prefix=OFF
 ; By default (-agx-air-native-f64-arith) only addition, subtraction,
-; multiplication, fused multiply-add, division and square root rounded to
-; nearest become double operations: AGXSoftF64 has short paths for them; the
-; comparisons and conversions of the library are as fast as AGX's.
+; multiplication, fused multiply-add, division, square root and the
+; conversions to and from float and 64-bit integers rounded to nearest become
+; double operations: AGXSoftF64 has short paths for them; the library's
+; comparisons are as fast as AGX's.
 ; RUN: opt -mtriple=agx -mcpu=agx-g14g -passes=agx-lower-air -S %t.air.ll | FileCheck %s --check-prefix=ARITH
 
 ; CHECK-LABEL: define agx_kernel void @k(
@@ -26,7 +27,7 @@
 ; ARITH: fmul double
 ; ARITH: call double @llvm.fma.f64(
 ; ARITH-NOT: fcmp
-; ARITH-NOT: fptrunc
+; ARITH: fptrunc double {{.*}} to float
 ; ARITH: fsub double
 ; ARITH-NOT: fdiv double
 ; ARITH: ret void

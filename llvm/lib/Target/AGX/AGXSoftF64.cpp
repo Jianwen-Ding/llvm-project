@@ -478,6 +478,81 @@ public:
     return {Bits, Valid};
   }
 
+  /// A float (bits in an i64) as a double, where it is normal or zero, and
+  /// whether it is: the exponent rebiased and the fraction 29 places up.
+  std::pair<Value *, Value *> extFast(Value *X) {
+    Value *E = B.CreateAnd(B.CreateLShr(X, 23), c64(0xff));
+    Value *Sign = B.CreateShl(B.CreateAnd(B.CreateLShr(X, 31), c64(1)), 63);
+    Value *Zero = B.CreateICmpEQ(B.CreateAnd(X, c64(0x7fffffff)), c64(0));
+    Value *Bits = B.CreateOr(B.CreateShl(B.CreateAdd(E, c64(1023 - 127)), 52),
+                             B.CreateShl(B.CreateAnd(X, c64(0x7fffff)), 29));
+    Bits = B.CreateOr(select(Zero, c64(0), Bits), Sign);
+    Value *Normal = B.CreateICmpULT(B.CreateSub(E, c64(1)), c64(254));
+    return {Bits, B.CreateOr(Normal, Zero)};
+  }
+  /// A double rounded to nearest even to a float (bits in an i64), where the
+  /// double is zero or the result normal, and whether it is.
+  std::pair<Value *, Value *> truncFast(Value *X) {
+    Value *E = B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll()));
+    Value *Frac = B.CreateAnd(X, c64(F64.fracMask()));
+    Value *M = B.CreateLShr(Frac, 29);
+    Value *Rest = B.CreateAnd(Frac, c64((uint64_t(1) << 29) - 1));
+    Value *Half = c64(uint64_t(1) << 28);
+    Value *Inc = B.CreateOr(B.CreateICmpUGT(Rest, Half),
+                            B.CreateAnd(B.CreateICmpEQ(Rest, Half), B.CreateTrunc(M, I1)));
+    // the exponent field E - 896, the rounding carry into it
+    Value *EF = B.CreateSub(E, c64(1023 - 127));
+    Value *Bits = B.CreateAdd(B.CreateAdd(B.CreateShl(EF, 23), M), B.CreateZExt(Inc, I64));
+    Value *Valid = B.CreateAnd(B.CreateICmpULT(B.CreateSub(EF, c64(1)), c64(254)),
+                               B.CreateICmpULT(Bits, c64(0x7f800000)));
+    Value *Zero = isZero(X, F64);
+    Bits = select(Zero, c64(0), Bits);
+    Bits = B.CreateOr(Bits, B.CreateShl(B.CreateLShr(X, 63), 31));
+    return {Bits, B.CreateOr(Valid, Zero)};
+  }
+  /// A double truncated to an integer of type Ty where it fits (finite, of
+  /// a magnitude below 2^(W - 1), or below 2^W and not negative unsigned),
+  /// and whether it does; a negative value is 0 unsigned (saturating).
+  std::pair<Value *, Value *> toIntFast(Value *X, Type *Ty, bool Signed) {
+    unsigned W = Ty->getIntegerBitWidth();
+    Value *E = B.CreateTrunc(B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll())), I32);
+    Value *M = B.CreateOr(B.CreateAnd(X, c64(F64.fracMask())), c64(F64.fracMask() + 1));
+    // X = M 2^(E - 1075); E below 1023 is below 1 (zero, denormal or not):
+    // the shifts give 0
+    Value *Sh = B.CreateSub(E, c32(F64.Bias + 52));
+    Value *Left = shl(M, B.CreateBinaryIntrinsic(Intrinsic::smax, Sh, c32(0)));
+    Value *Right = lshr(M, B.CreateNeg(B.CreateBinaryIntrinsic(Intrinsic::smin, Sh, c32(0))));
+    Value *Mag = select(B.CreateICmpSGT(Sh, c32(0)), Left, Right);
+    Value *Neg = B.CreateICmpSLT(X, c64(0));
+    Value *Fits = B.CreateICmpULT(E, c32(F64.Bias + W - (Signed ? 1 : 0)));
+    Value *R;
+    if (Signed) {
+      R = select(Neg, B.CreateNeg(Mag), Mag);
+    } else {
+      R = select(Neg, c64(0), Mag);
+      // any negative value (not NaN) saturates to 0
+      Fits = B.CreateOr(Fits, B.CreateAnd(Neg, B.CreateICmpULT(E, c32(F64.expAll()))));
+    }
+    return {B.CreateTrunc(R, Ty), Fits};
+  }
+  /// An integer as a double where it is exact (a magnitude below 2^53), and
+  /// whether it is: one count of leading zeros places its top bit at 52.
+  std::pair<Value *, Value *> fromIntFast(Value *V, bool Signed) {
+    Value *V64 = Signed ? B.CreateSExt(V, I64) : B.CreateZExt(V, I64);
+    Value *Neg = Signed ? B.CreateICmpSLT(V64, c64(0)) : B.getFalse();
+    Value *A = select(Neg, B.CreateNeg(V64), V64);
+    Value *Lz = umin64(B.CreateBinaryIntrinsic(Intrinsic::ctlz, A, B.getFalse()), 63);
+    Value *Sh = B.CreateSub(Lz, c64(11));
+    Value *Valid = B.CreateICmpUGE(Lz, c64(11));
+    // (only used where valid: a shift of at most 52 places)
+    Value *M = B.CreateShl(A, B.CreateBinaryIntrinsic(Intrinsic::umin, Sh, c64(52)));
+    // biased exponent 1075 - Sh, minus one for the implicit bit added by M
+    Value *Bits = B.CreateAdd(B.CreateShl(B.CreateSub(c64(F64.Bias + 52 - 1), Sh), 52), M);
+    Bits = select(B.CreateICmpEQ(A, c64(0)), c64(0), Bits);
+    Bits = B.CreateOr(Bits, select(Neg, c64(F64.signBit()), c64(0)));
+    return {Bits, B.CreateOr(Valid, B.CreateICmpEQ(A, c64(0)))};
+  }
+
   /// T (a double's significand) with its top bit at bit 52, unless it is 0.
   Term normalize53(Term T) {
     Value *S = B.CreateSub(c32(F64.P), bitLength(T.M));
@@ -1025,6 +1100,10 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     return B.CreateZExt(B.CreateBitCast(V, B.getIntNTy(W)), I64);
   };
   auto Dbl = [&](Value *V) { return B.CreateBitCast(V, B.getDoubleTy()); };
+  // conversions rounded to nearest (or truncating) with short paths
+  auto *RoundC = dyn_cast<ConstantInt>(Rounding);
+  bool Fast = AGXSoftF64FastPaths && FastPathsHere && RoundC &&
+              RoundC->getZExtValue() == RoundNearestEven;
   Value *R = nullptr;
   switch (I.getOpcode()) {
   case Instruction::FAdd:
@@ -1067,26 +1146,67 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     break;
   case Instruction::FPExt: {
     Fmt In = formatOf(I.getOperand(0)->getType());
-    R = Dbl(SD.convert(Bits(0), In, F64));
+    Value *X = Bits(0);
+    if (Fast && In.P == F32.P && In.Bias == F32.Bias) {
+      auto [FastBits, Valid] = SD.extFast(X);
+      R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+        return Slow.convert(X, In, F64);
+      }, Rounding, CanonicalNaN));
+      break;
+    }
+    R = Dbl(SD.convert(X, In, F64));
     break;
   }
   case Instruction::FPTrunc: {
     Type *Ty = I.getType();
     Fmt Out = formatOf(Ty);
-    Value *V = SD.convert(Bits(0), F64, Out);
+    Value *X = Bits(0);
+    if (Fast && Ty->isFloatTy()) {
+      auto [FastBits, Valid] = SD.truncFast(X);
+      Value *V = withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+        return Slow.convert(X, F64, Out);
+      }, Rounding, CanonicalNaN);
+      R = B.CreateBitCast(B.CreateTrunc(V, B.getIntNTy(Out.W)), Ty);
+      break;
+    }
+    Value *V = SD.convert(X, F64, Out);
     R = B.CreateBitCast(B.CreateTrunc(V, B.getIntNTy(Out.W)), Ty);
     break;
   }
   case Instruction::SIToFP:
-  case Instruction::UIToFP:
+  case Instruction::UIToFP: {
     if (!isDouble(&I))
       return nullptr;
-    R = Dbl(SD.fromInt(I.getOperand(0), I.getOpcode() == Instruction::SIToFP));
+    bool Signed = I.getOpcode() == Instruction::SIToFP;
+    Value *V = I.getOperand(0);
+    if (Fast && V->getType()->getIntegerBitWidth() <= 64) {
+      auto [FastBits, Valid] = SD.fromIntFast(V, Signed);
+      // 32-bit integers are always exact
+      if (V->getType()->getIntegerBitWidth() <= 32)
+        R = Dbl(FastBits);
+      else
+        R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+          return Slow.fromInt(V, Signed);
+        }, Rounding, CanonicalNaN));
+      break;
+    }
+    R = Dbl(SD.fromInt(V, Signed));
     break;
+  }
   case Instruction::FPToSI:
-  case Instruction::FPToUI:
-    R = SD.toInt(Bits(0), I.getType(), I.getOpcode() == Instruction::FPToSI);
+  case Instruction::FPToUI: {
+    bool Signed = I.getOpcode() == Instruction::FPToSI;
+    Value *X = Bits(0);
+    if (Fast && I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64) {
+      auto [FastV, Valid] = SD.toIntFast(X, I.getType(), Signed);
+      R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
+        return Slow.toInt(X, I.getType(), Signed);
+      }, Rounding, CanonicalNaN);
+      break;
+    }
+    R = SD.toInt(X, I.getType(), Signed);
     break;
+  }
   case Instruction::FCmp:
     R = SD.compare(cast<FCmpInst>(I).getPredicate(), Bits(0), Bits(1));
     break;
@@ -1171,10 +1291,19 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
                        cast<ConstantInt>(II.getArgOperand(1))->getZExtValue());
       break;
     case Intrinsic::fptosi_sat:
-    case Intrinsic::fptoui_sat:
-      R = SD.toInt(Bits(0), I.getType(),
-                   II.getIntrinsicID() == Intrinsic::fptosi_sat);
+    case Intrinsic::fptoui_sat: {
+      bool Signed = II.getIntrinsicID() == Intrinsic::fptosi_sat;
+      Value *X = Bits(0);
+      if (Fast && I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64) {
+        auto [FastV, Valid] = SD.toIntFast(X, I.getType(), Signed);
+        R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
+          return Slow.toInt(X, I.getType(), Signed);
+        }, Rounding, CanonicalNaN);
+        break;
+      }
+      R = SD.toInt(X, I.getType(), Signed);
       break;
+    }
     default:
       return nullptr;
     }

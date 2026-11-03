@@ -73,3 +73,23 @@ define agx_kernel void @mul_rz(ptr addrspace(1) %out, double %a, double %b) #0 {
 }
 
 attributes #0 = { strictfp }
+
+; Conversions: a float (normal or zero) widens without a slow path condition
+; on the exponent's range beyond its being normal; a double narrows to a
+; normal float with one rounding; an integer below 2^53 converts exactly
+; (a 32-bit one always: no branch).
+; CHECK-LABEL: @conv(
+; CHECK: br i1 %{{.*}}, label %{{[^,]*}}, label %{{[^,]*}}, !prof
+; CHECK: br i1 %{{.*}}, label %{{[^,]*}}, label %{{[^,]*}}, !prof
+; CHECK: call i64 @llvm.ctlz.i64
+; CHECK-NOT: br i1
+; CHECK: ret void
+define agx_kernel void @conv(ptr addrspace(1) %out, float %f, double %d, i32 %i) {
+  %e = fpext float %f to double
+  %t = fptrunc double %d to float
+  %c = sitofp i32 %i to double
+  store volatile double %e, ptr addrspace(1) %out
+  store volatile float %t, ptr addrspace(1) %out
+  store volatile double %c, ptr addrspace(1) %out
+  ret void
+}
