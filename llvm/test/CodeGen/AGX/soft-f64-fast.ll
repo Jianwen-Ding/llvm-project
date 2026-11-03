@@ -97,8 +97,8 @@ define agx_kernel void @conv(ptr addrspace(1) %out, float %f, double %d, i32 %i)
 ; Rounding to integral values by masks on the bits, the general code only
 ; for NaNs.
 ; CHECK-LABEL: @floor(
-; CHECK: br i1 %{{.*}}, label %{{[^,]*}}, label %{{[^,]*}}, !prof
 ; CHECK-NOT: ctlz
+; CHECK: br i1 %{{.*}}, label %{{[^,]*}}, label %{{[^,]*}}, !prof
 ; CHECK: phi i64
 define agx_kernel void @floor(ptr addrspace(1) %out, double %d) {
   %r = call double @llvm.floor.f64(double %d)
