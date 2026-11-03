@@ -5,3 +5,9 @@ mlir_tablegen(Passes.capi.cpp.inc -gen-pass-capi-impl --prefix GPU)
 add_mlir_dialect_tablegen_target(MLIRGPUPassIncGen)
 
 add_mlir_doc(Passes GPUPasses ./ -gen-pass-doc)
+
+add_subdirectory(AIR)
+add_subdirectory(NVVM)
+add_subdirectory(ROCDL)
+add_subdirectory(SPIRV)
+add_subdirectory(XeVM)

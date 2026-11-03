@@ -25,6 +25,7 @@ set(ANALYSIS_TEST_SOURCES
   CGSCCPassManagerTest.cpp
   ConstraintSystemTest.cpp
   CtxProfAnalysisTest.cpp
+  CycleInfoTest.cpp
   DDGTest.cpp
   DomTreeUpdaterTest.cpp
   DXILResourceTest.cpp
@@ -49,7 +50,6 @@ set(ANALYSIS_TEST_SOURCES
   PluginInlineAdvisorAnalysisTest.cpp
   PluginInlineOrderAnalysisTest.cpp
   ProfileSummaryInfoTest.cpp
-  RegionInfoTest.cpp
   ReplaceWithVecLibTest.cpp
   ScalarEvolutionTest.cpp
   SparsePropagation.cpp
