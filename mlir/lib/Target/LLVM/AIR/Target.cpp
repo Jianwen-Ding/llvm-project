@@ -135,7 +135,7 @@ LogicalResult runPipeline(llvm::TargetMachine &tm, llvm::Module &module,
   llvm::FunctionAnalysisManager fam;
   llvm::CGSCCAnalysisManager cgam;
   llvm::ModuleAnalysisManager mam;
-  llvm::PassBuilder pb(&tm);
+  llvm::PassBuilder pb(module.getContext(), &tm);
   pb.registerModuleAnalyses(mam);
   pb.registerCGSCCAnalyses(cgam);
   pb.registerFunctionAnalyses(fam);
