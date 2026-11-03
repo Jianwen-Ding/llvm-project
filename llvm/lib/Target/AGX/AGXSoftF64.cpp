@@ -21,6 +21,7 @@
 #include "AGX.h"
 #include "AGXSubtarget.h"
 #include "llvm/ADT/FloatingPointMode.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -838,6 +839,69 @@ public:
   }
 
   enum Integral { Floor, Ceil, Trunc, Nearest, Even, Away };
+  /// X rounded to an integral value with masks on its bits (Mode Nearest as
+  /// Even: rounded to nearest), and whether X is not a NaN: at or above 2^52
+  /// (or infinite) X itself; below 1 a zero or one of its sign; otherwise the
+  /// fraction's bits cleared, and one unit of the lowest integral bit added
+  /// to the magnitude where Mode rounds it away from zero (a carry into the
+  /// exponent is right).
+  std::pair<Value *, Value *> integralFast(Value *X, Integral Mode) {
+    Value *E = B.CreateTrunc(B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll())), I32);
+    Value *Neg = B.CreateICmpSLT(X, c64(0));
+    Value *Sign = B.CreateAnd(X, c64(F64.signBit()));
+    Value *Mag = magnitude(X, F64);
+    // 1 <= |X| < 2^52: K = 1075 - E fraction bits (1 to 52)
+    Value *EC = umin(B.CreateBinaryIntrinsic(Intrinsic::umax, E, c32(F64.Bias)), c32(F64.Bias + 51));
+    Value *K = B.CreateZExt(B.CreateSub(c32(F64.Bias + 52), EC), I64);
+    Value *Unit = B.CreateShl(c64(1), K);
+    Value *Mask = B.CreateSub(Unit, c64(1));
+    Value *Frac = B.CreateAnd(X, Mask);
+    Value *T = B.CreateAnd(X, B.CreateNot(Mask));
+    Value *HasFrac = B.CreateICmpNE(Frac, c64(0));
+    Value *Up;
+    Value *One = B.CreateOr(Sign, c64(0x3ff0000000000000ULL));
+    // below 1: whether the result is one (of X's sign)
+    Value *SmallOne;
+    switch (Mode) {
+    case Trunc:
+      Up = B.getFalse();
+      SmallOne = B.getFalse();
+      break;
+    case Floor:
+      Up = B.CreateAnd(Neg, HasFrac);
+      SmallOne = B.CreateAnd(Neg, B.CreateICmpNE(Mag, c64(0)));
+      break;
+    case Ceil:
+      Up = B.CreateAnd(B.CreateNot(Neg), HasFrac);
+      SmallOne = B.CreateAnd(B.CreateNot(Neg), B.CreateICmpNE(Mag, c64(0)));
+      break;
+    case Away: {
+      Value *Half = B.CreateLShr(Unit, 1);
+      Up = B.CreateICmpUGE(Frac, Half);
+      SmallOne = B.CreateICmpUGE(Mag, c64(0x3fe0000000000000ULL)); // >= 0.5
+      break;
+    }
+    default: { // to nearest, ties to even
+      Value *Half = B.CreateLShr(Unit, 1);
+      Value *Odd = B.CreateICmpNE(B.CreateAnd(T, Unit), c64(0));
+      Up = B.CreateOr(B.CreateICmpUGT(Frac, Half),
+                      B.CreateAnd(B.CreateICmpEQ(Frac, Half), Odd));
+      SmallOne = B.CreateICmpUGT(Mag, c64(0x3fe0000000000000ULL)); // > 0.5
+      break;
+    }
+    }
+    Value *Mid = B.CreateAdd(T, select(Up, Unit, c64(0)));
+    // (for directed modes the small results: a zero of X's sign, or the one
+    // of the side rounded to)
+    if (Mode == Floor)
+      One = c64(0xbff0000000000000ULL);
+    else if (Mode == Ceil)
+      One = c64(0x3ff0000000000000ULL);
+    Value *Small = select(SmallOne, One, Sign);
+    Value *R = select(B.CreateICmpUGE(E, c32(F64.Bias + 52)), X,
+                      select(B.CreateICmpULT(E, c32(F64.Bias)), Small, Mid));
+    return {R, B.CreateNot(isNaN(X, F64))};
+  }
   Value *integral(Value *X, Integral Mode) {
     Term T = unpack(X, F64);
     Value *NE = B.CreateNeg(B.CreateBinaryIntrinsic(Intrinsic::smin, T.E, c32(0)));
@@ -1263,24 +1327,33 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
                         II.getIntrinsicID() == Intrinsic::minimumnum, false, true));
       break;
     case Intrinsic::floor:
-      R = Dbl(SD.integral(Bits(0), SoftDouble::Floor));
-      break;
     case Intrinsic::ceil:
-      R = Dbl(SD.integral(Bits(0), SoftDouble::Ceil));
-      break;
     case Intrinsic::trunc:
-      R = Dbl(SD.integral(Bits(0), SoftDouble::Trunc));
-      break;
     case Intrinsic::rint:
     case Intrinsic::nearbyint:
-      R = Dbl(SD.integral(Bits(0), SoftDouble::Nearest));
-      break;
     case Intrinsic::roundeven:
-      R = Dbl(SD.integral(Bits(0), SoftDouble::Even));
+    case Intrinsic::round: {
+      SoftDouble::Integral Mode =
+          StringSwitch<SoftDouble::Integral>(Intrinsic::getBaseName(II.getIntrinsicID()))
+              .Case("llvm.floor", SoftDouble::Floor)
+              .Case("llvm.ceil", SoftDouble::Ceil)
+              .Case("llvm.trunc", SoftDouble::Trunc)
+              .Case("llvm.roundeven", SoftDouble::Even)
+              .Case("llvm.round", SoftDouble::Away)
+              .Default(SoftDouble::Nearest);
+      Value *X = Bits(0);
+      // rint / nearbyint round in the current direction: nearest here only
+      bool Directional = Mode == SoftDouble::Nearest;
+      if (AGXSoftF64FastPaths && FastPathsHere && (!Directional || Fast)) {
+        auto [FastBits, Valid] = SD.integralFast(X, Mode);
+        R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+          return Slow.integral(X, Mode);
+        }, Rounding, CanonicalNaN));
+        break;
+      }
+      R = Dbl(SD.integral(X, Mode));
       break;
-    case Intrinsic::round:
-      R = Dbl(SD.integral(Bits(0), SoftDouble::Away));
-      break;
+    }
     case Intrinsic::canonicalize: {
       Value *X = Bits(0);
       R = Dbl(SD.select(SD.isNaN(X, F64), SD.nanResult({X}, F64, F64), X));
