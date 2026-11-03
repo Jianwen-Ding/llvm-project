@@ -1,6 +1,6 @@
 ; agx-lower-air compiles AIR's portable forms of operations AGX has as those
-; operations: afn 1 / x, 1 / sqrt(x) and sin / cos of x * pi / 2 as the
-; hardware approximations, AIR's minimum (fmin with a NaN check) as AGX's,
+; operations: afn 1 / x, 1 / sqrt(x) and sin / cos as the hardware
+; approximations (in radians: the argument is kept, x * pi / 2 here), AIR's minimum (fmin with a NaN check) as AGX's,
 ; in the narrow type when computed in float, and drops PTX's explicit .ftz
 ; flushes where the f32 ALU flushes anyway.
 ; RUN: llc -mtriple=air -air-portable %s -o %t.air.ll
@@ -9,7 +9,8 @@
 ; CHECK-LABEL: define agx_kernel void @k(
 ; CHECK: call float @llvm.agx.rcp.f32(float %x.val)
 ; CHECK: call float @llvm.agx.rsqrt.f32(float %x.val)
-; CHECK: call float @llvm.agx.sin.f32(float %x.val)
+; CHECK: %q = fmul afn float %x.val
+; CHECK: call float @llvm.agx.sin.f32(float %q)
 ; CHECK: call float @llvm.minimum.f32(float %x.val, float %y.val)
 ; CHECK: call bfloat @llvm.minimum.bf16(bfloat %b.val, bfloat %c.val)
 ; CHECK: %ff = fadd float %x.val, %y.val
