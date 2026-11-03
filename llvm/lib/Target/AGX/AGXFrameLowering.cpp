@@ -42,6 +42,11 @@ static cl::opt<bool> MeasuredCallFrames(
 // !{i64 KernelRegion, i64 DepthRegion}, or, measured, !{i64 KernelRegion,
 // i64 0, i64 Depth1, ..., i64 Depth7}, each depth's largest frame recorded as
 // the functions are compiled in increasing depth.
+static cl::opt<unsigned> MeasuredStackBytes(
+    "agx-measured-stack-bytes", cl::init(0), cl::Hidden,
+    cl::desc("Measured call frames: the stack reserved per thread instead of "
+             "all addressable bytes (an error if the frames do not fit)"));
+
 static constexpr StringLiteral CallFramesMD = "agx.call.frames";
 // Frame offsets are 15-bit immediates.
 static constexpr uint64_t AddressableStackBytes = 0x8000;
@@ -120,7 +125,8 @@ unsigned AGXFrameLowering::getStackAdjustUnits(const MachineFunction &MF) {
           V[0] = KernelRegion;
           writeCallFrames(M, V);
         }
-        Bytes = AddressableStackBytes;
+        Bytes = MeasuredStackBytes ? MeasuredStackBytes.getValue()
+                                   : AddressableStackBytes;
       } else if (Bytes > CallFrameRegionBytes) {
         // A larger kernel region, which the functions it calls must know:
         // only with one kernel in the module (they are compiled after it).
@@ -173,9 +179,14 @@ void AGXFrameLowering::emitPrologue(MachineFunction &MF,
                              MF.getName() + ")");
       V[CallDepth + 1] = std::max(V[CallDepth + 1], alignTo(Frame, 16));
       writeCallFrames(M, V);
-      if (getCalleeFrameOffset(MF) + Frame > AddressableStackBytes)
+      if (getCalleeFrameOffset(MF) + Frame >
+          (MeasuredStackBytes ? MeasuredStackBytes.getValue()
+                              : AddressableStackBytes))
         report_fatal_error("experimental AGX call frames exceed " +
-                           Twine(AddressableStackBytes) + " bytes (" +
+                           Twine(MeasuredStackBytes
+                                     ? MeasuredStackBytes.getValue()
+                                     : uint64_t(AddressableStackBytes)) +
+                           " bytes (" +
                            MF.getName() + ")");
     } else {
       uint64_t DepthBytes = V.size() == 2 ? V[1] : CallFrameRegionBytes;
