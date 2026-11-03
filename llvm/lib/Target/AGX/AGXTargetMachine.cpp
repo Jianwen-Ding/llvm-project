@@ -22,6 +22,7 @@
 #include "AGXTargetTransformInfo.h"
 #include "TargetInfo/AGXTargetInfo.h"
 #include "llvm/CodeGen/MachineScheduler.h"
+#include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
@@ -138,6 +139,20 @@ MachineFunctionInfo *AGXTargetMachine::createMachineFunctionInfo(
     const TargetSubtargetInfo *STI) const {
   return AGXMachineFunctionInfo::create<AGXMachineFunctionInfo>(Allocator, F,
                                                                 STI);
+}
+
+// Stack slots are private memory: a memory operand the DAG rebuilds from a frame
+// index (merged or split stores of an alloca) has the stack's pseudo source value,
+// whose address space must be the alloca's for the private_load / private_store
+// patterns to match (it was 0: "Cannot select: store (s64) into %stack.0" on two
+// zero <2 x float> stores into one alloca, llama.cpp's mul_mat_vec_q_moe).
+unsigned AGXTargetMachine::getAddressSpaceForPseudoSourceKind(unsigned Kind) const {
+  switch (Kind) {
+  case PseudoSourceValue::Stack:
+  case PseudoSourceValue::FixedStack:
+    return AGX::PRIVATE_ADDRESS;
+  }
+  return CodeGenTargetMachineImpl::getAddressSpaceForPseudoSourceKind(Kind);
 }
 
 bool AGXTargetMachine::isNoopAddrSpaceCast(const DataLayout &DL, unsigned SrcAS,
