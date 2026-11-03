@@ -3,8 +3,13 @@
 ; software f64; a directed rounding stays a call.
 ; RUN: llc -mtriple=air -air-portable %s -o %t.air.ll
 ; RUN: opt -mtriple=agx -mcpu=agx-g14g -passes=agx-lower-air -agx-air-native-f64 -S %t.air.ll | FileCheck %s
-; RUN: opt -mtriple=agx -mcpu=agx-g14g -passes=agx-lower-air -agx-air-native-f64=0 -S %t.air.ll \
+; RUN: opt -mtriple=agx -mcpu=agx-g14g -passes=agx-lower-air -agx-air-native-f64=0 -agx-air-native-f64-arith=0 -S %t.air.ll \
 ; RUN:   | FileCheck %s --check-prefix=OFF
+; By default (-agx-air-native-f64-arith) only addition, subtraction,
+; multiplication, fused multiply-add, division and square root rounded to
+; nearest become double operations: AGXSoftF64 has short paths for them; the
+; comparisons and conversions of the library are as fast as AGX's.
+; RUN: opt -mtriple=agx -mcpu=agx-g14g -passes=agx-lower-air -S %t.air.ll | FileCheck %s --check-prefix=ARITH
 
 ; CHECK-LABEL: define agx_kernel void @k(
 ; CHECK: fadd double
@@ -16,6 +21,15 @@
 ; CHECK-NOT: fdiv double
 ; CHECK: ret void
 ; OFF-NOT: fadd double
+; ARITH-LABEL: define agx_kernel void @k(
+; ARITH: fadd double
+; ARITH: fmul double
+; ARITH: call double @llvm.fma.f64(
+; ARITH-NOT: fcmp
+; ARITH-NOT: fptrunc
+; ARITH: fsub double
+; ARITH-NOT: fdiv double
+; ARITH: ret void
 define void @k(ptr addrspace(1) %out, i64 %x, i64 %y) "air-kernel" {
   %a = call i64 @__air_f64_add(i64 %x, i64 %y)
   %m = call i64 @__air_f64_mul(i64 %a, i64 %y)

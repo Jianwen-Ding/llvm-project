@@ -1,5 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g13g -o /dev/null -print-after=agx-soft-f64 < %s 2>&1 | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g13g -verify-machineinstrs < %s | FileCheck %s --check-prefix=ASM
+; RUN: llc -mtriple=agx -mcpu=agx-g13g -o /dev/null -print-after=agx-soft-f64 -agx-soft-f64-fast-paths=false < %s 2>&1 \
+; RUN:   | FileCheck %s --check-prefix=GENERAL
 
 ; Double precision arithmetic becomes integer arithmetic on the bits, with
 ; 128-bit intermediate values; values that are only moved stay double.
@@ -27,13 +29,25 @@ define agx_kernel void @arith(ptr addrspace(1) %out, double %a, float %b) {
 }
 
 ; The square root has no loop: an agx_rsqrt estimate refined by Newton steps
-; on fixed-point values, then corrected with the exact remainder.
+; on fixed-point values, then corrected with the exact remainder. Rounded to
+; nearest, a positive normal operand takes a short path, and the general
+; computation (zeros, denormals, negative values, infinities, NaNs) is in a
+; conditional block.
 ; CHECK-LABEL: @root(
-; CHECK-NOT: br
 ; CHECK: call float @llvm.agx.rsqrt.f32
 ; CHECK: mul i128
-; CHECK-NOT: br
+; CHECK: br i1 %{{.*}}, label %[[SLOW:.*]], label %[[JOIN:.*]]
+; CHECK: [[SLOW]]:
+; CHECK: call float @llvm.agx.rsqrt.f32
+; CHECK: [[JOIN]]:
+; CHECK-NEXT: phi i64
 ; CHECK: ret void
+; GENERAL-LABEL: @root(
+; GENERAL-NOT: br
+; GENERAL: call float @llvm.agx.rsqrt.f32
+; GENERAL: mul i128
+; GENERAL-NOT: br
+; GENERAL: ret void
 define agx_kernel void @root(ptr addrspace(1) %out, double %a) {
   %r = call double @llvm.sqrt.f64(double %a)
   store double %r, ptr addrspace(1) %out

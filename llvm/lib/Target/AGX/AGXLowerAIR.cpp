@@ -84,6 +84,15 @@ static cl::opt<bool> NativeF64(
              "nearest) as double operations, lowered as AGX lowers them "
              "(off: the library is as fast; see EXPERIMENTS.md L4-E2)"));
 
+static cl::opt<bool> NativeF64Arith(
+    "agx-air-native-f64-arith", cl::init(true), cl::Hidden,
+    cl::desc("Compile AIR's software f64 addition, subtraction, "
+             "multiplication, fused multiply-add, division and square root "
+             "rounded to nearest as double operations, whose "
+             "AGXSoftF64 lowering has a short path for normal operands and "
+             "results (the other functions stay the library's unless "
+             "-agx-air-native-f64)"));
+
 namespace {
 // Layout must match the struct emitted by -gen-searchable-tables for the
 // AIRFunction class in AIRIntrinsicMappings.td.
@@ -1846,7 +1855,7 @@ void LowerAIR::recoverAGXOperations(Function &F) {
 // or the `_r` ones with a constant rounding of 1, FLT_ROUNDS' nearest) become
 // the double operations again.
 void LowerAIR::recoverDoubles() {
-  if (!NativeF64)
+  if (!NativeF64 && !NativeF64Arith)
     return;
   LLVMContext &Ctx = M.getContext();
   Type *F64 = Type::getDoubleTy(Ctx), *F32 = Type::getFloatTy(Ctx);
@@ -1856,6 +1865,9 @@ void LowerAIR::recoverDoubles() {
     if (!Name.consume_front("__air_f64_"))
       continue;
     bool Directed = Name.consume_back("_r");
+    if (!NativeF64 && Name != "add" && Name != "sub" && Name != "mul" &&
+        Name != "fma" && Name != "div" && Name != "sqrt")
+      continue;
     for (User *U : make_early_inc_range(Lib.users())) {
       auto *CI = dyn_cast<CallInst>(U);
       if (!CI || CI->getCalledFunction() != &Lib)
