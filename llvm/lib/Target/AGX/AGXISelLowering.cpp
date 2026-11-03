@@ -137,6 +137,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::FSHL, MVT::i32, Expand);
   setOperationAction(ISD::FSHR, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i32, Legal);
+  setOperationAction(ISD::BITREVERSE, MVT::i64, Custom);
   setOperationAction(ISD::BITREVERSE, MVT::i16, Promote);
   setOperationAction({ISD::CTPOP, ISD::CTLZ, ISD::CTTZ}, MVT::i16, Promote);
   setOperationAction({ISD::CTLZ, ISD::CTTZ}, MVT::i64, Custom);
@@ -732,6 +733,14 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
   case ISD::CTLZ:
   case ISD::CTTZ:
     return lowerCTLZ_CTTZ64(Op, DAG);
+  case ISD::BITREVERSE: {
+    // the halves reversed by the 32-bit instruction, and swapped
+    SDLoc DL(Op);
+    auto [Lo, Hi] = split64(DAG, DL, Op.getOperand(0));
+    return DAG.getNode(ISD::BUILD_PAIR, DL, MVT::i64,
+                       DAG.getNode(ISD::BITREVERSE, DL, MVT::i32, Hi),
+                       DAG.getNode(ISD::BITREVERSE, DL, MVT::i32, Lo));
+  }
   case ISD::FP_TO_BF16:
     return lowerFP_TO_BF16(Op, DAG);
   case ISD::STRICT_FP_TO_BF16:
