@@ -36,7 +36,7 @@ define agx_kernel void @arith(ptr addrspace(1) %out, double %a, float %b) {
 ; CHECK-LABEL: @root(
 ; CHECK: call float @llvm.agx.rsqrt.f32
 ; CHECK: mul i128
-; CHECK: br i1 %{{.*}}, label %[[SLOW:.*]], label %[[JOIN:.*]]
+; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
 ; CHECK: [[SLOW]]:
 ; CHECK: call float @llvm.agx.rsqrt.f32
 ; CHECK: [[JOIN]]:

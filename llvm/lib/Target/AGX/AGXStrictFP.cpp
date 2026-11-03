@@ -45,6 +45,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
@@ -805,7 +806,9 @@ static void lowerWithSlowPath(Instruction &I, CondFn BuildCond,
   IRBuilder<> B(Next);
   SoftFloat SF(B);
   Value *Cond = BuildCond(SF, B);
-  Instruction *ThenTerm = SplitBlockAndInsertIfThen(Cond, Next, false);
+  Instruction *ThenTerm = SplitBlockAndInsertIfThen(
+      Cond, Next->getIterator(), false,
+      MDBuilder(I.getContext()).createUnlikelyBranchWeights());
   B.SetInsertPoint(ThenTerm);
   Value *Slow = BuildSlow(SF, B);
   BasicBlock *Then = ThenTerm->getParent();
@@ -828,7 +831,8 @@ static void replaceWithSlowPath(Instruction &I, FastFn BuildFast,
   SoftFloat SF(B);
   auto [Fast, Valid] = BuildFast(SF, B);
   Instruction *ThenTerm =
-      SplitBlockAndInsertIfThen(B.CreateNot(Valid), Next, false);
+      SplitBlockAndInsertIfThen(B.CreateNot(Valid), Next->getIterator(), false,
+                                MDBuilder(I.getContext()).createUnlikelyBranchWeights());
   B.SetInsertPoint(ThenTerm);
   Value *Slow = BuildSlow(SF, B);
   BasicBlock *Then = ThenTerm->getParent();

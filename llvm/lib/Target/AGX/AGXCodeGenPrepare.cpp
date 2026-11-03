@@ -62,12 +62,16 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include <cmath>
+#include <map>
+#include <set>
+#include <tuple>
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/IntegerDivision.h"
@@ -826,6 +830,17 @@ static cl::opt<bool> AGXNewtonDiv64(
     cl::desc("Expand 64-bit division and remainder with a reciprocal estimate "
              "and Newton-Raphson steps in integers instead of a bit loop"));
 
+// Each expansion is ~200 bytes of code more than the loop, in every kernel
+// that divides, whether or not its 64-bit case runs; a kernel that divides by
+// many 64-bit values (PyTorch's strided copies: their 32-bit case is the one
+// that runs) keeps the compact loop rather than grow past the instruction
+// fetch's reach (AGX Performance Simulator: permute4d, 6 divisions, 13.9 ->
+// 16.4 KB, +24% cycles per SIMD group with 24 groups per core).
+static cl::opt<unsigned> AGXNewtonDiv64Max(
+    "agx-newton-div64-max", cl::init(4), cl::Hidden,
+    cl::desc("Most 64-bit division expansions per function with "
+             "-agx-newton-div64 (the others take the bit loop)"));
+
 /// A 64-bit division or remainder without the 64-iteration bit loop, as
 /// AMDGPU expands them (AMDGPUTargetLowering::LowerUDIVREM64): an estimate
 /// of 2^64 / y from the f32 reciprocal, two Newton-Raphson steps in
@@ -837,19 +852,20 @@ static cl::opt<bool> AGXNewtonDiv64(
 /// steps: corrections that add one while the remainder is at least y give
 /// the exact result.
 /// Division by zero gives all ones (remainder: x), as the 32-bit expansion.
-static Value *expandDivRem64(BinaryOperator &BO) {
+/// Returns the quotient and the remainder (both signed for a signed
+/// operation), so that a division and remainder of the same operands share
+/// one expansion.
+static std::pair<Value *, Value *> expandDivRem64(BinaryOperator &BO) {
   IRBuilder<> B(&BO);
   Instruction::BinaryOps Op = BO.getOpcode();
   bool IsSigned = Op == Instruction::SDiv || Op == Instruction::SRem;
-  bool IsRem = Op == Instruction::URem || Op == Instruction::SRem;
   Type *I32 = B.getInt32Ty(), *I64 = B.getInt64Ty(), *I128 = B.getInt128Ty();
   Type *F32 = B.getFloatTy();
   Value *X = BO.getOperand(0), *Y0 = BO.getOperand(1);
-  Value *Y = Y0, *Neg = nullptr;
+  Value *Y = Y0, *XNeg = nullptr, *YNeg = nullptr;
   if (IsSigned) {
-    Value *XNeg = B.CreateICmpSLT(X, B.getInt64(0));
-    Value *YNeg = B.CreateICmpSLT(Y, B.getInt64(0));
-    Neg = IsRem ? XNeg : B.CreateXor(XNeg, YNeg);
+    XNeg = B.CreateICmpSLT(X, B.getInt64(0));
+    YNeg = B.CreateICmpSLT(Y, B.getInt64(0));
     X = B.CreateSelect(XNeg, B.CreateNeg(X), X);
     Y = B.CreateSelect(YNeg, B.CreateNeg(Y), Y);
   }
@@ -860,13 +876,12 @@ static Value *expandDivRem64(BinaryOperator &BO) {
     return B.CreateTrunc(B.CreateLShr(P, 64), I64);
   };
   Value *Z;
-  unsigned Corrections = 3;
+  unsigned Corrections = 2;
   if (auto *C = dyn_cast<ConstantInt>(Y); C && !C->isZero() && !C->isOne()) {
     // a constant divisor: floor(2^64 / y) exactly, so the quotient is at
     // most one below x / y (x / y - x z / 2^64 < x / 2^64 < 1, and the
     // truncation of the multiply-high)
     Z = B.getInt64(APInt::getMaxValue(64).udiv(C->getValue()).getZExtValue());
-    Corrections = 2;
   } else {
     // y as an f32 (from its halves: an i64 conversion is not native), its
     // reciprocal scaled to 2^64 (1 - 2^-19), split into halves for the
@@ -892,18 +907,22 @@ static Value *expandDivRem64(BinaryOperator &BO) {
   Value *R = B.CreateSub(X, B.CreateMul(Q, Y));
   // Corrections without a loop (a loop's trip count is what loop strength
   // reduction would rewrite back into a division): the quotient is at most
-  // two below x / y (an exact model of the f32 steps with the reciprocal two
-  // units off, over 15,000 random and edge pairs, never needs a third), and
-  // a third correction is kept as a margin.
+  // two below x / y (after the steps the estimate is within about two units
+  // of 2^64 / y, so x z / 2^64 is within three of x / y; an exact model of
+  // the f32 steps with the reciprocal two units off, over 15,000 random and
+  // edge pairs, never needs a third). Each correction is code in every
+  // kernel that divides, whether or not the 64-bit case runs.
   for (unsigned I = 0; I < Corrections; ++I) {
     Value *C = B.CreateICmpUGE(R, Y);
     Q = B.CreateSelect(C, B.CreateAdd(Q, B.getInt64(1)), Q);
     R = B.CreateSelect(C, B.CreateSub(R, Y), R);
   }
-  Value *Res = IsRem ? R : Q;
-  if (IsSigned)
-    Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
-  return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : B.getInt64(-1), Res);
+  if (IsSigned) {
+    Q = B.CreateSelect(B.CreateXor(XNeg, YNeg), B.CreateNeg(Q), Q);
+    R = B.CreateSelect(XNeg, B.CreateNeg(R), R);
+  }
+  return {B.CreateSelect(Zero, B.getInt64(-1), Q),
+          B.CreateSelect(Zero, BO.getOperand(0), R)};
 }
 
 bool AGXCodeGenPrepare::expandDivisions(Function &F) {
@@ -981,12 +1000,46 @@ bool AGXCodeGenPrepare::expandDivisions(Function &F) {
     BO->replaceAllUsesWith(R);
     BO->eraseFromParent();
   }
+  std::map<std::tuple<BasicBlock *, Value *, Value *, bool>,
+           std::pair<Value *, Value *>>
+      Expanded64;
+  // the expansions a function would have (a division and a remainder of the
+  // same operands in one block share one)
+  std::set<std::tuple<BasicBlock *, Value *, Value *, bool>> Sites;
+  for (BinaryOperator *BO : Wide)
+    if (BO->getType()->isIntegerTy(64))
+      Sites.insert({BO->getParent(), BO->getOperand(0), BO->getOperand(1),
+                    BO->getOpcode() == Instruction::SDiv ||
+                        BO->getOpcode() == Instruction::SRem});
+  bool Newton = AGXNewtonDiv64 && Sites.size() <= AGXNewtonDiv64Max;
   for (BinaryOperator *BO : Wide) {
     bool IsRem = BO->getOpcode() == Instruction::URem ||
                  BO->getOpcode() == Instruction::SRem;
     bool Is64 = BO->getType()->getIntegerBitWidth() > 32;
-    if (AGXNewtonDiv64 && BO->getType()->isIntegerTy(64)) {
-      Value *R = expandDivRem64(*BO);
+    if (Newton && BO->getType()->isIntegerTy(64)) {
+      // The 64-bit case of a bypassed division (operands that do not fit in
+      // 32 bits) is the rare one: unlikely, so that block placement moves it
+      // out of the fast path's way.
+      if (BasicBlock *Pred = BO->getParent()->getSinglePredecessor())
+        if (auto *Br = dyn_cast<CondBrInst>(Pred->getTerminator());
+            Br && !Br->hasMetadata(LLVMContext::MD_prof)) {
+          MDBuilder MDB(BO->getContext());
+          Br->setMetadata(LLVMContext::MD_prof,
+                          Br->getSuccessor(0) == BO->getParent()
+                              ? MDB.createUnlikelyBranchWeights()
+                              : MDB.createLikelyBranchWeights());
+        }
+      // a division or remainder of the same operands earlier in the block
+      // (bypassSlowDivision puts them together) reuses its expansion
+      bool Signed = BO->getOpcode() == Instruction::SDiv ||
+                    BO->getOpcode() == Instruction::SRem;
+      auto Key = std::make_tuple(BO->getParent(), BO->getOperand(0),
+                                 BO->getOperand(1), Signed);
+      auto It = Expanded64.find(Key);
+      std::pair<Value *, Value *> QR =
+          It != Expanded64.end() ? It->second : expandDivRem64(*BO);
+      Expanded64[Key] = QR;
+      Value *R = IsRem ? QR.second : QR.first;
       R->takeName(BO);
       BO->replaceAllUsesWith(R);
       BO->eraseFromParent();

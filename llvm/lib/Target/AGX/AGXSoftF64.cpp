@@ -28,6 +28,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
@@ -42,8 +43,18 @@ using namespace llvm;
 
 static cl::opt<bool> AGXSoftF64FastPaths(
     "agx-soft-f64-fast-paths", cl::init(true), cl::Hidden,
-    cl::desc("Double precision addition and multiplication rounded to nearest "
-             "take a short path for normal operands and results"));
+    cl::desc("Double precision arithmetic rounded to nearest takes a short "
+             "path for normal operands and results"));
+
+// A short path is code beside the general one: a function with many double
+// operations (strict mode's exact texture sampler: ~2000 in one kernel) would
+// take 40% more memory to compile (544 -> 764 MB); it keeps the general code
+// alone.
+static cl::opt<unsigned> AGXSoftF64FastPathsMax(
+    "agx-soft-f64-fast-paths-max", cl::init(256), cl::Hidden,
+    cl::desc("Most double precision operations per function that get a "
+             "short path"));
+
 
 namespace {
 
@@ -315,6 +326,10 @@ public:
     return select(NaN, nanResult({X, OrigY}, F64, F64), R);
   }
 
+  /// Whether a double is zero or normal (finite, not denormal).
+  Value *isNormalOrZero(Value *Bits) {
+    return B.CreateOr(isNormal(Bits), isZero(Bits, F64));
+  }
   /// Whether a double's exponent field is that of a normal number.
   Value *isNormal(Value *Bits) {
     Value *Exp = B.CreateAnd(B.CreateLShr(Bits, 52), c64(F64.expAll()));
@@ -360,8 +375,13 @@ public:
     Value *E = B.CreateAdd(B.CreateSub(B.CreateAdd(EX, EY), c32(F64.Bias)),
                            B.CreateZExt(Top, I32));
     auto [Bits, Valid] = roundNormalRNE(N, E);
-    Bits = B.CreateOr(Bits, B.CreateAnd(B.CreateXor(X, Y), c64(F64.signBit())));
-    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormal(X), isNormal(Y)))};
+    Value *SignBits = B.CreateAnd(B.CreateXor(X, Y), c64(F64.signBit()));
+    Bits = B.CreateOr(Bits, SignBits);
+    // a zero operand: a zero with the sign of the product
+    Value *AnyZero = B.CreateOr(isZero(X, F64), isZero(Y, F64));
+    Bits = select(AnyZero, SignBits, Bits);
+    Valid = B.CreateOr(AnyZero, Valid);
+    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y)))};
   }
   /// X + Y rounded to nearest even where both are normal and so is the
   /// result (not zero), and whether they are. The significands go 10 places
@@ -388,8 +408,14 @@ public:
     Value *E = B.CreateSub(B.CreateAdd(EB, c32(1)), B.CreateTrunc(Lz, I32));
     auto [Bits, Valid] = roundNormalRNE(N, E);
     Bits = B.CreateOr(Bits, B.CreateAnd(Big, c64(F64.signBit())));
-    Valid = B.CreateAnd(Valid, B.CreateICmpNE(S, c64(0)));
-    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormal(X), isNormal(Y)))};
+    // an exact cancellation: +0; a zero operand: the other one (two zeros:
+    // -0 only if both are, their bits ANDed)
+    Value *SZero = B.CreateICmpEQ(S, c64(0));
+    Bits = select(SZero, c64(0), Bits);
+    Value *SmallZero = isZero(Small, F64);
+    Bits = select(SmallZero, select(isZero(Big, F64), B.CreateAnd(Big, Small), Big), Bits);
+    Valid = B.CreateOr(B.CreateOr(SmallZero, SZero), Valid);
+    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y)))};
   }
 
   /// X * Y + Z rounded to nearest even where all three are normal and so is
@@ -402,16 +428,24 @@ public:
   /// at most 20 places, when nothing was shifted out.
   std::pair<Value *, Value *> fmaFast(Value *X, Value *Y, Value *Z) {
     Value *Implicit = c64(F64.fracMask() + 1);
-    auto Sig = [&](Value *V) { return B.CreateOr(B.CreateAnd(V, c64(F64.fracMask())), Implicit); };
+    // a zero's significand is 0 (and its exponent below any other's)
+    auto Sig = [&](Value *V) {
+      return select(isZero(V, F64), c64(0),
+                    B.CreateOr(B.CreateAnd(V, c64(F64.fracMask())), Implicit));
+    };
     auto Exp = [&](Value *V) {
       return B.CreateTrunc(B.CreateAnd(B.CreateLShr(V, 52), c64(F64.expAll())), I32);
     };
+    Value *PZero = B.CreateOr(isZero(X, F64), isZero(Y, F64));
+    Value *ZZero = isZero(Z, F64);
     Value *P = B.CreateMul(B.CreateZExt(Sig(X), I128), B.CreateZExt(Sig(Y), I128));
     Value *A = B.CreateShl(P, 20);
     Value *C = B.CreateShl(B.CreateZExt(Sig(Z), I128), 72);
     // exponents of the lowest bits of A and C
     Value *EA = B.CreateSub(B.CreateAdd(Exp(X), Exp(Y)), c32(2 * (F64.Bias + 52) + 20));
     Value *EC = B.CreateSub(Exp(Z), c32(F64.Bias + 52 + 72));
+    EA = select(PZero, c32(-100000), EA);
+    EC = select(ZZero, c32(-100000), EC);
     // only the one with the lower exponent is aligned
     Value *D = B.CreateSub(EA, EC);
     Value *Swap = B.CreateICmpSLT(D, c32(0));
@@ -433,8 +467,14 @@ public:
     Value *E = B.CreateAdd(B.CreateSub(Base, B.CreateTrunc(Lz, I32)), c32(64 + 1086));
     auto [Bits, Valid] = roundNormalRNE(N, E);
     Bits = B.CreateOr(Bits, select(Sign, c64(F64.signBit()), c64(0)));
-    Valid = B.CreateAnd(Valid, B.CreateICmpNE(S, cw(S, 0)));
-    Valid = B.CreateAnd(Valid, B.CreateAnd(isNormal(X), B.CreateAnd(isNormal(Y), isNormal(Z))));
+    // an exact zero: -0 only for a zero product and a zero Z both negative,
+    // +0 for a cancellation
+    Value *SZero = B.CreateICmpEQ(S, cw(S, 0));
+    Value *ZeroSign = B.CreateAnd(B.CreateAnd(PZero, ZZero), B.CreateAnd(SignP, SignZ));
+    Bits = select(SZero, select(ZeroSign, c64(F64.signBit()), c64(0)), Bits);
+    Valid = B.CreateOr(Valid, SZero);
+    Valid = B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X),
+                                           B.CreateAnd(isNormalOrZero(Y), isNormalOrZero(Z))));
     return {Bits, Valid};
   }
 
@@ -549,8 +589,13 @@ public:
     Value *E = B.CreateSub(B.CreateAdd(B.CreateSub(EX, EY), c32(F64.Bias)),
                            B.CreateZExt(Less, I32));
     auto [Bits, Valid] = roundNormalRNE(B.CreateShl(M, 8), E);
-    Bits = B.CreateOr(Bits, B.CreateAnd(B.CreateXor(X, Y), c64(F64.signBit())));
-    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormal(X), isNormal(Y)))};
+    Value *SignBits = B.CreateAnd(B.CreateXor(X, Y), c64(F64.signBit()));
+    Bits = B.CreateOr(Bits, SignBits);
+    // a zero dividend: a zero with the quotient's sign
+    Value *XZero = isZero(X, F64);
+    Bits = select(XZero, SignBits, Bits);
+    Valid = B.CreateOr(Valid, XZero);
+    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormal(Y)))};
   }
 
   Value *div(Value *X, Value *Y) {
@@ -628,7 +673,11 @@ public:
     // M 2^(E / 2 - 29), M << 8 as N 2^(E' - 1086)
     Value *EF = B.CreateAdd(B.CreateAShr(E, 1), c32(1086 - 29 - 8));
     auto [Bits, Valid] = roundNormalRNE(B.CreateShl(M, 8), EF);
-    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormal(X), B.CreateICmpSGE(X, c64(0))))};
+    // the root of a zero is that zero
+    Value *XZero = isZero(X, F64);
+    Bits = select(XZero, X, Bits);
+    Valid = B.CreateAnd(Valid, B.CreateAnd(isNormal(X), B.CreateICmpSGE(X, c64(0))));
+    return {Bits, B.CreateOr(Valid, XZero)};
   }
 
   Value *sqrt(Value *X) {
@@ -943,7 +992,11 @@ template <typename BuildFn>
 static Value *withSlowPath(Instruction &I, IRBuilder<> &B, Value *Fast,
                            Value *Valid, BuildFn Build, Value *Rounding,
                            bool CanonicalNaN) {
-  Instruction *ThenTerm = SplitBlockAndInsertIfThen(B.CreateNot(Valid), &I, false);
+  // (unlikely: block placement keeps the general code out of the way of the
+  // fast path's instruction fetch)
+  Instruction *ThenTerm = SplitBlockAndInsertIfThen(
+      B.CreateNot(Valid), I.getIterator(), false,
+      MDBuilder(I.getContext()).createUnlikelyBranchWeights());
   IRBuilder<> SB(ThenTerm);
   SoftDouble Slow(SB, Rounding, CanonicalNaN);
   Value *SlowBits = Build(Slow);
@@ -958,7 +1011,7 @@ static Value *withSlowPath(Instruction &I, IRBuilder<> &B, Value *Fast,
 }
 
 Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
-                                  bool CanonicalNaN) {
+                                  bool CanonicalNaN, bool FastPathsHere) {
   if (!isDoubleArithmetic(I))
     return nullptr;
   IRBuilder<> B(&I);
@@ -981,7 +1034,7 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     bool Sub = I.getOpcode() == Instruction::FSub;
     Value *X = Bits(0), *Y = Bits(1);
     auto *RC = dyn_cast<ConstantInt>(Rounding);
-    if (!AGXSoftF64FastPaths || !RC || RC->getZExtValue() != RoundNearestEven) {
+    if (!AGXSoftF64FastPaths || !FastPathsHere || !RC || RC->getZExtValue() != RoundNearestEven) {
       R = Dbl(Mul ? SD.mul(X, Y) : SD.add(X, Y, Sub));
       break;
     }
@@ -999,7 +1052,7 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
   case Instruction::FDiv: {
     Value *X = Bits(0), *Y = Bits(1);
     auto *RC = dyn_cast<ConstantInt>(Rounding);
-    if (!AGXSoftF64FastPaths || !RC || RC->getZExtValue() != RoundNearestEven) {
+    if (!AGXSoftF64FastPaths || !FastPathsHere || !RC || RC->getZExtValue() != RoundNearestEven) {
       R = Dbl(SD.div(X, Y));
       break;
     }
@@ -1044,7 +1097,7 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     case Intrinsic::fmuladd: {
       Value *X = Bits(0), *Y = Bits(1), *Z = Bits(2);
       auto *RC = dyn_cast<ConstantInt>(Rounding);
-      if (!AGXSoftF64FastPaths || !RC || RC->getZExtValue() != RoundNearestEven) {
+      if (!AGXSoftF64FastPaths || !FastPathsHere || !RC || RC->getZExtValue() != RoundNearestEven) {
         R = Dbl(SD.fma(X, Y, Z));
         break;
       }
@@ -1057,7 +1110,7 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     case Intrinsic::sqrt: {
       Value *X = Bits(0);
       auto *RC = dyn_cast<ConstantInt>(Rounding);
-      if (!AGXSoftF64FastPaths || !RC || RC->getZExtValue() != RoundNearestEven) {
+      if (!AGXSoftF64FastPaths || !FastPathsHere || !RC || RC->getZExtValue() != RoundNearestEven) {
         R = Dbl(SD.sqrt(X));
         break;
       }
@@ -1170,7 +1223,9 @@ bool AGXSoftF64::runOnFunction(Function &F) {
   bool Changed = false;
   Value *Nearest = ConstantInt::get(Type::getInt32Ty(F.getContext()),
                                     RoundNearestEven);
+  bool FastPaths = Worklist.size() <= AGXSoftF64FastPathsMax;
   for (Instruction *I : Worklist)
-    Changed |= AGX::lowerDoubleArithmetic(*I, Nearest, ST.hasCanonicalNaN()) != nullptr;
+    Changed |= AGX::lowerDoubleArithmetic(*I, Nearest, ST.hasCanonicalNaN(),
+                                          FastPaths) != nullptr;
   return Changed;
 }

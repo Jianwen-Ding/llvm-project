@@ -24,7 +24,8 @@ bool isDoubleArithmetic(const Instruction &I);
 /// value numbered like FLT_ROUNDS). Returns the replacement, or null (and
 /// leaves I) if the operation is not supported.
 Value *lowerDoubleArithmetic(Instruction &I, Value *Rounding,
-                             bool CanonicalNaN);
+                             bool CanonicalNaN,
+                             bool FastPaths = true);
 
 /// The fused multiply-add of X, Y and Z (half, bfloat, float or double),
 /// computed exactly with integer arithmetic and rounded once.

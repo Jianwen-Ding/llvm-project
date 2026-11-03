@@ -12,7 +12,7 @@
 ; count of leading zeros before the branch.
 ; CHECK: mul i128
 ; CHECK-NOT: ctlz
-; CHECK: br i1 %{{.*}}, label %[[SLOW:.*]], label %[[JOIN:.*]]
+; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
 ; CHECK: [[SLOW]]:
 ; CHECK: ctlz
 ; CHECK: [[JOIN]]:
@@ -25,7 +25,7 @@ define agx_kernel void @mul(ptr addrspace(1) %out, double %a, double %b) {
 
 ; CHECK-LABEL: @add(
 ; CHECK: call i64 @llvm.ctlz.i64
-; CHECK: br i1 %{{.*}}, label %[[SLOW:.*]], label %[[JOIN:.*]]
+; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
 ; CHECK: [[JOIN]]:
 ; CHECK-NEXT: phi i64
 define agx_kernel void @add(ptr addrspace(1) %out, double %a, double %b) {
@@ -40,7 +40,7 @@ define agx_kernel void @add(ptr addrspace(1) %out, double %a, double %b) {
 ; CHECK: mul i128
 ; CHECK: call i128 @llvm.ctlz.i128
 ; CHECK-NOT: call i128 @llvm.ctlz.i128
-; CHECK: br i1 %{{.*}}, label %[[SLOW:.*]], label %[[JOIN:.*]]
+; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
 ; CHECK: [[JOIN]]:
 ; CHECK-NEXT: phi i64
 define agx_kernel void @fma(ptr addrspace(1) %out, double %a, double %b, double %c) {
@@ -51,7 +51,7 @@ define agx_kernel void @fma(ptr addrspace(1) %out, double %a, double %b, double 
 
 ; CHECK-LABEL: @div(
 ; CHECK: call float @llvm.agx.rcp.f32
-; CHECK: br i1 %{{.*}}, label %[[SLOW:.*]], label %[[JOIN:.*]]
+; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
 ; CHECK: [[SLOW]]:
 ; CHECK: call float @llvm.agx.rcp.f32
 ; CHECK: [[JOIN]]:
