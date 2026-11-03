@@ -87,6 +87,12 @@ INITIALIZE_PASS(AGXAsmPrinter, "agx-asm-printer", "AGX Assembly Printer",
 /// The number of 32-bit general purpose registers used, counting from r0.
 static unsigned getGPRCount(const MachineFunction &MF) {
   const MachineRegisterInfo &MRI = MF.getRegInfo();
+  // A kernel's threads hold the registers of what it calls too, which a
+  // register mask that preserves some does not show.
+  for (const MachineBasicBlock &MBB : MF)
+    for (const MachineInstr &MI : MBB)
+      if (MI.getOpcode() == AGX::AGX_CALL)
+        return 128;
   unsigned Count = 1; // r0l is always used for the execution mask.
   for (unsigned I = 0; I < 128; ++I)
     if (MRI.isPhysRegUsed(AGX::GPR32RegClass.getRegister(I)))

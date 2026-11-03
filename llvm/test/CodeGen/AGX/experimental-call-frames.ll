@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=0 -verify-machineinstrs < %s | FileCheck %s
 ; The caller and leaf both spill, but use disjoint scratch regions. The kernel
 ; reserves both regions once and the leaf does not change stack_adjust.
 ; CHECK-LABEL: kernel:

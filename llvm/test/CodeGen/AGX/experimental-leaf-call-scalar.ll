@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=0 -verify-machineinstrs < %s | FileCheck %s
 ;
 ; The argument and result use r2. The original load remains live across the
 ; call, so register allocation must spill and reload it. A wait must complete

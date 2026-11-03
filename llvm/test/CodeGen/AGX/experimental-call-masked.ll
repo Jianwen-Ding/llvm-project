@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=0 -verify-machineinstrs < %s | FileCheck %s
 ; A masked caller enters a divergent callee. A post-RA spill reload must stay
 ; after the return's mask pop, and the callee must inherit r0l from its caller.
 ; CHECK-LABEL: kernel:

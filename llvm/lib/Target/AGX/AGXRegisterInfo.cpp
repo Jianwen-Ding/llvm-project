@@ -11,6 +11,7 @@
 #include "AGX.h"
 #include "AGXFrameLowering.h"
 #include "AGXSubtarget.h"
+#include "AGXISelLowering.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -25,14 +26,53 @@ using namespace llvm;
 AGXRegisterInfo::AGXRegisterInfo(const AGXSubtarget &ST)
     : AGXGenRegisterInfo(AGX::R1), ST(ST) {}
 
+static cl::opt<unsigned> CalleeSaved(
+    "agx-callee-saved", cl::init(48), cl::Hidden,
+    cl::desc("Registers at the top of the file that called functions keep: "
+             "0, 8, 16, 32, 48, 64 or 80"));
+
 const MCPhysReg *
-AGXRegisterInfo::getCalleeSavedRegs(const MachineFunction *) const {
-  return CSR_AGX_NoRegs_SaveList;
+AGXRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
+  // A kernel has no caller to keep anything for.
+  if (!MF || MF->getFunction().getCallingConv() == CallingConv::AGX_KERNEL ||
+      !agxExperimentalLeafCallsEnabled())
+    return CSR_AGX_NoRegs_SaveList;
+  switch (CalleeSaved) {
+  case 8:
+    return CSR_AGX_Top8_SaveList;
+  case 16:
+    return CSR_AGX_Top16_SaveList;
+  case 32:
+    return CSR_AGX_Top32_SaveList;
+  case 48:
+    return CSR_AGX_Top48_SaveList;
+  case 64:
+    return CSR_AGX_Top64_SaveList;
+  case 80:
+    return CSR_AGX_Top80_SaveList;
+  default:
+    return CSR_AGX_NoRegs_SaveList;
+  }
 }
 
 const uint32_t *AGXRegisterInfo::getCallPreservedMask(const MachineFunction &,
                                                       CallingConv::ID) const {
-  return CSR_AGX_NoRegs_RegMask;
+  switch (CalleeSaved) {
+  case 8:
+    return CSR_AGX_Top8_RegMask;
+  case 16:
+    return CSR_AGX_Top16_RegMask;
+  case 32:
+    return CSR_AGX_Top32_RegMask;
+  case 48:
+    return CSR_AGX_Top48_RegMask;
+  case 64:
+    return CSR_AGX_Top64_RegMask;
+  case 80:
+    return CSR_AGX_Top80_RegMask;
+  default:
+    return CSR_AGX_NoRegs_RegMask;
+  }
 }
 
 static cl::opt<bool> ReserveCallRegisters(
