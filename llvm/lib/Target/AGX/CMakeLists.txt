@@ -33,6 +33,7 @@ add_llvm_target(AGXCodeGen
   AGXLowerRecursion.cpp
   AGXFoldOperands.cpp
   AGXHoistFromElseFlow.cpp
+  AGXSinkRemat.cpp
   AGXFrameLowering.cpp
   AGXHoistGuardedLoads.cpp
   AGXNarrowInductions.cpp

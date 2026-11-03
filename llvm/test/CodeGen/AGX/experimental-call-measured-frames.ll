@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-measured-call-frames < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=0 -agx-measured-call-frames < %s | FileCheck %s
 ; Measured call frames (a module of one kernel): the kernel's region is its
 ; frame, each call depth's is its largest function frame (here depth 1's is
 ; 6416 bytes, over the fixed 4096), recorded as the functions are compiled in

@@ -26,6 +26,11 @@ public:
   const uint32_t *getCallPreservedMask(const MachineFunction &MF,
                                        CallingConv::ID CC) const override;
   BitVector getReservedRegs(const MachineFunction &MF) const override;
+  /// The registers the scheduler tries to stay under (-agx-sched-target-gprs),
+  /// as AMDGPU's scheduler aims for an occupancy: below what is allocatable,
+  /// since the most registers held set how many threads fit on a core.
+  unsigned getRegPressureSetLimit(const MachineFunction &MF,
+                                  unsigned Idx) const override;
 
   bool requiresRegisterScavenging(const MachineFunction &MF) const override {
     return false;

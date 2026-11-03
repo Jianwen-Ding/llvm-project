@@ -1308,8 +1308,13 @@ bool AGXCodeGenPrepare::flushFloatMinMax(Function &F) {
   for (IntrinsicInst *II : MinMax) {
     IRBuilder<> B(II->getNextNode());
     SmallVector<Use *, 4> Uses;
+    // The hardware's compares flush denormals, and a min / max gives what
+    // flushing its operands would once its own result is flushed.
     for (Use &U : II->uses())
-      Uses.push_back(&U);
+      if (!isa<FCmpInst>(U.getUser()) && !llvm::is_contained(MinMax, U.getUser()))
+        Uses.push_back(&U);
+    if (Uses.empty())
+      continue;
     Value *R = B.CreateUnaryIntrinsic(Intrinsic::canonicalize, II);
     for (Use *U : Uses)
       U->set(R);

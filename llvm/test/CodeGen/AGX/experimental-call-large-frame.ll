@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=0 < %s | FileCheck %s
 ; The only kernel of a module may have a frame over 4096 bytes when it calls:
 ; its region is its frame (6412 bytes, here at optnone so the array stays
 ; whole) rounded to 16, and the called function's depth-1 region follows it.

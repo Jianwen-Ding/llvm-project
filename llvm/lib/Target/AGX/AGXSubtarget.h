@@ -79,6 +79,9 @@ public:
   /// "agx-max-threads-per-threadgroup"="N" (PTX .maxntid / .reqntid), which
   /// keeps the register use low enough for N threads to fit on a core.
   unsigned getMaxGPRs(const Function &F) const;
+  /// What every function may use, whatever its own attributes: what a kernel
+  /// with calls must declare, as its callees may use any of it.
+  unsigned getMaxGPRsOfAllFunctions() const;
 
   const AGXInstrInfo *getInstrInfo() const override { return &InstrInfo; }
   const AGXFrameLowering *getFrameLowering() const override {
