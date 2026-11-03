@@ -542,12 +542,20 @@ AGXTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
     if (!canUseCallRegisters(Outs, MRI))
       diagnose(DAG, DL, "experimental AGX call results exceed r2..r29");
     unsigned Slot = 0;
+    SDValue Glue;
+    SmallVector<SDValue, 8> Ops = {Chain};
     for (unsigned I = 0; I < Outs.size(); ++I) {
       MCRegister PReg = callValueReg(Outs[I].VT, Slot, MRI);
-      if (PReg)
-        Chain = DAG.getCopyToReg(Chain, DL, PReg, OutVals[I]);
+      if (PReg) {
+        Chain = DAG.getCopyToReg(Chain, DL, PReg, OutVals[I], Glue);
+        Glue = Chain.getValue(1);
+        Ops.push_back(DAG.getRegister(PReg, Outs[I].VT));
+      }
     }
-    return DAG.getNode(AGXISD::RET, DL, MVT::Other, Chain);
+    Ops[0] = Chain;
+    if (Glue)
+      Ops.push_back(Glue);
+    return DAG.getNode(AGXISD::RET, DL, MVT::Other, Ops);
   }
   if (!Outs.empty())
     diagnose(DAG, DL, "AGX kernels cannot return values");
@@ -588,22 +596,34 @@ SDValue AGXTargetLowering::LowerCall(CallLoweringInfo &CLI,
         if (!F->isDeclaration() && Returns == 1 && HasCall && Supported &&
             Signature && F->hasFnAttribute(Attribute::NoInline)) {
           SDValue Chain = CLI.Chain;
+          SDValue Glue;
           unsigned Slot = 0;
+          SmallVector<SDValue, 8> ArgRegs;
           for (unsigned I = 0; I < CLI.OutVals.size(); ++I) {
             MCRegister PReg = callValueReg(CLI.Outs[I].VT, Slot, MRI);
-            Chain = DAG.getCopyToReg(Chain, CLI.DL, PReg, CLI.OutVals[I]);
+            Chain = DAG.getCopyToReg(Chain, CLI.DL, PReg, CLI.OutVals[I], Glue);
+            Glue = Chain.getValue(1);
+            ArgRegs.push_back(DAG.getRegister(PReg, CLI.Outs[I].VT));
           }
           SDValue Target = DAG.getTargetGlobalAddress(F, CLI.DL, MVT::i64);
           const uint32_t *Mask = ST.getRegisterInfo()->getCallPreservedMask(
               DAG.getMachineFunction(), CallingConv::C);
-          Chain = DAG.getNode(AGXISD::CALL, CLI.DL, MVT::Other, Chain, Target,
-                              DAG.getRegisterMask(Mask));
+          SmallVector<SDValue, 12> Ops = {Chain, Target,
+                                          DAG.getRegisterMask(Mask)};
+          Ops.append(ArgRegs);
+          if (Glue)
+            Ops.push_back(Glue);
+          Chain = DAG.getNode(AGXISD::CALL, CLI.DL,
+                              DAG.getVTList(MVT::Other, MVT::Glue), Ops);
+          Glue = Chain.getValue(1);
           Slot = 0;
           for (const ISD::InputArg &In : CLI.Ins) {
             MCRegister PReg = callValueReg(In.VT, Slot, MRI);
-            SDValue Result = DAG.getCopyFromReg(Chain, CLI.DL, PReg, In.VT);
+            SDValue Result =
+                DAG.getCopyFromReg(Chain, CLI.DL, PReg, In.VT, Glue);
             InVals.push_back(Result.getValue(0));
             Chain = Result.getValue(1);
+            Glue = Result.getValue(2);
           }
           return Chain;
         }

@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGXRegisterInfo.h"
+#include "llvm/Support/CommandLine.h"
 #include "AGX.h"
 #include "AGXFrameLowering.h"
 #include "AGXSubtarget.h"
@@ -34,6 +35,10 @@ const uint32_t *AGXRegisterInfo::getCallPreservedMask(const MachineFunction &,
   return CSR_AGX_NoRegs_RegMask;
 }
 
+static cl::opt<bool> ReserveCallRegisters(
+    "agx-reserve-call-registers", cl::init(false), cl::Hidden,
+    cl::desc("Keep r2 to r36 out of register allocation in code with calls"));
+
 BitVector AGXRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   BitVector Reserved(getNumRegs());
   auto ReserveWithAliases = [&](MCRegister Reg) {
@@ -54,10 +59,18 @@ BitVector AGXRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
           UsesCallABI |= !Callee || !Callee->isIntrinsic();
         }
   if (agxExperimentalLeafCallsEnabled() && UsesCallABI) {
+    // r1 is the link. r30 up hold the links of the functions with calls, by
+    // call depth: this function must keep those of its callers and its own.
+    // The rest is free, as no register survives a call (the arguments and
+    // results are uses and definitions of the call and the return).
     ReserveWithAliases(AGX::R1);
-    for (unsigned I = 2; I < 30; ++I)
-      ReserveWithAliases(AGX::GPR32RegClass.getRegister(I));
-    for (unsigned I = 30; I <= 36; ++I)
+    unsigned Links = AGXFrameLowering::getCallDepth(MF);
+    if (ReserveCallRegisters) {
+      Links = 7;
+      for (unsigned I = 2; I < 30; ++I)
+        ReserveWithAliases(AGX::GPR32RegClass.getRegister(I));
+    }
+    for (unsigned I = 30; I < 30 + Links && I <= 36; ++I)
       ReserveWithAliases(AGX::GPR32RegClass.getRegister(I));
   }
 

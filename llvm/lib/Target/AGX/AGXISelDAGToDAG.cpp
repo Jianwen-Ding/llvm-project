@@ -116,22 +116,39 @@ void AGXDAGToDAGISel::Select(SDNode *N) {
     // Reserve the caller's masked lanes before RET changes its counters.
     SDValue Zero = CurDAG->getTargetConstant(0, DL, MVT::i32);
     SDValue Two = CurDAG->getTargetConstant(2, DL, MVT::i32);
-    SDValue PushOps[] = {Zero, Zero, Zero, Zero, Zero, Zero, Two,
-                         N->getOperand(0)};
+    bool HasGlue = N->getOperand(N->getNumOperands() - 1).getValueType() ==
+                   MVT::Glue;
+    SmallVector<SDValue, 10> PushOps = {Zero, Zero, Zero, Zero,
+                                        Zero, Zero, Two,  N->getOperand(0)};
+    if (HasGlue)
+      PushOps.push_back(N->getOperand(N->getNumOperands() - 1));
     SDNode *Push = CurDAG->getMachineNode(AGX::IF_FCMP, DL, MVT::Other,
-                                          PushOps);
+                                          MVT::Glue, PushOps);
+    // Target, the argument registers (implicit uses), register mask.
+    SmallVector<SDValue, 16> CallOps = {N->getOperand(1)};
+    for (unsigned I = 3, E = N->getNumOperands() - HasGlue; I != E; ++I)
+      CallOps.push_back(N->getOperand(I));
+    CallOps.push_back(N->getOperand(2));
+    CallOps.push_back(SDValue(Push, 0));
+    CallOps.push_back(SDValue(Push, 1));
     SDNode *Call = CurDAG->getMachineNode(AGX::AGX_CALL, DL, MVT::Other,
-                                          N->getOperand(1), N->getOperand(2),
-                                          SDValue(Push, 0));
+                                          MVT::Glue, CallOps);
+    SDValue PopOps[] = {Zero, Two, SDValue(Call, 0), SDValue(Call, 1)};
     ReplaceNode(N, CurDAG->getMachineNode(AGX::POP_CALL_EXEC, DL, MVT::Other,
-                                          Zero, Two, SDValue(Call, 0)));
+                                          MVT::Glue, PopOps));
     return;
   }
   case AGXISD::RET: {
     SDLoc DL(N);
-    SDValue Link = CurDAG->getRegister(AGX::R1, MVT::i32);
-    ReplaceNode(N, CurDAG->getMachineNode(AGX::AGX_RET, DL, MVT::Other,
-                                          Link, N->getOperand(0)));
+    bool HasGlue = N->getOperand(N->getNumOperands() - 1).getValueType() ==
+                   MVT::Glue;
+    SmallVector<SDValue, 16> Ops = {CurDAG->getRegister(AGX::R1, MVT::i32)};
+    for (unsigned I = 1, E = N->getNumOperands() - HasGlue; I != E; ++I)
+      Ops.push_back(N->getOperand(I));
+    Ops.push_back(N->getOperand(0));
+    if (HasGlue)
+      Ops.push_back(N->getOperand(N->getNumOperands() - 1));
+    ReplaceNode(N, CurDAG->getMachineNode(AGX::AGX_RET, DL, MVT::Other, Ops));
     return;
   }
   case AGXISD::LOAD_V2:

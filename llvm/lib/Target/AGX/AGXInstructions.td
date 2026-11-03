@@ -1767,8 +1767,10 @@ def AGX_RET : AGXPseudo<(outs), (ins AGXCallReg:$target), []> {
 }
 
 // A return leaves its issuing lanes at mask depth two. No caller instruction
-// may execute before the pop, even when it has no register dependence on it.
-let isBarrier = 1, hasSideEffects = 1, Uses = [R0L], Defs = [R0L],
+// may execute before the pop, even when it has no register dependence on it
+// (AGXInstrInfo::isSchedulingBoundary, and AGXInsertWaits keeps it right after
+// the call). Control does continue after it: it may end a block.
+let hasSideEffects = 1, Uses = [R0L], Defs = [R0L],
     IsExecMaskOp = 1 in
 def POP_CALL_EXEC : AGXPseudo<(outs), (ins i32imm:$nest, i32imm:$n), []> {
   let G13Real = POP_EXEC_g13;

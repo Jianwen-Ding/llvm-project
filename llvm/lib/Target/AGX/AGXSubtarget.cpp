@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGXSubtarget.h"
+#include "llvm/Support/CommandLine.h"
 #include "AGXTargetMachine.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -49,10 +50,17 @@ unsigned AGXSubtarget::maxThreadsForHalves(unsigned Halves) {
   return std::min(64 * (1664 / Halves), 1024u);
 }
 
+static cl::opt<unsigned> DefaultMaxGPRs(
+    "agx-default-max-gprs", cl::init(0), cl::Hidden,
+    cl::desc("At most this many 32-bit general purpose registers in every "
+             "function: more threads resident on a core, against spills"));
+
 unsigned AGXSubtarget::getMaxGPRs(const Function &F) const {
   // Enough for any instruction's operands and the reserved r0.
   constexpr unsigned MinGPRs = 16;
   unsigned Max = getMaxGPRs();
+  if (DefaultMaxGPRs)
+    Max = std::min(Max, std::max<unsigned>(DefaultMaxGPRs, MinGPRs));
   if (unsigned N = F.getFnAttributeAsParsedInteger("agx-max-gprs", 0))
     Max = std::min(Max, std::max(N, MinGPRs));
   if (unsigned T = F.getFnAttributeAsParsedInteger(

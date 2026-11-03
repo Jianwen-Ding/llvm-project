@@ -5,7 +5,7 @@
 ; CHECK: call leaf
 ; CHECK-NEXT: pop_exec r0l, 2
 ; CHECK-LABEL: leaf:
-; CHECK: iadd r2
+; CHECK: iadd r{{[0-9]+}}
 ; CHECK: ret r1
 
 target triple = "agx-unknown-unknown"
