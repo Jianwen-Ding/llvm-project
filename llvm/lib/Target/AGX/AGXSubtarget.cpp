@@ -55,6 +55,11 @@ static cl::opt<unsigned> DefaultMaxGPRs(
     cl::desc("At most this many 32-bit general purpose registers in every "
              "function: more threads resident on a core, against spills"));
 
+unsigned AGXSubtarget::getMaxGPRsOfAllFunctions() const {
+  return DefaultMaxGPRs ? std::min(getMaxGPRs(), std::max(DefaultMaxGPRs.getValue(), 16u))
+                        : getMaxGPRs();
+}
+
 unsigned AGXSubtarget::getMaxGPRs(const Function &F) const {
   // Enough for any instruction's operands and the reserved r0.
   constexpr unsigned MinGPRs = 16;

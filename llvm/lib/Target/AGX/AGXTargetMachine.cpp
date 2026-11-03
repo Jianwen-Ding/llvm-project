@@ -77,6 +77,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXFoldOperandsPass(PR);
   initializeAGXUniformConstantsPassPass(PR);
   initializeAGXHoistFromElseFlowPass(PR);
+  initializeAGXSinkRematPass(PR);
   initializeAGXLowerControlFlowPass(PR);
   initializeAGXInsertWaitsPass(PR);
   initializeAGXAsmPrinterPass(PR);
@@ -400,6 +401,11 @@ bool AGXPassConfig::addInstSelector() {
   return false;
 }
 
+static cl::opt<bool> AGXSinkRematEnabled(
+    "agx-sink-remat", cl::init(false), cl::Hidden,
+    cl::desc("Give each block that uses a constant from another block its own "
+             "move of it, for fewer registers held"));
+
 void AGXPassConfig::addMachineSSAOptimization() {
   TargetPassConfig::addMachineSSAOptimization();
   addPass(createAGXUniformConstantsPass());
@@ -407,6 +413,8 @@ void AGXPassConfig::addMachineSSAOptimization() {
   // MachineCSE and MachineSink may have put code where only the threads of
   // a then side run it.
   addPass(createAGXHoistFromElseFlowPass());
+  if (AGXSinkRematEnabled)
+    addPass(createAGXSinkRematPass());
 }
 
 void AGXPassConfig::addPreEmitPass() {

@@ -53,6 +53,19 @@ class AGXAsmPrinter : public AsmPrinter {
   std::unique_ptr<MCCodeEmitter> MesaChecker;
   /// The .agx.kernels record of each kernel, emitted at the end of the file.
   SmallVector<std::pair<std::string, SmallVector<uint32_t, 16>>, 4> Kernels;
+  /// For each function: the registers its own code uses and what it calls, so
+  /// that a kernel's record declares what its call tree really holds.
+  struct RegisterUse {
+    unsigned GPRs = 1;
+    SmallVector<const Function *, 8> Callees;
+    bool Unknown = false;
+  };
+  DenseMap<const Function *, RegisterUse> RegisterUses;
+  /// The kernels' functions, in the order of Kernels.
+  SmallVector<const Function *, 4> KernelFunctions;
+  unsigned MaxGPRsOfAllFunctions = 128;
+
+  unsigned getTreeGPRs(const Function *F) const;
 
   void recordKernel();
 
@@ -84,6 +97,11 @@ char AGXAsmPrinter::ID = 0;
 INITIALIZE_PASS(AGXAsmPrinter, "agx-asm-printer", "AGX Assembly Printer",
                 false, false)
 
+static cl::opt<bool> DeclareTreeGPRs(
+    "agx-declare-tree-gprs", cl::init(false), cl::Hidden,
+    cl::desc("Kernels with calls declare what their call tree uses, not every "
+             "register a function may use"));
+
 /// The number of 32-bit general purpose registers used, counting from r0.
 static unsigned getGPRCount(const MachineFunction &MF) {
   const MachineRegisterInfo &MRI = MF.getRegInfo();
@@ -92,7 +110,7 @@ static unsigned getGPRCount(const MachineFunction &MF) {
   for (const MachineBasicBlock &MBB : MF)
     for (const MachineInstr &MI : MBB)
       if (MI.getOpcode() == AGX::AGX_CALL)
-        return 128;
+        return MF.getSubtarget<AGXSubtarget>().getMaxGPRsOfAllFunctions();
   unsigned Count = 1; // r0l is always used for the execution mask.
   for (unsigned I = 0; I < 128; ++I)
     if (MRI.isPhysRegUsed(AGX::GPR32RegClass.getRegister(I)))
@@ -167,8 +185,57 @@ void AGXAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
 ///
 /// Argument values are packed little-endian from their first half in 32-bit
 /// words (16-bit arguments in one half).
+/// What the code of \p MF itself uses. The masks of its calls are left out: they
+/// say what may change, not what is used.
+static unsigned getOwnGPRCount(const MachineFunction &MF) {
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  unsigned Count = 1;
+  for (unsigned I = 0; I < 128; ++I)
+    if (MRI.isPhysRegUsed(AGX::GPR32RegClass.getRegister(I),
+                          /*SkipRegMaskTest=*/true))
+      Count = I + 1;
+  return Count;
+}
+
+/// The registers \p F and all it reaches through calls use.
+unsigned AGXAsmPrinter::getTreeGPRs(const Function *F) const {
+  SmallPtrSet<const Function *, 32> Seen;
+  SmallVector<const Function *, 32> Work = {F};
+  unsigned GPRs = 1;
+  while (!Work.empty()) {
+    const Function *G = Work.pop_back_val();
+    if (!Seen.insert(G).second)
+      continue;
+    auto It = RegisterUses.find(G);
+    // Not in this module, or a call to no known function: anything.
+    if (It == RegisterUses.end() || It->second.Unknown)
+      return MaxGPRsOfAllFunctions;
+    GPRs = std::max(GPRs, It->second.GPRs);
+    Work.append(It->second.Callees.begin(), It->second.Callees.end());
+  }
+  return GPRs;
+}
+
 void AGXAsmPrinter::recordKernel() {
   const Function &F = MF->getFunction();
+  {
+    RegisterUse &Use = RegisterUses[&F];
+    Use.GPRs = getOwnGPRCount(*MF);
+    MaxGPRsOfAllFunctions =
+        MF->getSubtarget<AGXSubtarget>().getMaxGPRsOfAllFunctions();
+    for (const MachineBasicBlock &MBB : *MF)
+      for (const MachineInstr &MI : MBB)
+        if (MI.getOpcode() == AGX::AGX_CALL) {
+          Use.GPRs = std::max(Use.GPRs, 2u); // the link
+          const MachineOperand &Target = MI.getOperand(0);
+          const auto *Callee =
+              Target.isGlobal() ? dyn_cast<Function>(Target.getGlobal()) : nullptr;
+          if (Callee)
+            Use.Callees.push_back(Callee);
+          else
+            Use.Unknown = true;
+        }
+  }
   if (F.getCallingConv() != CallingConv::AGX_KERNEL)
     return;
   const auto *MFI = MF->getInfo<AGXMachineFunctionInfo>();
@@ -273,10 +340,16 @@ void AGXAsmPrinter::recordKernel() {
       R.append({V.Half, Half(V.Arg) + 2 * V.Word, V.Kind});
   }
   Kernels.push_back({std::string(getSymbol(&F)->getName()), std::move(R)});
+  KernelFunctions.push_back(&F);
 }
 
 void AGXAsmPrinter::emitEndOfAsmFile(Module &M) {
   if (!Kernels.empty()) {
+    // (the word of the general purpose registers: see recordKernel)
+    if (DeclareTreeGPRs)
+      for (auto [K, F] : zip(Kernels, KernelFunctions))
+        if (!RegisterUses[F].Callees.empty() || RegisterUses[F].Unknown)
+          K.second[3] = getTreeGPRs(F);
     OutStreamer->switchSection(
         OutContext.getELFSection(".agx.kernels", ELF::SHT_PROGBITS, 0));
     OutStreamer->emitValueToAlignment(Align(4));

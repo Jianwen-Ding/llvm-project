@@ -16,13 +16,5 @@
 //===----------------------------------------------------------------------===//
 
 def CSR_AGX_NoRegs : CalleeSavedRegs<(add)>;
-// Called functions keep the top of the register file (-agx-callee-saved, 48 by
-// default), so that what is live across a call need not go to memory unless the
-// callee uses them. Blender Cycles' Open Data scenes at 0 / 16 / 48 / 64 / 80:
-// classroom 176 / 191 / 197 / 196 / 193 samples per minute.
-def CSR_AGX_Top8 : CalleeSavedRegs<(sequence "R%u", 120, 127)>;
-def CSR_AGX_Top16 : CalleeSavedRegs<(sequence "R%u", 112, 127)>;
-def CSR_AGX_Top32 : CalleeSavedRegs<(sequence "R%u", 96, 127)>;
-def CSR_AGX_Top48 : CalleeSavedRegs<(sequence "R%u", 80, 127)>;
-def CSR_AGX_Top64 : CalleeSavedRegs<(sequence "R%u", 64, 127)>;
-def CSR_AGX_Top80 : CalleeSavedRegs<(sequence "R%u", 48, 127)>;
+
+// What called functions keep is built at run time: AGXRegisterInfo calleeSavedSet.
