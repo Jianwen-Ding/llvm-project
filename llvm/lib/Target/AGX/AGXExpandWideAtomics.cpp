@@ -23,12 +23,22 @@
 // releases it in the same iteration, before the other threads of its
 // SIMD-group, which may wait for the same lock, try again.
 //
+// A read-modify-write or compare-and-swap whose SIMD group's active threads
+// all access the same address (an atomic counter or accumulator) takes the
+// lock once for the group instead of once per thread, one after another: the
+// lowest thread takes it and reads the value, every thread applies the
+// operations of all of them in lane order (a serialization of the group's
+// atomics) and keeps the value before its own, and the lowest thread writes
+// the result and frees the lock.
+//
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
 #include "AGXSubtarget.h"
 #include "AGXTargetMachine.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -41,6 +51,12 @@ using namespace llvm;
 #define DEBUG_TYPE "agx-expand-wide-atomics"
 
 static constexpr unsigned NumLocks = 1024;
+
+static cl::opt<bool> UniformBatch(
+    "agx-wide-atomics-batch", cl::init(true), cl::Hidden,
+    cl::desc("Read-modify-write and compare-and-swap wide atomics whose SIMD "
+             "group's active threads all access one address take the lock "
+             "once for all of them, the operations applied in lane order"));
 
 namespace {
 
@@ -119,6 +135,134 @@ static Value *fromInt(IRBuilderBase &B, Value *V, Type *Ty) {
   return B.CreateBitCast(V, Ty);
 }
 
+/// Words of the wide value at Ptr, read with 32-bit atomics.
+static Value *readWide(IRBuilderBase &B, Value *Ptr, unsigned Bits) {
+  Value *Loaded = ConstantInt::get(B.getIntNTy(Bits), 0);
+  for (unsigned K = 0; K < Bits / 32; ++K) {
+    Value *W = B.CreateAtomicRMW(AtomicRMWInst::Or,
+                                 B.CreateConstGEP1_32(B.getInt8Ty(), Ptr, 4 * K),
+                                 B.getInt32(0), MaybeAlign(4), AtomicOrdering::Monotonic);
+    Loaded = B.CreateOr(Loaded, B.CreateShl(B.CreateZExt(W, B.getIntNTy(Bits)), 32 * K));
+  }
+  return Loaded;
+}
+
+static void writeWide(IRBuilderBase &B, Value *Ptr, Value *NewInt, unsigned Bits) {
+  for (unsigned K = 0; K < Bits / 32; ++K)
+    B.CreateAtomicRMW(AtomicRMWInst::Xchg, B.CreateConstGEP1_32(B.getInt8Ty(), Ptr, 4 * K),
+                      B.CreateTrunc(B.CreateLShr(NewInt, 32 * K), B.getInt32Ty()),
+                      MaybeAlign(4), AtomicOrdering::Monotonic);
+}
+
+/// V (Bits wide) from lane L of the SIMD group, by 32-bit shuffles.
+static Value *shuffleWide(IRBuilderBase &B, Value *V, Value *L, unsigned Bits) {
+  Value *R = ConstantInt::get(B.getIntNTy(Bits), 0);
+  for (unsigned K = 0; K < Bits / 32; ++K) {
+    Value *W = B.CreateTrunc(B.CreateLShr(V, 32 * K), B.getInt32Ty());
+    W = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {B.getInt32Ty()}, {W, L});
+    R = B.CreateOr(R, B.CreateShl(B.CreateZExt(W, B.getIntNTy(Bits)), 32 * K));
+  }
+  return R;
+}
+
+/// The SIMD group's batch of I for a group whose active threads all access
+/// one address, in blocks from Uni to Exit; returns the block that ends it
+/// and the result.
+static std::pair<BasicBlock *, Value *>
+expandUniform(Instruction &I, unsigned Bits, Value *Ptr, Value *Lock, Type *ValTy,
+              BasicBlock *Uni, BasicBlock *Exit, Value *First) {
+  LLVMContext &Ctx = I.getContext();
+  Function *F = Uni->getParent();
+  IntegerType *IntTy = IntegerType::get(Ctx, Bits);
+  auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+  auto *CX = dyn_cast<AtomicCmpXchgInst>(&I);
+  AtomicOrdering Ord = RMW ? RMW->getOrdering() : CX->getSuccessOrdering();
+  bool Strong = isStrongerThanMonotonic(Ord);
+  BasicBlock *Acquire = BasicBlock::Create(Ctx, "wide.atomic.batch.lock", F, Exit);
+  BasicBlock *Locked = BasicBlock::Create(Ctx, "wide.atomic.batch.read", F, Exit);
+  BasicBlock *Read = BasicBlock::Create(Ctx, "wide.atomic.batch", F, Exit);
+  BasicBlock *Chain = BasicBlock::Create(Ctx, "wide.atomic.batch.op", F, Exit);
+  BasicBlock *ChainEnd = BasicBlock::Create(Ctx, "wide.atomic.batch.ops", F, Exit);
+  BasicBlock *Release = BasicBlock::Create(Ctx, "wide.atomic.batch.write", F, Exit);
+  BasicBlock *End = BasicBlock::Create(Ctx, "wide.atomic.batch.end", F, Exit);
+
+  IRBuilder<> B(Uni);
+  Value *Lane = B.CreateIntrinsic(B.getInt32Ty(), Intrinsic::agx_thread_index_in_simdgroup, {});
+  Value *Pending = B.CreateIntrinsic(B.getInt32Ty(), Intrinsic::agx_simd_ballot, {B.getTrue()});
+  Value *Leader = B.CreateICmpEQ(Lane, First);
+  B.CreateCondBr(Leader, Acquire, Read);
+  // the lowest thread takes the lock (no other thread of the group waits for
+  // it, so spinning cannot stop the group) and reads the value
+  B.SetInsertPoint(Acquire);
+  Value *Acq = B.CreateAtomicCmpXchg(Lock, B.getInt32(0), B.getInt32(1), MaybeAlign(4),
+                                     AtomicOrdering::Monotonic, AtomicOrdering::Monotonic);
+  B.CreateCondBr(B.CreateExtractValue(Acq, 1), Locked, Acquire);
+  B.SetInsertPoint(Locked);
+  B.CreateFence(AtomicOrdering::Acquire);
+  Value *V0 = readWide(B, Ptr, Bits);
+  B.CreateBr(Read);
+  B.SetInsertPoint(Read);
+  PHINode *V0P = B.CreatePHI(IntTy, 2);
+  V0P->addIncoming(V0, Locked);
+  V0P->addIncoming(PoisonValue::get(IntTy), Uni);
+  Value *V = shuffleWide(B, V0P, First, Bits);
+  if (Strong)
+    B.CreateFence(AtomicOrdering::Acquire);
+  B.CreateBr(Chain);
+  // the operations in lane order, every thread computing the same values
+  B.SetInsertPoint(Chain);
+  PHINode *Rem = B.CreatePHI(B.getInt32Ty(), 2);
+  PHINode *Cur = B.CreatePHI(IntTy, 2);
+  PHINode *Mine = B.CreatePHI(IntTy, 2);
+  PHINode *MineOk = B.CreatePHI(B.getInt1Ty(), 2);
+  Rem->addIncoming(Pending, Read);
+  Cur->addIncoming(V, Read);
+  Mine->addIncoming(PoisonValue::get(IntTy), Read);
+  MineOk->addIncoming(B.getFalse(), Read);
+  Value *J = B.CreateBinaryIntrinsic(Intrinsic::cttz, Rem, B.getTrue());
+  Value *IsMe = B.CreateICmpEQ(Lane, J);
+  Value *Next, *Ok = B.getFalse();
+  if (RMW) {
+    Value *A = fromInt(B, shuffleWide(B, toInt(B, RMW->getValOperand(), Bits), J, Bits),
+                       RMW->getValOperand()->getType());
+    Next = toInt(B, buildAtomicRMWValue(RMW->getOperation(), B, fromInt(B, Cur, ValTy), A), Bits);
+  } else {
+    Value *Cmp = shuffleWide(B, toInt(B, CX->getCompareOperand(), Bits), J, Bits);
+    Value *New = shuffleWide(B, toInt(B, CX->getNewValOperand(), Bits), J, Bits);
+    Ok = B.CreateICmpEQ(Cur, Cmp);
+    Next = B.CreateSelect(Ok, New, Cur);
+  }
+  Value *Mine2 = B.CreateSelect(IsMe, Cur, Mine);
+  Value *MineOk2 = B.CreateSelect(IsMe, Ok, MineOk);
+  Value *Rem2 = B.CreateAnd(Rem, B.CreateSub(Rem, B.getInt32(1)));
+  Rem->addIncoming(Rem2, Chain);
+  Cur->addIncoming(Next, Chain);
+  Mine->addIncoming(Mine2, Chain);
+  MineOk->addIncoming(MineOk2, Chain);
+  B.CreateCondBr(B.CreateICmpNE(Rem2, B.getInt32(0)), Chain, ChainEnd);
+  B.SetInsertPoint(ChainEnd);
+  if (Strong)
+    B.CreateFence(AtomicOrdering::Release);
+  B.CreateCondBr(Leader, Release, End);
+  B.SetInsertPoint(Release);
+  writeWide(B, Ptr, Next, Bits);
+  B.CreateFence(AtomicOrdering::Release);
+  B.CreateAtomicRMW(AtomicRMWInst::Xchg, Lock, B.getInt32(0), MaybeAlign(4),
+                    AtomicOrdering::Monotonic);
+  B.CreateBr(End);
+  B.SetInsertPoint(End);
+  if (Strong)
+    B.CreateFence(AtomicOrdering::Acquire);
+  Value *Old = fromInt(B, Mine2, ValTy);
+  Value *Result = Old;
+  if (CX) {
+    Value *Pair = B.CreateInsertValue(PoisonValue::get(CX->getType()), Old, 0);
+    Result = B.CreateInsertValue(Pair, MineOk2, 1);
+  }
+  B.CreateBr(Exit);
+  return {End, Result};
+}
+
 static void expand(Instruction &I, unsigned Bits, GlobalVariable *Locks) {
   const DataLayout &DL = I.getDataLayout();
   LLVMContext &Ctx = I.getContext();
@@ -144,6 +288,23 @@ static void expand(Instruction &I, unsigned Bits, GlobalVariable *Locks) {
   Value *Slot = B.CreateAnd(B.CreateLShr(Addr, 4), NumLocks - 1);
   Value *Lock = B.CreateInBoundsGEP(Locks->getValueType(), Locks,
                                     {B.getInt64(0), B.CreateZExtOrTrunc(Slot, B.getInt64Ty())});
+
+  BasicBlock *UniEnd = nullptr;
+  Value *UniResult = nullptr;
+  if (UniformBatch && (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I))) {
+    // whether the group's active threads all access one address
+    Value *Pending = B.CreateIntrinsic(B.getInt32Ty(), Intrinsic::agx_simd_ballot, {B.getTrue()});
+    Value *First = B.CreateBinaryIntrinsic(Intrinsic::cttz, Pending, B.getTrue());
+    Value *A64 = B.CreateZExtOrTrunc(Addr, B.getInt64Ty());
+    Value *FirstAddr = shuffleWide(B, A64, First, 64);
+    Value *Same = B.CreateIntrinsic(B.getInt32Ty(), Intrinsic::agx_simd_ballot,
+                                    {B.CreateICmpEQ(A64, FirstAddr)});
+    BasicBlock *Uni = BasicBlock::Create(Ctx, "wide.atomic.batch.check", F, Head);
+    Pre->getTerminator()->eraseFromParent();
+    B.SetInsertPoint(Pre);
+    B.CreateCondBr(B.CreateICmpEQ(Same, Pending), Uni, Head);
+    std::tie(UniEnd, UniResult) = expandUniform(I, Bits, Ptr, Lock, ValTy, Uni, Exit, First);
+  }
 
   B.SetInsertPoint(Head);
   Value *Acq = B.CreateAtomicCmpXchg(Lock, B.getInt32(0), B.getInt32(1), MaybeAlign(4),
@@ -217,8 +378,10 @@ static void expand(Instruction &I, unsigned Bits, GlobalVariable *Locks) {
 
   if (!I.getType()->isVoidTy()) {
     B.SetInsertPoint(&I);
-    PHINode *Out = B.CreatePHI(ResTy, 1);
+    PHINode *Out = B.CreatePHI(ResTy, UniEnd ? 2 : 1);
     Out->addIncoming(Res, Latch);
+    if (UniEnd)
+      Out->addIncoming(UniResult, UniEnd);
     I.replaceAllUsesWith(Out);
   }
   I.eraseFromParent();

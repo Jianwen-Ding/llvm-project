@@ -1854,12 +1854,85 @@ void LowerAIR::recoverAGXOperations(Function &F) {
 // (AGXSoftF64), tuned for its ALU. Calls rounded to nearest (the plain names,
 // or the `_r` ones with a constant rounding of 1, FLT_ROUNDS' nearest) become
 // the double operations again.
+/// AIR's emulation of a double precision atomic addition or subtraction (a
+/// compare-exchange loop of the bits around __air_f64_add / _sub, from
+/// air-emulate-f64) as the atomicrmw it stands for, which AGX expands with
+/// its wide atomics (a SIMD group of one address takes the lock once):
+///   loop: old = phi [init, pre], [loaded, loop]; new = call(old, x)
+///         {loaded, ok} = cmpxchg ptr, old, new; br ok, exit, loop
+static bool recoverAtomicLoop(CallInst *CI, bool Sub) {
+  BasicBlock *Loop = CI->getParent();
+  auto *Old = dyn_cast<PHINode>(CI->getArgOperand(0));
+  if (!Old || Old->getParent() != Loop || Old->getNumIncomingValues() != 2 ||
+      !CI->hasOneUse())
+    return false;
+  auto *CX = dyn_cast<AtomicCmpXchgInst>(CI->user_back());
+  if (!CX || CX->getParent() != Loop || CX->getCompareOperand() != Old ||
+      CX->getNewValOperand() != CI || CX->isVolatile() || CX->isWeak())
+    return false;
+  ExtractValueInst *Loaded = nullptr, *Ok = nullptr;
+  for (User *U : CX->users()) {
+    auto *E = dyn_cast<ExtractValueInst>(U);
+    if (!E || E->getParent() != Loop || E->getNumIndices() != 1)
+      return false;
+    (E->getIndices()[0] == 0 ? Loaded : Ok) = E;
+  }
+  auto *Br = dyn_cast<CondBrInst>(Loop->getTerminator());
+  if (!Loaded || !Ok || !Br || Br->getCondition() != Ok ||
+      Br->getSuccessor(1) != Loop || Br->getSuccessor(0) == Loop)
+    return false;
+  int LoopIn = Old->getBasicBlockIndex(Loop);
+  if (LoopIn < 0 || Old->getIncomingValue(LoopIn) != Loaded)
+    return false;
+  BasicBlock *Pre = Old->getIncomingBlock(1 - LoopIn);
+  Value *Init = Old->getIncomingValue(1 - LoopIn);
+  // nothing else in the loop
+  for (Instruction &I : *Loop)
+    if (&I != Old && &I != CI && &I != CX && &I != Loaded && &I != Ok && &I != Br)
+      return false;
+  // the loop's values used after it: the loaded value (the old one)
+  for (Instruction *V : {(Instruction *)Old, (Instruction *)CI, (Instruction *)CX,
+                         (Instruction *)Ok})
+    for (User *U : V->users())
+      if (cast<Instruction>(U)->getParent() != Loop)
+        return false;
+  BasicBlock *Exit = Br->getSuccessor(0);
+  if (Exit->getSinglePredecessor() != Loop || Pre->getTerminator()->getNumSuccessors() != 1)
+    return false;
+  IRBuilder<> B(Pre->getTerminator());
+  Type *F64 = B.getDoubleTy();
+  Value *RMW = B.CreateAtomicRMW(Sub ? AtomicRMWInst::FSub : AtomicRMWInst::FAdd,
+                                 CX->getPointerOperand(),
+                                 B.CreateBitCast(CI->getArgOperand(1), F64),
+                                 CX->getAlign(), CX->getSuccessOrdering(),
+                                 CX->getSyncScopeID());
+  Value *Bits = B.CreateBitCast(RMW, B.getInt64Ty());
+  Loaded->replaceAllUsesWith(Bits);
+  Pre->getTerminator()->setSuccessor(0, Exit);
+  Br->eraseFromParent();
+  Ok->eraseFromParent();
+  Loaded->eraseFromParent();
+  CX->eraseFromParent();
+  CI->eraseFromParent();
+  Old->eraseFromParent();
+  Loop->eraseFromParent();
+  // the emulation's first read of the value
+  if (auto *LI = dyn_cast<LoadInst>(Init); LI && LI->use_empty())
+    LI->eraseFromParent();
+  return true;
+}
+
 void LowerAIR::recoverDoubles() {
   if (!NativeF64 && !NativeF64Arith)
     return;
   LLVMContext &Ctx = M.getContext();
   Type *F64 = Type::getDoubleTy(Ctx), *F32 = Type::getFloatTy(Ctx);
   Type *I64 = Type::getInt64Ty(Ctx), *I32 = Type::getInt32Ty(Ctx);
+  for (const char *Name : {"__air_f64_add", "__air_f64_sub"})
+    if (Function *Lib = M.getFunction(Name))
+      for (User *U : make_early_inc_range(Lib->users()))
+        if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == Lib)
+          recoverAtomicLoop(CI, Name[10] == 's');
   for (Function &Lib : make_early_inc_range(M)) {
     StringRef Name = Lib.getName();
     if (!Name.consume_front("__air_f64_"))
