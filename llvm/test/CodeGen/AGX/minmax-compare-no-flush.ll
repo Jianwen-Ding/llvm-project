@@ -29,4 +29,4 @@ define agx_kernel void @stored(float %a, float %b, ptr addrspace(1) %p) #0 {
   ret void
 }
 
-attributes #0 = { "denormal-fp-math-f32"="preserve-sign,preserve-sign" }
+attributes #0 = { denormal_fpenv(preservesign) }
