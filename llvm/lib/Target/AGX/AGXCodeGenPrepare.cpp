@@ -746,7 +746,8 @@ static Value *expandDivRem16(BinaryOperator &BO) {
     X = B.CreateSelect(XNeg, B.CreateNeg(X), X);
     Y = B.CreateSelect(YNeg, B.CreateNeg(Y), Y);
   }
-  Value *Rcp = B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, B.CreateUIToFP(Y, F32));
+  Value *Rcp =
+      B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, B.CreateUIToFP(Y, F32));
   Value *Q = B.CreateFPToUI(B.CreateFMul(B.CreateUIToFP(X, F32), Rcp), I32);
   Value *R = B.CreateSub(X, B.CreateMul(Q, Y));
   Value *Low = B.CreateICmpSLT(R, B.getInt32(0));
@@ -760,7 +761,8 @@ static Value *expandDivRem16(BinaryOperator &BO) {
     Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
   Res = B.CreateTrunc(Res, Ty);
   Value *Zero = B.CreateICmpEQ(BO.getOperand(1), ConstantInt::get(Ty, 0));
-  return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : ConstantInt::getAllOnesValue(Ty), Res);
+  return B.CreateSelect(
+      Zero, IsRem ? BO.getOperand(0) : ConstantInt::getAllOnesValue(Ty), Res);
 }
 
 static cl::opt<bool> AGXNarrowDivisions(
