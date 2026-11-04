@@ -58,13 +58,18 @@ static cl::opt<bool> UniformBatch(
              "group's active threads all access one address take the lock "
              "once for all of them, the operations applied in lane order"));
 
-static cl::opt<bool> IncDecBatch(
-    "agx-inc-dec-batch", cl::init(true), cl::Hidden,
-    cl::desc("32-bit atomic increments and decrements with wrap (CUDA's "
-             "atomicInc / atomicDec, compare-and-swap loops) whose SIMD "
-             "group's active threads all access one address: one "
-             "compare-and-swap of the group's result, the operations applied "
-             "in lane order"));
+static cl::opt<bool> CASBatchTryFirst(
+    "agx-cas-batch-try-first", cl::init(false), cl::Hidden,
+    cl::desc("Each thread tries one compare-and-swap before the batch (only "
+             "the threads that failed are batched)"));
+
+static cl::opt<bool> CASBatch(
+    "agx-cas-batch", cl::init(true), cl::Hidden,
+    cl::desc("32-bit read-modify-write atomics that are compare-and-swap "
+             "loops (atomicInc / atomicDec, f16x2 / bf16x2 additions, float "
+             "min / max): after one try, the threads whose try failed on one "
+             "address take one compare-and-swap of their group's result, the "
+             "operations applied in lane order"));
 
 namespace {
 
@@ -395,30 +400,60 @@ static void expand(Instruction &I, unsigned Bits, GlobalVariable *Locks) {
   I.eraseFromParent();
 }
 
-/// A 32-bit uinc_wrap / udec_wrap (a compare-and-swap loop otherwise) for a
-/// SIMD group whose active threads all access one address: the lowest thread
-/// reads the value, every thread applies the group's operations in lane order
-/// (each with its own operand), the lowest one compare-and-swaps the result,
-/// and the group tries again if it failed. A contended counter is the common
-/// use; other groups keep the per-thread loop.
-static void expandIncDec(AtomicRMWInst &I) {
+/// A 32-bit read-modify-write that AtomicExpand makes a compare-and-swap loop
+/// of (atomicInc / atomicDec, f16x2 / bf16x2 additions, float min / max, ...):
+/// a SIMD group whose active threads all access one address forms a batch:
+/// the lowest thread reads the value, all apply their operations in lane
+/// order, the lowest compare-and-swaps the result, and the batch tries again
+/// if that failed. Groups on different addresses keep the loop. With
+/// -agx-cas-batch-try-first every thread first tries one compare-and-swap,
+/// as the loop would, and only those that failed are batched: no check on an
+/// uncontended atomic, but on one address each group's 32 tries serialize.
+static void expandCASBatch(AtomicRMWInst &I) {
   LLVMContext &Ctx = I.getContext();
   const DataLayout &DL = I.getDataLayout();
   Value *Ptr = I.getPointerOperand();
+  Type *ValTy = I.getType();
   Type *I32 = Type::getInt32Ty(Ctx);
+  Align A = I.getAlign();
   BasicBlock *Pre = I.getParent();
   Function *F = Pre->getParent();
-  BasicBlock *Exit = Pre->splitBasicBlock(I.getIterator(), "inc.dec.end");
-  BasicBlock *Batch = BasicBlock::Create(Ctx, "inc.dec.batch", F, Exit);
-  BasicBlock *Read = BasicBlock::Create(Ctx, "inc.dec.batch.read", F, Exit);
-  BasicBlock *Got = BasicBlock::Create(Ctx, "inc.dec.batch.ops", F, Exit);
-  BasicBlock *Chain = BasicBlock::Create(Ctx, "inc.dec.batch.op", F, Exit);
-  BasicBlock *ChainEnd = BasicBlock::Create(Ctx, "inc.dec.batch.cas", F, Exit);
-  BasicBlock *Swap = BasicBlock::Create(Ctx, "inc.dec.batch.swap", F, Exit);
-  BasicBlock *Tried = BasicBlock::Create(Ctx, "inc.dec.batch.tried", F, Exit);
-  BasicBlock *Single = BasicBlock::Create(Ctx, "inc.dec.single", F, Exit);
+  BasicBlock *Exit = Pre->splitBasicBlock(I.getIterator(), "cas.batch.end");
+  BasicBlock *Failed = BasicBlock::Create(Ctx, "cas.batch.failed", F, Exit);
+  BasicBlock *Batch = BasicBlock::Create(Ctx, "cas.batch", F, Exit);
+  BasicBlock *Read = BasicBlock::Create(Ctx, "cas.batch.read", F, Exit);
+  BasicBlock *LoadBB = BasicBlock::Create(Ctx, "cas.batch.load", F, Exit);
+  BasicBlock *Got = BasicBlock::Create(Ctx, "cas.batch.ops", F, Exit);
+  BasicBlock *Chain = BasicBlock::Create(Ctx, "cas.batch.op", F, Exit);
+  BasicBlock *ChainEnd = BasicBlock::Create(Ctx, "cas.batch.cas", F, Exit);
+  BasicBlock *Swap = BasicBlock::Create(Ctx, "cas.batch.swap", F, Exit);
+  BasicBlock *Tried = BasicBlock::Create(Ctx, "cas.batch.tried", F, Exit);
+  BasicBlock *Single = BasicBlock::Create(Ctx, "cas.batch.single", F, Exit);
+  Value *Old0 = nullptr;
 
+  // the first try (or none: all threads to the batch's check)
   IRBuilder<> B(Pre->getTerminator());
+  if (!CASBatchTryFirst) {
+    Pre->getTerminator()->setSuccessor(0, Failed);
+  } else {
+    LoadInst *L0 = B.CreateAlignedLoad(I32, Ptr, A);
+    L0->setAtomic(AtomicOrdering::Monotonic, I.getSyncScopeID());
+    Value *New0 =
+        toInt(B,
+              buildAtomicRMWValue(I.getOperation(), B, fromInt(B, L0, ValTy),
+                                  I.getValOperand()),
+              32);
+    Value *CX0 =
+        B.CreateAtomicCmpXchg(Ptr, L0, New0, A, I.getOrdering(),
+                              AtomicOrdering::Monotonic, I.getSyncScopeID());
+    Pre->getTerminator()->eraseFromParent();
+    B.SetInsertPoint(Pre);
+    B.CreateCondBr(B.CreateExtractValue(CX0, 1), Exit, Failed);
+    Old0 = fromInt(B, L0, ValTy);
+  }
+
+  // the threads that failed: one address?
+  B.SetInsertPoint(Failed);
   unsigned PtrBits =
       DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
   Value *A64 = B.CreateZExtOrTrunc(B.CreatePtrToInt(Ptr, B.getIntNTy(PtrBits)),
@@ -429,21 +464,20 @@ static void expandIncDec(AtomicRMWInst &I) {
   Value *Same =
       B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot,
                         {B.CreateICmpEQ(A64, shuffleWide(B, A64, First, 64))});
-  Pre->getTerminator()->eraseFromParent();
-  B.SetInsertPoint(Pre);
   B.CreateCondBr(B.CreateICmpEQ(Same, Pending), Batch, Single);
 
   B.SetInsertPoint(Batch);
   Value *Lane =
       B.CreateIntrinsic(I32, Intrinsic::agx_thread_index_in_simdgroup, {});
   Value *Leader = B.CreateICmpEQ(Lane, First);
+  Value *Arg = toInt(B, I.getValOperand(), 32);
   B.CreateBr(Read);
-  // (the retries: every thread loops until the lowest one's swap succeeds)
+  // (the retries: every thread of the batch loops until the lowest one's
+  // swap succeeds)
   B.SetInsertPoint(Read);
-  BasicBlock *LoadBB = BasicBlock::Create(Ctx, "inc.dec.batch.load", F, Got);
   B.CreateCondBr(Leader, LoadBB, Got);
   B.SetInsertPoint(LoadBB);
-  LoadInst *L = B.CreateAlignedLoad(I32, Ptr, Align(4));
+  LoadInst *L = B.CreateAlignedLoad(I32, Ptr, A);
   L->setAtomic(AtomicOrdering::Monotonic, I.getSyncScopeID());
   B.CreateBr(Got);
   B.SetInsertPoint(Got);
@@ -460,9 +494,12 @@ static void expandIncDec(AtomicRMWInst &I) {
   Cur->addIncoming(V, Got);
   Mine->addIncoming(PoisonValue::get(I32), Got);
   Value *J = B.CreateBinaryIntrinsic(Intrinsic::cttz, Rem, B.getTrue());
-  Value *Arg = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32},
-                                 {I.getValOperand(), J});
-  Value *Next = buildAtomicRMWValue(I.getOperation(), B, Cur, Arg);
+  Value *ArgJ = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {Arg, J});
+  Value *Next =
+      toInt(B,
+            buildAtomicRMWValue(I.getOperation(), B, fromInt(B, Cur, ValTy),
+                                fromInt(B, ArgJ, ValTy)),
+            32);
   Value *Mine2 = B.CreateSelect(B.CreateICmpEQ(Lane, J), Cur, Mine);
   Value *Rem2 = B.CreateAnd(Rem, B.CreateSub(Rem, B.getInt32(1)));
   Rem->addIncoming(Rem2, Chain);
@@ -473,7 +510,7 @@ static void expandIncDec(AtomicRMWInst &I) {
   B.CreateCondBr(Leader, Swap, Tried);
   B.SetInsertPoint(Swap);
   Value *CX =
-      B.CreateAtomicCmpXchg(Ptr, V, Next, Align(4), I.getOrdering(),
+      B.CreateAtomicCmpXchg(Ptr, V, Next, A, I.getOrdering(),
                             AtomicOrdering::Monotonic, I.getSyncScopeID());
   Value *Ok = B.CreateZExt(B.CreateExtractValue(CX, 1), I32);
   B.CreateBr(Tried);
@@ -485,15 +522,20 @@ static void expandIncDec(AtomicRMWInst &I) {
       B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {OkP, First});
   B.CreateCondBr(B.CreateICmpNE(Done, B.getInt32(0)), Exit, Read);
 
-  // the other groups: the instruction as it was (AtomicExpand's loop)
+  // threads that failed on different addresses: the instruction as it was
+  // (AtomicExpand's loop)
   B.SetInsertPoint(Single);
   Instruction *Copy = I.clone();
   B.Insert(Copy);
   B.CreateBr(Exit);
 
+  IRBuilder<> TB(Tried->getTerminator());
+  Value *OldBatch = fromInt(TB, Mine2, ValTy);
   B.SetInsertPoint(&I);
-  PHINode *Out = B.CreatePHI(I32, 2);
-  Out->addIncoming(Mine2, Tried);
+  PHINode *Out = B.CreatePHI(ValTy, 3);
+  if (Old0)
+    Out->addIncoming(Old0, Pre);
+  Out->addIncoming(OldBatch, Tried);
   Out->addIncoming(Copy, Single);
   I.replaceAllUsesWith(Out);
   I.eraseFromParent();
@@ -506,14 +548,16 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   const AGXTargetLowering *TLI =
       TM ? TM->getSubtargetImpl(F)->getTargetLowering() : nullptr;
   SmallVector<std::pair<Instruction *, unsigned>, 4> Wide;
-  SmallVector<AtomicRMWInst *, 4> IncDec;
+  SmallVector<AtomicRMWInst *, 4> CASLoops;
   for (Instruction &I : instructions(F)) {
     if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
-        IncDecBatch && RMW && RMW->getType()->isIntegerTy(32) &&
-        (RMW->getOperation() == AtomicRMWInst::UIncWrap ||
-         RMW->getOperation() == AtomicRMWInst::UDecWrap) &&
+        CASBatch && RMW && TLI && !TM->getSubtargetImpl(F)->hasMesaISA() &&
+        DL.getTypeStoreSize(RMW->getType()) == 4 &&
+        !RMW->getType()->isPointerTy() &&
+        TLI->shouldExpandAtomicRMWInIR(RMW) ==
+            TargetLowering::AtomicExpansionKind::CmpXChg &&
         !isStrongerThanMonotonic(RMW->getOrdering())) {
-      IncDec.push_back(RMW);
+      CASLoops.push_back(RMW);
       continue;
     }
     // Wide operations the chip has an instruction for.
@@ -525,10 +569,10 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
     if (unsigned Bits = wideAtomicSize(I, DL))
       Wide.push_back({&I, Bits});
   }
-  for (AtomicRMWInst *RMW : IncDec)
-    expandIncDec(*RMW);
+  for (AtomicRMWInst *RMW : CASLoops)
+    expandCASBatch(*RMW);
   if (Wide.empty())
-    return !IncDec.empty();
+    return !CASLoops.empty();
   GlobalVariable *Locks = getLocks(*F.getParent());
   for (auto [I, Bits] : Wide)
     expand(*I, Bits, Locks);
