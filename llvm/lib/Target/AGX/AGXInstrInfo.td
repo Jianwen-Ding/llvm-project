@@ -109,6 +109,8 @@ def AGXstore_v4 : SDNode<"AGXISD::STORE_V4", SDT_AGXStoreV4,
 // combiner folds through the halves.
 def SDT_AGXHi32 : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisVT<1, i64>]>;
 def AGXhi32 : SDNode<"AGXISD::HI32", SDT_AGXHi32>;
+// Clamp to [0, 1], a NaN to +0 (the .sat output modifier).
+def AGXfsat : SDNode<"AGXISD::FSAT", SDTFPUnaryOp>;
 // The 64-bit product of two 32-bit values, unsigned or signed (one imadd).
 def SDT_AGXMulWide : SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i32>,
                                           SDTCisVT<2, i32>]>;

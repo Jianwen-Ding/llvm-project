@@ -732,6 +732,8 @@ defm FADD16_F16 : FBinPseudo<FADD16_g13, GPR16, Src16Op>;
 defm FMUL16_F16 : FBinPseudo<FMUL16_g13, GPR16, Src16Op>;
 defm FADD32_SAT_F32 : FBinPseudo<FADD32_SAT_g13, GPR32, Src32Op>;
 defm FADD16_SAT_F16 : FBinPseudo<FADD16_SAT_g13, GPR16, Src16Op>;
+defm FMUL32_SAT_F32 : FBinPseudo<FMUL32_SAT_g13, GPR32, Src32Op>;
+defm FMUL16_SAT_F16 : FBinPseudo<FMUL16_SAT_g13, GPR16, Src16Op>;
 // Conversions between half and single precision through fadd32 -0.0.
 def FADD32_F32_F16 : AGXALUPseudo<FADD32_g13, (outs GPR32:$dst),
                                   (ins SrcMods:$src0_mods, Src16Op:$src0,
@@ -788,6 +790,35 @@ multiclass FMAPseudo<Instruction real, RegisterClass rc, RegisterOperand src,
 
 defm FMADD32_F32 : FMAPseudo<FMADD32_g13, GPR32, Src32Op, WriteFP3>;
 defm FMADD16_F16 : FMAPseudo<FMADD16_g13, GPR16, Src16Op>;
+defm FMADD32_SAT_F32 : FMAPseudo<FMADD32_SAT_g13, GPR32, Src32Op, WriteFP3>;
+defm FMADD16_SAT_F16 : FMAPseudo<FMADD16_SAT_g13, GPR16, Src16Op>;
+
+// The clamp to [0, 1] (AGXfsat): the .sat form of the operation that produced
+// the value, or an addition of -0.
+def : Pat<(f32 (AGXfsat (fma (AGXFPSrc32 f32:$a, i32:$am),
+                             (AGXFPSrc32 f32:$b, i32:$bm),
+                             (AGXFPSrc32 f32:$c, i32:$cm)))),
+          (FMADD32_SAT_F32 $am, $a, $bm, $b, $cm, $c)>;
+def : Pat<(f16 (AGXfsat (fma (AGXFPSrc16 f16:$a, i32:$am),
+                             (AGXFPSrc16 f16:$b, i32:$bm),
+                             (AGXFPSrc16 f16:$c, i32:$cm)))),
+          (FMADD16_SAT_F16 $am, $a, $bm, $b, $cm, $c)>;
+def : Pat<(f32 (AGXfsat (fadd (AGXFPSrc32 f32:$a, i32:$am),
+                              (AGXFPSrc32 f32:$b, i32:$bm)))),
+          (FADD32_SAT_F32 $am, $a, $bm, $b)>;
+def : Pat<(f16 (AGXfsat (fadd (AGXFPSrc16 f16:$a, i32:$am),
+                              (AGXFPSrc16 f16:$b, i32:$bm)))),
+          (FADD16_SAT_F16 $am, $a, $bm, $b)>;
+def : Pat<(f32 (AGXfsat (fmul (AGXFPSrc32 f32:$a, i32:$am),
+                              (AGXFPSrc32 f32:$b, i32:$bm)))),
+          (FMUL32_SAT_F32 $am, $a, $bm, $b)>;
+def : Pat<(f16 (AGXfsat (fmul (AGXFPSrc16 f16:$a, i32:$am),
+                              (AGXFPSrc16 f16:$b, i32:$bm)))),
+          (FMUL16_SAT_F16 $am, $a, $bm, $b)>;
+def : Pat<(f32 (AGXfsat (AGXFPSrc32 f32:$a, i32:$am))),
+          (FADD32_SAT_F32 $am, $a, 0, (i32 FPIMM_NEG_ZERO))>;
+def : Pat<(f16 (AGXfsat (AGXFPSrc16 f16:$a, i32:$am))),
+          (FADD16_SAT_F16 $am, $a, 0, (i16 FPIMM_NEG_ZERO))>;
 
 def : Pat<(f32 (fma (AGXFPSrc32 f32:$a, i32:$am), (AGXFPSrc32 f32:$b, i32:$bm),
                     (AGXFPSrc32 f32:$c, i32:$cm))),

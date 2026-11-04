@@ -102,7 +102,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
   setTargetDAGCombine({ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
-                       ISD::ZERO_EXTEND});
+                       ISD::ZERO_EXTEND, ISD::FMINIMUMNUM});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1387,6 +1387,33 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   switch (N->getOpcode()) {
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
+  case ISD::FMINIMUMNUM: {
+    // minimumnum(maximumnum(x, +0), 1): the clamp of .sat (a NaN becomes +0
+    // and -0 becomes +0, as maximumnum(-0, +0) is +0), before the two become
+    // hardware min / max and their signed-zero fixes. Under ieee-fp32 a float
+    // must keep its denormals, which the hardware's .sat flushes.
+    EVT VT = N->getValueType(0);
+    if (DCI.isAfterLegalizeDAG() || (VT != MVT::f16 && VT != MVT::f32) ||
+        (VT == MVT::f32 && DCI.DAG.getSubtarget<AGXSubtarget>().hasIEEEFP32()))
+      return SDValue();
+    auto IsConst = [](SDValue V, double C) {
+      auto *F = dyn_cast<ConstantFPSDNode>(V);
+      return F && F->getValueAPF().isPosZero() == (C == 0.0) &&
+             F->isExactlyValue(C);
+    };
+    SDValue M = N->getOperand(0), One = N->getOperand(1);
+    if (!IsConst(One, 1.0))
+      std::swap(M, One);
+    if (!IsConst(One, 1.0) || M.getOpcode() != ISD::FMAXIMUMNUM ||
+        !M.hasOneUse())
+      return SDValue();
+    SDValue X = M.getOperand(0), Zero = M.getOperand(1);
+    if (!IsConst(Zero, 0.0))
+      std::swap(X, Zero);
+    if (!IsConst(Zero, 0.0))
+      return SDValue();
+    return DCI.DAG.getNode(AGXISD::FSAT, SDLoc(N), VT, X);
+  }
   case ISD::ZERO_EXTEND: {
     // Booleans (i1 promoted to i16) combined with and / or / xor and then
     // extended to 32 bits (for a branch): compute them in 32 bits, where
