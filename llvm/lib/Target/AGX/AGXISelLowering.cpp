@@ -1879,6 +1879,14 @@ SDValue AGXTargetLowering::lowerFP_TO_BF16(SDValue Op,
   SDValue R = DAG.getNode(ISD::ADD, DL, MVT::i32, X,
                           DAG.getNode(ISD::ADD, DL, MVT::i32, Lsb, C(0x7fff)));
   R = DAG.getNode(ISD::SRL, DL, MVT::i32, R, C(16));
+  // The f32 arithmetic's NaN is 0x7fc00000, which the rounding keeps a NaN:
+  // a result of it needs no NaN test (unless NaNs follow PTX's canonical
+  // form, whose 0x7fffffff the rounding would carry out of).
+  unsigned SrcOp = Src.getOpcode();
+  if (!DAG.getSubtarget<AGXSubtarget>().hasCanonicalNaN() &&
+      (SrcOp == ISD::FADD || SrcOp == ISD::FSUB || SrcOp == ISD::FMUL ||
+       SrcOp == ISD::FMA || SrcOp == ISD::FMAD))
+    return DAG.getNode(ISD::TRUNCATE, DL, Op.getValueType(), R);
   SDValue Quiet = DAG.getNode(ISD::OR, DL, MVT::i32,
                               DAG.getNode(ISD::SRL, DL, MVT::i32, X, C(16)), C(0x40));
   EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), MVT::i32);
