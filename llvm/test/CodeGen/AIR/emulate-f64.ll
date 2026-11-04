@@ -50,9 +50,10 @@ define internal double @helper(double %x, double %y) {
 ; CHECK: xor i64 %{{.*}}, -9223372036854775808
 ; CHECK: and i64 %{{.*}}, 9223372036854775807
 ; CHECK: %h = call i64 @helper(
-; CHECK: call i64 @__air_f64_to_i64(
-; CHECK: call i64 @llvm.smin.i64(
-; CHECK: call i64 @llvm.smax.i64(
+; a 32-bit result in 32-bit operations (exponent, shifted significand, limits)
+; CHECK-NOT: call i64 @__air_f64_to_i64(
+; CHECK: lshr i32
+; CHECK: call i32 @llvm.umin.i32(
 ; CHECK: call i64 @__air_f64_from_f32(
 ; CHECK: call i32 @__air_f64_to_f32(
 ; CHECK: call i32 @__air_f64_to_f16_r({{.*}}, i32 1)

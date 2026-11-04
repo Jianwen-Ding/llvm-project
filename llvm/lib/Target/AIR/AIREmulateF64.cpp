@@ -1762,38 +1762,33 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
         R = RoundingMode == 0 ? Trunc(A[0])
             : RoundingMode == 2 ? Ceil(A[0])
                                 : Floor(A[0]);
-    } else if (B2 == "minnum" || B2 == "maxnum") {
-      // The non-NaN operand when one is NaN.
-      bool Min = B2 == "minnum";
-      Value *Lt = Bool(Lib("__air_f64_lt", I32,
-                           Min ? ArrayRef<Value *>{A[0], A[1]}
-                               : ArrayRef<Value *>{A[1], A[0]}));
-      Value *ANaN = Bool(Lib("__air_f64_unord", I32, {A[0], A[0]}));
-      R = B.CreateSelect(ANaN, A[1], B.CreateSelect(Lt, A[0], A[1]));
-    } else if (B2 == "minimum" || B2 == "maximum" || B2 == "minimumnum" ||
-               B2 == "maximumnum") {
-      // -0 orders below +0; minimum / maximum return a NaN operand (quiet),
-      // the *num forms the other operand.
+    } else if (B2 == "minnum" || B2 == "maxnum" || B2 == "minimum" ||
+               B2 == "maximum" || B2 == "minimumnum" || B2 == "maximumnum") {
+      // On the bits: x ^ ((x >> 63) & 0x7fff...) orders doubles as signed
+      // integers (-0 below +0, as minimum / maximum need and minnum / maxnum
+      // allow). A NaN operand: minimum / maximum return it (quiet), the
+      // other forms the other operand.
       bool Min = B2.starts_with("min");
       Value *X = A[0], *Y = A[1];
-      Value *Lt = Bool(Lib("__air_f64_lt", I32,
-                           Min ? ArrayRef<Value *>{X, Y}
-                               : ArrayRef<Value *>{Y, X}));
-      Value *Eq = Bool(Lib("__air_f64_eq", I32, {X, Y}));
-      // equal values: the one with the sign bit for min, without for max
-      Value *XNeg = B.CreateICmpSLT(X, B.getInt64(0));
-      Value *PickX =
-          B.CreateOr(Lt, B.CreateAnd(Eq, Min ? XNeg : B.CreateNot(XNeg)));
-      Value *XNaN = Bool(Lib("__air_f64_unord", I32, {X, X}));
-      Value *YNaN = Bool(Lib("__air_f64_unord", I32, {Y, Y}));
+      auto Key = [&](Value *V) {
+        return B.CreateXor(
+            V, B.CreateAnd(B.CreateAShr(V, 63), B.getInt64(AbsMask)));
+      };
+      auto IsNaN = [&](Value *V) {
+        return B.CreateICmpUGT(B.CreateAnd(V, B.getInt64(AbsMask)),
+                               B.getInt64(0x7ff0000000000000ull));
+      };
+      Value *PickX = Min ? B.CreateICmpSLT(Key(X), Key(Y))
+                         : B.CreateICmpSGT(Key(X), Key(Y));
+      Value *XNaN = IsNaN(X), *YNaN = IsNaN(Y);
       R = B.CreateSelect(PickX, X, Y);
       Value *Quiet = B.getInt64(0x0008000000000000ull);
-      if (B2.ends_with("num")) {
-        R = B.CreateSelect(YNaN, X, R);
-        R = B.CreateSelect(XNaN, Y, R);
-      } else {
+      if (B2 == "minimum" || B2 == "maximum") {
         R = B.CreateSelect(YNaN, B.CreateOr(Y, Quiet), R);
         R = B.CreateSelect(XNaN, B.CreateOr(X, Quiet), R);
+      } else {
+        R = B.CreateSelect(YNaN, X, R);
+        R = B.CreateSelect(XNaN, Y, R);
       }
     } else if (B2 == "fcmp") {
       Value *Uno = Bool(Lib("__air_f64_unord", I32, {A[0], A[1]}));
@@ -1820,6 +1815,40 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
       default: break;
       }
     } else if ((B2 == "fptosi" || B2 == "fptoui") && Ret->isIntegerTy() &&
+               Ret->getIntegerBitWidth() <= 32) {
+      // Saturating, NaN to 0, in 32-bit integer operations: the top 32 bits
+      // of the significand (leading one at bit 31) shifted down by 31 - e
+      // for an unbiased exponent e in [0, 31]; 0 below, the limit above.
+      bool Signed = B2 == "fptosi";
+      unsigned W = Ret->getIntegerBitWidth();
+      Value *Hi = B.CreateTrunc(B.CreateLShr(A[0], 32), I32);
+      Value *Lo = B.CreateTrunc(A[0], I32);
+      Value *Neg = B.CreateICmpSLT(Hi, B.getInt32(0));
+      Value *E = B.CreateSub(B.CreateAnd(B.CreateLShr(Hi, 20), 0x7ff),
+                             B.getInt32(1023));
+      Value *M =
+          B.CreateOr(B.CreateOr(B.CreateShl(Hi, 11), B.CreateLShr(Lo, 21)),
+                     B.getInt32(0x80000000u));
+      Value *Mag = B.CreateSelect(
+          B.CreateICmpULE(E, B.getInt32(31)),
+          B.CreateLShr(M, B.CreateAnd(B.CreateSub(B.getInt32(31), E), 31)),
+          B.getInt32(0));
+      Value *Over = B.CreateICmpSGT(E, B.getInt32(31));
+      Value *NaN = B.CreateICmpUGT(B.CreateAnd(A[0], B.getInt64(AbsMask)),
+                                   B.getInt64(0x7ff0000000000000ull));
+      Value *Lim;
+      if (Signed) {
+        uint32_t Max = uint32_t(APInt::getSignedMaxValue(W).getZExtValue());
+        Lim = B.CreateSelect(Neg, B.getInt32(Max + 1), B.getInt32(Max));
+      } else {
+        Lim = B.getInt32(uint32_t(APInt::getMaxValue(W).getZExtValue()));
+      }
+      Value *C = B.CreateSelect(
+          Over, Lim, B.CreateBinaryIntrinsic(Intrinsic::umin, Mag, Lim));
+      C = Signed ? B.CreateSelect(Neg, B.CreateNeg(C), C)
+                 : B.CreateSelect(Neg, B.getInt32(0), C);
+      R = B.CreateTrunc(B.CreateSelect(NaN, B.getInt32(0), C), Ret);
+    } else if ((B2 == "fptosi" || B2 == "fptoui") && Ret->isIntegerTy() &&
                Ret->getIntegerBitWidth() <= 64) {
       // Saturating, NaN to 0 (llvm.fpto[su]i.sat; out of range values are
       // poison for the instructions).
@@ -1839,6 +1868,26 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
                       B.getInt64(APInt::getMaxValue(W).getZExtValue()));
         R = B.CreateTrunc(R, Ret);
       }
+    } else if ((B2 == "sitofp" || B2 == "uitofp") &&
+               A[0]->getType()->getIntegerBitWidth() <= 32) {
+      bool Signed = B2 == "sitofp";
+      // Exact, from 32-bit integer operations: the magnitude normalized by
+      // its leading zeros (exponent 1054 - zeros), the bits below the
+      // leading one split between the two words.
+      Value *X = Signed ? B.CreateSExt(A[0], I32) : B.CreateZExt(A[0], I32);
+      Value *Neg = Signed ? B.CreateICmpSLT(X, B.getInt32(0)) : B.getFalse();
+      Value *Mag = Signed ? B.CreateSelect(Neg, B.CreateNeg(X), X) : X;
+      Value *LZ = B.CreateAnd(
+          B.CreateBinaryIntrinsic(Intrinsic::ctlz, Mag, B.getFalse()), 31);
+      Value *F = B.CreateShl(B.CreateShl(Mag, LZ), 1);
+      Value *HiW = B.CreateOr(
+          B.CreateOr(B.CreateShl(B.CreateSub(B.getInt32(1054), LZ), 20),
+                     B.CreateLShr(F, 12)),
+          B.CreateSelect(Neg, B.getInt32(0x80000000u), B.getInt32(0)));
+      Value *Bits = B.CreateOr(B.CreateShl(B.CreateZExt(HiW, I64), 32),
+                               B.CreateZExt(B.CreateShl(F, 20), I64));
+      R = B.CreateSelect(B.CreateICmpEQ(Mag, B.getInt32(0)), B.getInt64(0),
+                         Bits);
     } else if ((B2 == "sitofp" || B2 == "uitofp") &&
                A[0]->getType()->getIntegerBitWidth() <= 64) {
       bool Signed = B2 == "sitofp";
