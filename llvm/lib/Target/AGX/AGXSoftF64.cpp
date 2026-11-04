@@ -484,13 +484,21 @@ public:
   /// A float (bits in an i64) as a double, where it is normal or zero, and
   /// whether it is: the exponent rebiased and the fraction 29 places up.
   std::pair<Value *, Value *> extFast(Value *X) {
-    Value *E = B.CreateAnd(B.CreateLShr(X, 23), c64(0xff));
-    Value *Sign = B.CreateShl(B.CreateAnd(B.CreateLShr(X, 31), c64(1)), 63);
-    Value *Zero = B.CreateICmpEQ(B.CreateAnd(X, c64(0x7fffffff)), c64(0));
-    Value *Bits = B.CreateOr(B.CreateShl(B.CreateAdd(E, c64(1023 - 127)), 52),
-                             B.CreateShl(B.CreateAnd(X, c64(0x7fffff)), 29));
-    Bits = B.CreateOr(select(Zero, c64(0), Bits), Sign);
-    Value *Normal = B.CreateICmpULT(B.CreateSub(E, c64(1)), c64(254));
+    // in 32 bits: the float's fields go to the double's high word (the top 20
+    // fraction bits) and low word (the other 3, at its top)
+    Value *F = B.CreateTrunc(X, I32);
+    Value *E = B.CreateAnd(B.CreateLShr(F, 23), c32(0xff));
+    Value *Frac = B.CreateAnd(F, c32(0x7fffff));
+    Value *Zero = B.CreateICmpEQ(B.CreateAnd(F, c32(0x7fffffff)), c32(0));
+    Value *Hi = B.CreateOr(B.CreateShl(B.CreateAdd(E, c32(1023 - 127)), 20),
+                           B.CreateLShr(Frac, 3));
+    Value *Lo = B.CreateShl(Frac, 29);
+    Hi = B.CreateSelect(Zero, c32(0), Hi);
+    Lo = B.CreateSelect(Zero, c32(0), Lo);
+    Hi = B.CreateOr(Hi, B.CreateAnd(F, c32(int32_t(0x80000000u))));
+    Value *Bits = B.CreateOr(B.CreateShl(B.CreateZExt(Hi, I64), 32),
+                             B.CreateZExt(Lo, I64));
+    Value *Normal = B.CreateICmpULT(B.CreateSub(E, c32(1)), c32(254));
     return {Bits, B.CreateOr(Normal, Zero)};
   }
   /// A double rounded to nearest even to a float (bits in an i64), where the
