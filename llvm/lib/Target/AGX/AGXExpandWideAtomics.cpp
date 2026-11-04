@@ -435,7 +435,8 @@ static void expandCASBatch(AtomicRMWInst &I) {
   Value *Shift = nullptr, *WordPtr = Ptr;
   if (Bits == 16) {
     IRBuilder<> SB(Pre->getTerminator());
-    unsigned PB = DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
+    unsigned PB =
+        DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
     Value *Low = SB.CreateAnd(SB.CreatePtrToInt(Ptr, SB.getIntNTy(PB)), 3);
     WordPtr = SB.CreateGEP(SB.getInt8Ty(), Ptr, SB.CreateNeg(Low));
     Shift = SB.CreateShl(SB.CreateTrunc(Low, I32), 3);
@@ -471,8 +472,8 @@ static void expandCASBatch(AtomicRMWInst &I) {
   B.SetInsertPoint(Failed);
   unsigned PtrBits =
       DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
-  Value *A64 = B.CreateZExtOrTrunc(B.CreatePtrToInt(WordPtr, B.getIntNTy(PtrBits)),
-                                   B.getInt64Ty());
+  Value *A64 = B.CreateZExtOrTrunc(
+      B.CreatePtrToInt(WordPtr, B.getIntNTy(PtrBits)), B.getInt64Ty());
   Value *Pending =
       B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {B.getTrue()});
   Value *First = B.CreateBinaryIntrinsic(Intrinsic::cttz, Pending, B.getTrue());
@@ -575,11 +576,13 @@ static void widenNarrowAtomicLoad(LoadInst &LI) {
   IRBuilder<> B(&LI);
   const DataLayout &DL = LI.getDataLayout();
   Value *Ptr = LI.getPointerOperand();
-  unsigned PtrBits = DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
+  unsigned PtrBits =
+      DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
   unsigned Bits = DL.getTypeStoreSizeInBits(LI.getType());
   Value *Low = B.CreateAnd(B.CreatePtrToInt(Ptr, B.getIntNTy(PtrBits)), 3);
   Value *Word = B.CreateGEP(B.getInt8Ty(), Ptr, B.CreateNeg(Low));
-  LoadInst *W = B.CreateAlignedLoad(B.getInt32Ty(), Word, Align(4), LI.isVolatile());
+  LoadInst *W =
+      B.CreateAlignedLoad(B.getInt32Ty(), Word, Align(4), LI.isVolatile());
   W->setAtomic(LI.getOrdering(), LI.getSyncScopeID());
   Value *Shift = B.CreateShl(B.CreateTrunc(Low, B.getInt32Ty()), 3);
   Value *V = B.CreateTrunc(B.CreateLShr(W, Shift), B.getIntNTy(Bits));
