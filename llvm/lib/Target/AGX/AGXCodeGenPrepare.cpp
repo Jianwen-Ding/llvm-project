@@ -782,11 +782,16 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
 }
 
 /// Division and remainder of at most 16 bits (8- and 16-bit PTX div / rem):
-/// the magnitudes (at most 2^16) are exact floats, so q = trunc(x rcp(y)) is
-/// within 2^-6 of x / y (rcp within 0.75 ulp, one rounding of the product)
-/// and so within one of the quotient; the remainder x - q y corrects it once
-/// either way. Division by zero gives all ones (remainder: x), as the 32-bit
-/// expansion does; the signed overflow -2^(n-1) / -1 wraps.
+/// the operands (magnitudes at most 2^16) are exact floats, and
+/// q = trunc(x rcp(y) (1 + 2^-18)) is the quotient rounded toward zero, signs
+/// included, with no correction: the factor makes up for rcp's error (within
+/// 0.75 ulp, far below 2^-19) and the products' roundings, so the biased value
+/// is never below |x / y| in magnitude, and it exceeds it by less than
+/// |x / y| 2^-17, which is below 1 / |y| (|x| < 2^16): it never reaches the
+/// next integer up from a quotient that is not one (at most 1 - 1 / |y| above
+/// an integer). The remainder is x - q y. Division by zero gives all ones
+/// (remainder: x), as the 32-bit expansion does; the signed overflow
+/// -2^(n-1) / -1 wraps.
 static Value *expandDivRem16(BinaryOperator &BO) {
   IRBuilder<> B(&BO);
   Instruction::BinaryOps Op = BO.getOpcode();
@@ -798,27 +803,14 @@ static Value *expandDivRem16(BinaryOperator &BO) {
                       : B.CreateZExt(BO.getOperand(0), I32);
   Value *Y = IsSigned ? B.CreateSExt(BO.getOperand(1), I32)
                       : B.CreateZExt(BO.getOperand(1), I32);
-  Value *Neg = nullptr;
-  if (IsSigned) {
-    Value *XNeg = B.CreateICmpSLT(X, B.getInt32(0));
-    Value *YNeg = B.CreateICmpSLT(Y, B.getInt32(0));
-    Neg = IsRem ? XNeg : B.CreateXor(XNeg, YNeg);
-    X = B.CreateSelect(XNeg, B.CreateNeg(X), X);
-    Y = B.CreateSelect(YNeg, B.CreateNeg(Y), Y);
-  }
-  Value *Rcp =
-      B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, B.CreateUIToFP(Y, F32));
-  Value *Q = B.CreateFPToUI(B.CreateFMul(B.CreateUIToFP(X, F32), Rcp), I32);
-  Value *R = B.CreateSub(X, B.CreateMul(Q, Y));
-  Value *Low = B.CreateICmpSLT(R, B.getInt32(0));
-  Q = B.CreateSelect(Low, B.CreateSub(Q, B.getInt32(1)), Q);
-  R = B.CreateSelect(Low, B.CreateAdd(R, Y), R);
-  Value *High = B.CreateICmpSGE(R, Y);
-  Q = B.CreateSelect(High, B.CreateAdd(Q, B.getInt32(1)), Q);
-  R = B.CreateSelect(High, B.CreateSub(R, Y), R);
-  Value *Res = IsRem ? R : Q;
-  if (IsSigned)
-    Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
+  auto ToF = [&](Value *V) {
+    return IsSigned ? B.CreateSIToFP(V, F32) : B.CreateUIToFP(V, F32);
+  };
+  Value *Rcp = B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, ToF(Y));
+  Rcp = B.CreateFMul(Rcp, ConstantFP::get(F32, 1.0 + 0x1p-18));
+  Value *P = B.CreateFMul(ToF(X), Rcp);
+  Value *Q = IsSigned ? B.CreateFPToSI(P, I32) : B.CreateFPToUI(P, I32);
+  Value *Res = IsRem ? B.CreateSub(X, B.CreateMul(Q, Y)) : Q;
   Res = B.CreateTrunc(Res, Ty);
   Value *Zero = B.CreateICmpEQ(BO.getOperand(1), ConstantInt::get(Ty, 0));
   return B.CreateSelect(
