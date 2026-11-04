@@ -1961,6 +1961,320 @@ static bool mergeMaskedOrs(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXBytePermutes(
+    "agx-byte-permutes", cl::init(true), cl::Hidden,
+    cl::desc("Build 32-bit values whose bytes are bytes (or sign bytes) of "
+             "other values from 16-bit halves: bit-field inserts of bytes"));
+
+namespace {
+/// Where a byte of a value comes from: zero, byte Idx of V, or all copies of
+/// the sign bit of byte Idx of V.
+struct ByteSrc {
+  enum Kind { Zero, Byte, Sign } K = Zero;
+  Value *V = nullptr;
+  unsigned Idx = 0;
+  bool operator==(const ByteSrc &O) const {
+    return K == O.K && (K == Zero || (V == O.V && Idx == O.Idx));
+  }
+};
+using Bytes4 = std::array<ByteSrc, 4>;
+} // namespace
+
+/// The bytes of 32-bit V through ors of disjoint bytes, masks of whole bytes,
+/// shifts by whole bytes, sign fills (ashr by whole bytes or by 31) and zero
+/// extensions; Tree gets the instructions looked through.
+static Bytes4 byteSources(Value *V, unsigned Depth,
+                          SmallVectorImpl<Instruction *> &Tree) {
+  using namespace PatternMatch;
+  auto Leaf = [&](Value *L) {
+    Bytes4 R;
+    unsigned N = L->getType()->getIntegerBitWidth() / 8;
+    for (unsigned I = 0; I < N && I < 4; ++I)
+      R[I] = {ByteSrc::Byte, L, I};
+    return R;
+  };
+  auto *I = dyn_cast<Instruction>(V);
+  if (auto *C = dyn_cast<ConstantInt>(V); C && C->isZero())
+    return Bytes4();
+  if (!I || Depth == 0 || !I->getType()->isIntegerTy(32))
+    return Leaf(V);
+  Value *X, *Y;
+  const APInt *C;
+  Bytes4 R;
+  // (the instructions below this one join Tree only with it)
+  SmallVector<Instruction *, 16> Sub;
+  if (match(I, m_And(m_Value(X), m_APInt(C)))) {
+    for (unsigned B = 0; B < 4; ++B) {
+      unsigned M = C->extractBitsAsZExtValue(8, 8 * B);
+      if (M != 0 && M != 255)
+        return Leaf(V);
+    }
+    Bytes4 S = byteSources(X, Depth - 1, Sub);
+    for (unsigned B = 0; B < 4; ++B)
+      if (C->extractBitsAsZExtValue(8, 8 * B))
+        R[B] = S[B];
+  } else if (match(I, m_Or(m_Value(X), m_Value(Y)))) {
+    Bytes4 A = byteSources(X, Depth - 1, Sub);
+    Bytes4 Bs = byteSources(Y, Depth - 1, Sub);
+    for (unsigned B = 0; B < 4; ++B) {
+      if (A[B].K != ByteSrc::Zero && Bs[B].K != ByteSrc::Zero)
+        return Leaf(V);
+      R[B] = A[B].K != ByteSrc::Zero ? A[B] : Bs[B];
+    }
+  } else if (match(I, m_Shl(m_Value(X), m_APInt(C))) && C->ult(32) &&
+             C->getZExtValue() % 8 == 0) {
+    unsigned K = C->getZExtValue() / 8;
+    Bytes4 S = byteSources(X, Depth - 1, Sub);
+    for (unsigned B = K; B < 4; ++B)
+      R[B] = S[B - K];
+  } else if (match(I, m_LShr(m_Value(X), m_APInt(C))) && C->ult(32) &&
+             C->getZExtValue() % 8 == 0) {
+    unsigned K = C->getZExtValue() / 8;
+    Bytes4 S = byteSources(X, Depth - 1, Sub);
+    for (unsigned B = 0; B + K < 4; ++B)
+      R[B] = S[B + K];
+  } else if (match(I, m_AShr(m_Value(X), m_APInt(C))) && C->ult(32) &&
+             (C->getZExtValue() % 8 == 0 || C->getZExtValue() == 31)) {
+    Bytes4 S = byteSources(X, Depth - 1, Sub);
+    if (S[3].K == ByteSrc::Zero)
+      return Leaf(V);
+    ByteSrc Fill = S[3];
+    if (Fill.K == ByteSrc::Byte)
+      Fill.K = ByteSrc::Sign;
+    unsigned K = C->getZExtValue() == 31 ? 4 : C->getZExtValue() / 8;
+    for (unsigned B = 0; B < 4; ++B)
+      R[B] = B + K < 4 ? S[B + K] : Fill;
+  } else if (auto *Sel = dyn_cast<SelectInst>(I);
+             Sel && isa<ConstantInt>(Sel->getTrueValue()) &&
+             isa<ConstantInt>(Sel->getFalseValue())) {
+    // whole bytes of the sign of a byte: c ? m : 0 (or c ? 0 : m) with c
+    // testing bit 8 i + 7 of x (as InstCombine writes a sign fill)
+    CmpPredicate Pred;
+    const APInt *Bit;
+    unsigned Pos;
+    bool SetWhenTrue;
+    if (match(Sel->getCondition(),
+              m_ICmp(Pred, m_And(m_Value(X), m_APInt(Bit)), m_Zero())) &&
+        Bit->isPowerOf2() && ICmpInst::isEquality(Pred)) {
+      Pos = Bit->logBase2();
+      SetWhenTrue = Pred == ICmpInst::ICMP_NE;
+    } else if (match(Sel->getCondition(),
+                     m_SpecificICmp(ICmpInst::ICMP_SLT, m_Value(X), m_Zero())) &&
+               X->getType()->isIntegerTy(32)) {
+      Pos = 31;
+      SetWhenTrue = true;
+    } else {
+      return Leaf(V);
+    }
+    const APInt &T = cast<ConstantInt>(Sel->getTrueValue())->getValue();
+    const APInt &Fv = cast<ConstantInt>(Sel->getFalseValue())->getValue();
+    const APInt &M = SetWhenTrue ? T : Fv;
+    if (Pos % 8 != 7 || !X->getType()->isIntegerTy(32) ||
+        !(SetWhenTrue ? Fv : T).isZero())
+      return Leaf(V);
+    ByteSrc Src = byteSources(X, Depth - 1, Sub)[Pos / 8];
+    if (Src.K == ByteSrc::Zero)
+      return Leaf(V);
+    if (Src.K == ByteSrc::Byte)
+      Src.K = ByteSrc::Sign;
+    for (unsigned B = 0; B < 4; ++B) {
+      unsigned Mb = M.extractBitsAsZExtValue(8, 8 * B);
+      if (Mb != 0 && Mb != 255)
+        return Leaf(V);
+      if (Mb)
+        R[B] = Src;
+    }
+  } else if (match(I, m_ZExt(m_Value(X))) &&
+             X->getType()->getIntegerBitWidth() <= 16) {
+    Value *W;
+    if (X->getType()->isIntegerTy(16) && match(X, m_Trunc(m_Value(W))) &&
+        W->getType()->isIntegerTy(32)) {
+      Bytes4 S = byteSources(W, Depth - 1, Sub);
+      R[0] = S[0];
+      R[1] = S[1];
+    } else {
+      R = Leaf(X);
+    }
+  } else {
+    return Leaf(V);
+  }
+  Tree.append(Sub.begin(), Sub.end());
+  Tree.push_back(I);
+  return R;
+}
+
+/// 32-bit or trees whose bytes are bytes of other values (constant byte
+/// permutes, PTX prmt, byte packing and sign extension of bytes), built half
+/// by half: each 16-bit half is at most one bit-field insert of one byte
+/// into the other's half (and a shift or a sign fill for the byte), the
+/// halves the 32-bit register's, where that takes fewer instructions than
+/// the tree.
+static bool permuteBytes(Function &F) {
+  if (!AGXBytePermutes)
+    return false;
+  SmallVector<WeakVH, 16> Roots;
+  for (Instruction &I : instructions(F)) {
+    if (I.getOpcode() != Instruction::Or || !I.getType()->isIntegerTy(32))
+      continue;
+    if (I.hasOneUse())
+      if (auto *U = dyn_cast<Instruction>(I.user_back());
+          U && U->getType()->isIntegerTy(32) &&
+          (U->getOpcode() == Instruction::Or ||
+           U->getOpcode() == Instruction::And ||
+           U->getOpcode() == Instruction::Shl ||
+           U->getOpcode() == Instruction::LShr ||
+           U->getOpcode() == Instruction::AShr))
+        continue;
+    Roots.push_back(&I);
+  }
+  bool Changed = false;
+  for (WeakVH &H : Roots) {
+    auto *Root = dyn_cast_or_null<Instruction>(H);
+    if (!Root)
+      continue;
+    SmallVector<Instruction *, 16> Tree;
+    Bytes4 Src = byteSources(Root, 8, Tree);
+    if (Tree.empty() || Tree.back() != Root)
+      continue;
+    // the instructions that go with the tree: the root and those of one use
+    unsigned Old = 0;
+    for (Instruction *I : Tree)
+      Old += I == Root || I->hasOneUse();
+    // a byte of a value narrower than 32 bits: its 16-bit half
+    auto HalfCost = [](Value *S, unsigned K) {
+      return S->getType()->isIntegerTy(8) ? 1u : 0u;
+    };
+    auto SignCost = [&](const ByteSrc &B) {
+      return HalfCost(B.V, B.Idx / 2) + (B.Idx % 2 ? 1u : 2u);
+    };
+    // the cost of half H (bytes 2H, 2H + 1), and whether it is zero
+    auto PlanHalf = [&](const ByteSrc &Q0, const ByteSrc &Q1) -> unsigned {
+      if (Q0.K == ByteSrc::Zero && Q1.K == ByteSrc::Zero)
+        return 0;
+      if (Q0.K == ByteSrc::Byte && Q1.K == ByteSrc::Byte && Q0.V == Q1.V &&
+          Q0.Idx % 2 == 0 && Q1.Idx == Q0.Idx + 1)
+        return HalfCost(Q0.V, Q0.Idx / 2);
+      if (Q0.K == ByteSrc::Sign && Q0 == Q1)
+        return SignCost(Q0);
+      auto Carrier = [&](const ByteSrc &Q) -> unsigned {
+        if (Q.K == ByteSrc::Sign)
+          return SignCost(Q);
+        return HalfCost(Q.V, Q.Idx / 2) + Q.Idx % 2;
+      };
+      if (Q1.K == ByteSrc::Zero)
+        return Carrier(Q0) + (Q0.K == ByteSrc::Byte && Q0.Idx % 2 ? 0 : 1);
+      if (Q0.K == ByteSrc::Zero)
+        return (Q1.K == ByteSrc::Sign ? SignCost(Q1) : HalfCost(Q1.V, 0)) + 1;
+      // the low byte's carrier, bfi into the high byte's half (or of it)
+      unsigned High = Q1.K == ByteSrc::Sign ? SignCost(Q1)
+                                            : HalfCost(Q1.V, Q1.Idx / 2);
+      return Carrier(Q0) + High + 1;
+    };
+    bool Z0 = Src[0].K == ByteSrc::Zero && Src[1].K == ByteSrc::Zero;
+    bool Z1 = Src[2].K == ByteSrc::Zero && Src[3].K == ByteSrc::Zero;
+    unsigned New = PlanHalf(Src[0], Src[1]) + PlanHalf(Src[2], Src[3]) +
+                   (Z0 != Z1 ? 1 : 0);
+    // a sign-extended byte of a 32-bit value: two shifts
+    bool SextByte = Src[0].K == ByteSrc::Byte &&
+                    Src[0].V->getType()->isIntegerTy(32) &&
+                    Src[1].K == ByteSrc::Sign && Src[1].V == Src[0].V &&
+                    Src[1].Idx == Src[0].Idx && Src[2] == Src[1] &&
+                    Src[3] == Src[1];
+    if (SextByte)
+      New = std::min(New, Src[0].Idx == 3 ? 1u : 2u);
+    // (halves that are halves of values, or zero, are the register halves
+    // instruction selection already makes: only trees with bytes moved)
+    auto WholeHalf = [](const ByteSrc &Q0, const ByteSrc &Q1) {
+      return (Q0.K == ByteSrc::Zero && Q1.K == ByteSrc::Zero) ||
+             (Q0.K == ByteSrc::Byte && Q1.K == ByteSrc::Byte && Q0.V == Q1.V &&
+              Q0.Idx % 2 == 0 && Q1.Idx == Q0.Idx + 1);
+    };
+    if (WholeHalf(Src[0], Src[1]) && WholeHalf(Src[2], Src[3]))
+      continue;
+    if (New >= Old)
+      continue;
+    IRBuilder<> B(Root);
+    Type *I16 = B.getInt16Ty();
+    Value *R;
+    if (SextByte && New == (Src[0].Idx == 3 ? 1u : 2u)) {
+      Value *X = Src[0].V;
+      if (Src[0].Idx != 3)
+        X = B.CreateShl(X, 24 - 8 * Src[0].Idx);
+      R = B.CreateAShr(X, 24);
+    } else {
+      DenseMap<std::pair<Value *, unsigned>, Value *> Halves, Signs;
+      auto Half = [&](Value *S, unsigned K) -> Value * {
+        Value *&H = Halves[{S, K}];
+        if (H)
+          return H;
+        if (S->getType()->isIntegerTy(32))
+          H = B.CreateTrunc(K ? B.CreateLShr(S, 16) : S, I16);
+        else
+          H = B.CreateZExtOrTrunc(S, I16);
+        return H;
+      };
+      auto Sign = [&](const ByteSrc &Q) -> Value * {
+        Value *&G = Signs[{Q.V, Q.Idx}];
+        if (G)
+          return G;
+        Value *H = Half(Q.V, Q.Idx / 2);
+        if (Q.Idx % 2 == 0)
+          H = B.CreateShl(H, 8);
+        G = B.CreateAShr(H, 15);
+        return G;
+      };
+      // a value with byte Q in its low byte
+      auto Low = [&](const ByteSrc &Q) -> Value * {
+        if (Q.K == ByteSrc::Sign)
+          return Sign(Q);
+        Value *H = Half(Q.V, Q.Idx / 2);
+        return Q.Idx % 2 ? B.CreateLShr(H, 8) : H;
+      };
+      auto BuildHalf = [&](const ByteSrc &Q0, const ByteSrc &Q1) -> Value * {
+        if (Q0.K == ByteSrc::Zero && Q1.K == ByteSrc::Zero)
+          return nullptr;
+        if (Q0.K == ByteSrc::Byte && Q1.K == ByteSrc::Byte && Q0.V == Q1.V &&
+            Q0.Idx % 2 == 0 && Q1.Idx == Q0.Idx + 1)
+          return Half(Q0.V, Q0.Idx / 2);
+        if (Q0.K == ByteSrc::Sign && Q0 == Q1)
+          return Sign(Q0);
+        if (Q1.K == ByteSrc::Zero) {
+          Value *L = Low(Q0);
+          return Q0.K == ByteSrc::Byte && Q0.Idx % 2
+                     ? L
+                     : B.CreateAnd(L, ConstantInt::get(I16, 255));
+        }
+        // the high byte: in the high byte of a half (and its mask), or in
+        // the low byte of one shifted up
+        Value *Hi;
+        if (Q1.K == ByteSrc::Sign)
+          Hi = B.CreateAnd(Sign(Q1), ConstantInt::get(I16, 0xff00));
+        else if (Q1.Idx % 2)
+          Hi = B.CreateAnd(Half(Q1.V, Q1.Idx / 2),
+                           ConstantInt::get(I16, 0xff00));
+        else
+          Hi = B.CreateShl(Half(Q1.V, Q1.Idx / 2), 8);
+        if (Q0.K == ByteSrc::Zero)
+          return Hi;
+        Value *L = B.CreateAnd(Low(Q0), ConstantInt::get(I16, 255));
+        return B.CreateOr(L, Hi, "", /*IsDisjoint=*/true);
+      };
+      Value *H0 = BuildHalf(Src[0], Src[1]);
+      Value *H1 = BuildHalf(Src[2], Src[3]);
+      Type *I32 = B.getInt32Ty();
+      Value *W0 = H0 ? B.CreateZExt(H0, I32) : nullptr;
+      Value *W1 = H1 ? B.CreateShl(B.CreateZExt(H1, I32), 16) : nullptr;
+      R = W0 && W1 ? B.CreateOr(W0, W1, "", /*IsDisjoint=*/true)
+                   : (W0 ? W0 : W1);
+    }
+    R->takeName(Root);
+    Root->replaceAllUsesWith(R);
+    RecursivelyDeleteTriviallyDeadInstructions(Root);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -1980,6 +2294,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= flushFloatMinMax(F);
   Changed |= expandDivisions(F);
   Changed |= mergeMaskedOrs(F);
+  Changed |= permuteBytes(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

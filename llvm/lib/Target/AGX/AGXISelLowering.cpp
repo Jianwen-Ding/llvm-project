@@ -1444,12 +1444,68 @@ static SDValue widenBoolean(SDValue V, SelectionDAG &DAG, const SDLoc &DL) {
                      widenBoolean(V.getOperand(1), DAG, DL));
 }
 
+/// Byte fields inserted by bfi where the or-of-masks form would take two or
+/// three instructions: (x & m) | (y & ~m), m the low w bits (w a multiple of
+/// 8), is bfi(y, x, 0, w), y needing no mask (bfi keeps it outside the
+/// field); and in 16 bits (x << s) | q, q known zero from bit s, is bfi(q, x,
+/// s, 16 - s), q's mask of its low s bits dropped. (32-bit shifted fields are
+/// the combine below; the 16-bit low half of a 32-bit value is its register
+/// half, no bfi.)
+static SDValue performBfiInsertCombine(SDNode *N,
+                                       TargetLowering::DAGCombinerInfo &DCI) {
+  EVT VT = N->getValueType(0);
+  if (!DCI.isAfterLegalizeDAG() || (VT != MVT::i32 && VT != MVT::i16))
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  unsigned BW = VT.getSizeInBits();
+  SDLoc DL(N);
+  auto MaskOf = [](SDValue V) -> std::optional<APInt> {
+    if (V.getOpcode() != ISD::AND || !isa<ConstantSDNode>(V.getOperand(1)))
+      return std::nullopt;
+    return V.getConstantOperandAPInt(1);
+  };
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue P = N->getOperand(I), Q = N->getOperand(1 - I);
+    auto MP = MaskOf(P), MQ = MaskOf(Q);
+    // (or x known zero above its low w bits, x >> s among them)
+    if (MQ && (~*MQ).isMask() && Q.hasOneUse()) {
+      unsigned W = (~*MQ).countr_one();
+      bool Masked = MP && *MP == ~*MQ && P.hasOneUse();
+      if (W % 8 == 0 && W < BW && !(BW == 32 && W == 16) &&
+          (Masked || APInt::getBitsSetFrom(BW, W).isSubsetOf(
+                         DAG.computeKnownBits(P).Zero)))
+        return DAG.getNode(AGXISD::BFI_FIELD, DL, VT, Q.getOperand(0),
+                           Masked ? P.getOperand(0) : P,
+                           DAG.getConstant(0, DL, VT),
+                           DAG.getTargetConstant(W, DL, MVT::i32));
+    }
+    if (BW != 16 || P.getOpcode() != ISD::SHL ||
+        !isa<ConstantSDNode>(P.getOperand(1)) || !P.hasOneUse())
+      continue;
+    uint64_t S = P.getConstantOperandVal(1);
+    if (S == 0 || S >= 16 || S % 8 != 0)
+      continue;
+    APInt High = APInt::getBitsSetFrom(16, S);
+    if (!High.isSubsetOf(DAG.computeKnownBits(Q).Zero))
+      continue;
+    SDValue Base = Q;
+    if (MQ && *MQ == ~High && Q.hasOneUse())
+      Base = Q.getOperand(0);
+    return DAG.getNode(AGXISD::BFI_FIELD, DL, VT, Base, P.getOperand(0),
+                       DAG.getConstant(S, DL, VT),
+                       DAG.getTargetConstant(16 - S, DL, MVT::i32));
+  }
+  return SDValue();
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
   case ISD::OR: {
+    if (SDValue V = performBfiInsertCombine(N, DCI))
+      return V;
     // or(Q, P) where P is x << s (with masks around the shift) whose bits
     // that may be set are one field [s, s + w) and Q is known zero there:
     // one bfi of x into Q, instead of the shift, the masks and the or.
@@ -1501,9 +1557,15 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       // take the common forms; here an assembled low part (an insert or an
       // or of fields), never a shifted one (a funnel shift's).
       if (S == 16) {
+        // (or a 16-bit value zero-extended, an assembled half)
+        bool Half16 = Q.getOpcode() == ISD::ZERO_EXTEND &&
+                      Q.getOperand(0).getValueType() == MVT::i16;
         if (Field.popcount() != 16 ||
-            (Q.getOpcode() != AGXISD::BFI_FIELD && Q.getOpcode() != ISD::OR))
+            (Q.getOpcode() != AGXISD::BFI_FIELD && Q.getOpcode() != ISD::OR &&
+             !Half16))
           continue;
+        if (Half16)
+          Q = DAG.getNode(ISD::ANY_EXTEND, DL, MVT::i32, Q.getOperand(0));
         return DAG.getNode(AGXISD::PACK16, DL, MVT::i32, Q, X);
       }
       return DAG.getNode(AGXISD::BFI_FIELD, DL, MVT::i32, Q, X,
@@ -1737,10 +1799,11 @@ void AGXTargetLowering::computeKnownBitsForTargetNode(
   case AGXISD::BFI_FIELD: {
     // the base outside the field, the inserted bits in it
     unsigned S = Op.getConstantOperandVal(2), W = Op.getConstantOperandVal(3);
-    APInt Field = APInt::getBitsSet(32, S, std::min(S + W, 32u));
+    unsigned BW = Op.getValueSizeInBits();
+    APInt Field = APInt::getBitsSet(BW, S, std::min(S + W, BW));
     KnownBits B = DAG.computeKnownBits(Op.getOperand(0), Depth + 1);
     KnownBits X = DAG.computeKnownBits(Op.getOperand(1), Depth + 1);
-    X = KnownBits::shl(X, KnownBits::makeConstant(APInt(32, S)));
+    X = KnownBits::shl(X, KnownBits::makeConstant(APInt(BW, S)));
     Known.Zero = (B.Zero & ~Field) | (X.Zero & Field);
     Known.One = (B.One & ~Field) | (X.One & Field);
     break;

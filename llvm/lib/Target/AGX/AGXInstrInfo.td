@@ -111,8 +111,9 @@ def SDT_AGXHi32 : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisVT<1, i64>]>;
 def AGXhi32 : SDNode<"AGXISD::HI32", SDT_AGXHi32>;
 // A field of Ins (Width bits from bit 0) inserted at Offset into Base:
 // (Base, Ins, Offset, Width), the last two constants.
-def SDT_AGXBfiField : SDTypeProfile<1, 4, [SDTCisVT<0, i32>, SDTCisVT<1, i32>,
-                                           SDTCisVT<2, i32>, SDTCisVT<3, i32>,
+// (i32, or i16 with an i16 offset)
+def SDT_AGXBfiField : SDTypeProfile<1, 4, [SDTCisInt<0>, SDTCisSameAs<1, 0>,
+                                           SDTCisSameAs<2, 0>, SDTCisSameAs<3, 0>,
                                            SDTCisVT<4, i32>]>;
 def AGXbfi_field : SDNode<"AGXISD::BFI_FIELD", SDT_AGXBfiField>;
 // The low halves of Lo and Hi as the low and high halves of a 32-bit value.

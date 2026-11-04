@@ -5,8 +5,7 @@
 ; under an assembled one is the register's high half.
 
 ; CHECK-LABEL: pk:
-; CHECK: and r1, u3, 255
-; CHECK-NEXT: bfi r1, r1, u2, 8, mask 0xFF
+; CHECK: bfi r1l, u3l, u2l, 8, mask 0xFF
 ; CHECK-NEXT: bitop 0101, r1h, u4l, 0
 ; CHECK-NEXT: device_store
 define agx_kernel void @pk(ptr addrspace(1) %p, i32 %a, i32 %b, i32 %c) {
