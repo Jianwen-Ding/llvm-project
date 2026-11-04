@@ -51,6 +51,11 @@ static cl::opt<bool> ExperimentalLeafCalls(
 
 bool llvm::agxExperimentalLeafCallsEnabled() { return ExperimentalLeafCalls; }
 
+static cl::opt<bool> AGXPairedHalfStores(
+    "agx-paired-half-stores", cl::Hidden, cl::init(true),
+    cl::desc("Store 4-byte aligned pairs of 16-bit elements as one 32-bit "
+             "word each"));
+
 #define DEBUG_TYPE "agx-lower"
 
 static void diagnose(SelectionDAG &DAG, const SDLoc &DL, const Twine &Msg) {
@@ -116,6 +121,11 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // pair, whose halves are the elements (ReplaceNodeResults)
   setOperationAction(ISD::LOAD, {MVT::v2i16, MVT::v4i16, MVT::v2f16, MVT::v4f16},
                      Custom);
+  // and stores: one 32-bit store per pair, its halves the elements
+  // (lowerVectorStore), not a 16-bit store each
+  if (AGXPairedHalfStores)
+    setOperationAction(ISD::STORE,
+                       {MVT::v2i16, MVT::v4i16, MVT::v2f16, MVT::v4f16}, Custom);
 
   //===--------------------------------------------------------------------===//
   // Integer operations
@@ -1057,6 +1067,35 @@ SDValue AGXTargetLowering::lowerVectorStore(SDValue Op,
     return DAG.getMemIntrinsicNode(
         NumElts == 2 ? AGXISD::STORE_V2_I8 : AGXISD::STORE_V4_I8, DL,
         DAG.getVTList(MVT::Other), Ops, S->getMemoryVT(), S->getMemOperand());
+  }
+  // Pairs of 16-bit elements, 4-byte aligned: a 32-bit word each, whose
+  // halves are the elements (a register's halves, no instruction to pack).
+  if ((VT == MVT::v2i16 || VT == MVT::v4i16 || VT == MVT::v2f16 ||
+       VT == MVT::v4f16) &&
+      !S->isTruncatingStore() && !S->isIndexed() && S->isSimple() &&
+      S->getAlign() >= Align(4) &&
+      (S->getAddressSpace() == AGX::DEVICE_ADDRESS ||
+       S->getAddressSpace() == AGX::THREADGROUP_ADDRESS)) {
+    unsigned Words = VT.getVectorNumElements() / 2;
+    SmallVector<SDValue, 2> W;
+    for (unsigned I = 0; I < Words; ++I) {
+      SDValue Half[2];
+      for (unsigned K = 0; K < 2; ++K)
+        Half[K] = DAG.getNode(
+            ISD::ANY_EXTEND, DL, MVT::i32,
+            DAG.getBitcast(MVT::i16,
+                           DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL,
+                                       VT.getScalarType(), Val,
+                                       DAG.getVectorIdxConstant(2 * I + K, DL))));
+      W.push_back(DAG.getNode(AGXISD::PACK16, DL, MVT::i32, Half[0], Half[1]));
+    }
+    if (Words == 1)
+      return DAG.getStore(S->getChain(), DL, W[0], S->getBasePtr(),
+                          S->getMemOperand());
+    return DAG.getMemIntrinsicNode(vectorNode(false, 2), DL,
+                                   DAG.getVTList(MVT::Other),
+                                   {S->getChain(), W[0], W[1], S->getBasePtr()},
+                                   S->getMemoryVT(), S->getMemOperand());
   }
   if (S->isTruncatingStore() || S->isIndexed() || !isVectorAccess(VT, S))
     return SDValue();

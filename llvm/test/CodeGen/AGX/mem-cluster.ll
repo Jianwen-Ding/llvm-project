@@ -25,6 +25,6 @@ define agx_kernel void @stores(ptr addrspace(1) %in, ptr addrspace(1) %out) {
 ; OFF-NEXT:    device_store 0, i16, x, {{r[0-9]+[lh]}}, u2_u3, 0, signed
   %v = load i16, ptr addrspace(1) %in, align 2
   %w = insertelement <2 x i16> <i16 22136, i16 poison>, i16 %v, i64 1
-  store <2 x i16> %w, ptr addrspace(1) %out, align 4
+  store <2 x i16> %w, ptr addrspace(1) %out, align 2
   ret void
 }
