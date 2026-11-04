@@ -831,7 +831,8 @@ static bool isBFloatArith(const Instruction &I) {
 
 /// An f32 operation that ieee32 emulates: add, sub, mul, div, fma, sqrt.
 static StringRef ieeeF32Op(const Instruction &I) {
-  if (!I.getType()->isFloatTy() || I.hasMetadata("air.ieee32.checked"))
+  if (!I.getType()->isFloatTy() || I.hasMetadata("air.ieee32.checked") ||
+      I.hasMetadata("air.flush.harmless"))
     return "";
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
     switch (BO->getOpcode()) {

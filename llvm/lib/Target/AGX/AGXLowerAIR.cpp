@@ -2125,6 +2125,11 @@ void LowerAIR::lowerCalls() {
       }
       if (Result) {
         Result->takeName(CI);
+        // (a front end's promise that a flush does not change the result)
+        if (auto *RI = dyn_cast<Instruction>(Result);
+            RI && CI->hasMetadata("air.flush.harmless"))
+          RI->setMetadata("air.flush.harmless",
+                          CI->getMetadata("air.flush.harmless"));
         CI->replaceAllUsesWith(Result);
       }
       CI->eraseFromParent();

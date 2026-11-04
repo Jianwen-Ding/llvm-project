@@ -30,3 +30,18 @@ define agx_kernel void @ieee(ptr addrspace(1) %out, half %a, half %b) {
 }
 
 attributes #0 = { denormal_fpenv(preservesign) }
+
+; air.flush.harmless (a front end's operation whose result a flush does not
+; change): no flush.
+; CHECK-LABEL: harmless:
+; CHECK-NOT:     fcmpsel
+; CHECK:         fadd16
+; CHECK-NOT:     fcmpsel
+; CHECK:         device_store
+define agx_kernel void @harmless(ptr addrspace(1) %out, half %a, half %b) #0 {
+  %s = fadd half %a, %b, !air.flush.harmless !0
+  store half %s, ptr addrspace(1) %out
+  ret void
+}
+
+!0 = !{}

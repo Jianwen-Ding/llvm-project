@@ -1550,6 +1550,9 @@ bool AGXStrictFP::runOnFunction(Function &F) {
         Changed = true;
       }
   for (Instruction *I : Worklist) {
+    // (a front end's operation whose result a flush does not change)
+    if (I->hasMetadata("air.flush.harmless"))
+      continue;
     if (I->hasMetadata(KeepDenormalsTag) ||
         (ST.hasIEEEFP32() && (FunctionIEEE || I->hasMetadata(IEEETag))))
       Changed |= lowerIEEE(*I);

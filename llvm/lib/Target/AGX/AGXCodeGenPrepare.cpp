@@ -1637,8 +1637,10 @@ bool AGXCodeGenPrepare::flushHalfDenormals(Function &F) {
 
   SmallVector<Instruction *, 32> Worklist;
   for (Instruction &I : instructions(F)) {
-    // Operations with their own denormal handling (from AGXLowerFPEnv).
-    if (I.hasMetadata("agx.ieee") || I.hasMetadata("agx.exact"))
+    // Operations with their own denormal handling (from AGXLowerFPEnv), and
+    // those a flush does not change (a front end's air.flush.harmless).
+    if (I.hasMetadata("agx.ieee") || I.hasMetadata("agx.exact") ||
+        I.hasMetadata("air.flush.harmless"))
       continue;
     bool Arith = isFPArithmetic(I) && isHalf(I.getType());
     bool Reads = Arith || (isa<FCmpInst>(I) &&

@@ -1538,6 +1538,10 @@ void flushHalfDenormals(Module &M) {
 
     SmallVector<Instruction *, 32> Worklist;
     for (Instruction &I : instructions(F)) {
+      // (air.flush.harmless: a front end's operation whose result a flush of
+      // its operands or result does not change)
+      if (I.hasMetadata("air.flush.harmless"))
+        continue;
       Type *Op0 = I.getNumOperands() ? I.getOperand(0)->getType() : nullptr;
       bool Reads = isHalfArithmetic(I) ||
                    ((isa<FCmpInst>(I) || isa<FPExtInst>(I) ||
