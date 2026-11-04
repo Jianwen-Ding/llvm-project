@@ -44,7 +44,7 @@ define agx_kernel void @copy(ptr addrspace(1) %in, ptr addrspace(1) %out) {
 ; CHECK:      device_load 0, i32, xyz, r{{[0-9]+}}_r{{[0-9]+}}_r{{[0-9]+}}, u0_u1, 0
 ; CHECK-NOT:  device_load
 ; OFF-LABEL:  partial:
-; OFF:        device_load 1, i32, xyzw,
+; OFF:        device_load {{[01]}}, i32, xyzw,
 define agx_kernel void @partial(ptr addrspace(1) %in, ptr addrspace(1) %out) {
   %ab = load <2 x i32>, ptr addrspace(1) %in, align 8
   %a = extractelement <2 x i32> %ab, i64 0

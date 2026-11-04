@@ -78,13 +78,13 @@ unsigned AGXSubtarget::getMaxGPRs(const Function &F) const {
 }
 
 static cl::opt<bool> AGXSubRegLiveness(
-    "agx-subreg-liveness", cl::init(false), cl::Hidden,
+    "agx-subreg-liveness", cl::init(true), cl::Hidden,
     cl::desc("Track the liveness of 16-bit register halves apart"));
 
 bool AGXSubtarget::enableSubRegLiveness() const { return AGXSubRegLiveness; }
 
 static cl::opt<bool> AGXSchedLaneMasks(
-    "agx-sched-lane-masks", cl::init(true), cl::Hidden,
+    "agx-sched-lane-masks", cl::init(false), cl::Hidden,
     cl::desc("With -agx-subreg-liveness, the scheduler tracks the pressure "
              "of register halves apart"));
 

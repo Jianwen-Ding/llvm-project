@@ -34,15 +34,15 @@ define agx_kernel void @reductions(ptr addrspace(1) %out, i32 %x, float %f) {
   ; 16: iadd, 22: smax, 1: fadd, 7: fmax
 ; CHECK-LABEL: reductions:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 5 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    simd_iadd r1, u2
 ; CHECK-NEXT:    quad_fadd r2, u3
-; CHECK-NEXT:    simd_prefix_max.s r3, r1
-; CHECK-NEXT:    quad_prefix_max.f r4, r2
-; CHECK-NEXT:    device_store 0, i32, xy, r3_r4, u0_u1, 0, signed
+; CHECK-NEXT:    quad_prefix_max.f r2, r2
+; CHECK-NEXT:    simd_prefix_max.s r1, r1
+; CHECK-NEXT:    device_store 0, i32, xy, r1_r2, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap

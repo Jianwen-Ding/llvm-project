@@ -110,7 +110,7 @@ define agx_kernel void @fadd(ptr addrspace(1) %p, float %v) {
 ; CHECK-NEXT:  .LBB3_1: // %atomicrmw.start
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
 ; CHECK-NEXT:    bitop 0101, r3, r1, 0
-; CHECK-NEXT:    fadd32 r2, r3, u2
+; CHECK-NEXT:    fadd32 r2, r1, u2
 ; CHECK-NEXT:    atomic cmpxchg, 0, r1, u0_u1, 0, signed, r2_r3, 0
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    while_icmp r0l, nueq, r1, r3, 1
