@@ -300,6 +300,12 @@ bool AGXTargetLowering::isFMAFasterThanFMulAndFAdd(const MachineFunction &MF,
   return VT == MVT::f32 || VT == MVT::f16;
 }
 
+static cl::opt<unsigned> AGXSignedBytesALU(
+    "agx-signed-bytes-alu", cl::Hidden, cl::init(1),
+    cl::desc("Sign-extend bytes with an and (or a field extract), an xor and "
+             "a subtraction instead of two shifts: 0 never, 1 the low byte, "
+             "2 every byte"));
+
 static cl::opt<bool> AGXDecomposeMul(
     "agx-decompose-mul", cl::Hidden, cl::init(true),
     cl::desc("Multiply 32-bit values by 3, 5, 9 or 17 with a shifted iadd"));
@@ -1427,8 +1433,15 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
         continue;
       // bytes only (packing 8-bit values): the fields of soft-f64 and the
       // like are left to the shifts, ors and funnel shifts they are now
-      if (S % 8 != 0 || Field.popcount() % 8 != 0)
+      // (or any field where q is masked by exactly its complement, the
+      // insert idiom of PTX bfi)
+      bool Insert = Q.getOpcode() == ISD::AND &&
+                    isa<ConstantSDNode>(Q.getOperand(1)) &&
+                    Q.getConstantOperandAPInt(1) == ~Field;
+      if (!Insert && (S % 8 != 0 || Field.popcount() % 8 != 0))
         continue;
+      if (Insert)
+        Q = Q.getOperand(0);
       SDLoc DL(N);
       // A 16-bit value under another: the register's halves. The patterns
       // take the common forms; here an assembled low part (an insert or an
@@ -1446,6 +1459,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     return SDValue();
   }
   case ISD::SIGN_EXTEND_INREG: {
+    if (!AGXSignedBytesALU)
+      return SDValue();
     // The low byte signed: ((x & 255) ^ 128) - 128, as below. (16 bits are
     // one addition with a sign-extended 16-bit source.)
     if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32 ||
@@ -1459,6 +1474,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                        DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(128)), C(128));
   }
   case ISD::SRA: {
+    if (AGXSignedBytesALU < 2)
+      return SDValue();
     // A signed byte, sra(shl(x, 24 - p), 24): the field (one extract, or an
     // and at p = 0) and (f ^ 128) - 128 on the ALUs, instead of two shifts on
     // the unit that integer multiplies, bit fields and conversions share
