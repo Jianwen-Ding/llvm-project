@@ -1189,14 +1189,14 @@ void EmulateF64::replaceOperations(Function &F) {
         constrainBFloat(I);
   for (Instruction &I : make_early_inc_range(instructions(F)))
     scalarizeDoubles(I);
-  // A conversion to a 32-bit integer of a value just rounded to an integral
-  // one (cvt.rni / rmi / rpi.s32.f64: roundeven, floor or ceil of one use,
+  // A conversion to an integer of a value just rounded to an integral one
+  // (cvt.rni / rmi / rpi .s32 / .s64 .f64: roundeven, floor or ceil of one use,
   // then fptosi.sat): the conversion of the value itself, marked air.round,
   // which rounds the bits it shifts out (emulate()) instead of the 64-bit
   // rounding before it.
   for (Instruction &I : make_early_inc_range(instructions(F))) {
     auto *CI = dyn_cast<IntrinsicInst>(&I);
-    if (!CI || CI->getType()->getScalarSizeInBits() > 32 ||
+    if (!CI || CI->getType()->getScalarSizeInBits() > 64 ||
         CI->getType()->isVectorTy() ||
         (CI->getIntrinsicID() != Intrinsic::fptosi_sat &&
          CI->getIntrinsicID() != Intrinsic::fptoui_sat))
@@ -1955,6 +1955,58 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
       // poison for the instructions).
       bool Signed = B2 == "fptosi";
       R = Lib(Signed ? "__air_f64_to_i64" : "__air_f64_to_u64", I64, {A[0]});
+      // With the air.round mark (see the 32-bit form), the truncated value
+      // and a unit more in magnitude from the fraction's bits: a value with
+      // a fraction is below 2^52, so the unit never overflows.
+      StringRef RMode;
+      for (StringRef P : drop_begin(Parts, 2))
+        if (P.consume_front("round:"))
+          RMode = P;
+      if (!RMode.empty()) {
+        Value *X = A[0];
+        Value *Neg = B.CreateICmpSLT(X, B.getInt64(0));
+        Value *Ex = B.CreateAnd(B.CreateLShr(X, 52), 0x7ff);
+        // e = Ex - 1023; the fraction has 52 - e bits for e in [0, 51]
+        Value *Mant = B.CreateOr(B.CreateAnd(X, B.getInt64(0xfffffffffffffull)),
+                                 B.getInt64(1ull << 52));
+        Value *Frac0 = B.CreateICmpULT(Ex, B.getInt64(1023)); // |x| < 1
+        Value *HasFrac = B.CreateICmpULT(Ex, B.getInt64(1075)); // e < 52
+        Value *FB = B.CreateSub(B.getInt64(1075), Ex);          // 52 - e
+        Value *FBc = B.CreateAnd(FB, 63);
+        Value *FMask = B.CreateSub(B.CreateShl(B.getInt64(1), FBc), B.getInt64(1));
+        Value *Frac = B.CreateAnd(Mant, FMask);
+        Value *Half = B.CreateLShr(B.CreateAdd(FMask, B.getInt64(1)), 1);
+        Value *NonZero = B.CreateICmpNE(B.CreateAnd(X, B.getInt64(AbsMask)),
+                                        B.getInt64(0));
+        Value *NaN = B.CreateICmpUGT(B.CreateAnd(X, B.getInt64(AbsMask)),
+                                     B.getInt64(0x7ff0000000000000ull));
+        Value *Inc;
+        if (RMode == "rne") {
+          // |x| < 1: a unit where |x| > 1/2 (e = -1 and a nonzero fraction
+          // below the leading one)
+          Value *Small = B.CreateAnd(
+              B.CreateICmpEQ(Ex, B.getInt64(1022)),
+              B.CreateICmpNE(B.CreateAnd(X, B.getInt64(0xfffffffffffffull)),
+                             B.getInt64(0)));
+          Value *Odd = B.CreateICmpNE(
+              B.CreateAnd(B.CreateLShr(Mant, FBc), B.getInt64(1)),
+              B.getInt64(0));
+          Value *Above = B.CreateICmpUGT(Frac, Half);
+          Value *Tie = B.CreateAnd(B.CreateICmpEQ(Frac, Half), Odd);
+          Value *Big = B.CreateAnd(HasFrac, B.CreateOr(Above, Tie));
+          Inc = B.CreateSelect(Frac0, Small, Big);
+        } else {
+          Value *Inexact = B.CreateSelect(
+              Frac0, NonZero,
+              B.CreateAnd(HasFrac, B.CreateICmpNE(Frac, B.getInt64(0))));
+          Inc = B.CreateAnd(Inexact,
+                            RMode == "down" ? Neg : B.CreateNot(Neg));
+        }
+        Inc = B.CreateAnd(Inc, B.CreateNot(NaN));
+        Value *Unit = B.CreateZExt(Inc, I64);
+        R = Signed ? B.CreateSelect(Neg, B.CreateSub(R, Unit), B.CreateAdd(R, Unit))
+                   : B.CreateSelect(Neg, R, B.CreateAdd(R, Unit));
+      }
       unsigned W = Ret->getIntegerBitWidth();
       if (W < 64) {
         R = Signed
