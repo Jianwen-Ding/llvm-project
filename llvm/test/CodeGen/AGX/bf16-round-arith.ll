@@ -7,10 +7,10 @@
 
 ; CHECK-LABEL: add:
 ; CHECK: fadd32
-; CHECK-NOT: icmpsel
+; CHECK-NOT: fcmpsel eq
 ; CHECK: stop
 ; CANON-LABEL: add:
-; CANON: icmpsel
+; CANON: fcmpsel eq
 define agx_kernel void @add(ptr addrspace(1) %p, float %a, float %b) {
   %s = fadd float %a, %b
   %r = fptrunc float %s to bfloat
@@ -19,7 +19,7 @@ define agx_kernel void @add(ptr addrspace(1) %p, float %a, float %b) {
 }
 
 ; CHECK-LABEL: cvt:
-; CHECK: icmpsel ugt
+; CHECK: fcmpsel eq
 define agx_kernel void @cvt(ptr addrspace(1) %p, float %a) {
   %r = fptrunc float %a to bfloat
   store bfloat %r, ptr addrspace(1) %p

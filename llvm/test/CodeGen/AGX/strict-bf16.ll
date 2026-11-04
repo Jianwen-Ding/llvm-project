@@ -8,7 +8,7 @@
 ; CHECK-LABEL: strict_fadd_bf16:
 ; CHECK: fadd32
 ; CHECK: mov_imm {{r[0-9]+}}, 32767
-; CHECK-NOT: icmpsel
+; CHECK-NOT: fcmpsel
 ; CHECK: device_store 0, i16
 define agx_kernel void @strict_fadd_bf16(ptr addrspace(1) %o, bfloat %a, bfloat %b) strictfp {
   %r = call bfloat @llvm.experimental.constrained.fadd.bf16(bfloat %a, bfloat %b, metadata !"round.dynamic", metadata !"fpexcept.ignore") strictfp
