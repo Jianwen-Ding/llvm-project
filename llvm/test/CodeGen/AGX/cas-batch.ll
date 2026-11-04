@@ -63,3 +63,18 @@ define agx_kernel void @add_f16(ptr addrspace(1) %p, half %v, ptr addrspace(1) %
   store half %o, ptr addrspace(1) %out
   ret void
 }
+
+; a 16-bit compare-and-swap (a partword loop) batches on its aligned word too:
+; each thread's half compared with what it expects
+; CHECK-LABEL: @cas16(
+; CHECK: cas.batch.op:
+; CHECK: icmp eq i16
+; CHECK: cas.batch.swap:
+; CHECK: cmpxchg ptr addrspace(1) %{{.*}}, i32
+; CHECK: cmpxchg ptr addrspace(1) %p, i16 %a, i16 %b monotonic monotonic
+define agx_kernel void @cas16(ptr addrspace(1) %p, i16 %a, i16 %b, ptr addrspace(1) %out) {
+  %r = cmpxchg ptr addrspace(1) %p, i16 %a, i16 %b monotonic monotonic, align 2
+  %v = extractvalue { i16, i1 } %r, 0
+  store i16 %v, ptr addrspace(1) %out
+  ret void
+}

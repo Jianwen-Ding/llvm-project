@@ -409,13 +409,18 @@ static void expand(Instruction &I, unsigned Bits, GlobalVariable *Locks) {
 /// -agx-cas-batch-try-first every thread first tries one compare-and-swap,
 /// as the loop would, and only those that failed are batched: no check on an
 /// uncontended atomic, but on one address each group's 32 tries serialize.
-static void expandCASBatch(AtomicRMWInst &I) {
+static void expandCASBatch(Instruction &I) {
   LLVMContext &Ctx = I.getContext();
   const DataLayout &DL = I.getDataLayout();
-  Value *Ptr = I.getPointerOperand();
-  Type *ValTy = I.getType();
+  auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+  auto *CXI = dyn_cast<AtomicCmpXchgInst>(&I);
+  Value *Ptr = RMW ? RMW->getPointerOperand() : CXI->getPointerOperand();
+  Type *ValTy = RMW ? RMW->getType() : CXI->getCompareOperand()->getType();
+  Value *ValOp = RMW ? RMW->getValOperand() : CXI->getNewValOperand();
+  AtomicOrdering Ord = RMW ? RMW->getOrdering() : CXI->getSuccessOrdering();
+  SyncScope::ID SSID = RMW ? RMW->getSyncScopeID() : CXI->getSyncScopeID();
   Type *I32 = Type::getInt32Ty(Ctx);
-  Align A = I.getAlign();
+  Align A = RMW ? RMW->getAlign() : CXI->getAlign();
   BasicBlock *Pre = I.getParent();
   Function *F = Pre->getParent();
   BasicBlock *Exit = Pre->splitBasicBlock(I.getIterator(), "cas.batch.end");
@@ -449,19 +454,17 @@ static void expandCASBatch(AtomicRMWInst &I) {
 
   // the first try (or none: all threads to the batch's check)
   IRBuilder<> B(Pre->getTerminator());
-  if (!CASBatchTryFirst || Bits != 32) {
+  if (!CASBatchTryFirst || Bits != 32 || CXI) {
     Pre->getTerminator()->setSuccessor(0, Failed);
   } else {
     LoadInst *L0 = B.CreateAlignedLoad(I32, Ptr, A);
-    L0->setAtomic(AtomicOrdering::Monotonic, I.getSyncScopeID());
-    Value *New0 =
-        toInt(B,
-              buildAtomicRMWValue(I.getOperation(), B, fromInt(B, L0, ValTy),
-                                  I.getValOperand()),
-              32);
-    Value *CX0 =
-        B.CreateAtomicCmpXchg(Ptr, L0, New0, A, I.getOrdering(),
-                              AtomicOrdering::Monotonic, I.getSyncScopeID());
+    L0->setAtomic(AtomicOrdering::Monotonic, SSID);
+    Value *New0 = toInt(B,
+                        buildAtomicRMWValue(RMW->getOperation(), B,
+                                            fromInt(B, L0, ValTy), ValOp),
+                        32);
+    Value *CX0 = B.CreateAtomicCmpXchg(Ptr, L0, New0, A, Ord,
+                                       AtomicOrdering::Monotonic, SSID);
     Pre->getTerminator()->eraseFromParent();
     B.SetInsertPoint(Pre);
     B.CreateCondBr(B.CreateExtractValue(CX0, 1), Exit, Failed);
@@ -486,9 +489,13 @@ static void expandCASBatch(AtomicRMWInst &I) {
   Value *Lane =
       B.CreateIntrinsic(I32, Intrinsic::agx_thread_index_in_simdgroup, {});
   Value *Leader = B.CreateICmpEQ(Lane, First);
-  Value *Arg = toInt(B, I.getValOperand(), Bits);
-  if (Bits == 16)
+  Value *Arg = toInt(B, ValOp, Bits);
+  Value *Cmp = CXI ? toInt(B, CXI->getCompareOperand(), Bits) : nullptr;
+  if (Bits == 16) {
     Arg = B.CreateZExt(Arg, I32);
+    if (Cmp)
+      Cmp = B.CreateZExt(Cmp, I32);
+  }
   B.CreateBr(Read);
   // (the retries: every thread of the batch loops until the lowest one's
   // swap succeeds)
@@ -496,7 +503,7 @@ static void expandCASBatch(AtomicRMWInst &I) {
   B.CreateCondBr(Leader, LoadBB, Got);
   B.SetInsertPoint(LoadBB);
   LoadInst *L = B.CreateAlignedLoad(I32, WordPtr, A);
-  L->setAtomic(AtomicOrdering::Monotonic, I.getSyncScopeID());
+  L->setAtomic(AtomicOrdering::Monotonic, SSID);
   B.CreateBr(Got);
   B.SetInsertPoint(Got);
   PHINode *V0 = B.CreatePHI(I32, 2);
@@ -508,6 +515,8 @@ static void expandCASBatch(AtomicRMWInst &I) {
   PHINode *Rem = B.CreatePHI(I32, 2);
   PHINode *Cur = B.CreatePHI(I32, 2);
   PHINode *Mine = B.CreatePHI(B.getIntNTy(Bits), 2);
+  PHINode *MineOk = B.CreatePHI(B.getInt1Ty(), 2);
+  MineOk->addIncoming(B.getFalse(), Got);
   Rem->addIncoming(Pending, Got);
   Cur->addIncoming(V, Got);
   Mine->addIncoming(PoisonValue::get(B.getIntNTy(Bits)), Got);
@@ -517,17 +526,31 @@ static void expandCASBatch(AtomicRMWInst &I) {
       Shift ? B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {Shift, J})
             : nullptr;
   Value *CurJ = Narrow(B, Cur, ShJ);
-  Value *Next = toInt(
-      B,
-      buildAtomicRMWValue(I.getOperation(), B, fromInt(B, CurJ, ValTy),
-                          fromInt(B, Narrow(B, ArgJ, B.getInt32(0)), ValTy)),
-      Bits);
+  Value *ArgJN = Narrow(B, ArgJ, B.getInt32(0));
+  Value *OkJ = B.getFalse(), *Next;
+  if (CXI) {
+    // a compare-and-swap: the new value where the thread's half is the one
+    // it expects
+    Value *CmpJ =
+        B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {Cmp, J});
+    OkJ = B.CreateICmpEQ(CurJ, Narrow(B, CmpJ, B.getInt32(0)));
+    Next = B.CreateSelect(OkJ, ArgJN, CurJ);
+  } else {
+    Next = toInt(B,
+                 buildAtomicRMWValue(RMW->getOperation(), B,
+                                     fromInt(B, CurJ, ValTy),
+                                     fromInt(B, ArgJN, ValTy)),
+                 Bits);
+  }
   if (Bits == 16) {
     Value *Mask = B.CreateShl(B.getInt32(0xffff), ShJ);
     Next = B.CreateOr(B.CreateAnd(Cur, B.CreateNot(Mask)),
                       B.CreateShl(B.CreateZExt(Next, I32), ShJ));
   }
-  Value *Mine2 = B.CreateSelect(B.CreateICmpEQ(Lane, J), CurJ, Mine);
+  Value *IsMe = B.CreateICmpEQ(Lane, J);
+  Value *Mine2 = B.CreateSelect(IsMe, CurJ, Mine);
+  Value *MineOk2 = B.CreateSelect(IsMe, OkJ, MineOk);
+  MineOk->addIncoming(MineOk2, Chain);
   Value *Rem2 = B.CreateAnd(Rem, B.CreateSub(Rem, B.getInt32(1)));
   Rem->addIncoming(Rem2, Chain);
   Cur->addIncoming(Next, Chain);
@@ -536,9 +559,8 @@ static void expandCASBatch(AtomicRMWInst &I) {
   B.SetInsertPoint(ChainEnd);
   B.CreateCondBr(Leader, Swap, Tried);
   B.SetInsertPoint(Swap);
-  Value *CX =
-      B.CreateAtomicCmpXchg(WordPtr, V, Next, A, I.getOrdering(),
-                            AtomicOrdering::Monotonic, I.getSyncScopeID());
+  Value *CX = B.CreateAtomicCmpXchg(WordPtr, V, Next, A, Ord,
+                                    AtomicOrdering::Monotonic, SSID);
   Value *Ok = B.CreateZExt(B.CreateExtractValue(CX, 1), I32);
   B.CreateBr(Tried);
   B.SetInsertPoint(Tried);
@@ -558,8 +580,12 @@ static void expandCASBatch(AtomicRMWInst &I) {
 
   IRBuilder<> TB(Tried->getTerminator());
   Value *OldBatch = fromInt(TB, Mine2, ValTy);
+  if (CXI)
+    OldBatch = TB.CreateInsertValue(
+        TB.CreateInsertValue(PoisonValue::get(CXI->getType()), OldBatch, 0),
+        MineOk2, 1);
   B.SetInsertPoint(&I);
-  PHINode *Out = B.CreatePHI(ValTy, 3);
+  PHINode *Out = B.CreatePHI(I.getType(), 3);
   if (Old0)
     Out->addIncoming(Old0, Pre);
   Out->addIncoming(OldBatch, Tried);
@@ -599,9 +625,20 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   const AGXTargetLowering *TLI =
       TM ? TM->getSubtargetImpl(F)->getTargetLowering() : nullptr;
   SmallVector<std::pair<Instruction *, unsigned>, 4> Wide;
-  SmallVector<AtomicRMWInst *, 4> CASLoops;
+  SmallVector<Instruction *, 4> CASLoops;
   SmallVector<LoadInst *, 4> NarrowLoads;
   for (Instruction &I : instructions(F)) {
+    // 16-bit compare-and-swaps (AtomicExpand's partword loops)
+    if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I);
+        CASBatch && CX && TM && !TM->getSubtargetImpl(F)->hasMesaISA() &&
+        !CX->isVolatile() &&
+        DL.getTypeStoreSize(CX->getCompareOperand()->getType()) == 2 &&
+        CX->getAlign() >= 2 &&
+        !CX->getCompareOperand()->getType()->isPointerTy() &&
+        !isStrongerThanMonotonic(CX->getSuccessOrdering())) {
+      CASLoops.push_back(CX);
+      continue;
+    }
     if (auto *LI = dyn_cast<LoadInst>(&I);
         LI && LI->isAtomic() && !LI->getType()->isPointerTy() &&
         DL.getTypeStoreSize(LI->getType()) < 4 &&
@@ -631,8 +668,8 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   }
   for (LoadInst *LI : NarrowLoads)
     widenNarrowAtomicLoad(*LI);
-  for (AtomicRMWInst *RMW : CASLoops)
-    expandCASBatch(*RMW);
+  for (Instruction *CAS : CASLoops)
+    expandCASBatch(*CAS);
   if (Wide.empty())
     return !CASLoops.empty() || !NarrowLoads.empty();
   GlobalVariable *Locks = getLocks(*F.getParent());
