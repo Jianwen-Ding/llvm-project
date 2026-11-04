@@ -3001,28 +3001,23 @@ define dso_local i64 @__air_f64_floor(i64 noundef %0) local_unnamed_addr #0 {
   %7 = and i64 %5, 63
   %8 = lshr i64 4503599627370495, %7
   %9 = select i1 %6, i64 %8, i64 0
-  %10 = and i64 %9, %0
-  %11 = icmp eq i64 %10, 0
-  %12 = icmp sgt i64 %0, -1
-  %13 = or i1 %12, %11
-  %14 = add i64 %0, 1
-  %15 = add i64 %14, %9
-  %16 = select i1 %13, i64 %0, i64 %15
-  %17 = xor i64 %9, -1
-  %18 = and i64 %16, %17
-  %19 = and i64 %0, 9223372036854775807
-  %20 = icmp eq i64 %19, 0
-  %21 = icmp slt i64 %0, 0
-  %22 = select i1 %21, i64 -4616189618054758400, i64 0
-  %23 = select i1 %20, i64 %0, i64 %22
-  %24 = icmp ugt i32 %4, 1074
-  %25 = icmp ult i64 %19, 9218868437227405313
-  %26 = or i64 %0, 2251799813685248
-  %27 = select i1 %25, i64 %0, i64 %26
-  %28 = icmp ult i32 %4, 1023
-  %29 = select i1 %28, i64 %23, i64 %18
-  %30 = select i1 %24, i64 %27, i64 %29
-  ret i64 %30
+  %10 = icmp slt i64 %0, 0
+  %11 = select i1 %10, i64 %9, i64 0
+  %12 = add i64 %11, %0
+  %13 = xor i64 %9, -1
+  %14 = and i64 %12, %13
+  %15 = and i64 %0, 9223372036854775807
+  %16 = icmp eq i64 %15, 0
+  %17 = select i1 %10, i64 -4616189618054758400, i64 0
+  %18 = select i1 %16, i64 %0, i64 %17
+  %19 = icmp ugt i32 %4, 1074
+  %20 = icmp ult i64 %15, 9218868437227405313
+  %21 = or i64 %0, 2251799813685248
+  %22 = select i1 %20, i64 %0, i64 %21
+  %23 = icmp ult i32 %4, 1023
+  %24 = select i1 %23, i64 %18, i64 %14
+  %25 = select i1 %19, i64 %22, i64 %24
+  ret i64 %25
 }
 
 ; Function Attrs: mustprogress nofree norecurse nosync nounwind willreturn memory(none)

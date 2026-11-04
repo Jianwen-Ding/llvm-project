@@ -506,9 +506,9 @@ API u32 __air_f64_to_bf16_r(u64 a, i32 rm) { return to_format(a, 8, 8, rm); }
 API u64 __air_f64_floor(u64 a) {
   i32 e = (a >> 52) & 0x7ff;
   u64 mask = lshr(FRAC, e - 1023);
-  // Away from zero for a negative value; a carry goes into the exponent.
-  int up = ((a & mask) != 0) & (a >= SIGN);
-  u64 r = (up ? a + mask + 1 : a) & ~mask;
+  // Away from zero for a negative value: + mask carries exactly where the
+  // fraction is not zero (a carry goes into the exponent).
+  u64 r = (a + ((u64)((i64)a >> 63) & mask)) & ~mask;
   // |a| < 1: -1 or +0.
   u64 small = (a & ~SIGN) == 0 ? a : (a & SIGN) ? 0xbff0000000000000ULL : 0;
   r = e < 1023 ? small : r;
