@@ -47,3 +47,19 @@ define agx_kernel void @inc_seq(ptr addrspace(1) %p, i32 %v) {
   %o = atomicrmw uinc_wrap ptr addrspace(1) %p, i32 %v seq_cst, align 4
   ret void
 }
+
+; a 16-bit operation batches on its aligned word, each thread's operation on
+; its half
+; CHECK-LABEL: @add_f16(
+; CHECK: cas.batch.op:
+; CHECK: lshr i32
+; CHECK: fadd half
+; CHECK: shl i32 65535
+; CHECK: cas.batch.swap:
+; CHECK: cmpxchg ptr addrspace(1) %{{.*}}, i32
+; CHECK: atomicrmw fadd ptr addrspace(1) %p, half %v monotonic
+define agx_kernel void @add_f16(ptr addrspace(1) %p, half %v, ptr addrspace(1) %out) {
+  %o = atomicrmw fadd ptr addrspace(1) %p, half %v monotonic, align 2
+  store half %o, ptr addrspace(1) %out
+  ret void
+}

@@ -430,10 +430,25 @@ static void expandCASBatch(AtomicRMWInst &I) {
   BasicBlock *Tried = BasicBlock::Create(Ctx, "cas.batch.tried", F, Exit);
   BasicBlock *Single = BasicBlock::Create(Ctx, "cas.batch.single", F, Exit);
   Value *Old0 = nullptr;
+  // a 16-bit operation works on its aligned word, at bit Shift of it
+  unsigned Bits = DL.getTypeStoreSizeInBits(ValTy);
+  Value *Shift = nullptr, *WordPtr = Ptr;
+  if (Bits == 16) {
+    IRBuilder<> SB(Pre->getTerminator());
+    unsigned PB = DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
+    Value *Low = SB.CreateAnd(SB.CreatePtrToInt(Ptr, SB.getIntNTy(PB)), 3);
+    WordPtr = SB.CreateGEP(SB.getInt8Ty(), Ptr, SB.CreateNeg(Low));
+    Shift = SB.CreateShl(SB.CreateTrunc(Low, I32), 3);
+    A = Align(4);
+  }
+  auto Narrow = [&](IRBuilderBase &IB, Value *Word, Value *Sh) -> Value * {
+    return Bits == 16 ? IB.CreateTrunc(IB.CreateLShr(Word, Sh), IB.getInt16Ty())
+                      : Word;
+  };
 
   // the first try (or none: all threads to the batch's check)
   IRBuilder<> B(Pre->getTerminator());
-  if (!CASBatchTryFirst) {
+  if (!CASBatchTryFirst || Bits != 32) {
     Pre->getTerminator()->setSuccessor(0, Failed);
   } else {
     LoadInst *L0 = B.CreateAlignedLoad(I32, Ptr, A);
@@ -456,7 +471,7 @@ static void expandCASBatch(AtomicRMWInst &I) {
   B.SetInsertPoint(Failed);
   unsigned PtrBits =
       DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
-  Value *A64 = B.CreateZExtOrTrunc(B.CreatePtrToInt(Ptr, B.getIntNTy(PtrBits)),
+  Value *A64 = B.CreateZExtOrTrunc(B.CreatePtrToInt(WordPtr, B.getIntNTy(PtrBits)),
                                    B.getInt64Ty());
   Value *Pending =
       B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {B.getTrue()});
@@ -470,14 +485,16 @@ static void expandCASBatch(AtomicRMWInst &I) {
   Value *Lane =
       B.CreateIntrinsic(I32, Intrinsic::agx_thread_index_in_simdgroup, {});
   Value *Leader = B.CreateICmpEQ(Lane, First);
-  Value *Arg = toInt(B, I.getValOperand(), 32);
+  Value *Arg = toInt(B, I.getValOperand(), Bits);
+  if (Bits == 16)
+    Arg = B.CreateZExt(Arg, I32);
   B.CreateBr(Read);
   // (the retries: every thread of the batch loops until the lowest one's
   // swap succeeds)
   B.SetInsertPoint(Read);
   B.CreateCondBr(Leader, LoadBB, Got);
   B.SetInsertPoint(LoadBB);
-  LoadInst *L = B.CreateAlignedLoad(I32, Ptr, A);
+  LoadInst *L = B.CreateAlignedLoad(I32, WordPtr, A);
   L->setAtomic(AtomicOrdering::Monotonic, I.getSyncScopeID());
   B.CreateBr(Got);
   B.SetInsertPoint(Got);
@@ -489,18 +506,27 @@ static void expandCASBatch(AtomicRMWInst &I) {
   B.SetInsertPoint(Chain);
   PHINode *Rem = B.CreatePHI(I32, 2);
   PHINode *Cur = B.CreatePHI(I32, 2);
-  PHINode *Mine = B.CreatePHI(I32, 2);
+  PHINode *Mine = B.CreatePHI(B.getIntNTy(Bits), 2);
   Rem->addIncoming(Pending, Got);
   Cur->addIncoming(V, Got);
-  Mine->addIncoming(PoisonValue::get(I32), Got);
+  Mine->addIncoming(PoisonValue::get(B.getIntNTy(Bits)), Got);
   Value *J = B.CreateBinaryIntrinsic(Intrinsic::cttz, Rem, B.getTrue());
   Value *ArgJ = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {Arg, J});
-  Value *Next =
-      toInt(B,
-            buildAtomicRMWValue(I.getOperation(), B, fromInt(B, Cur, ValTy),
-                                fromInt(B, ArgJ, ValTy)),
-            32);
-  Value *Mine2 = B.CreateSelect(B.CreateICmpEQ(Lane, J), Cur, Mine);
+  Value *ShJ =
+      Shift ? B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {Shift, J})
+            : nullptr;
+  Value *CurJ = Narrow(B, Cur, ShJ);
+  Value *Next = toInt(
+      B,
+      buildAtomicRMWValue(I.getOperation(), B, fromInt(B, CurJ, ValTy),
+                          fromInt(B, Narrow(B, ArgJ, B.getInt32(0)), ValTy)),
+      Bits);
+  if (Bits == 16) {
+    Value *Mask = B.CreateShl(B.getInt32(0xffff), ShJ);
+    Next = B.CreateOr(B.CreateAnd(Cur, B.CreateNot(Mask)),
+                      B.CreateShl(B.CreateZExt(Next, I32), ShJ));
+  }
+  Value *Mine2 = B.CreateSelect(B.CreateICmpEQ(Lane, J), CurJ, Mine);
   Value *Rem2 = B.CreateAnd(Rem, B.CreateSub(Rem, B.getInt32(1)));
   Rem->addIncoming(Rem2, Chain);
   Cur->addIncoming(Next, Chain);
@@ -510,7 +536,7 @@ static void expandCASBatch(AtomicRMWInst &I) {
   B.CreateCondBr(Leader, Swap, Tried);
   B.SetInsertPoint(Swap);
   Value *CX =
-      B.CreateAtomicCmpXchg(Ptr, V, Next, A, I.getOrdering(),
+      B.CreateAtomicCmpXchg(WordPtr, V, Next, A, I.getOrdering(),
                             AtomicOrdering::Monotonic, I.getSyncScopeID());
   Value *Ok = B.CreateZExt(B.CreateExtractValue(CX, 1), I32);
   B.CreateBr(Tried);
@@ -541,6 +567,28 @@ static void expandCASBatch(AtomicRMWInst &I) {
   I.eraseFromParent();
 }
 
+/// An 8- or 16-bit atomic load as an atomic load of its aligned 32-bit word,
+/// shifted and truncated: AtomicExpand makes atomic loads compare-and-swaps
+/// and does not widen the narrow ones it makes (instruction selection has no
+/// 8- or 16-bit compare-and-swap).
+static void widenNarrowAtomicLoad(LoadInst &LI) {
+  IRBuilder<> B(&LI);
+  const DataLayout &DL = LI.getDataLayout();
+  Value *Ptr = LI.getPointerOperand();
+  unsigned PtrBits = DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
+  unsigned Bits = DL.getTypeStoreSizeInBits(LI.getType());
+  Value *Low = B.CreateAnd(B.CreatePtrToInt(Ptr, B.getIntNTy(PtrBits)), 3);
+  Value *Word = B.CreateGEP(B.getInt8Ty(), Ptr, B.CreateNeg(Low));
+  LoadInst *W = B.CreateAlignedLoad(B.getInt32Ty(), Word, Align(4), LI.isVolatile());
+  W->setAtomic(LI.getOrdering(), LI.getSyncScopeID());
+  Value *Shift = B.CreateShl(B.CreateTrunc(Low, B.getInt32Ty()), 3);
+  Value *V = B.CreateTrunc(B.CreateLShr(W, Shift), B.getIntNTy(Bits));
+  if (!LI.getType()->isIntegerTy())
+    V = B.CreateBitCast(V, LI.getType());
+  LI.replaceAllUsesWith(V);
+  LI.eraseFromParent();
+}
+
 bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -549,10 +597,19 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
       TM ? TM->getSubtargetImpl(F)->getTargetLowering() : nullptr;
   SmallVector<std::pair<Instruction *, unsigned>, 4> Wide;
   SmallVector<AtomicRMWInst *, 4> CASLoops;
+  SmallVector<LoadInst *, 4> NarrowLoads;
   for (Instruction &I : instructions(F)) {
+    if (auto *LI = dyn_cast<LoadInst>(&I);
+        LI && LI->isAtomic() && !LI->getType()->isPointerTy() &&
+        DL.getTypeStoreSize(LI->getType()) < 4 &&
+        LI->getAlign() >= DL.getTypeStoreSize(LI->getType())) {
+      NarrowLoads.push_back(LI);
+      continue;
+    }
     if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
         CASBatch && RMW && TLI && !TM->getSubtargetImpl(F)->hasMesaISA() &&
-        DL.getTypeStoreSize(RMW->getType()) == 4 &&
+        (DL.getTypeStoreSize(RMW->getType()) == 4 ||
+         (DL.getTypeStoreSize(RMW->getType()) == 2 && RMW->getAlign() >= 2)) &&
         !RMW->getType()->isPointerTy() &&
         TLI->shouldExpandAtomicRMWInIR(RMW) ==
             TargetLowering::AtomicExpansionKind::CmpXChg &&
@@ -569,10 +626,12 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
     if (unsigned Bits = wideAtomicSize(I, DL))
       Wide.push_back({&I, Bits});
   }
+  for (LoadInst *LI : NarrowLoads)
+    widenNarrowAtomicLoad(*LI);
   for (AtomicRMWInst *RMW : CASLoops)
     expandCASBatch(*RMW);
   if (Wide.empty())
-    return !CASLoops.empty();
+    return !CASLoops.empty() || !NarrowLoads.empty();
   GlobalVariable *Locks = getLocks(*F.getParent());
   for (auto [I, Bits] : Wide)
     expand(*I, Bits, Locks);
