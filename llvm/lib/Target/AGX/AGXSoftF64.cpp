@@ -665,9 +665,17 @@ public:
     Value *Y0 = estimate(Intrinsic::agx_rcp, B.CreateLShr(Dv, 29), 53);
     Value *E0 = B.CreateNeg(B.CreateMul(Dv, Y0)); // 2^82 - Dv * Y0
     Value *Z = B.CreateAdd(B.CreateShl(Y0, 33), hi(mulWide(Y0, E0), 49));
-    Value *E1 = B.CreateSub(ConstantInt::get(I128, APInt::getOneBitSet(128, 115)),
-                            mulWide(Dv, Z));
-    Value *Z2 = B.CreateAdd(Z, hi(mulWide(Z, hi(E1, 16)), 99));
+    // E1 = 2^115 - Dv * Z (at least 0: Z stays below) in units of 2^53, from
+    // the high word P of (Dv << 11) * Z (Dv < 2^53): 2^62 - 1 - P is below
+    // it by less than one unit (2^53, inside the 2^55 that Z2 to 2^-60
+    // tolerates), so that Z2 stays below too; clamped at 0. No 128-bit
+    // product.
+    Value *E1 = B.CreateBinaryIntrinsic(
+        Intrinsic::smax,
+        B.CreateSub(c64((uint64_t(1) << 62) - 1),
+                    hi(mulWide(B.CreateShl(Dv, 11), Z), 64)),
+        c64(0));
+    Value *Z2 = B.CreateAdd(Z, hi(mulWide(Z, B.CreateShl(E1, 37)), 99));
     Value *Q = hi(mulWide(N, Z2), 61);
     Value *R = B.CreateSub(B.CreateShl(N, 54), B.CreateMul(Q, Dv));
     for (int I = 0; I < 2; ++I) {
@@ -743,12 +751,22 @@ public:
   /// 2 units, which the exact remainder corrects.
   Value *rootSticky(Value *N, Value *NE) {
     Value *Y0 = estimate(Intrinsic::agx_rsqrt, B.CreateLShr(NE, 30), 42);
-    auto Two114 = ConstantInt::get(I128, APInt::getOneBitSet(128, 114));
-    Value *D0 = B.CreateSub(Two114, mulWide(NE, B.CreateMul(Y0, Y0)));
-    Value *Y1 = B.CreateAdd(B.CreateShl(Y0, 32),
-                            hi(mulWide(Y0, hi(D0, 40, true), true), 43, true));
-    Value *D1 = B.CreateSub(Two114, mulWide(NE, hi(mulWide(Y1, Y1), 64)));
-    Value *Y2 = B.CreateAdd(Y1, hi(mulWide(Y1, hi(D1, 18, true), true), 97, true));
+    // The steps' residuals D = 2^114 - NE * Y^2 in units of 2^54, from the
+    // high word of (NE << 10) * Y^2 (NE < 2^54): off by less than 2^54, far
+    // inside what each step tolerates (2^77 for Y1 to 2^-35, about 2^54 for
+    // Y2 to 2^-58, and the remainder below corrects two units either way),
+    // with no 128-bit product or difference.
+    auto Residual = [&](Value *YSq) {
+      Value *P = hi(mulWide(B.CreateShl(NE, 10), YSq), 64);
+      return B.CreateSub(c64(uint64_t(1) << 60), P);
+    };
+    Value *D0 = Residual(B.CreateMul(Y0, Y0)); // Y0 < 2^31
+    Value *Y1 = B.CreateAdd(
+        B.CreateShl(Y0, 32),
+        hi(mulWide(Y0, B.CreateShl(D0, 14), true), 43, true)); // D 2^-40
+    Value *D1 = Residual(hi(mulWide(Y1, Y1), 64));
+    Value *Y2 = B.CreateAdd(
+        Y1, hi(mulWide(Y1, B.CreateShl(D1, 36), true), 97, true)); // D 2^-18
     Value *Root = hi(mulWide(NE, Y2), 61);
     Value *Rem = B.CreateSub(B.CreateShl(N, 56), B.CreateMul(Root, Root));
     for (int I = 0; I < 2; ++I) {
