@@ -30,3 +30,36 @@ define agx_kernel void @ur2(ptr addrspace(1) %p, i32 %a, i32 %b) {
   store i32 %q, ptr addrspace(1) %p
   ret void
 }
+
+; The signed guard, d + 1 <u 2 ? 1 : d, with ZLUDA's selects for d = -1 and
+; d = 0: the expansion of d with no select of its own (one compare-select
+; each for d = -1 and d = 0, after the quotient's sign).
+; CHECK-LABEL: sd:
+; CHECK-NOT: icmpsel ult, r{{[0-9]+}}, r{{[0-9]+}}, 2
+; CHECK: stop
+define agx_kernel void @sd(ptr addrspace(1) %p, i32 %a, i32 %b) {
+  %z = icmp eq i32 %b, 0
+  %m = icmp eq i32 %b, -1
+  %b1 = add i32 %b, 1
+  %c = icmp ult i32 %b1, 2
+  %g = select i1 %c, i32 1, i32 %b
+  %q = sdiv i32 %a, %g
+  %n = sub i32 0, %a
+  %r1 = select i1 %m, i32 %n, i32 %q
+  %r = select i1 %z, i32 -1, i32 %r1
+  store i32 %r, ptr addrspace(1) %p
+  ret void
+}
+
+; Without them, the result of dividing by one where the guard took 1.
+; CHECK-LABEL: sr2:
+; CHECK: icmpsel ult, r{{[0-9]+}}, r{{[0-9]+}}, 2, 0,
+; CHECK: stop
+define agx_kernel void @sr2(ptr addrspace(1) %p, i32 %a, i32 %b) {
+  %b1 = add i32 %b, 1
+  %c = icmp ult i32 %b1, 2
+  %g = select i1 %c, i32 1, i32 %b
+  %q = srem i32 %a, %g
+  store i32 %q, ptr addrspace(1) %p
+  ret void
+}

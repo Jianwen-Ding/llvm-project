@@ -706,11 +706,27 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   // umax(d, 1) (ZLUDA's guard of a PTX division, which selects its own
   // result where d is zero): the expansion of d, whose zero divisor is
   // replaced below by the result of dividing by one, so no maximum.
+  using namespace PatternMatch;
   Value *Y0 = BO.getOperand(1), *Guarded = nullptr;
-  if (!IsSigned &&
-      match(Y0, PatternMatch::m_UMax(PatternMatch::m_Value(Guarded),
-                                     PatternMatch::m_One())))
+  if (!IsSigned && match(Y0, m_UMax(m_Value(Guarded), m_One())))
     Y0 = Guarded;
+  // ZLUDA's guard of a signed division, d + 1 <u 2 ? 1 : d (d = 0 and -1,
+  // whose results it selects itself): the expansion of d, as above
+  // (d = -1 ? 1 : d where d is known nonzero)
+  bool GuardsZero = !IsSigned;
+  if (IsSigned &&
+      match(Y0, m_Select(m_SpecificICmp(ICmpInst::ICMP_ULT,
+                                        m_Add(m_Value(Guarded), m_One()),
+                                        m_SpecificInt(2)),
+                         m_One(), m_Deferred(Guarded)))) {
+    Y0 = Guarded;
+    GuardsZero = true;
+  } else if (IsSigned &&
+             match(Y0, m_Select(m_SpecificICmp(ICmpInst::ICMP_EQ,
+                                               m_Value(Guarded), m_AllOnes()),
+                                m_One(), m_Deferred(Guarded)))) {
+    Y0 = Guarded;
+  }
   Divisor D = Divisors.get(Y0, IsSigned, BO);
   Value *Y = D.Y, *Z = D.Z;
   Value *XNeg = nullptr, *Neg = nullptr;
@@ -734,19 +750,32 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   if (IsSigned)
     Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
   if (Guarded) {
-    // where the only use already selects another value for d = 0, as
-    // ZLUDA's does, no select
-    using namespace PatternMatch;
-    if (BO.hasOneUse())
-      if (auto *Sel = dyn_cast<SelectInst>(BO.user_back());
-          Sel && Sel->getFalseValue() == &BO &&
-          match(
-              Sel->getCondition(),
-              m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(Guarded), m_Zero())))
-        return Res;
-    // x / 1 = x, x % 1 = 0
-    return B.CreateSelect(B.CreateICmpEQ(Y0, B.getInt32(0)),
-                          IsRem ? B.getInt32(0) : BO.getOperand(0), Res);
+    // where the uses (through at most two single-use selects of which it is
+    // the false value) select another value for d = 0, as ZLUDA's do, no
+    // select
+    // (signed: and for d = -1 too)
+    Value *V = &BO;
+    bool Zero = false, MinusOne = !IsSigned;
+    for (int Depth = 0; Depth < 2 && V->hasOneUse(); ++Depth) {
+      auto *Sel = dyn_cast<SelectInst>(V->user_back());
+      if (!Sel || Sel->getFalseValue() != V)
+        break;
+      Zero |= match(
+          Sel->getCondition(),
+          m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(Guarded), m_Zero()));
+      MinusOne |= match(
+          Sel->getCondition(),
+          m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(Guarded), m_AllOnes()));
+      V = Sel;
+    }
+    if ((Zero || !GuardsZero) && MinusOne)
+      return Res;
+    // where the guard took 1 (d = 0, or signed d = -1): x / 1 = x, x % 1 = 0
+    Value *One = !IsSigned    ? B.CreateICmpEQ(Y0, B.getInt32(0))
+                 : GuardsZero ? B.CreateICmpULT(B.CreateAdd(Y0, B.getInt32(1)),
+                                                B.getInt32(2))
+                              : B.CreateICmpEQ(Y0, B.getInt32(-1));
+    return B.CreateSelect(One, IsRem ? B.getInt32(0) : BO.getOperand(0), Res);
   }
   Value *Zero = B.CreateICmpEQ(Y0, B.getInt32(0));
   return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : B.getInt32(-1), Res);
