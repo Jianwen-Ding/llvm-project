@@ -763,11 +763,14 @@ public:
     Value *D0 = Residual(B.CreateMul(Y0, Y0)); // Y0 < 2^31
     Value *Y1 = B.CreateAdd(
         B.CreateShl(Y0, 32),
-        hi(mulWide(Y0, B.CreateShl(D0, 14), true), 43, true)); // D 2^-40
+        // (Y0 shifted by 21 as its headroom allows, Y0 < 2^31: the high word
+        // is the product shifted by 43, exactly)
+        hi(mulWide(B.CreateShl(Y0, 21), B.CreateShl(D0, 14), true), 64,
+           true)); // D 2^-40
     Value *D1 = Residual(hi(mulWide(Y1, Y1), 64));
     Value *Y2 = B.CreateAdd(
         Y1, hi(mulWide(Y1, B.CreateShl(D1, 36), true), 97, true)); // D 2^-18
-    Value *Root = hi(mulWide(NE, Y2), 61);
+    Value *Root = hi(mulWide(B.CreateShl(NE, 3), Y2), 64); // NE < 2^54
     Value *Rem = B.CreateSub(B.CreateShl(N, 56), B.CreateMul(Root, Root));
     for (int I = 0; I < 2; ++I) {
       Value *Neg = B.CreateICmpSLT(Rem, c64(0));
