@@ -1866,6 +1866,55 @@ SDValue AGXTargetLowering::lowerFROUND(SDValue Op, SelectionDAG &DAG) const {
 
 /// float to bfloat bits, rounded to nearest even: (x + 0x7fff + lsb) >> 16,
 /// with NaNs quieted.
+/// Whether the float (or its bits) V is a bfloat exactly (its low 16 bits
+/// zero): a widened bfloat, a constant, and the sign operations, minimum /
+/// maximum, selects and bit operations of such values (the hardware's min /
+/// max give an operand, or the NaN 0x7fc00000).
+static bool isBF16Exact(SelectionDAG &DAG, SDValue V, unsigned Depth = 0) {
+  if (Depth > 4)
+    return false;
+  switch (V.getOpcode()) {
+  case ISD::FP_EXTEND:
+    return V.getOperand(0).getValueType().getScalarType() == MVT::bf16;
+  case ISD::BF16_TO_FP:
+    return true;
+  case ISD::ConstantFP: {
+    APInt Bits = cast<ConstantFPSDNode>(V)->getValueAPF().bitcastToAPInt();
+    return Bits.countr_zero() >= 16;
+  }
+  case ISD::BITCAST:
+    return isBF16Exact(DAG, V.getOperand(0), Depth + 1);
+  case ISD::AND:
+    return isBF16Exact(DAG, V.getOperand(0), Depth + 1) ||
+           isBF16Exact(DAG, V.getOperand(1), Depth + 1) ||
+           DAG.computeKnownBits(V).countMinTrailingZeros() >= 16;
+  case ISD::OR:
+  case ISD::XOR:
+    return isBF16Exact(DAG, V.getOperand(0), Depth + 1) &&
+           isBF16Exact(DAG, V.getOperand(1), Depth + 1);
+  case ISD::FNEG:
+  case ISD::FABS:
+    return isBF16Exact(DAG, V.getOperand(0), Depth + 1);
+  case ISD::FMINNUM:
+  case ISD::FMAXNUM:
+  case ISD::FMINIMUM:
+  case ISD::FMAXIMUM:
+  case ISD::FMINIMUMNUM:
+  case ISD::FMAXIMUMNUM:
+    return isBF16Exact(DAG, V.getOperand(0), Depth + 1) &&
+           isBF16Exact(DAG, V.getOperand(1), Depth + 1);
+  case ISD::SELECT:
+    return isBF16Exact(DAG, V.getOperand(1), Depth + 1) &&
+           isBF16Exact(DAG, V.getOperand(2), Depth + 1);
+  case ISD::SELECT_CC:
+    return isBF16Exact(DAG, V.getOperand(2), Depth + 1) &&
+           isBF16Exact(DAG, V.getOperand(3), Depth + 1);
+  default:
+    return V.getValueType().isInteger() &&
+           DAG.computeKnownBits(V).countMinTrailingZeros() >= 16;
+  }
+}
+
 SDValue AGXTargetLowering::lowerFP_TO_BF16(SDValue Op,
                                            SelectionDAG &DAG) const {
   SDLoc DL(Op);
@@ -1874,6 +1923,10 @@ SDValue AGXTargetLowering::lowerFP_TO_BF16(SDValue Op,
     Src = DAG.getNode(ISD::FP_EXTEND, DL, MVT::f32, Src);
   SDValue X = DAG.getBitcast(MVT::i32, Src);
   auto C = [&](uint32_t V) { return DAG.getConstant(V, DL, MVT::i32); };
+  // already a bfloat (min / max of bfloats): its top half
+  if (isBF16Exact(DAG, Src))
+    return DAG.getNode(ISD::TRUNCATE, DL, Op.getValueType(),
+                       DAG.getNode(ISD::SRL, DL, MVT::i32, X, C(16)));
   SDValue Lsb = DAG.getNode(ISD::AND, DL, MVT::i32,
                             DAG.getNode(ISD::SRL, DL, MVT::i32, X, C(16)), C(1));
   SDValue R = DAG.getNode(ISD::ADD, DL, MVT::i32, X,

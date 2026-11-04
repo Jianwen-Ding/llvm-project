@@ -654,8 +654,58 @@ public:
   /// A float converted to half, rounded in the direction Rounding.
   Value *roundedToHalf(Value *X) {
     Value *XB = bits(X);
-    Value *Exact = toFloat(convert(unpack(XB, false), Binary16), B.getHalfTy());
     Value *HW = B.CreateFPTrunc(X, B.getHalfTy());
+    Value *NegX = B.CreateICmpSLT(XB, c32(0));
+    // A known direction: the hardware's conversion to nearest, one unit
+    // toward the direction where it went past X (its half is a normal float
+    // or zero, so the comparison is exact; that covers zeros, the overflow
+    // to infinity and infinities, NaNs compare false). A float denormal,
+    // which the hardware flushes, takes the integer conversion.
+    if (auto *RC = dyn_cast<ConstantInt>(Rounding)) {
+      uint64_t Dir = RC->getZExtValue();
+      if (Dir == RoundNearestEven || Dir == RoundTowardZero || Dir == RoundUp ||
+          Dir == RoundDown) {
+        Value *R = HW;
+        if (Dir != RoundNearestEven) {
+          Value *E = B.CreateFPExt(HW, X->getType());
+          Value *HB = B.CreateBitCast(HW, B.getInt16Ty());
+          Value *Up = B.CreateAdd(HB, ConstantInt::get(B.getInt16Ty(), 1));
+          Value *Down = B.CreateSub(HB, ConstantInt::get(B.getInt16Ty(), 1));
+          // a unit up or down in magnitude (the sign bit is kept)
+          Value *Adj;
+          if (Dir == RoundTowardZero) {
+            Value *Past =
+                B.CreateFCmpOGT(B.CreateUnaryIntrinsic(Intrinsic::fabs, E),
+                                B.CreateUnaryIntrinsic(Intrinsic::fabs, X));
+            Adj = B.CreateSelect(Past, Down, HB);
+          } else {
+            bool UpDir = Dir == RoundUp;
+            Value *Past = UpDir ? B.CreateFCmpOLT(E, X) : B.CreateFCmpOGT(E, X);
+            // toward +inf: a positive grows, a negative shrinks (and the
+            // reverse toward -inf)
+            Value *Grow = UpDir ? B.CreateNot(NegX) : NegX;
+            Adj = B.CreateSelect(Past, B.CreateSelect(Grow, Up, Down), HB);
+          }
+          R = B.CreateBitCast(Adj, B.getHalfTy());
+        }
+        // a float denormal (which the hardware flushes) is below half the
+        // smallest half denormal: a zero of its sign, or that denormal
+        // rounding away from zero
+        Value *Mag = B.CreateAnd(XB, c32(0x7fffffff));
+        Value *Denormal = B.CreateAnd(B.CreateICmpNE(Mag, c32(0)),
+                                      B.CreateICmpULT(Mag, c32(0x800000)));
+        Value *Away = Dir == RoundUp     ? B.CreateNot(NegX)
+                      : Dir == RoundDown ? NegX
+                                         : B.getFalse();
+        Value *Tiny = B.CreateOr(
+            B.CreateSelect(NegX, ConstantInt::get(B.getInt16Ty(), 0x8000),
+                           ConstantInt::get(B.getInt16Ty(), 0)),
+            B.CreateZExt(Away, B.getInt16Ty()));
+        return B.CreateSelect(Denormal, B.CreateBitCast(Tiny, B.getHalfTy()),
+                              R);
+      }
+    }
+    Value *Exact = toFloat(convert(unpack(XB, false), Binary16), B.getHalfTy());
     return B.CreateSelect(isInfOrNaN(XB), HW, Exact);
   }
 
