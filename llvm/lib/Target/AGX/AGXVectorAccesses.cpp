@@ -21,10 +21,18 @@
 //   instruction waits for it. After the vectorizer, such a store is split
 //   into the runs of lanes that need no copy.
 //
+// Before the vectorizer, accesses also get the alignment their neighbours
+// prove: in a block, an access at base + c with alignment A that runs
+// whenever another at base + d does makes base + d aligned to
+// min(A, the largest power of two dividing d - c) (else the first would be
+// undefined). The bytes after a 2-byte aligned f16 in a packed struct
+// (llama.cpp's q4_0 blocks) are then 2-byte aligned pairs, one access each.
+//
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
 #include "Utils/AGXBaseInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PatternMatch.h"
@@ -40,6 +48,11 @@ using namespace llvm::PatternMatch;
 static cl::opt<bool> AGXNarrowVectorLoads(
     "agx-narrow-vector-loads", cl::init(true), cl::Hidden,
     cl::desc("Load only the used lanes of a vector load"));
+
+static cl::opt<bool> AGXNeighbourAlignment(
+    "agx-neighbour-alignment", cl::init(true), cl::Hidden,
+    cl::desc("Raise access alignments to what accesses of the same base that "
+             "run with them prove"));
 
 static cl::opt<bool> AGXSplitPermutedStores(
     "agx-split-permuted-stores", cl::init(true), cl::Hidden,
@@ -227,10 +240,67 @@ static bool splitStore(StoreInst &SI) {
   return true;
 }
 
+/// The alignment accesses of the same base prove for the accesses of BB (see
+/// the file comment). An access runs whenever a later one of the block does,
+/// and whenever an earlier one does that no instruction between them may stop.
+static bool raiseAlignments(BasicBlock &BB) {
+  const DataLayout &DL = BB.getDataLayout();
+  struct Anchor {
+    int64_t Offset;
+    Align A;
+  };
+  // the best-aligned access of each base so far (its alignment fixes the
+  // base's residue modulo every smaller power of two)
+  DenseMap<const Value *, Anchor> Known;
+  bool Changed = false;
+  auto It = BB.begin();
+  while (It != BB.end()) {
+    // a run of instructions that all run when its first does
+    SmallVector<Instruction *, 16> Run;
+    for (; It != BB.end(); ++It) {
+      Run.push_back(&*It);
+      if (!isGuaranteedToTransferExecutionToSuccessor(&*It)) {
+        ++It;
+        break;
+      }
+    }
+    SmallVector<std::tuple<Instruction *, const Value *, int64_t>, 16> Mem;
+    for (Instruction *I : Run) {
+      Value *Ptr = getLoadStorePointerOperand(I);
+      if (!Ptr)
+        continue;
+      int64_t Off = 0;
+      const Value *Base = GetPointerBaseWithConstantOffset(Ptr, Off, DL);
+      Align A = getLoadStoreAlignment(I);
+      Mem.push_back({I, Base, Off});
+      auto [Pos, New] = Known.try_emplace(Base, Anchor{Off, A});
+      if (!New && A > Pos->second.A)
+        Pos->second = Anchor{Off, A};
+    }
+    for (auto [I, Base, Off] : Mem) {
+      const Anchor &K = Known.find(Base)->second;
+      uint64_t Diff = static_cast<uint64_t>(Off - K.Offset);
+      Align A = Diff ? std::min(K.A, Align(uint64_t(1) << llvm::countr_zero(Diff)))
+                     : K.A;
+      if (A <= getLoadStoreAlignment(I))
+        continue;
+      if (auto *LI = dyn_cast<LoadInst>(I))
+        LI->setAlignment(A);
+      else
+        cast<StoreInst>(I)->setAlignment(A);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool AGXVectorAccesses::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
   bool Changed = false;
+  if (BeforeVectorizer && AGXNeighbourAlignment)
+    for (BasicBlock &BB : F)
+      Changed |= raiseAlignments(BB);
   // Collected first: rewriting one erases its users that follow it.
   SmallVector<Instruction *, 16> Accesses;
   for (BasicBlock &BB : F)

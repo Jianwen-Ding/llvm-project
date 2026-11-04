@@ -13,12 +13,13 @@ define agx_kernel void @masked_u8(ptr addrspace(1) %out, i16 %x) {
 }
 
 ; CHECK-LABEL: vector_bytes:
+; (the byte format zero-extends each byte into its half: u8 or u16 alike)
 ; CHECK: device_load {{[01]}}, i8, xyzw
 ; CHECK-NOT: and {{.*}}, 255
-; CHECK: convert u8_to_f
-; CHECK: convert u8_to_f
-; CHECK: convert u8_to_f
-; CHECK: convert u8_to_f
+; CHECK: convert u{{8|16}}_to_f
+; CHECK: convert u{{8|16}}_to_f
+; CHECK: convert u{{8|16}}_to_f
+; CHECK: convert u{{8|16}}_to_f
 define agx_kernel void @vector_bytes(ptr addrspace(1) %out, ptr addrspace(1) %in) {
   %v = load <4 x i8>, ptr addrspace(1) %in, align 4
   %a = extractelement <4 x i8> %v, i32 0

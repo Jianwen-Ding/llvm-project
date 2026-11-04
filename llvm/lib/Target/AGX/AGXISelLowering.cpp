@@ -1021,6 +1021,12 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
 /// M2 Max (ptx-re-blockers B33).
 bool AGXTTIImpl::elementAlignedVectors() { return AGXElementAlignedVectors; }
 
+static cl::opt<bool> AGXBytePairChains(
+    "agx-byte-pair-chains", cl::init(false), cl::Hidden,
+    cl::desc("Merge two neighbouring 2-byte aligned device bytes into one "
+             "access of the byte format"));
+bool AGXTTIImpl::bytePairChains() { return AGXBytePairChains; }
+
 bool AGXTargetLowering::allowsMisalignedMemoryAccesses(
     EVT VT, unsigned AS, Align Alignment, MachineMemOperand::Flags Flags,
     unsigned *Fast) const {
@@ -1600,9 +1606,20 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     return widenBoolean(A, DCI.DAG, SDLoc(N));
   }
   case ISD::SRL: {
-    // (x & (m << s)) >> s = (x >> s) & m: one bfeil (a field extract).
     SDValue A = N->getOperand(0);
     auto *S = dyn_cast<ConstantSDNode>(N->getOperand(1));
+    // A 16-bit value zero-extended, then shifted: shifted in its 16-bit
+    // register half (no copy into a 32-bit register first).
+    if (S && N->getValueType(0) == MVT::i32 &&
+        A.getOpcode() == ISD::ZERO_EXTEND &&
+        A.getOperand(0).getValueType() == MVT::i16 && S->getZExtValue() < 16) {
+      SDLoc DL(N);
+      SDValue Narrow =
+          DCI.DAG.getNode(ISD::SRL, DL, MVT::i16, A.getOperand(0),
+                          DCI.DAG.getConstant(S->getZExtValue(), DL, MVT::i16));
+      return DCI.DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i32, Narrow);
+    }
+    // (x & (m << s)) >> s = (x >> s) & m: one bfeil (a field extract).
     auto *M = A.getOpcode() == ISD::AND
                   ? dyn_cast<ConstantSDNode>(A.getOperand(1))
                   : nullptr;
@@ -1714,6 +1731,16 @@ void AGXTargetLowering::computeKnownBitsForTargetNode(
   case AGXISD::HI32:
     Known = DAG.computeKnownBits(Op.getOperand(0), Depth + 1).extractBits(32, 32);
     break;
+  case AGXISD::LOAD_V2_I8:
+  case AGXISD::LOAD_V4_I8: {
+    // each byte zero-extended into its 16-bit half (bytes in memory; 16-bit
+    // elements fill their halves)
+    auto *M = cast<MemSDNode>(Op.getNode());
+    if (Op.getResNo() < Op.getNode()->getNumValues() - 1 &&
+        M->getMemoryVT().getScalarSizeInBits() == 8)
+      Known.Zero.setBitsFrom(8);
+    break;
+  }
   case AGXISD::MUL_WIDE_U:
   case AGXISD::MUL_WIDE_S: {
     bool S = Op.getOpcode() == AGXISD::MUL_WIDE_S;

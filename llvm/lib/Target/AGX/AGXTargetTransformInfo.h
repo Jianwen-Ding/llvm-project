@@ -85,12 +85,18 @@ public:
     // With -agx-element-aligned-vectors, chains of 8- and 16-bit elements
     // below 4-byte alignment too (allowsMisalignedMemoryAccesses checks the
     // element's alignment).
+    // Otherwise two bytes naturally aligned too (-agx-byte-pair-chains): one
+    // access of the byte format.
     Align Need = elementAlignedVectors() ? Align(1) : Align(4);
-    return Alignment >= Need && Bytes % (Need.value() == 4 ? 4 : 2) == 0 &&
+    bool Natural2 = bytePairChains() && Bytes == 2 && Alignment >= Align(2) &&
+                    AS == AGX::DEVICE_ADDRESS;
+    return (Natural2 ||
+            (Alignment >= Need && Bytes % (Need.value() == 4 ? 4 : 2) == 0)) &&
            Bytes <= 16 &&
            (AS == AGX::DEVICE_ADDRESS || AS == AGX::THREADGROUP_ADDRESS);
   }
   static bool elementAlignedVectors();
+  static bool bytePairChains();
 };
 
 } // namespace llvm
