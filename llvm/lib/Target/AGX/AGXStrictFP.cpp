@@ -46,12 +46,14 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include <cmath>
 
@@ -841,6 +843,9 @@ static Intrinsic::ID getIntrinsicID(const Instruction &I) {
 static bool producesArithmeticNaN(const Instruction &I) {
   if (!I.getType()->isFPOrFPVectorTy())
     return false;
+  // (nnan: a front end's promise that no NaN comes of it)
+  if (isa<FPMathOperator>(I) && I.hasNoNaNs())
+    return false;
   switch (I.getOpcode()) {
   case Instruction::FAdd:
   case Instruction::FSub:
@@ -901,6 +906,56 @@ static void canonicalizeNaN(Instruction &I) {
                             &I);
   for (Use *U : Uses)
     U->set(R);
+}
+
+/// A canonical NaN made on the bits of a float V (a front end does it so where
+/// float comparisons may be taken for fast math), either
+/// select((bits(V) & Abs) > bits(Inf), Abs, bits(V)) or, as InstCombine makes
+/// it, select(bits(fabs(V)) > bits(Inf), NaN, V): returns V, or null. On AGX
+/// a float comparison sees NaNs, and one fcmpsel replaces the and and icmpsel.
+static Value *matchBitsCanonicalNaN(SelectInst &S) {
+  using namespace PatternMatch;
+  Value *X, *V;
+  const APInt *Abs = nullptr, *Inf, *NaN = nullptr;
+  if (match(&S, m_Select(m_SpecificICmp(ICmpInst::ICMP_UGT,
+                                        m_And(m_Value(X), m_APInt(Abs)),
+                                        m_APInt(Inf)),
+                         m_APInt(NaN), m_Deferred(X)))) {
+    auto *BC = dyn_cast<BitCastInst>(X);
+    if (!BC)
+      return nullptr;
+    V = BC->getOperand(0);
+  } else if (!match(&S, m_Select(m_SpecificICmp(
+                                     ICmpInst::ICMP_UGT,
+                                     m_BitCast(m_FAbs(m_Value(V))),
+                                     m_APInt(Inf)),
+                                 m_Constant(), m_Deferred(V)))) {
+    return nullptr;
+  }
+  Type *FTy = V->getType();
+  Type *ITy = S.getCondition()->getType();
+  if (!FTy->getScalarType()->isFloatingPointTy() ||
+      FTy->isVectorTy() != ITy->isVectorTy() ||
+      (FTy->isVectorTy() && cast<VectorType>(FTy)->getElementCount() !=
+                                cast<VectorType>(ITy)->getElementCount()))
+    return nullptr;
+  const fltSemantics &Sem = FTy->getScalarType()->getFltSemantics();
+  unsigned W = APFloat::getSizeInBits(Sem);
+  APInt Max = APInt::getSignedMaxValue(W);
+  if (Inf->getBitWidth() != W ||
+      *Inf != APFloat::getInf(Sem).bitcastToAPInt())
+    return nullptr;
+  if (Abs) {
+    if (*Abs != Max || *NaN != Max)
+      return nullptr;
+  } else {
+    auto *T = cast<Constant>(S.getTrueValue());
+    auto *C = dyn_cast_or_null<ConstantFP>(
+        T->getType()->isVectorTy() ? T->getSplatValue() : T);
+    if (!C || C->getValueAPF().bitcastToAPInt() != Max)
+      return nullptr;
+  }
+  return V;
 }
 
 /// Replace I by Fast where Slow is false, and by the value computed by Build
@@ -977,6 +1032,13 @@ static bool lowerIEEE(Instruction &I) {
       return false;
     Value *X = I.getOperand(0), *Y = I.getOperand(1);
     bool Sub = I.getOpcode() == Instruction::FSub;
+    // (never with an operand of at least 2^-101: a constant one, say)
+    auto Large = [](Value *V) {
+      auto *C = dyn_cast<ConstantFP>(V);
+      return C && !(abs(C->getValueAPF()) < APFloat(0x1p-101f));
+    };
+    if (Large(X) || Large(Y))
+      return false;
     // The hardware result is right unless both operands are below 2^-101:
     // otherwise the result is above 2^-102, so a denormal operand is below
     // half an ulp of it, and a cancellation of normal operands cannot reach
@@ -1427,10 +1489,45 @@ bool AGXStrictFP::runOnFunction(Function &F) {
   bool KeepDenormals = any_of(instructions(F), [](const Instruction &I) {
     return I.hasMetadata(KeepDenormalsTag);
   });
-  if (!ST.hasIEEEFP32() && !CanonicalNaN && !KeepDenormals)
-    return false;
-
   bool Changed = false;
+  // Canonical NaNs made on the bits: nothing where the value is canonicalized
+  // here anyway, else a float comparison.
+  {
+    SmallPtrSet<Value *, 32> WillCanonicalize;
+    if (CanonicalNaN)
+      for (Instruction &I : instructions(F))
+        if (!I.hasMetadata(ExactTag) && producesArithmeticNaN(I))
+          WillCanonicalize.insert(&I);
+    for (Instruction &I : make_early_inc_range(instructions(F))) {
+      auto *S = dyn_cast<SelectInst>(&I);
+      Value *V = S ? matchBitsCanonicalNaN(*S) : nullptr;
+      if (!V)
+        continue;
+      // (the value unchanged, as bits or as the float)
+      Value *R = S->getFalseValue();
+      if (!WillCanonicalize.contains(V)) {
+        IRBuilder<> B(S);
+        const fltSemantics &Sem =
+            V->getType()->getScalarType()->getFltSemantics();
+        APFloat NaN(Sem, APInt::getSignedMaxValue(APFloat::getSizeInBits(Sem)));
+        R = B.CreateBitCast(
+            B.CreateSelect(B.CreateFCmpUNO(V, V),
+                           ConstantFP::get(V->getType(), NaN), V),
+            S->getType());
+      }
+      S->replaceAllUsesWith(R);
+      R->takeName(S);
+      Instruction *Cmp = dyn_cast<Instruction>(S->getCondition());
+      S->eraseFromParent();
+      if (Cmp)
+        RecursivelyDeleteTriviallyDeadInstructions(Cmp);
+      Changed = true;
+    }
+  }
+
+  if (!ST.hasIEEEFP32() && !CanonicalNaN && !KeepDenormals)
+    return Changed;
+
   if (ST.hasIEEEFP32()) {
     SmallVector<Instruction *, 8> BFloat;
     for (Instruction &I : instructions(F))
