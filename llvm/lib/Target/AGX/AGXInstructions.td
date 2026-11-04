@@ -327,6 +327,27 @@ def : Pat<(i64 (anyext i16:$a)),
 def : Pat<(i64 (sext i16:$a)),
           (IADD_I64_FROM32 MOD_SX, (IADD_I32_FROM16 MOD_SX, $a, 0, (i16 0), 0),
                            0, (i32 0), 0)>;
+// Two 16-bit values packed into a 32-bit one: its halves, no shift or or.
+foreach Ext = [zext, anyext] in
+def : Pat<(i32 (or (i32 (zext i16:$lo)), (i32 (shl (i32 (Ext i16:$hi)), (i32 16))))),
+          (REG_SEQUENCE GPR32, $lo, lo16, $hi, hi16)>;
+// ... and of the halves of 32-bit values: the low half (x & 0xffff, or the
+// high one x >> 16) under the high half (y << 16, or y & 0xffff0000).
+def : Pat<(i32 (or (and i32:$lo, (i32 0xffff)), (shl i32:$hi, (i32 16)))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, lo16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
+def : Pat<(i32 (or (and i32:$lo, (i32 0xffff)), (and i32:$hi, (i32 -65536)))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, lo16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+def : Pat<(i32 (or (srl i32:$lo, (i32 16)), (and i32:$hi, (i32 -65536)))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, hi16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+def : Pat<(i32 (or (srl i32:$lo, (i32 16)), (shl i32:$hi, (i32 16)))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, hi16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
+def : Pat<(i32 (or (i32 (zext i16:$lo)), (and i32:$hi, (i32 -65536)))),
+          (REG_SEQUENCE GPR32, $lo, lo16, (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+
 def : Pat<(i32 (sext_inreg i32:$a, i16)),
           (IADD_I32_FROM16 MOD_SX, (EXTRACT_SUBREG $a, lo16), 0, (i16 0), 0)>;
 def : Pat<(i64 (sext_inreg i64:$a, i32)),
