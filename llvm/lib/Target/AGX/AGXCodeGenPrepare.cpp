@@ -526,13 +526,19 @@ FunctionPass *llvm::createAGXCodeGenPreparePass() {
 
 /// Division by a power of two is a shift, and 32-bit division by another
 /// constant is a multiply-high; both are left to instruction selection.
+static cl::opt<bool> Div64ConstMulHi(
+    "agx-div64-const-mulhi", cl::init(true), cl::Hidden,
+    cl::desc("64-bit division by a constant as instruction selection's "
+             "multiply-high (the 64-bit high product is four multiply-adds)"));
+
 static bool isCheapDivision(const BinaryOperator &BO) {
   auto *C = dyn_cast<ConstantInt>(BO.getOperand(1));
   if (!C)
     return false;
   if (C->getValue().isPowerOf2())
     return true;
-  return BO.getType()->isIntegerTy(32);
+  return BO.getType()->isIntegerTy(32) ||
+         (Div64ConstMulHi && BO.getType()->isIntegerTy(64));
 }
 
 static cl::opt<bool> ShareDivisors(
@@ -1022,6 +1028,26 @@ bool AGXCodeGenPrepare::expandDivisions(Function &F) {
   }
   for (BinaryOperator *BO : Worklist) {
     if (BO->getType()->getIntegerBitWidth() <= 16 && AGXNarrowDivisions) {
+      // by a constant: the 32-bit division of the extended operands, which
+      // instruction selection makes a multiply-high
+      if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+          C && !C->isZero()) {
+        IRBuilder<> B(BO);
+        bool Signed = BO->getOpcode() == Instruction::SDiv ||
+                      BO->getOpcode() == Instruction::SRem;
+        auto Ext = [&](Value *V) {
+          return Signed ? B.CreateSExt(V, B.getInt32Ty())
+                        : B.CreateZExt(V, B.getInt32Ty());
+        };
+        Value *R =
+            B.CreateTrunc(B.CreateBinOp(BO->getOpcode(), Ext(BO->getOperand(0)),
+                                        Ext(BO->getOperand(1))),
+                          BO->getType());
+        R->takeName(BO);
+        BO->replaceAllUsesWith(R);
+        BO->eraseFromParent();
+        continue;
+      }
       Value *R = expandDivRem16(*BO);
       R->takeName(BO);
       BO->replaceAllUsesWith(R);

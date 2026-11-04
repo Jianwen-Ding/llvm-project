@@ -22,3 +22,14 @@ define agx_kernel void @srem8(ptr addrspace(1) %p, i8 %a, i8 %b) {
   store i8 %r, ptr addrspace(1) %p
   ret void
 }
+
+; by a constant: the 32-bit division, a multiply-high (no reciprocal)
+; CHECK-LABEL: udiv16c:
+; CHECK-NOT: rcp
+; CHECK: imadd
+; CHECK: stop
+define agx_kernel void @udiv16c(ptr addrspace(1) %p, i16 %a) {
+  %q = udiv i16 %a, 10
+  store i16 %q, ptr addrspace(1) %p
+  ret void
+}
