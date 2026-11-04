@@ -41,23 +41,21 @@
 #include "AGXMachineFunctionInfo.h"
 #include "AGXSubtarget.h"
 #include "llvm/ADT/GenericUniformityImpl.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
-#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/Transforms/Utils/BypassSlowDivision.h"
-#include "llvm/Transforms/Utils/CallPromotionUtils.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -65,19 +63,23 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/ReplaceConstant.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/BypassSlowDivision.h"
+#include "llvm/Transforms/Utils/CallPromotionUtils.h"
+#include "llvm/Transforms/Utils/IntegerDivision.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
 #include <cmath>
 #include <map>
 #include <set>
 #include <tuple>
-#include "llvm/Support/MathExtras.h"
-#include "llvm/Target/TargetMachine.h"
-#include "llvm/Transforms/Utils/IntegerDivision.h"
-#include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
-#include "llvm/IR/ReplaceConstant.h"
-#include "llvm/ADT/SetVector.h"
 
 using namespace llvm;
 
@@ -1686,6 +1688,97 @@ bool AGXCodeGenPrepare::diagnoseDoubles(Function &F) {
   return true;
 }
 
+static cl::opt<bool> AGXMergeMaskedOrs(
+    "agx-merge-masked-ors", cl::init(true), cl::Hidden,
+    cl::desc("Merge the masked parts of one shifted value in an or tree "
+             "(byte permutes with constant selectors)"));
+
+/// An or tree (of 32-bit ors with one use) whose leaves are masked parts of
+/// a few shifted values, as a byte permute with a constant selector folds to
+/// (one leaf per byte): the leaves of one value and shift, (x op c) & m1 and
+/// (x op c) & m2, become one, (x op c) & (m1 | m2), which instruction
+/// selection then sees as a half of a register or a bit-field insert.
+static bool mergeMaskedOrs(Function &F) {
+  if (!AGXMergeMaskedOrs)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  SmallVector<WeakVH, 16> Roots;
+  for (Instruction &I : instructions(F)) {
+    auto *BO = dyn_cast<BinaryOperator>(&I);
+    if (!BO || BO->getOpcode() != Instruction::Or ||
+        !BO->getType()->isIntegerTy(32))
+      continue;
+    // a root: not itself the single-use operand of another or
+    if (BO->hasOneUse())
+      if (auto *U = dyn_cast<BinaryOperator>(BO->user_back());
+          U && U->getOpcode() == Instruction::Or)
+        continue;
+    Roots.push_back(BO);
+  }
+  for (WeakVH &H : Roots) {
+    // (a root deleted with an earlier tree, as its dead leaf)
+    auto *Root = dyn_cast_or_null<BinaryOperator>(H);
+    if (!Root)
+      continue;
+    SmallVector<Value *, 8> Leaves, Work{Root};
+    while (!Work.empty()) {
+      Value *V = Work.pop_back_val();
+      auto *O = dyn_cast<BinaryOperator>(V);
+      if (O && O->getOpcode() == Instruction::Or &&
+          (O == Root || O->hasOneUse())) {
+        Work.push_back(O->getOperand(0));
+        Work.push_back(O->getOperand(1));
+        continue;
+      }
+      Leaves.push_back(V);
+    }
+    if (Leaves.size() < 3)
+      continue;
+    // a leaf as (shifted value, mask)
+    struct Part {
+      Value *Shifted;
+      APInt Mask;
+    };
+    SmallVector<Part, 8> Parts;
+    for (Value *L : Leaves) {
+      Value *X;
+      const APInt *M;
+      if (match(L, m_And(m_Value(X), m_APInt(M))))
+        Parts.push_back({X, *M});
+      else
+        Parts.push_back({L, APInt::getAllOnes(32)});
+    }
+    // the same shifted value: one instruction (x << c, x >> c) or the value
+    bool Merge = false;
+    for (unsigned I = 0; I < Parts.size() && !Merge; ++I)
+      for (unsigned J = I + 1; J < Parts.size() && !Merge; ++J)
+        Merge = Parts[I].Shifted == Parts[J].Shifted;
+    if (!Merge)
+      continue;
+    SmallVector<Part, 8> Merged;
+    for (Part &P : Parts) {
+      auto It = llvm::find_if(Merged,
+                              [&](Part &Q) { return Q.Shifted == P.Shifted; });
+      if (It == Merged.end())
+        Merged.push_back(P);
+      else
+        It->Mask |= P.Mask;
+    }
+    IRBuilder<> B(Root);
+    Value *R = nullptr;
+    for (Part &P : Merged) {
+      Value *L =
+          P.Mask.isAllOnes() ? P.Shifted : B.CreateAnd(P.Shifted, P.Mask);
+      R = R ? B.CreateOr(R, L) : L;
+    }
+    Root->replaceAllUsesWith(R);
+    RecursivelyDeleteTriviallyDeadInstructions(Root);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -1704,6 +1797,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= flushHalfDenormals(F);
   Changed |= flushFloatMinMax(F);
   Changed |= expandDivisions(F);
+  Changed |= mergeMaskedOrs(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);
