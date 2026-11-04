@@ -538,8 +538,13 @@ public:
     // X = M 2^(E - 1075); E below 1023 is below 1 (zero, denormal or not):
     // the shifts give 0
     Value *Sh = B.CreateSub(E, c32(F64.Bias + 52));
-    Value *Left = shl(M, B.CreateBinaryIntrinsic(Intrinsic::smax, Sh, c32(0)));
-    Value *Right = lshr(M, B.CreateNeg(B.CreateBinaryIntrinsic(Intrinsic::smin, Sh, c32(0))));
+    // (where it fits, a left shift by at most W - 53 places; a right shift
+    // by 53 or more gives 0, so 63 places do)
+    Value *Left = B.CreateShl(M, B.CreateZExt(B.CreateAnd(Sh, c32(63)), I64));
+    Value *Right = B.CreateLShr(
+        M, B.CreateZExt(B.CreateBinaryIntrinsic(Intrinsic::umin,
+                                                B.CreateNeg(Sh), c32(63)),
+                        I64));
     Value *Mag = select(B.CreateICmpSGT(Sh, c32(0)), Left, Right);
     Value *Neg = B.CreateICmpSLT(X, c64(0));
     Value *Fits = B.CreateICmpULT(E, c32(F64.Bias + W - (Signed ? 1 : 0)));
@@ -559,13 +564,21 @@ public:
     Value *V64 = Signed ? B.CreateSExt(V, I64) : B.CreateZExt(V, I64);
     Value *Neg = Signed ? B.CreateICmpSLT(V64, c64(0)) : B.getFalse();
     Value *A = select(Neg, B.CreateNeg(V64), V64);
-    Value *Lz = umin64(B.CreateBinaryIntrinsic(Intrinsic::ctlz, A, B.getFalse()), 63);
-    Value *Sh = B.CreateSub(Lz, c64(11));
-    Value *Valid = B.CreateICmpUGE(Lz, c64(11));
+    // (the counts in 32 bits)
+    Value *Lz = B.CreateTrunc(
+        umin64(B.CreateBinaryIntrinsic(Intrinsic::ctlz, A, B.getFalse()), 63),
+        I32);
+    Value *Sh = B.CreateSub(Lz, c32(11));
+    Value *Valid = B.CreateICmpUGE(Lz, c32(11));
     // (only used where valid: a shift of at most 52 places)
-    Value *M = B.CreateShl(A, B.CreateBinaryIntrinsic(Intrinsic::umin, Sh, c64(52)));
+    Value *M = B.CreateShl(
+        A, B.CreateZExt(B.CreateBinaryIntrinsic(Intrinsic::umin, Sh, c32(52)),
+                        I64));
     // biased exponent 1075 - Sh, minus one for the implicit bit added by M
-    Value *Bits = B.CreateAdd(B.CreateShl(B.CreateSub(c64(F64.Bias + 52 - 1), Sh), 52), M);
+    Value *Bits = B.CreateAdd(
+        B.CreateShl(B.CreateZExt(B.CreateSub(c32(F64.Bias + 52 - 1), Sh), I64),
+                    52),
+        M);
     Bits = select(B.CreateICmpEQ(A, c64(0)), c64(0), Bits);
     Bits = B.CreateOr(Bits, select(Neg, c64(F64.signBit()), c64(0)));
     return {Bits, B.CreateOr(Valid, B.CreateICmpEQ(A, c64(0)))};
