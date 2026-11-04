@@ -130,7 +130,14 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                        VT == MVT::i64 ? Expand : Legal);
   }
   setOperationAction({ISD::MULHU, ISD::MULHS}, MVT::i32, Legal);
-  setOperationAction({ISD::MULHU, ISD::MULHS}, {MVT::i16, MVT::i64}, Expand);
+  // Both halves of a 32 x 32 -> 64-bit product from one multiply (the
+  // expansions of 64-bit multiplications would otherwise take the low half
+  // from a second, 32-bit one).
+  setOperationAction({ISD::UMUL_LOHI, ISD::SMUL_LOHI}, MVT::i32, Custom);
+  setOperationAction({ISD::MULHU, ISD::MULHS}, MVT::i16, Expand);
+  // four 32 x 32 -> 64-bit multiply-adds; the signed high half from the
+  // unsigned one
+  setOperationAction({ISD::MULHU, ISD::MULHS}, MVT::i64, Custom);
   setOperationAction({ISD::ROTL, ISD::ROTR, ISD::FSHL}, {MVT::i16, MVT::i64},
                      Expand);
   setOperationAction(ISD::ROTL, MVT::i32, Expand);
@@ -733,6 +740,53 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
   case ISD::CTLZ:
   case ISD::CTTZ:
     return lowerCTLZ_CTTZ64(Op, DAG);
+  case ISD::MULHU: {
+    // With a = a1 2^32 + a0, b likewise, no sum overflows 64 bits:
+    // t = a1 b0 + hi(a0 b0), u = a0 b1 + lo(t),
+    // mulhu = a1 b1 + hi(t) + hi(u)
+    SDLoc DL(Op);
+    auto [A0, A1] = split64(DAG, DL, Op.getOperand(0));
+    auto [B0, B1] = split64(DAG, DL, Op.getOperand(1));
+    auto Wide = [&](SDValue X, SDValue Y) {
+      return DAG.getNode(AGXISD::MUL_WIDE_U, DL, MVT::i64, X, Y);
+    };
+    SDValue C32 = DAG.getConstant(32, DL, MVT::i32);
+    auto Hi = [&](SDValue X) {
+      return DAG.getNode(ISD::SRL, DL, MVT::i64, X, C32);
+    };
+    auto Add = [&](SDValue X, SDValue Y) {
+      return DAG.getNode(ISD::ADD, DL, MVT::i64, X, Y);
+    };
+    SDValue T = Add(Wide(A1, B0), Hi(Wide(A0, B0)));
+    SDValue U = Add(Wide(A0, B1),
+                    DAG.getNode(ISD::AND, DL, MVT::i64, T,
+                                DAG.getConstant(0xffffffffu, DL, MVT::i64)));
+    return Add(Add(Wide(A1, B1), Hi(T)), Hi(U));
+  }
+  case ISD::MULHS: {
+    // mulhs(a, b) = mulhu(a, b) - (a < 0 ? b : 0) - (b < 0 ? a : 0)
+    SDLoc DL(Op);
+    SDValue A = Op.getOperand(0), B = Op.getOperand(1);
+    SDValue C63 = DAG.getConstant(63, DL, MVT::i32);
+    SDValue R = DAG.getNode(ISD::MULHU, DL, MVT::i64, A, B);
+    R = DAG.getNode(ISD::SUB, DL, MVT::i64, R,
+                    DAG.getNode(ISD::AND, DL, MVT::i64, B,
+                                DAG.getNode(ISD::SRA, DL, MVT::i64, A, C63)));
+    return DAG.getNode(
+        ISD::SUB, DL, MVT::i64, R,
+        DAG.getNode(ISD::AND, DL, MVT::i64, A,
+                    DAG.getNode(ISD::SRA, DL, MVT::i64, B, C63)));
+  }
+  case ISD::UMUL_LOHI:
+  case ISD::SMUL_LOHI: {
+    SDLoc DL(Op);
+    SDValue W =
+        DAG.getNode(Op.getOpcode() == ISD::UMUL_LOHI ? AGXISD::MUL_WIDE_U
+                                                     : AGXISD::MUL_WIDE_S,
+                    DL, MVT::i64, Op.getOperand(0), Op.getOperand(1));
+    auto [Lo, Hi] = split64(DAG, DL, W);
+    return DAG.getMergeValues({Lo, Hi}, DL);
+  }
   case ISD::BITREVERSE: {
     // the halves reversed by the 32-bit instruction, and swapped
     SDLoc DL(Op);

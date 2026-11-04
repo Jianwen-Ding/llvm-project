@@ -379,6 +379,15 @@ def : Pat<(i64 (AGXmul_wide_u i32:$a, i32:$b)),
           (IMADD_I64_FROM32 0, $a, 0, $b, 0, (i64 0), 0)>;
 def : Pat<(i64 (AGXmul_wide_s i32:$a, i32:$b)),
           (IMADD_I64_FROM32 MOD_SX, $a, MOD_SX, $b, 0, (i64 0), 0)>;
+// with a 64-bit addend (the partial products of wider multiplications)
+def : Pat<(i64 (add (mul (zext i32:$a), (zext i32:$b)), i64:$c)),
+          (IMADD_I64_FROM32 0, $a, 0, $b, 0, $c, 0)>;
+def : Pat<(i64 (add (mul (sext i32:$a), (sext i32:$b)), i64:$c)),
+          (IMADD_I64_FROM32 MOD_SX, $a, MOD_SX, $b, 0, $c, 0)>;
+def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), i64:$c)),
+          (IMADD_I64_FROM32 0, $a, 0, $b, 0, $c, 0)>;
+def : Pat<(i64 (add (AGXmul_wide_s i32:$a, i32:$b), i64:$c)),
+          (IMADD_I64_FROM32 MOD_SX, $a, MOD_SX, $b, 0, $c, 0)>;
 def : Pat<(i32 (mulhu i32:$a, i32:$b)),
           (EXTRACT_SUBREG (IMADD_I64_FROM32 0, $a, 0, $b, 0, (i64 0), 0), sub1)>;
 def : Pat<(i32 (mulhs i32:$a, i32:$b)),
