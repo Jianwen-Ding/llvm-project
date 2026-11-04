@@ -103,7 +103,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
   setTargetDAGCombine({ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
-                       ISD::SIGN_EXTEND_INREG});
+                       ISD::SIGN_EXTEND_INREG, ISD::OR});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1388,6 +1388,62 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   switch (N->getOpcode()) {
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
+  case ISD::OR: {
+    // or(Q, P) where P is x << s (with masks around the shift) whose bits
+    // that may be set are one field [s, s + w) and Q is known zero there:
+    // one bfi of x into Q, instead of the shift, the masks and the or.
+    if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32)
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    for (unsigned I = 0; I < 2; ++I) {
+      SDValue P = N->getOperand(I), Q = N->getOperand(1 - I);
+      SDValue Sh = P;
+      if (Sh.getOpcode() == ISD::AND && isa<ConstantSDNode>(Sh.getOperand(1)))
+        Sh = Sh.getOperand(0);
+      if (Sh.getOpcode() != ISD::SHL ||
+          !isa<ConstantSDNode>(Sh.getOperand(1)) || !P.hasOneUse())
+        continue;
+      uint64_t S = Sh.getConstantOperandVal(1);
+      if (S == 0 || S >= 32)
+        continue;
+      SDValue X = Sh.getOperand(0);
+      if (X.getOpcode() == ISD::AND && isa<ConstantSDNode>(X.getOperand(1)))
+        X = X.getOperand(0);
+      // (y >> (32 - s)) | (x << s), y perhaps the low word of a 64-bit
+      // shift, is a funnel shift: one extr
+      SDValue QS = Q;
+      while (QS.getOpcode() == ISD::TRUNCATE || QS.getOpcode() == ISD::AND ||
+             QS.getOpcode() == ISD::BUILD_PAIR)
+        QS = QS.getOperand(0);
+      if ((QS.getOpcode() == ISD::SRL || QS.getOpcode() == ISD::SRA) &&
+          isa<ConstantSDNode>(QS.getOperand(1)) &&
+          QS.getConstantOperandVal(1) % 32 == 32 - S)
+        continue;
+      APInt Field = ~DAG.computeKnownBits(P).Zero;
+      if (Field.isZero() || !Field.isShiftedMask() || Field.countr_zero() != S)
+        continue;
+      if (!Field.isSubsetOf(DAG.computeKnownBits(Q).Zero))
+        continue;
+      // bytes only (packing 8-bit values): the fields of soft-f64 and the
+      // like are left to the shifts, ors and funnel shifts they are now
+      if (S % 8 != 0 || Field.popcount() % 8 != 0)
+        continue;
+      SDLoc DL(N);
+      // A 16-bit value under another: the register's halves. The patterns
+      // take the common forms; here an assembled low part (an insert or an
+      // or of fields), never a shifted one (a funnel shift's).
+      if (S == 16) {
+        if (Field.popcount() != 16 ||
+            (Q.getOpcode() != AGXISD::BFI_FIELD && Q.getOpcode() != ISD::OR))
+          continue;
+        return DAG.getNode(AGXISD::PACK16, DL, MVT::i32, Q, X);
+      }
+      return DAG.getNode(AGXISD::BFI_FIELD, DL, MVT::i32, Q, X,
+                         DAG.getConstant(S, DL, MVT::i32),
+                         DAG.getTargetConstant(Field.popcount(), DL, MVT::i32));
+    }
+    return SDValue();
+  }
   case ISD::SIGN_EXTEND_INREG: {
     // The low byte signed: ((x & 255) ^ 128) - 128, as below. (16 bits are
     // one addition with a sign-extended 16-bit source.)
@@ -1572,6 +1628,17 @@ void AGXTargetLowering::computeKnownBitsForTargetNode(
     const SelectionDAG &DAG, unsigned Depth) const {
   Known.resetAll();
   switch (Op.getOpcode()) {
+  case AGXISD::BFI_FIELD: {
+    // the base outside the field, the inserted bits in it
+    unsigned S = Op.getConstantOperandVal(2), W = Op.getConstantOperandVal(3);
+    APInt Field = APInt::getBitsSet(32, S, std::min(S + W, 32u));
+    KnownBits B = DAG.computeKnownBits(Op.getOperand(0), Depth + 1);
+    KnownBits X = DAG.computeKnownBits(Op.getOperand(1), Depth + 1);
+    X = KnownBits::shl(X, KnownBits::makeConstant(APInt(32, S)));
+    Known.Zero = (B.Zero & ~Field) | (X.Zero & Field);
+    Known.One = (B.One & ~Field) | (X.One & Field);
+    break;
+  }
   case AGXISD::HI32:
     Known = DAG.computeKnownBits(Op.getOperand(0), Depth + 1).extractBits(32, 32);
     break;

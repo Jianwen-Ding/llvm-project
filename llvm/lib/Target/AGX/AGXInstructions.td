@@ -484,6 +484,12 @@ def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
 def : Pat<(i16 (and (agx_srl_oneuse AGXIntSrc16:$a, (i16 imm:$s)),
                     agx_field_mask:$m)),
           (BFEIL_I16 0, (i16 0), 0, $a, 0, (i16 imm:$s), (AGXFieldWidth $m))>;
+def : Pat<(i32 (AGXpack16 i32:$lo, i32:$hi)),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, lo16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
+def : Pat<(i32 (AGXbfi_field AGXIntSrc32:$base, AGXIntSrc32:$ins, (i32 imm:$off),
+                             (i32 timm:$w))),
+          (BFI_I32 0, $base, 0, $ins, 0, (i32 imm:$off), timm:$w)>;
 def : Pat<(i32 (AGXbfi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
           (BFI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXextr7 AGXIntSrc32:$lo, AGXIntSrc32:$hi, AGXIntSrc32:$s)),

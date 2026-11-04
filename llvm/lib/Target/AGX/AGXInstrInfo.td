@@ -109,6 +109,14 @@ def AGXstore_v4 : SDNode<"AGXISD::STORE_V4", SDT_AGXStoreV4,
 // combiner folds through the halves.
 def SDT_AGXHi32 : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisVT<1, i64>]>;
 def AGXhi32 : SDNode<"AGXISD::HI32", SDT_AGXHi32>;
+// A field of Ins (Width bits from bit 0) inserted at Offset into Base:
+// (Base, Ins, Offset, Width), the last two constants.
+def SDT_AGXBfiField : SDTypeProfile<1, 4, [SDTCisVT<0, i32>, SDTCisVT<1, i32>,
+                                           SDTCisVT<2, i32>, SDTCisVT<3, i32>,
+                                           SDTCisVT<4, i32>]>;
+def AGXbfi_field : SDNode<"AGXISD::BFI_FIELD", SDT_AGXBfiField>;
+// The low halves of Lo and Hi as the low and high halves of a 32-bit value.
+def AGXpack16 : SDNode<"AGXISD::PACK16", SDTIntBinOp>;
 // Clamp to [0, 1], a NaN to +0 (the .sat output modifier).
 def AGXfsat : SDNode<"AGXISD::FSAT", SDTFPUnaryOp>;
 // The 64-bit product of two 32-bit values, unsigned or signed (one imadd).
