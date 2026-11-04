@@ -86,6 +86,8 @@ public:
   const AGXInstrInfo *getInstrInfo() const override { return &InstrInfo; }
   /// Liveness of a register's 16-bit halves apart (-agx-subreg-liveness).
   bool enableSubRegLiveness() const override;
+  /// The scheduler's pressure by lanes with it (-agx-sched-lane-masks).
+  static bool schedLaneMasks();
   const AGXFrameLowering *getFrameLowering() const override {
     return &FrameLowering;
   }
@@ -130,7 +132,7 @@ public:
     // with subregister liveness, the pressure of a register's halves apart
     // (set each region: the policy outlives it)
     Policy.ShouldTrackLaneMasks =
-        enableSubRegLiveness() && Policy.ShouldTrackPressure;
+        enableSubRegLiveness() && schedLaneMasks() && Policy.ShouldTrackPressure;
   }
   // Local reassignment makes the greedy allocator try every other register
   // for each interfering live range. With the AGX register file (overlapping

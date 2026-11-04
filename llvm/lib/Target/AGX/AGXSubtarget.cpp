@@ -83,3 +83,9 @@ static cl::opt<bool> AGXSubRegLiveness(
 
 bool AGXSubtarget::enableSubRegLiveness() const { return AGXSubRegLiveness; }
 
+static cl::opt<bool> AGXSchedLaneMasks(
+    "agx-sched-lane-masks", cl::init(true), cl::Hidden,
+    cl::desc("With -agx-subreg-liveness, the scheduler tracks the pressure "
+             "of register halves apart"));
+
+bool AGXSubtarget::schedLaneMasks() { return AGXSchedLaneMasks; }
