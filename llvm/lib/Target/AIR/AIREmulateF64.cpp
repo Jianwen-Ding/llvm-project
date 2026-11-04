@@ -1189,6 +1189,55 @@ void EmulateF64::replaceOperations(Function &F) {
         constrainBFloat(I);
   for (Instruction &I : make_early_inc_range(instructions(F)))
     scalarizeDoubles(I);
+  // A conversion to a 32-bit integer of a value just rounded to an integral
+  // one (cvt.rni / rmi / rpi.s32.f64: roundeven, floor or ceil of one use,
+  // then fptosi.sat): the conversion of the value itself, marked air.round,
+  // which rounds the bits it shifts out (emulate()) instead of the 64-bit
+  // rounding before it.
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *CI = dyn_cast<IntrinsicInst>(&I);
+    if (!CI || CI->getType()->getScalarSizeInBits() > 32 ||
+        CI->getType()->isVectorTy() ||
+        (CI->getIntrinsicID() != Intrinsic::fptosi_sat &&
+         CI->getIntrinsicID() != Intrinsic::fptoui_sat))
+      continue;
+    auto *R = dyn_cast<IntrinsicInst>(CI->getArgOperand(0));
+    if (!R || !R->getType()->isDoubleTy())
+      continue;
+    // (NaN tests of the rounded value, as ZLUDA's NaN-to-INT_MIN select
+    // makes, test the value itself: rounding keeps NaNs)
+    for (User *U : make_early_inc_range(R->users()))
+      if (auto *C = dyn_cast<FCmpInst>(U);
+          C && (C->getPredicate() == CmpInst::FCMP_UNO ||
+                C->getPredicate() == CmpInst::FCMP_ORD) &&
+          C->getOperand(0) == R &&
+          (R->getIntrinsicID() == Intrinsic::roundeven ||
+           R->getIntrinsicID() == Intrinsic::floor ||
+           R->getIntrinsicID() == Intrinsic::ceil)) {
+        // (uno / ord with itself or with a constant that is not a NaN, as
+        // InstCombine writes it)
+        Value *O = C->getOperand(1);
+        auto *K = dyn_cast<ConstantFP>(O);
+        if (O != R && !(K && !K->isNaN()))
+          continue;
+        C->setOperand(0, R->getArgOperand(0));
+        if (O == R)
+          C->setOperand(1, R->getArgOperand(0));
+      }
+    if (!R->hasOneUse())
+      continue;
+    StringRef Mode;
+    switch (R->getIntrinsicID()) {
+    case Intrinsic::roundeven: Mode = "rne"; break;
+    case Intrinsic::floor: Mode = "down"; break;
+    case Intrinsic::ceil: Mode = "up"; break;
+    default: continue;
+    }
+    CI->setArgOperand(0, R->getArgOperand(0));
+    CI->setMetadata("air.round",
+                    MDNode::get(Ctx, MDString::get(Ctx, Mode)));
+    R->eraseFromParent();
+  }
   for (Instruction &I : make_early_inc_range(instructions(F))) {
     // No fast-math flags on what becomes an integer (a phi, a select, a
     // call of doubles).
@@ -1247,6 +1296,9 @@ void EmulateF64::replaceOperations(Function &F) {
                      ? "llvm.experimental.constrained.sitofp.f64.i32"
                      : "llvm.experimental.constrained.uitofp.f64.i32";
       }
+      if (MDNode *Round = CI->getMetadata("air.round"))
+        MD += "|round:" +
+              cast<MDString>(Round->getOperand(0))->getString().str();
       std::string Key =
           ("call:" + Name + "|" + doubleMask(CI->getType(), Tys) + MD).str();
       // bfloat is computed in float where the function keeps float
@@ -1822,8 +1874,17 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
       // for an unbiased exponent e in [0, 31]; 0 below, the limit above.
       bool Signed = B2 == "fptosi";
       unsigned W = Ret->getIntegerBitWidth();
-      Value *Hi = B.CreateTrunc(B.CreateLShr(A[0], 32), I32);
-      Value *Lo = B.CreateTrunc(A[0], I32);
+      // With the air.round mark of replaceOperations (the value was rounded
+      // to nearest even, down or up before), the conversion rounds itself
+      // from the bits it shifts out.
+      enum { RTZ, RNE, RDown, RUp } Mode = RTZ;
+      for (StringRef P : drop_begin(Parts, 2))
+        if (P.consume_front("round:"))
+          Mode = P == "rne" ? RNE : P == "down" ? RDown : RUp;
+      Value *X0 = A[0];
+      Value *Wrap = B.getFalse();
+      Value *Hi = B.CreateTrunc(B.CreateLShr(X0, 32), I32);
+      Value *Lo = B.CreateTrunc(X0, I32);
       Value *Neg = B.CreateICmpSLT(Hi, B.getInt32(0));
       Value *E = B.CreateSub(B.CreateAnd(B.CreateLShr(Hi, 20), 0x7ff),
                              B.getInt32(1023));
@@ -1834,8 +1895,47 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
           B.CreateICmpULE(E, B.getInt32(31)),
           B.CreateLShr(M, B.CreateAnd(B.CreateSub(B.getInt32(31), E), 31)),
           B.getInt32(0));
-      Value *Over = B.CreateICmpSGT(E, B.getInt32(31));
-      Value *NaN = B.CreateICmpUGT(B.CreateAnd(A[0], B.getInt64(AbsMask)),
+      if (Mode != RTZ) {
+        // the bits shifted out, top-aligned (shift s = 31 - e, s = 32 for
+        // e = -1, everything for e < -1), the 21 low bits of the
+        // significand below them
+        Value *S = B.CreateSub(B.getInt32(31), E);
+        Value *InRange = B.CreateICmpULE(B.CreateAdd(E, B.getInt32(1)),
+                                         B.getInt32(32)); // e in [-1, 31]
+        // (s = 0, e = 31: nothing of the top word shifted out, the 21 low
+        // bits the fraction, guard bit first)
+        Value *S0 = B.CreateICmpEQ(S, B.getInt32(0));
+        Value *Out = B.CreateSelect(
+            S0, B.CreateShl(Lo, 11),
+            B.CreateShl(M, B.CreateAnd(B.CreateSub(B.getInt32(32), S), 31)));
+        Value *LoBits = B.CreateAnd(
+            B.CreateNot(S0),
+            B.CreateICmpNE(B.CreateAnd(Lo, 0x1fffff), B.getInt32(0)));
+        Value *NonZero = B.CreateICmpNE(B.CreateAnd(X0, B.getInt64(AbsMask)),
+                                        B.getInt64(0));
+        Value *Inc;
+        if (Mode == RNE) {
+          // e < -1: |x| < 1/2, to zero
+          Value *Guard = B.CreateAnd(
+              InRange, B.CreateICmpSLT(Out, B.getInt32(0)));
+          Value *Sticky = B.CreateOr(
+              B.CreateICmpNE(B.CreateShl(Out, 1), B.getInt32(0)), LoBits);
+          Value *Odd = B.CreateTrunc(Mag, B.getInt1Ty());
+          Inc = B.CreateAnd(Guard, B.CreateOr(Sticky, Odd));
+        } else {
+          // inexact: bits shifted out, or (e < -1) any nonzero value
+          Value *Inexact = B.CreateSelect(
+              InRange,
+              B.CreateOr(B.CreateICmpNE(Out, B.getInt32(0)), LoBits),
+              B.CreateAnd(NonZero, B.CreateICmpSLT(E, B.getInt32(0))));
+          Inc = B.CreateAnd(Inexact, Mode == RDown ? Neg : B.CreateNot(Neg));
+        }
+        // (2^32 - 1 rounded up: past every limit)
+        Wrap = B.CreateAnd(Inc, B.CreateICmpEQ(Mag, B.getInt32(-1)));
+        Mag = B.CreateAdd(Mag, B.CreateZExt(Inc, I32));
+      }
+      Value *Over = B.CreateOr(B.CreateICmpSGT(E, B.getInt32(31)), Wrap);
+      Value *NaN = B.CreateICmpUGT(B.CreateAnd(X0, B.getInt64(AbsMask)),
                                    B.getInt64(0x7ff0000000000000ull));
       Value *Lim;
       if (Signed) {
