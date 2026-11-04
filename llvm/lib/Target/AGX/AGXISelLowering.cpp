@@ -1971,7 +1971,8 @@ SDValue AGXTargetLowering::lowerFP_TO_BF16(SDValue Op,
   // value with itself (one compare-select, no magnitude), and the select is
   // of the 32-bit words, so one shift serves both.
   SDValue Quiet = DAG.getNode(ISD::OR, DL, MVT::i32, X, C(0x400000));
-  EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), MVT::f32);
+  EVT CCVT =
+      getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), MVT::f32);
   SDValue IsNaN = DAG.getSetCC(DL, CCVT, Src, Src, ISD::SETUO);
   R = DAG.getSelect(DL, MVT::i32, IsNaN, Quiet, R);
   return DAG.getNode(ISD::TRUNCATE, DL, Op.getValueType(),

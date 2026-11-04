@@ -333,34 +333,50 @@ public:
 
   /// The magnitude of S, rounded to nearest even, rounded in the direction
   /// Rounding instead, with the sign of S: Err is the exact result minus S.
+  /// (A unit on the bits of S is a unit on its magnitude, the sign kept, and
+  /// the error with the sign of S applied is that of the exact magnitude
+  /// minus |S|: no magnitude, no sign put back.)
   Value *adjust(Value *S, Value *Err) {
     Value *SB = bits(S);
     Value *Neg = B.CreateICmpSLT(SB, c32(0));
-    Value *Q = flt(B.CreateAnd(SB, c32(0x7fffffff)));
-    Value *R = adjustMagnitude(Q, B.CreateSelect(Neg, B.CreateFNeg(Err), Err), Neg);
-    return flt(B.CreateOr(bits(R), B.CreateAnd(SB, c32(0x80000000))));
+    // Up or down, known: a unit up in value is +1 on the bits of a positive
+    // S and -1 on a negative one (the reverse down), where the exact value
+    // is beyond S in that direction.
+    if (auto *RC = dyn_cast<ConstantInt>(Rounding);
+        RC &&
+        (RC->getZExtValue() == RoundUp || RC->getZExtValue() == RoundDown)) {
+      bool Up = RC->getZExtValue() == RoundUp;
+      Value *Unit = B.CreateSelect(Neg, c32(Up ? -1 : 1), c32(Up ? 1 : -1));
+      Value *Beyond = Up ? B.CreateFCmpOGT(Err, fconst(0.0f))
+                         : B.CreateFCmpOLT(Err, fconst(0.0f));
+      return flt(B.CreateAdd(SB, B.CreateSelect(Beyond, Unit, c32(0))));
+    }
+    Value *ErrM = flt(B.CreateXor(bits(Err), B.CreateAnd(SB, c32(0x80000000))));
+    return adjustMagnitude(S, ErrM, Neg);
   }
 
   /// X + Y (X - Y) rounded in the direction Rounding, using the hardware: the
   /// error of the sum rounded to nearest even is exact (TwoSum) when the
   /// operands are zero or at least 2^-102 (all values are then multiples of
-  /// 2^-125, so none is denormal) and below 2^126, and the sum is finite and
-  /// nonzero. Returns the result and whether it is valid.
+  /// 2^-125, so none is denormal) and below 2^126 (all values are then
+  /// below 1.5 * 2^127, so the sum is finite). Returns the result and
+  /// whether it is valid.
   std::pair<Value *, Value *> fastAdd(Value *X, Value *Y, bool Sub) {
     if (Sub)
       Y = B.CreateFNeg(Y);
     Value *S = B.CreateFAdd(X, Y);
     Value *BB = B.CreateFSub(S, X);
     Value *Err = B.CreateFAdd(B.CreateFSub(X, B.CreateFSub(S, BB)), B.CreateFSub(Y, BB));
-    auto Operand = [&](Value *V) {
-      Value *M = B.CreateAnd(bits(V), c32(0x7fffffff));
-      // zero, or in [2^-102, 2^126)
-      return B.CreateOr(B.CreateICmpEQ(M, c32(0)),
-                        B.CreateICmpULT(B.CreateSub(M, c32(0x0c800000)), c32(0x7e800000 - 0x0c800000)));
-    };
+    // Both operands zero or in [2^-102, 2^126), at once: the smaller
+    // magnitude less one (a zero wraps to the largest) and the larger one.
+    Value *MX = B.CreateAnd(bits(X), c32(0x7fffffff));
+    Value *MY = B.CreateAnd(bits(Y), c32(0x7fffffff));
+    Value *Small = B.CreateBinaryIntrinsic(
+        Intrinsic::umin, B.CreateSub(MX, c32(1)), B.CreateSub(MY, c32(1)));
+    Value *Large = B.CreateBinaryIntrinsic(Intrinsic::umax, MX, MY);
+    Value *Valid = B.CreateAnd(B.CreateICmpUGE(Small, c32(0x0c800000 - 1)),
+                               B.CreateICmpULT(Large, c32(0x7e800000)));
     Value *SM = B.CreateAnd(bits(S), c32(0x7fffffff));
-    Value *Valid = B.CreateICmpULT(SM, c32(0x7f800000));
-    Valid = B.CreateAnd(Valid, B.CreateAnd(Operand(X), Operand(Y)));
     // An exact zero sum is -0 rounding down, unless both operands are +0.
     Value *BothPlusZero = B.CreateICmpEQ(B.CreateOr(bits(X), bits(Y)), c32(0));
     Value *DownZero = B.CreateAnd(B.CreateICmpEQ(SM, c32(0)), roundingIs(RoundDown));
