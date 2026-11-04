@@ -1832,7 +1832,14 @@ SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
   EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
   SDValue R = DAG.getNode(Max ? ISD::FMAXNUM : ISD::FMINNUM, DL, VT, A, B,
                           Op->getFlags());
-  if (!Op->getFlags().hasNoSignedZeros()) {
+  // (equal operands with different bits are zeros of two signs: none where
+  // one is a nonzero constant, as in a clamp)
+  auto NonZeroConst = [](SDValue V) {
+    auto *C = dyn_cast<ConstantFPSDNode>(V);
+    return C && !C->isZero();
+  };
+  if (!Op->getFlags().hasNoSignedZeros() && !NonZeroConst(A) &&
+      !NonZeroConst(B)) {
     EVT IntVT = VT.changeTypeToInteger();
     SDValue Bits = DAG.getNode(Max ? ISD::AND : ISD::OR, DL, IntVT,
                                DAG.getBitcast(IntVT, A),
