@@ -1022,7 +1022,7 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
 bool AGXTTIImpl::elementAlignedVectors() { return AGXElementAlignedVectors; }
 
 static cl::opt<bool> AGXBytePairChains(
-    "agx-byte-pair-chains", cl::init(false), cl::Hidden,
+    "agx-byte-pair-chains", cl::init(true), cl::Hidden,
     cl::desc("Merge two neighbouring 2-byte aligned device bytes into one "
              "access of the byte format"));
 bool AGXTTIImpl::bytePairChains() { return AGXBytePairChains; }
