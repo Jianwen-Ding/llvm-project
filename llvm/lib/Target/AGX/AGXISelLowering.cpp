@@ -1431,7 +1431,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     F = DAG.getNode(ISD::AND, DL, MVT::i32, F, C((1u << W) - 1));
     uint64_t Sign = 1u << (W - 1);
     return DAG.getNode(ISD::SUB, DL, MVT::i32,
-                       DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(Sign)), C(Sign));
+                       DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(Sign)),
+                       C(Sign));
   }
   case ISD::FMINIMUMNUM: {
     // minimumnum(maximumnum(x, +0), 1): the clamp of .sat (a NaN becomes +0
