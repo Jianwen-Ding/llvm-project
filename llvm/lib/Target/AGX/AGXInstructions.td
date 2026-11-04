@@ -309,6 +309,11 @@ def : Pat<(i64 (add i64:$a, (sext i32:$x))),
 def : Pat<(i64 (add i64:$a, (shl i64:$b, agx_iadd_shift:$s))),
           (IADD_I64 0, $a, 0, $b, imm:$s)>;
 // The shift applies to the second source (and to the addend of imadd).
+// x << s alone, s at most 4: an addition to zero on the ALU, not a bfi on the
+// unit integer multiplies, bit fields and conversions share.
+let AddedComplexity = 1 in
+def : Pat<(i32 (shl AGXIntSrc32:$b, agx_iadd_shift:$s)),
+          (IADD_I32 0, (i32 0), 0, $b, imm:$s)>;
 def : Pat<(i32 (add AGXIntSrc32:$a, (shl AGXIntSrc32:$b, agx_iadd_shift:$s))),
           (IADD_I32 0, $a, 0, $b, imm:$s)>;
 def : Pat<(i32 (sub AGXIntSrc32:$a, (shl AGXIntSrc32:$b, agx_iadd_shift:$s))),

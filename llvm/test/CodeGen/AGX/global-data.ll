@@ -26,7 +26,7 @@ define agx_kernel void @kernel(ptr addrspace(1) %out, i32 %i) {
 ; CHECK-NEXT:    convert s32_to_f, r3, r1, rte
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    fadd32 r2, r2, r3
-; CHECK-NEXT:    bfi r3, 0, u2, 2
+; CHECK-NEXT:    iadd r3, 0, u2, lsl 2
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, 0, signed
 ; CHECK-NEXT:    threadgroup_store i32, x, r1, r3l, 0
 ; CHECK-NEXT:    stop

@@ -13,7 +13,8 @@ declare i32 @llvm.agx.thread.position.in.threadgroup.x()
 
 ; G14-LABEL: exchange:
 ; G14:         threadgroup_store
-; G14-NEXT:    block_barrier
+; G14-NOT:     memory_barrier
+; G14:         block_barrier
 ; G14-NOT:     memory_barrier
 ; G14:         threadgroup_load
 ; G14:         stop
