@@ -395,11 +395,16 @@ public:
   std::pair<Value *, Value *> addFast(Value *X, Value *Y) {
     Value *YBigger = B.CreateICmpUGT(magnitude(Y, F64), magnitude(X, F64));
     Value *Big = select(YBigger, Y, X), *Small = select(YBigger, X, Y);
-    Value *Implicit = c64(F64.fracMask() + 1);
-    Value *MB = B.CreateShl(B.CreateOr(B.CreateAnd(Big, c64(F64.fracMask())), Implicit), 10);
-    Value *MS = B.CreateShl(B.CreateOr(B.CreateAnd(Small, c64(F64.fracMask())), Implicit), 10);
     Value *EB = B.CreateTrunc(B.CreateAnd(B.CreateLShr(Big, 52), c64(F64.expAll())), I32);
     Value *ES = B.CreateTrunc(B.CreateAnd(B.CreateLShr(Small, 52), c64(F64.expAll())), I32);
+    // (a zero's significand 0: the implicit bit only with a nonzero
+    // exponent, so that a zero operand adds nothing; denormals take the slow
+    // path)
+    auto Implicit = [&](Value *E) {
+      return B.CreateShl(B.CreateZExt(B.CreateICmpNE(E, c32(0)), I64), 52);
+    };
+    Value *MB = B.CreateShl(B.CreateOr(B.CreateAnd(Big, c64(F64.fracMask())), Implicit(EB)), 10);
+    Value *MS = B.CreateShl(B.CreateOr(B.CreateAnd(Small, c64(F64.fracMask())), Implicit(ES)), 10);
     Value *D = B.CreateSub(EB, ES);
     MS = B.CreateOr(lshrTopClear(MS, D), B.CreateZExt(lostBelow(MS, D), I64));
     Value *Same = B.CreateICmpSGE(B.CreateXor(X, Y), c64(0));
@@ -411,13 +416,11 @@ public:
     Value *E = B.CreateSub(B.CreateAdd(EB, c32(1)), B.CreateTrunc(Lz, I32));
     auto [Bits, Valid] = roundNormalRNE(N, E);
     Bits = B.CreateOr(Bits, B.CreateAnd(Big, c64(F64.signBit())));
-    // an exact cancellation: +0; a zero operand: the other one (two zeros:
-    // -0 only if both are, their bits ANDed)
+    // a zero sum (an exact cancellation, or two zeros): +0, or -0 where both
+    // are -0, the signs ANDed (a zero Small and a nonzero Big: Big, exactly)
     Value *SZero = B.CreateICmpEQ(S, c64(0));
-    Bits = select(SZero, c64(0), Bits);
-    Value *SmallZero = isZero(Small, F64);
-    Bits = select(SmallZero, select(isZero(Big, F64), B.CreateAnd(Big, Small), Big), Bits);
-    Valid = B.CreateOr(B.CreateOr(SmallZero, SZero), Valid);
+    Bits = select(SZero, B.CreateAnd(B.CreateAnd(Big, Small), c64(F64.signBit())), Bits);
+    Valid = B.CreateOr(SZero, Valid);
     return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y)))};
   }
 
