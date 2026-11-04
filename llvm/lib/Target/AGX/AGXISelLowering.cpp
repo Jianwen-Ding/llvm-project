@@ -102,7 +102,8 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
   setTargetDAGCombine({ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
-                       ISD::ZERO_EXTEND, ISD::FMINIMUMNUM});
+                       ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
+                       ISD::SIGN_EXTEND_INREG});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1387,6 +1388,51 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   switch (N->getOpcode()) {
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
+  case ISD::SIGN_EXTEND_INREG: {
+    // The low byte signed: ((x & 255) ^ 128) - 128, as below. (16 bits are
+    // one addition with a sign-extended 16-bit source.)
+    if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32 ||
+        cast<VTSDNode>(N->getOperand(1))->getVT() != MVT::i8)
+      return SDValue();
+    SDLoc DL(N);
+    SelectionDAG &DAG = DCI.DAG;
+    auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i32); };
+    SDValue F = DAG.getNode(ISD::AND, DL, MVT::i32, N->getOperand(0), C(255));
+    return DAG.getNode(ISD::SUB, DL, MVT::i32,
+                       DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(128)), C(128));
+  }
+  case ISD::SRA: {
+    // A signed byte, sra(shl(x, 24 - p), 24): the field (one extract, or an
+    // and at p = 0) and (f ^ 128) - 128 on the ALUs, instead of two shifts on
+    // the unit that integer multiplies, bit fields and conversions share
+    // (the sign-extended bytes of dp4a). A 16-bit field: its shift and a
+    // sign-extending addition, one shift fewer.
+    SDValue A = N->getOperand(0);
+    auto *S2 = dyn_cast<ConstantSDNode>(N->getOperand(1));
+    if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32 || !S2 ||
+        A.getOpcode() != ISD::SHL || !A.hasOneUse())
+      return SDValue();
+    auto *S1 = dyn_cast<ConstantSDNode>(A.getOperand(1));
+    if (!S1)
+      return SDValue();
+    uint64_t Sh1 = S1->getZExtValue(), Sh2 = S2->getZExtValue();
+    unsigned W = 32 - Sh2;
+    if (Sh2 >= 32 || Sh1 > Sh2 || (W != 8 && W != 16))
+      return SDValue();
+    SDLoc DL(N);
+    SelectionDAG &DAG = DCI.DAG;
+    auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i32); };
+    SDValue X = A.getOperand(0), F = X;
+    if (unsigned P = Sh2 - Sh1)
+      F = DAG.getNode(ISD::SRL, DL, MVT::i32, X, C(P));
+    if (W == 16)
+      return DAG.getNode(ISD::SIGN_EXTEND_INREG, DL, MVT::i32, F,
+                         DAG.getValueType(MVT::i16));
+    F = DAG.getNode(ISD::AND, DL, MVT::i32, F, C((1u << W) - 1));
+    uint64_t Sign = 1u << (W - 1);
+    return DAG.getNode(ISD::SUB, DL, MVT::i32,
+                       DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(Sign)), C(Sign));
+  }
   case ISD::FMINIMUMNUM: {
     // minimumnum(maximumnum(x, +0), 1): the clamp of .sat (a NaN becomes +0
     // and -0 becomes +0, as maximumnum(-0, +0) is +0), before the two become
