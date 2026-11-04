@@ -21,9 +21,11 @@
 #include "AGXMachineFunctionInfo.h"
 #include "AGXTargetTransformInfo.h"
 #include "TargetInfo/AGXTargetInfo.h"
+#include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineScheduler.h"
-#include "llvm/CodeGen/PseudoSourceValue.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/PseudoSourceValue.h"
+#include "llvm/CodeGen/RegisterPressure.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Constants.h"
@@ -32,20 +34,22 @@
 #include "llvm/IR/Module.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
-#include "llvm/Support/Compiler.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/NaryReassociate.h"
-#include "llvm/Transforms/Scalar/StraightLineStrengthReduce.h"
 #include "llvm/Transforms/Scalar/Scalarizer.h"
+#include "llvm/Transforms/Scalar/StraightLineStrengthReduce.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Vectorize/LoadStoreVectorizer.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "agx-target-machine"
 
 static cl::opt<bool> AGXPruneBeforeInline(
     "agx-prune-before-inline", cl::init(true), cl::Hidden,
@@ -231,9 +235,109 @@ void AGXTargetMachine::registerEarlyDefaultAliasAnalyses(AAManager &AAM) {
   AAM.registerFunctionAnalysis<AGXAA>();
 }
 
+static cl::opt<bool> AGXSchedKeepOccupancy(
+    "agx-sched-keep-occupancy", cl::init(true), cl::Hidden,
+    cl::desc("Keep a region's original order where scheduling it would lower "
+             "the threads its register pressure lets reside"));
+
+namespace {
+/// Picks the region's instructions in their order before the first
+/// scheduling (top-down; that order is a topological one of the DAG).
+class AGXOriginalOrderStrategy : public MachineSchedStrategy {
+  const DenseMap<const MachineInstr *, unsigned> &Index;
+  SmallVector<SUnit *, 64> Ready;
+
+public:
+  AGXOriginalOrderStrategy(const DenseMap<const MachineInstr *, unsigned> &I)
+      : Index(I) {}
+  void initialize(ScheduleDAGMI *) override { Ready.clear(); }
+  SUnit *pickNode(bool &IsTopNode) override {
+    IsTopNode = true;
+    if (Ready.empty())
+      return nullptr;
+    auto Best = llvm::min_element(Ready, [&](SUnit *A, SUnit *B) {
+      return Index.lookup(A->getInstr()) < Index.lookup(B->getInstr());
+    });
+    SUnit *SU = *Best;
+    Ready.erase(Best);
+    return SU;
+  }
+  void schedNode(SUnit *, bool) override {}
+  void releaseTopNode(SUnit *SU) override { Ready.push_back(SU); }
+  void releaseBottomNode(SUnit *) override {}
+};
+
+/// The generic scheduler, but a region whose new order needs more registers
+/// than its original one, enough to cost resident threads (the hardware
+/// allocates registers per thread: AGXSubtarget::maxThreadsForHalves), is
+/// scheduled again in its original order, as AMDGPU's scheduler reverts a
+/// region that lowered occupancy. The generic heuristics only see register
+/// pressure against the whole register file, not against the occupancy
+/// steps below it: on large straight-line blocks (emulated tensor-core and
+/// matrix operations) their latency ordering kept dozens more values live.
+class AGXScheduleDAGMILive : public ScheduleDAGMILive {
+  int GPRSet = -1;
+
+  /// The peak of the 16-bit GPR halves pressure set over the region, in its
+  /// current order (live-through values included).
+  unsigned regionHalves() {
+    if (GPRSet < 0 || RegionBegin == RegionEnd)
+      return 0;
+    IntervalPressure P;
+    RegPressureTracker RPT(P);
+    RPT.init(&MF, RegClassInfo, LIS, BB, RegionEnd, ShouldTrackLaneMasks,
+             /*TrackUntiedDefs=*/false);
+    while (RPT.getPos() != RegionBegin)
+      RPT.recede();
+    RPT.closeRegion();
+    return P.MaxSetPressure[GPRSet];
+  }
+
+public:
+  AGXScheduleDAGMILive(MachineSchedContext *C)
+      : ScheduleDAGMILive(C, std::make_unique<GenericScheduler>(C)) {
+    for (unsigned I = 0, E = TRI->getNumRegPressureSets(); I < E; ++I)
+      if (StringRef(TRI->getRegPressureSetName(I)) == "GPR16")
+        GPRSet = I;
+  }
+
+  void schedule() override {
+    if (!AGXSchedKeepOccupancy || GPRSet < 0) {
+      ScheduleDAGMILive::schedule();
+      return;
+    }
+    DenseMap<const MachineInstr *, unsigned> Index;
+    for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
+      Index[&MI] = Index.size();
+    unsigned Before = regionHalves();
+    ScheduleDAGMILive::schedule();
+    unsigned After = regionHalves();
+    LLVM_DEBUG(dbgs() << "agx-occupancy region " << BB->getName() << " "
+                      << Index.size() << " instrs: halves " << Before << " -> "
+                      << After << "\n");
+    if (After <= Before || AGXSubtarget::maxThreadsForHalves(After) >=
+                               AGXSubtarget::maxThreadsForHalves(Before))
+      return;
+    // the original order again, through the scheduler's own moves
+    std::unique_ptr<MachineSchedStrategy> Original =
+        std::make_unique<AGXOriginalOrderStrategy>(Index);
+    // (without the mutations, whose clustering edges need not hold in the
+    // original order)
+    std::vector<std::unique_ptr<ScheduleDAGMutation>> Kept;
+    std::swap(Mutations, Kept);
+    std::swap(SchedImpl, Original);
+    ScheduleDAGMILive::schedule();
+    std::swap(SchedImpl, Original);
+    std::swap(Mutations, Kept);
+    LLVM_DEBUG(dbgs() << "agx-occupancy reverted: halves " << regionHalves()
+                      << "\n");
+  }
+};
+} // namespace
+
 ScheduleDAGInstrs *
 AGXTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
-  ScheduleDAGMILive *DAG = createSchedLive(C);
+  ScheduleDAGMILive *DAG = new AGXScheduleDAGMILive(C);
   DAG->addMutation(createAGXMemClusterMutation());
   return DAG;
 }
