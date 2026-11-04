@@ -141,8 +141,9 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction({ISD::MULHU, ISD::MULHS}, MVT::i64, Custom);
   setOperationAction({ISD::ROTL, ISD::ROTR, ISD::FSHL}, {MVT::i16, MVT::i64},
                      Expand);
-  setOperationAction(ISD::ROTL, MVT::i32, Expand);
-  setOperationAction(ISD::FSHL, MVT::i32, Expand);
+  // fshl / rotl: extr by 32 - (s mod 32) (an amount of 32 gives the high
+  // word, as s = 0 needs)
+  setOperationAction({ISD::ROTL, ISD::FSHL}, MVT::i32, Legal);
   setOperationAction(ISD::FSHR, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i64, Custom);

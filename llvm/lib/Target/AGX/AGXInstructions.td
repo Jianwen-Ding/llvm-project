@@ -523,6 +523,23 @@ def : Pat<(i32 (fshr i32:$hi, i32:$lo, (i32 imm:$s))),
           (EXTR_I32 0, $lo, 0, $hi, 0, (i32 (AGXImm31 $s)), 0)>;
 def : Pat<(i32 (fshr i32:$hi, i32:$lo, AGXIntSrc32:$s)),
           (EXTR_I32 0, $lo, 0, $hi, 0, (BITOP_I32 TT_AND, 0, $s, 0, (i32 31)), 0)>;
+// fshl(hi, lo, s) = (hi:lo) >> (32 - s mod 32), rotl the same of (a:a).
+def AGXImm32Minus : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(32 - (N->getZExtValue() & 31), SDLoc(N),
+                                   MVT::i32);
+}]>;
+def : Pat<(i32 (fshl i32:$hi, i32:$lo, (i32 imm:$s))),
+          (EXTR_I32 0, $lo, 0, $hi, 0, (i32 (AGXImm32Minus $s)), 0)>;
+def : Pat<(i32 (fshl i32:$hi, i32:$lo, AGXIntSrc32:$s)),
+          (EXTR_I32 0, $lo, 0, $hi, 0,
+                    (ISUB_I32 0, (i32 32), 0,
+                              (BITOP_I32 TT_AND, 0, $s, 0, (i32 31)), 0), 0)>;
+def : Pat<(i32 (rotl i32:$a, (i32 imm:$s))),
+          (EXTR_I32 0, $a, 0, $a, 0, (i32 (AGXImm32Minus $s)), 0)>;
+def : Pat<(i32 (rotl i32:$a, AGXIntSrc32:$s)),
+          (EXTR_I32 0, $a, 0, $a, 0,
+                    (ISUB_I32 0, (i32 32), 0,
+                              (BITOP_I32 TT_AND, 0, $s, 0, (i32 31)), 0), 0)>;
 
 def : Pat<(i32 (sext_inreg i32:$a, i8)),
           (ASR_I32 0, (BFI_I32 0, (i32 0), 0, $a, 0, (i32 24), 0), 0, (i32 24))>;
