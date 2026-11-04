@@ -36,6 +36,12 @@
 #include "AGX.h"
 #include "AGXSubtarget.h"
 #include "AGXTargetMachine.h"
+#include "llvm/ADT/GenericUniformityImpl.h"
+#include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/UniformityAnalysis.h"
+#include "llvm/Analysis/PostDominators.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/Support/CommandLine.h"
@@ -405,10 +411,13 @@ static void expand(Instruction &I, unsigned Bits, GlobalVariable *Locks) {
 /// a SIMD group whose active threads all access one address forms a batch:
 /// the lowest thread reads the value, all apply their operations in lane
 /// order, the lowest compare-and-swaps the result, and the batch tries again
-/// if that failed. Groups on different addresses keep the loop. With
+/// if that failed. With
 /// -agx-cas-batch-try-first every thread first tries one compare-and-swap,
 /// as the loop would, and only those that failed are batched: no check on an
 /// uncontended atomic, but on one address each group's 32 tries serialize.
+/// Only for a uniform address (the batch needs every active thread on one
+/// address, which a divergent one rarely is: there the check would only cost),
+/// which also makes the check needless, outside divergent branches.
 static void expandCASBatch(Instruction &I) {
   LLVMContext &Ctx = I.getContext();
   const DataLayout &DL = I.getDataLayout();
@@ -471,19 +480,12 @@ static void expandCASBatch(Instruction &I) {
     Old0 = fromInt(B, L0, ValTy);
   }
 
-  // the threads that failed: one address?
+  // the threads that failed (all of them on the uniform address)
   B.SetInsertPoint(Failed);
-  unsigned PtrBits =
-      DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
-  Value *A64 = B.CreateZExtOrTrunc(
-      B.CreatePtrToInt(WordPtr, B.getIntNTy(PtrBits)), B.getInt64Ty());
   Value *Pending =
       B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {B.getTrue()});
   Value *First = B.CreateBinaryIntrinsic(Intrinsic::cttz, Pending, B.getTrue());
-  Value *Same =
-      B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot,
-                        {B.CreateICmpEQ(A64, shuffleWide(B, A64, First, 64))});
-  B.CreateCondBr(B.CreateICmpEQ(Same, Pending), Batch, Single);
+  B.CreateBr(Batch);
 
   B.SetInsertPoint(Batch);
   Value *Lane =
@@ -668,6 +670,34 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   }
   for (LoadInst *LI : NarrowLoads)
     widenNarrowAtomicLoad(*LI);
+  if (!CASLoops.empty()) {
+    DominatorTree DT(F);
+    CycleInfo CI;
+    CI.compute(F);
+    TargetTransformInfo TTI = TM->getTargetTransformInfo(F);
+    UniformityInfo UI(DT, CI, &TTI);
+    UI.compute();
+    PostDominatorTree PDT(F);
+    // Under a divergent branch (a dominating block whose terminator is
+    // divergent and that the atomic's block does not post-dominate) usually
+    // few threads are active, as in a block's or a SIMD group's one atomic
+    // of a reduction (if (tid == 0)): the plain loop.
+    auto UnderDivergentBranch = [&](BasicBlock *BB) {
+      for (DomTreeNode *N = DT.getNode(BB)->getIDom(); N; N = N->getIDom()) {
+        BasicBlock *D = N->getBlock();
+        if (UI.hasDivergentTerminator(*D) && !PDT.dominates(BB, D))
+          return true;
+      }
+      return false;
+    };
+    llvm::erase_if(CASLoops, [&](Instruction *I) {
+      unsigned PtrOp = isa<AtomicRMWInst>(I)
+                           ? AtomicRMWInst::getPointerOperandIndex()
+                           : AtomicCmpXchgInst::getPointerOperandIndex();
+      return UI.isDivergentAtUse(I->getOperandUse(PtrOp)) ||
+             UnderDivergentBranch(I->getParent());
+    });
+  }
   for (Instruction *CAS : CASLoops)
     expandCASBatch(*CAS);
   if (Wide.empty())

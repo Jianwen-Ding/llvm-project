@@ -4,8 +4,10 @@
 ; 32-bit read-modify-writes that are compare-and-swap loops: a SIMD group
 ; whose active threads all access one address forms a batch (the lowest
 ; reads, the group applies the operations in lane order, the lowest
-; compare-and-swaps the result, the batch retrying together); groups on
-; different addresses keep the instruction (AtomicExpand's loop).
+; compare-and-swaps the result, the batch retrying together). Only for a
+; uniform address outside divergent branches: a divergent address, or an
+; atomic under a divergent branch (a reduction's one atomic), keeps the
+; instruction (AtomicExpand's loop).
 
 ; CHECK-LABEL: @inc(
 ; CHECK: cas.batch.failed:
@@ -76,5 +78,31 @@ define agx_kernel void @cas16(ptr addrspace(1) %p, i16 %a, i16 %b, ptr addrspace
   %r = cmpxchg ptr addrspace(1) %p, i16 %a, i16 %b monotonic monotonic, align 2
   %v = extractvalue { i16, i1 } %r, 0
   store i16 %v, ptr addrspace(1) %out
+  ret void
+}
+
+; CHECK-LABEL: @divergent_address(
+; CHECK-NOT: cas.batch
+; CHECK: atomicrmw uinc_wrap ptr addrspace(1) %q, i32 %v monotonic
+; CHECK: ret void
+define agx_kernel void @divergent_address(ptr addrspace(1) %p, i32 %v) {
+  %t = call i32 @llvm.agx.thread.position.in.threadgroup.x()
+  %q = getelementptr i32, ptr addrspace(1) %p, i32 %t
+  %o = atomicrmw uinc_wrap ptr addrspace(1) %q, i32 %v monotonic, align 4
+  ret void
+}
+
+; CHECK-LABEL: @one_thread(
+; CHECK-NOT: cas.batch
+; CHECK: atomicrmw uinc_wrap ptr addrspace(1) %p, i32 %v monotonic
+; CHECK: ret void
+define agx_kernel void @one_thread(ptr addrspace(1) %p, i32 %v) {
+  %t = call i32 @llvm.agx.thread.position.in.threadgroup.x()
+  %c = icmp eq i32 %t, 0
+  br i1 %c, label %a, label %e
+a:
+  %o = atomicrmw uinc_wrap ptr addrspace(1) %p, i32 %v monotonic, align 4
+  br label %e
+e:
   ret void
 }
