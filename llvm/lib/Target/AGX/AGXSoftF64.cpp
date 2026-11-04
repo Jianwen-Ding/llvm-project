@@ -332,9 +332,11 @@ public:
     return B.CreateOr(isNormal(Bits), isZero(Bits, F64));
   }
   /// Whether a double's exponent field is that of a normal number.
+  /// (in 32 bits: the field is in the high word)
   Value *isNormal(Value *Bits) {
-    Value *Exp = B.CreateAnd(B.CreateLShr(Bits, 52), c64(F64.expAll()));
-    return B.CreateICmpULT(B.CreateSub(Exp, c64(1)), c64(F64.expAll() - 1));
+    Value *Hi = B.CreateTrunc(B.CreateLShr(Bits, 32), I32);
+    Value *Exp = B.CreateAnd(B.CreateLShr(Hi, 20), c32(F64.expAll()));
+    return B.CreateICmpULT(B.CreateSub(Exp, c32(1)), c32(F64.expAll() - 1));
   }
   /// The bits of a normal double rounded to nearest even from a 64-bit N
   /// with its top bit set (and a sticky bit in its low bits), of the value
@@ -351,10 +353,10 @@ public:
     // 2^53 adds one more to the exponent)
     Value *E64 = B.CreateSExt(E, I64);
     Value *Bits = B.CreateAdd(B.CreateShl(B.CreateSub(E64, c64(1)), 52), Sig);
-    Value *Field = B.CreateLShr(Bits, 52);
-    Value *Valid = B.CreateAnd(B.CreateICmpSGE(E, c32(1)),
-                               B.CreateICmpULT(B.CreateSub(Field, c64(1)),
-                                               c64(F64.expAll() - 1)));
+    Value *Field = B.CreateLShr(B.CreateTrunc(B.CreateLShr(Bits, 32), I32), 20);
+    Value *Valid = B.CreateAnd(
+        B.CreateICmpSGE(E, c32(1)),
+        B.CreateICmpULT(B.CreateSub(Field, c32(1)), c32(F64.expAll() - 1)));
     return {Bits, Valid};
   }
   /// X * Y rounded to nearest even where both are normal and so is the
@@ -494,22 +496,29 @@ public:
   /// A double rounded to nearest even to a float (bits in an i64), where the
   /// double is zero or the result normal, and whether it is.
   std::pair<Value *, Value *> truncFast(Value *X) {
-    Value *E = B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll()));
-    Value *Frac = B.CreateAnd(X, c64(F64.fracMask()));
-    Value *M = B.CreateLShr(Frac, 29);
-    Value *Rest = B.CreateAnd(Frac, c64((uint64_t(1) << 29) - 1));
-    Value *Half = c64(uint64_t(1) << 28);
+    // in 32 bits: the exponent field is in the high word, the 23 bits kept
+    // span both, the rest is in the low word
+    Value *Hi = B.CreateTrunc(B.CreateLShr(X, 32), I32);
+    Value *Lo = B.CreateTrunc(X, I32);
+    Value *E = B.CreateAnd(B.CreateLShr(Hi, 20), c32(F64.expAll()));
+    Value *M = B.CreateTrunc(
+        B.CreateLShr(B.CreateAnd(X, c64(F64.fracMask())), 29), I32);
+    Value *Rest = B.CreateAnd(Lo, c32((1 << 29) - 1));
+    Value *Half = c32(1 << 28);
     Value *Inc = B.CreateOr(B.CreateICmpUGT(Rest, Half),
                             B.CreateAnd(B.CreateICmpEQ(Rest, Half), B.CreateTrunc(M, I1)));
-    // the exponent field E - 896, the rounding carry into it
-    Value *EF = B.CreateSub(E, c64(1023 - 127));
-    Value *Bits = B.CreateAdd(B.CreateAdd(B.CreateShl(EF, 23), M), B.CreateZExt(Inc, I64));
-    Value *Valid = B.CreateAnd(B.CreateICmpULT(B.CreateSub(EF, c64(1)), c64(254)),
-                               B.CreateICmpULT(Bits, c64(0x7f800000)));
+    // the exponent field E - 896, the rounding carry into it (out of range,
+    // the sum may wrap, but the field check fails)
+    Value *EF = B.CreateSub(E, c32(1023 - 127));
+    Value *Bits = B.CreateAdd(B.CreateAdd(B.CreateShl(EF, 23), M),
+                              B.CreateZExt(Inc, I32));
+    Value *Valid =
+        B.CreateAnd(B.CreateICmpULT(B.CreateSub(EF, c32(1)), c32(254)),
+                    B.CreateICmpULT(Bits, c32(0x7f800000)));
     Value *Zero = isZero(X, F64);
-    Bits = select(Zero, c64(0), Bits);
-    Bits = B.CreateOr(Bits, B.CreateShl(B.CreateLShr(X, 63), 31));
-    return {Bits, B.CreateOr(Valid, Zero)};
+    Bits = B.CreateSelect(Zero, c32(0), Bits);
+    Bits = B.CreateOr(Bits, B.CreateAnd(Hi, c32(int32_t(0x80000000u))));
+    return {B.CreateZExt(Bits, I64), B.CreateOr(Valid, Zero)};
   }
   /// A double truncated to an integer of type Ty where it fits (finite, of
   /// a magnitude below 2^(W - 1), or below 2^W and not negative unsigned),
