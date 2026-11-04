@@ -84,6 +84,8 @@ public:
   unsigned getMaxGPRsOfAllFunctions() const;
 
   const AGXInstrInfo *getInstrInfo() const override { return &InstrInfo; }
+  /// Liveness of a register's 16-bit halves apart (-agx-subreg-liveness).
+  bool enableSubRegLiveness() const override;
   const AGXFrameLowering *getFrameLowering() const override {
     return &FrameLowering;
   }
@@ -125,6 +127,10 @@ public:
       Policy.OnlyTopDown = false;
       Policy.OnlyBottomUp = false;
     }
+    // with subregister liveness, the pressure of a register's halves apart
+    // (set each region: the policy outlives it)
+    Policy.ShouldTrackLaneMasks =
+        enableSubRegLiveness() && Policy.ShouldTrackPressure;
   }
   // Local reassignment makes the greedy allocator try every other register
   // for each interfering live range. With the AGX register file (overlapping

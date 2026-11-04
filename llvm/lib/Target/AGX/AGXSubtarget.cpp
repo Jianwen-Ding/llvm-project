@@ -77,3 +77,9 @@ unsigned AGXSubtarget::getMaxGPRs(const Function &F) const {
   return Max;
 }
 
+static cl::opt<bool> AGXSubRegLiveness(
+    "agx-subreg-liveness", cl::init(false), cl::Hidden,
+    cl::desc("Track the liveness of 16-bit register halves apart"));
+
+bool AGXSubtarget::enableSubRegLiveness() const { return AGXSubRegLiveness; }
+
