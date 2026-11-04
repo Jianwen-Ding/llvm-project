@@ -19,6 +19,11 @@
 #include "llvm/Pass.h"
 
 namespace llvm {
+class Function;
+/// The most 32-bit registers that F's IR values hold at once (SSA liveness,
+/// each value by its size): an estimate of its register pressure before
+/// instruction selection.
+unsigned agxEstimatePressure(const Function &F);
 
 class AGXTargetMachine;
 class ScheduleDAGMutation;

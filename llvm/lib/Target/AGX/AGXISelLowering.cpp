@@ -301,10 +301,19 @@ bool AGXTargetLowering::isFMAFasterThanFMulAndFAdd(const MachineFunction &MF,
 }
 
 static cl::opt<unsigned> AGXSignedBytesALU(
-    "agx-signed-bytes-alu", cl::Hidden, cl::init(1),
+    "agx-signed-bytes-alu", cl::Hidden, cl::init(3),
     cl::desc("Sign-extend bytes with an and (or a field extract), an xor and "
              "a subtraction instead of two shifts: 0 never, 1 the low byte, "
-             "2 every byte"));
+             "2 every byte, 3 every byte in functions with register headroom "
+             "(-agx-headroom-gprs), else the low byte"));
+
+static cl::opt<unsigned> AGXHeadroomGPRs(
+    "agx-headroom-gprs", cl::Hidden, cl::init(24),
+    cl::desc(
+        "Functions whose estimated register pressure (agxEstimatePressure, "
+        "32-bit registers) is at most this take the forms that trade "
+        "registers for speed: their allocation stays well below the "
+        "registers at which threads are lost"));
 
 static cl::opt<bool> AGXDecomposeMul(
     "agx-decompose-mul", cl::Hidden, cl::init(true),
@@ -1474,7 +1483,13 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                        DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(128)), C(128));
   }
   case ISD::SRA: {
-    if (AGXSignedBytesALU < 2)
+    if (AGXSignedBytesALU < 2 ||
+        (AGXSignedBytesALU == 3 &&
+         DCI.DAG.getMachineFunction()
+                 .getInfo<AGXMachineFunctionInfo>()
+                 ->getEstimatedPressure(
+                     DCI.DAG.getMachineFunction().getFunction()) >
+             AGXHeadroomGPRs))
       return SDValue();
     // A signed byte, sra(shl(x, 24 - p), 24): the field (one extract, or an
     // and at p = 0) and (f ^ 128) - 128 on the ALUs, instead of two shifts on

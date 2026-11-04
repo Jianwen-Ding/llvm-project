@@ -9,11 +9,12 @@
 #ifndef LLVM_LIB_TARGET_AGX_AGXMACHINEFUNCTIONINFO_H
 #define LLVM_LIB_TARGET_AGX_AGXMACHINEFUNCTIONINFO_H
 
+#include "AGX.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/Support/Alignment.h"
 #include <optional>
-#include "llvm/CodeGen/MachineFunction.h"
 
 namespace llvm {
 
@@ -65,6 +66,8 @@ class AGXMachineFunctionInfo : public MachineFunctionInfo {
   unsigned GlobalDataHalfIndex = 0;
   /// The kernel's first four uniform halves hold the texture heap address.
   bool TextureHeap = false;
+  /// agxEstimatePressure of the function, once asked for.
+  std::optional<unsigned> EstimatedPressure;
 
   /// Threadgroup memory: offset of each __shared__ style variable.
   DenseMap<const GlobalVariable *, unsigned> ThreadgroupOffsets;
@@ -80,6 +83,11 @@ public:
     return DestMF.cloneInfo<AGXMachineFunctionInfo>(*this);
   }
 
+  unsigned getEstimatedPressure(const Function &F) {
+    if (!EstimatedPressure)
+      EstimatedPressure = agxEstimatePressure(F);
+    return *EstimatedPressure;
+  }
   void setImplicitArgHalfIndex(unsigned I) { ImplicitArgHalfIndex = I; }
   unsigned getImplicitArgHalfIndex() const { return ImplicitArgHalfIndex; }
   /// The first uniform half of each IR argument (~0u if it has none).

@@ -7,14 +7,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGXTargetTransformInfo.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
+#include "AGX.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/Transforms/InstCombine/InstCombiner.h"
 
 using namespace llvm;
@@ -34,7 +35,7 @@ static cl::opt<int> StorePressureLimit(
 
 /// The most 32-bit registers that IR values hold at once in F: SSA liveness,
 /// each value by its size (at least one register).
-static unsigned estimatePressure(const Function &F) {
+unsigned llvm::agxEstimatePressure(const Function &F) {
   const DataLayout &DL = F.getDataLayout();
   auto Size = [&](const Value *V) -> unsigned {
     Type *T = V->getType();
@@ -112,7 +113,7 @@ unsigned AGXTTIImpl::maxStoreVectorBytes() const {
                                           : unsigned(StorePressureLimit);
   if (Limit) {
     if (!Pressure)
-      Pressure = estimatePressure(*Fn);
+      Pressure = agxEstimatePressure(*Fn);
     if (*Pressure >= Limit)
       return 4;
   }
