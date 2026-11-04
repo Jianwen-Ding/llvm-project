@@ -701,7 +701,15 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   bool IsRem = Op == Instruction::URem || Op == Instruction::SRem;
   Type *I32 = B.getInt32Ty();
   Value *X = BO.getOperand(0);
-  Divisor D = Divisors.get(BO.getOperand(1), IsSigned, BO);
+  // umax(d, 1) (ZLUDA's guard of a PTX division, which selects its own
+  // result where d is zero): the expansion of d, whose zero divisor is
+  // replaced below by the result of dividing by one, so no maximum.
+  Value *Y0 = BO.getOperand(1), *Guarded = nullptr;
+  if (!IsSigned &&
+      match(Y0, PatternMatch::m_UMax(PatternMatch::m_Value(Guarded),
+                                     PatternMatch::m_One())))
+    Y0 = Guarded;
+  Divisor D = Divisors.get(Y0, IsSigned, BO);
   Value *Y = D.Y, *Z = D.Z;
   Value *XNeg = nullptr, *Neg = nullptr;
   if (IsSigned) {
@@ -723,7 +731,22 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   Value *Res = IsRem ? R : Q;
   if (IsSigned)
     Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
-  Value *Zero = B.CreateICmpEQ(BO.getOperand(1), B.getInt32(0));
+  if (Guarded) {
+    // where the only use already selects another value for d = 0, as
+    // ZLUDA's does, no select
+    using namespace PatternMatch;
+    if (BO.hasOneUse())
+      if (auto *Sel = dyn_cast<SelectInst>(BO.user_back());
+          Sel && Sel->getFalseValue() == &BO &&
+          match(
+              Sel->getCondition(),
+              m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(Guarded), m_Zero())))
+        return Res;
+    // x / 1 = x, x % 1 = 0
+    return B.CreateSelect(B.CreateICmpEQ(Y0, B.getInt32(0)),
+                          IsRem ? B.getInt32(0) : BO.getOperand(0), Res);
+  }
+  Value *Zero = B.CreateICmpEQ(Y0, B.getInt32(0));
   return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : B.getInt32(-1), Res);
 }
 
