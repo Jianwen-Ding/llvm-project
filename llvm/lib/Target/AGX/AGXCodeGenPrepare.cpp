@@ -721,6 +721,53 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : B.getInt32(-1), Res);
 }
 
+/// Division and remainder of at most 16 bits (8- and 16-bit PTX div / rem):
+/// the magnitudes (at most 2^16) are exact floats, so q = trunc(x rcp(y)) is
+/// within 2^-6 of x / y (rcp within 0.75 ulp, one rounding of the product)
+/// and so within one of the quotient; the remainder x - q y corrects it once
+/// either way. Division by zero gives all ones (remainder: x), as the 32-bit
+/// expansion does; the signed overflow -2^(n-1) / -1 wraps.
+static Value *expandDivRem16(BinaryOperator &BO) {
+  IRBuilder<> B(&BO);
+  Instruction::BinaryOps Op = BO.getOpcode();
+  bool IsSigned = Op == Instruction::SDiv || Op == Instruction::SRem;
+  bool IsRem = Op == Instruction::URem || Op == Instruction::SRem;
+  Type *Ty = BO.getType();
+  Type *I32 = B.getInt32Ty(), *F32 = B.getFloatTy();
+  Value *X = IsSigned ? B.CreateSExt(BO.getOperand(0), I32)
+                      : B.CreateZExt(BO.getOperand(0), I32);
+  Value *Y = IsSigned ? B.CreateSExt(BO.getOperand(1), I32)
+                      : B.CreateZExt(BO.getOperand(1), I32);
+  Value *Neg = nullptr;
+  if (IsSigned) {
+    Value *XNeg = B.CreateICmpSLT(X, B.getInt32(0));
+    Value *YNeg = B.CreateICmpSLT(Y, B.getInt32(0));
+    Neg = IsRem ? XNeg : B.CreateXor(XNeg, YNeg);
+    X = B.CreateSelect(XNeg, B.CreateNeg(X), X);
+    Y = B.CreateSelect(YNeg, B.CreateNeg(Y), Y);
+  }
+  Value *Rcp = B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, B.CreateUIToFP(Y, F32));
+  Value *Q = B.CreateFPToUI(B.CreateFMul(B.CreateUIToFP(X, F32), Rcp), I32);
+  Value *R = B.CreateSub(X, B.CreateMul(Q, Y));
+  Value *Low = B.CreateICmpSLT(R, B.getInt32(0));
+  Q = B.CreateSelect(Low, B.CreateSub(Q, B.getInt32(1)), Q);
+  R = B.CreateSelect(Low, B.CreateAdd(R, Y), R);
+  Value *High = B.CreateICmpSGE(R, Y);
+  Q = B.CreateSelect(High, B.CreateAdd(Q, B.getInt32(1)), Q);
+  R = B.CreateSelect(High, B.CreateSub(R, Y), R);
+  Value *Res = IsRem ? R : Q;
+  if (IsSigned)
+    Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
+  Res = B.CreateTrunc(Res, Ty);
+  Value *Zero = B.CreateICmpEQ(BO.getOperand(1), ConstantInt::get(Ty, 0));
+  return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : ConstantInt::getAllOnesValue(Ty), Res);
+}
+
+static cl::opt<bool> AGXNarrowDivisions(
+    "agx-narrow-divisions", cl::init(true), cl::Hidden,
+    cl::desc("8- and 16-bit division and remainder from the float reciprocal "
+             "with one integer correction (otherwise LLVM's bit loop)"));
+
 static cl::opt<bool> AGXLaunchDivisors(
     "agx-launch-divisors", cl::init(false), cl::Hidden,
     cl::desc("Divide by a 32-bit kernel argument with a multiplier and "
@@ -972,6 +1019,13 @@ bool AGXCodeGenPrepare::expandDivisions(Function &F) {
     Kernel = Bytes + MaxLaunchDivisors * 2 * 12 <= 1024;
   }
   for (BinaryOperator *BO : Worklist) {
+    if (BO->getType()->getIntegerBitWidth() <= 16 && AGXNarrowDivisions) {
+      Value *R = expandDivRem16(*BO);
+      R->takeName(BO);
+      BO->replaceAllUsesWith(R);
+      BO->eraseFromParent();
+      continue;
+    }
     if (!BO->getType()->isIntegerTy(32)) {
       Wide.push_back(BO);
       continue;
