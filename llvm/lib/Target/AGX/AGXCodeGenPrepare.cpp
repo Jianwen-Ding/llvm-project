@@ -781,6 +781,126 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   return B.CreateSelect(Zero, IsRem ? BO.getOperand(0) : B.getInt32(-1), Res);
 }
 
+namespace {
+struct Guard16 {
+  Value *D = nullptr;                          // the unguarded divisor
+  SmallVector<std::pair<Instruction *, bool>, 4> Roots; // (value, remainder)
+  SmallVector<Instruction *, 8> Dead;
+};
+} // namespace
+
+/// ZLUDA guards a signed division's divisor as d = -1 ? 1 : d, or as
+/// d + 1 <u 2 ? 1 : d (d = 0 and -1), and selects its results itself there:
+/// the quotient -x and all ones, the remainder 0 and x (the remainder taken
+/// as x - q d' where DivRemPairs decomposed it). The expansion gives those
+/// values when it divides by d itself (-x wrapping as the select's does,
+/// x - q 0 = x, x - (-x)(-1) = 0), so where every use of the division is such
+/// a select (or the decomposed remainder ending in them), it divides by d and
+/// the selects go.
+static std::optional<Guard16> matchGuard16(BinaryOperator &BO) {
+  using namespace PatternMatch;
+  bool IsRem = BO.getOpcode() == Instruction::SRem;
+  Value *Y = BO.getOperand(1), *D;
+  Value *GuardSel = Y;
+  if (auto *Fr = dyn_cast<FreezeInst>(Y))
+    GuardSel = Fr->getOperand(0);
+  // (d + 1 <u 2: the guard takes d = 0 too, whose results the selects must
+  // then give; with d = -1 alone, division by 0 is undefined)
+  bool GuardsZero;
+  if (match(GuardSel, m_Select(m_SpecificICmp(ICmpInst::ICMP_ULT,
+                                              m_Add(m_Value(D), m_One()),
+                                              m_SpecificInt(2)),
+                               m_One(), m_Deferred(D))))
+    GuardsZero = true;
+  else if (match(GuardSel,
+                 m_Select(m_SpecificICmp(ICmpInst::ICMP_EQ, m_Value(D),
+                                         m_AllOnes()),
+                          m_One(), m_Deferred(D))))
+    GuardsZero = false;
+  else
+    return std::nullopt;
+  Value *X = BO.getOperand(0);
+  auto IsX = [&](Value *V) {
+    auto *Fr = dyn_cast<FreezeInst>(X);
+    return V == X || (Fr && V == Fr->getOperand(0));
+  };
+  // 1: selects d = -1's value, 2: d = 0's (the expansion by d gives
+  // quotient -x and all ones, remainder 0 and x), 0: neither
+  auto Kind = [&](SelectInst *S, bool Rem) {
+    Value *C = S->getCondition(), *T = S->getTrueValue(), *N;
+    if (match(C, m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(D),
+                                m_AllOnes())))
+      return (Rem ? match(T, m_Zero())
+                  : match(T, m_Neg(m_Value(N))) && IsX(N))
+                 ? 1
+                 : 0;
+    if (match(C, m_SpecificICmp(ICmpInst::ICMP_EQ, m_Specific(D), m_Zero())))
+      return (Rem ? IsX(T) : match(T, m_AllOnes())) ? 2 : 0;
+    return 0;
+  };
+  Guard16 G;
+  G.D = D;
+  // the chain of selects of such values from V, each the false value of the
+  // next and used once but the last: its last is a root, the value of the
+  // expansion's quotient or remainder if the chain covers what the guard
+  // changed (quotient: d = -1; and d = 0 if the guard takes it)
+  auto Chain = [&](Instruction *V, bool Rem) {
+    bool MinusOne = false, Zero = false;
+    Instruction *Start = V;
+    while (V->hasOneUse()) {
+      auto *S = dyn_cast<SelectInst>(V->user_back());
+      int K = S && S->getFalseValue() == V ? Kind(S, Rem) : 0;
+      if (!K)
+        break;
+      (K == 1 ? MinusOne : Zero) = true;
+      if (V != Start)
+        G.Dead.push_back(V);
+      V = S;
+    }
+    if (V == Start || (!Rem && !MinusOne) || (GuardsZero && !Zero))
+      return false;
+    G.Roots.push_back({V, Rem});
+    return true;
+  };
+  for (User *U : BO.users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      return std::nullopt;
+    // x - q d' (DivRemPairs): mul(q, d') used once by sub(x, mul)
+    Value *M;
+    if (!IsRem && match(I, m_c_Mul(m_Specific(&BO), m_Specific(Y))) &&
+        I->hasOneUse() &&
+        match(I->user_back(), m_Sub(m_Value(M), m_Specific(I))) && IsX(M)) {
+      G.Dead.push_back(I);
+      G.Dead.push_back(cast<Instruction>(I->user_back()));
+      if (!Chain(I->user_back(), true))
+        return std::nullopt;
+      continue;
+    }
+    // a chain from the division, through this select
+    auto *S = dyn_cast<SelectInst>(I);
+    if (!S || S->getFalseValue() != &BO || !Kind(S, IsRem))
+      return std::nullopt;
+    bool MinusOne = Kind(S, IsRem) == 1, Zero = !MinusOne;
+    Instruction *V = S;
+    while (V->hasOneUse()) {
+      auto *S2 = dyn_cast<SelectInst>(V->user_back());
+      int K = S2 && S2->getFalseValue() == V ? Kind(S2, IsRem) : 0;
+      if (!K)
+        break;
+      (K == 1 ? MinusOne : Zero) = true;
+      G.Dead.push_back(V);
+      V = S2;
+    }
+    if ((!IsRem && !MinusOne) || (GuardsZero && !Zero))
+      return std::nullopt;
+    G.Roots.push_back({V, IsRem});
+  }
+  if (G.Roots.empty())
+    return std::nullopt;
+  return G;
+}
+
 /// Division and remainder of at most 16 bits (8- and 16-bit PTX div / rem):
 /// the operands (magnitudes at most 2^16) are exact floats, and
 /// q = trunc(x rcp(y) (1 + 2^-18)) is the quotient rounded toward zero, signs
@@ -799,22 +919,61 @@ static Value *expandDivRem16(BinaryOperator &BO) {
   bool IsRem = Op == Instruction::URem || Op == Instruction::SRem;
   Type *Ty = BO.getType();
   Type *I32 = B.getInt32Ty(), *F32 = B.getFloatTy();
-  Value *X = IsSigned ? B.CreateSExt(BO.getOperand(0), I32)
-                      : B.CreateZExt(BO.getOperand(0), I32);
-  Value *Y = IsSigned ? B.CreateSExt(BO.getOperand(1), I32)
-                      : B.CreateZExt(BO.getOperand(1), I32);
+  std::optional<Guard16> G;
+  if (IsSigned)
+    G = matchGuard16(BO);
+  Value *X0 = BO.getOperand(0);
+  Value *Y0 = G ? G->D : BO.getOperand(1);
+  if (G && isa<FreezeInst>(BO.getOperand(1)))
+    Y0 = B.CreateFreeze(Y0);
   auto ToF = [&](Value *V) {
     return IsSigned ? B.CreateSIToFP(V, F32) : B.CreateUIToFP(V, F32);
   };
-  Value *Rcp = B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, ToF(Y));
+  // (converted from the narrow values: the 8- and 16-bit conversion modes
+  // extend them themselves)
+  Value *Rcp = B.CreateUnaryIntrinsic(Intrinsic::agx_rcp, ToF(Y0));
   Rcp = B.CreateFMul(Rcp, ConstantFP::get(F32, 1.0 + 0x1p-18));
-  Value *P = B.CreateFMul(ToF(X), Rcp);
+  Value *P = B.CreateFMul(ToF(X0), Rcp);
+  // (no select where d is not zero: known, or guarded as d + 1 <u 2 ? 1 : d)
+  using namespace PatternMatch;
+  Value *YG = Y0, *DG;
+  if (auto *Fr = dyn_cast<FreezeInst>(YG))
+    YG = Fr->getOperand(0);
+  bool NonZero =
+      isKnownNonZero(Y0, SimplifyQuery(BO.getDataLayout())) ||
+      match(YG, m_Select(m_SpecificICmp(ICmpInst::ICMP_ULT,
+                                        m_Add(m_Value(DG), m_One()),
+                                        m_SpecificInt(2)),
+                         m_One(), m_Deferred(DG)));
   Value *Q = IsSigned ? B.CreateFPToSI(P, I32) : B.CreateFPToUI(P, I32);
-  Value *Res = IsRem ? B.CreateSub(X, B.CreateMul(Q, Y)) : Q;
-  Res = B.CreateTrunc(Res, Ty);
-  Value *Zero = B.CreateICmpEQ(BO.getOperand(1), ConstantInt::get(Ty, 0));
-  return B.CreateSelect(
-      Zero, IsRem ? BO.getOperand(0) : ConstantInt::getAllOnesValue(Ty), Res);
+  Value *Q16 = B.CreateTrunc(Q, Ty);
+  Value *Quot = Q16;
+  if (!NonZero)
+    Quot = B.CreateSelect(B.CreateICmpEQ(Y0, ConstantInt::get(Ty, 0)),
+                          ConstantInt::getAllOnesValue(Ty), Q16);
+  // (the remainder in the narrow type, only its low bits being kept; by
+  // zero, x - q 0 = x needs no select, but the conversion of an infinity or
+  // NaN is poison, so frozen then)
+  Value *QR = NonZero ? Q16 : nullptr;
+  auto Rem = [&] {
+    if (!QR)
+      QR = B.CreateFreeze(Q16);
+    return B.CreateSub(X0, B.CreateMul(QR, Y0));
+  };
+  Value *Res = IsRem ? Rem() : Quot;
+  if (G) {
+    Value *R = nullptr;
+    for (auto [Root, RootRem] : G->Roots) {
+      Value *V = RootRem == IsRem ? Res : (R ? R : (R = Rem()));
+      Root->replaceAllUsesWith(V);
+    }
+    for (auto [Root, RootRem] : G->Roots)
+      Root->eraseFromParent();
+    for (Instruction *I : reverse(G->Dead))
+      if (I != &BO && I->use_empty())
+        I->eraseFromParent();
+  }
+  return Res;
 }
 
 static cl::opt<bool> AGXNarrowDivisions(

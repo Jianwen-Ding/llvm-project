@@ -1641,6 +1641,23 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       SDValue Lo = N->getOperand(0).getOperand(0);
       return DCI.DAG.getZExtOrTrunc(Lo, SDLoc(N), N->getValueType(0));
     }
+    // The low half of a 64-bit sign extension in register from at most the
+    // result's width: the extension of the low half (sext i16 -> i64 masked
+    // to 32 bits, as zext (sext i16 -> i32) becomes, is then one extension
+    // instead of a 64-bit one and its truncation).
+    if (N->getOperand(0).getOpcode() == ISD::SIGN_EXTEND_INREG &&
+        N->getOperand(0).hasOneUse()) {
+      SDValue In = N->getOperand(0);
+      EVT VT = N->getValueType(0);
+      EVT From = cast<VTSDNode>(In.getOperand(1))->getVT();
+      if (VT.isScalarInteger() && From.bitsLT(VT)) {
+        SDLoc DL(N);
+        return DCI.DAG.getNode(
+            ISD::SIGN_EXTEND_INREG, DL, VT,
+            DCI.DAG.getNode(ISD::TRUNCATE, DL, VT, In.getOperand(0)),
+            In.getOperand(1));
+      }
+    }
     return SDValue();
   case ISD::BUILD_PAIR: {
     // A value split and joined again.
