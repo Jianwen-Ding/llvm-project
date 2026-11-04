@@ -518,9 +518,10 @@ API u64 __air_f64_floor(u64 a) {
 API u64 __air_f64_roundeven(u64 a) {
   i32 e = (a >> 52) & 0x7ff;
   int sh = 1023 + 52 - e;
-  u64 one = shl(1, sh & 63), mask = one - 1, half = one >> 1;
-  u64 rem = a & mask, t = a & ~mask;
-  u64 r = t + ((rem > half) | ((rem == half) & ((t & one) != 0)) ? one : 0);
+  u64 one = shl(1, sh & 63), mask = one - 1;
+  // to nearest even by one carry: a + (half - 1) + (the unit bit), the
+  // fraction cleared (a carry out of the significand steps the exponent)
+  u64 r = (a + (mask >> 1) + ((a >> (sh & 63)) & 1)) & ~mask;
   // 0.5 <= |a| < 1: 0 at 0.5, 1 above; |a| < 0.5: 0.
   r = e == 1022 ? (a & SIGN) | ((a & FRAC) ? 0x3ff0000000000000ULL : 0) : r;
   r = e < 1022 ? a & SIGN : r;

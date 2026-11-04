@@ -3039,29 +3039,24 @@ define dso_local i64 @__air_f64_roundeven(i64 noundef %0) local_unnamed_addr #0 
   %11 = icmp eq i64 %10, 0
   %12 = select i1 %11, i64 0, i64 4607182418800017408
   %13 = or disjoint i64 %12, %9
-  %14 = sub i64 0, %7
-  %15 = and i64 %14, %0
-  %16 = add i64 %7, -1
-  %17 = and i64 %16, %0
-  %18 = lshr i64 %7, 1
-  %19 = icmp ugt i64 %17, %18
-  %20 = icmp eq i64 %17, %18
-  %21 = and i64 %7, %0
-  %22 = icmp ne i64 %21, 0
-  %23 = and i1 %22, %20
-  %24 = or i1 %19, %23
-  %25 = select i1 %24, i64 %7, i64 0
-  %26 = add i64 %25, %15
-  %27 = select i1 %8, i64 %13, i64 %26
-  %28 = icmp ugt i32 %4, 1074
-  %29 = and i64 %0, 9223372036854775807
-  %30 = icmp ult i64 %29, 9218868437227405313
-  %31 = or i64 %0, 2251799813685248
-  %32 = select i1 %30, i64 %0, i64 %31
-  %33 = icmp ult i32 %4, 1022
-  %34 = select i1 %33, i64 %9, i64 %27
-  %35 = select i1 %28, i64 %32, i64 %34
-  ret i64 %35
+  %14 = add i64 %7, -1
+  %15 = lshr i64 %14, 1
+  %16 = lshr i64 %0, %6
+  %17 = and i64 %16, 1
+  %18 = add i64 %17, %0
+  %19 = add i64 %18, %15
+  %20 = sub i64 0, %7
+  %21 = and i64 %19, %20
+  %22 = select i1 %8, i64 %13, i64 %21
+  %23 = icmp ugt i32 %4, 1074
+  %24 = and i64 %0, 9223372036854775807
+  %25 = icmp ult i64 %24, 9218868437227405313
+  %26 = or i64 %0, 2251799813685248
+  %27 = select i1 %25, i64 %0, i64 %26
+  %28 = icmp ult i32 %4, 1022
+  %29 = select i1 %28, i64 %9, i64 %22
+  %30 = select i1 %23, i64 %27, i64 %29
+  ret i64 %30
 }
 
 ; Function Attrs: mustprogress nocallback nofree nosync nounwind speculatable willreturn memory(none)
