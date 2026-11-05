@@ -123,13 +123,13 @@ the fix below, with the poll and the write on the two sides of a branch, in eith
 never sees the write.
 
 *Fixed:* when one side of a branch waits and the other does not, ZLUDA's module for Metal runs the
-other side first, and when the other side is empty, what follows the branch, in a copy of its own
-(``zludaRunWaitersLast``). Threads that wait for each other take turns block by block in one loop with
+other side first, and when the other side is empty, what follows the branch, in a copy of its own up
+to the first barrier or SIMD-group function, where all threads meet again (``zludaRunWaitersLast``). Threads that wait for each other take turns block by block in one loop with
 a single branch back to its head (``zludaRunThreadsInTurn``).
 
-**Still open:** code after the branch with a barrier, a SIMD-group function or a call, or more than
-4,096 instructions; threads that wait for each other in a function over 64 blocks or 1,024
-instructions, or with SIMD-group functions. Either can still run forever.
+**Still open:** a write after that barrier or SIMD-group function, or more than 4,096 instructions
+before it; threads that wait for each other in a function over 64 blocks or 1,024 instructions, or
+with SIMD-group functions. Each can still run forever.
 
 *Unblock:* forward progress between threads of one SIMD-group, which Metal does not offer.
 
