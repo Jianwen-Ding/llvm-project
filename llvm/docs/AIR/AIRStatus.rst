@@ -61,8 +61,8 @@ Verification so far
   32-bit addressing, ``.multimem``, ``.fabric``, ``.cooplaunch``, a hidden argument and texture
   initializers. On the simulator, all 841 pass every ``.expect``.
 * Since then, with ``air_ptx_formalization_check.py``: ``addr32``, ``addr32-generic``, ``multimem``,
-  ``fabric`` and ``fabric-mm-counted`` pass. ``optype-ext`` runs and **fails**, with shared memory
-  zeroed too, and passes on the simulator: the cause is not known.
+  ``fabric``, ``fabric-mm-counted`` and ``optype-ext`` pass, the last four with
+  ``LLVMZludaAirTablesInGlobals`` in place of the fixed table addresses.
 * Those results are for strict mode. Without ``--strict-fp`` f32 follows the GPU (denormals
   flushed, NaNs as they come), by design.
 

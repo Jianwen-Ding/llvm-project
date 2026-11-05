@@ -17,6 +17,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/Utils/Local.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include <optional>
 #include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
@@ -1419,13 +1420,47 @@ void defineThreadgroupGlobals(Module &M) {
 // Max; PTX cp.async with an ignore-src predicate). A length known at compile time,
 // or a function without a barrier, keeps Metal's faster lowering.
 void expandVariableMemIntrinsics(Module &M) {
-  SmallVector<MemIntrinsic *, 4> Ops;
+  SmallVector<MemIntrinsic *, 4> Ops, Always;
   for (Function &F : M) {
     bool HasBarrier = false;
     SmallVector<MemIntrinsic *, 4> Here;
     for (Instruction &I : instructions(F)) {
       if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
-        if (!isa<ConstantInt>(MI->getLength()))
+        // A threadgroup byte array may be retyped by AIRPrepare, which the intrinsic's i8 pointer
+        // would no longer match: as a loop of accesses, which follow the retyping.
+        auto OnByteGlobal = [](Value *P) {
+          auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(P));
+          auto *AT = GV && GV->getAddressSpace() == 3 ? dyn_cast<ArrayType>(GV->getValueType()) : nullptr;
+          if (!AT || !AT->getElementType()->isIntegerTy(8))
+            return false;
+          // (retyped only for accesses wider than a byte)
+          SmallVector<const Value *, 8> Work{GV};
+          SmallPtrSet<const Value *, 8> Seen;
+          while (!Work.empty()) {
+            const Value *V = Work.pop_back_val();
+            if (!Seen.insert(V).second)
+              continue;
+            for (const User *U : V->users()) {
+              if (auto *L = dyn_cast<LoadInst>(U)) {
+                if (!L->getType()->isIntegerTy(8))
+                  return true;
+              } else if (auto *S = dyn_cast<StoreInst>(U)) {
+                if (!S->getValueOperand()->getType()->isIntegerTy(8))
+                  return true;
+              } else if (isa<GEPOperator, BitCastOperator, AddrSpaceCastOperator, PtrToIntOperator, IntToPtrInst>(U) ||
+                         isa<BinaryOperator>(U)) {
+                Work.push_back(U);
+              }
+            }
+          }
+          return false;
+        };
+        bool Byte = OnByteGlobal(MI->getDest());
+        if (auto *MT = dyn_cast<MemTransferInst>(MI))
+          Byte |= OnByteGlobal(MT->getSource());
+        if (Byte)
+          Always.push_back(MI);
+        else if (!isa<ConstantInt>(MI->getLength()))
           Here.push_back(MI);
       } else if (auto *C = dyn_cast<CallBase>(&I)) {
         const Function *Callee = C->getCalledFunction();
@@ -1435,6 +1470,7 @@ void expandVariableMemIntrinsics(Module &M) {
     if (HasBarrier)
       append_range(Ops, Here);
   }
+  append_range(Ops, Always);
   if (Ops.empty())
     return;
   TargetTransformInfo TTI(M.getDataLayout());

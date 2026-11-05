@@ -167,15 +167,29 @@ static void collectTGByteGlobals(Module &M,
 // scalar, 16-byte vec, and 4-byte sub-element gaps. The signal is the presence
 // of a large gap, not stride irregularity. `Offsets` must be sorted+deduped and
 // exclude 0.
-// Whether a load, store or memory intrinsic reached from GV by constant offsets spans one of Offsets:
-// then these are not separate buffers packed in one arena, but one variable read another way (PTX
-// st.shared.v4.u32 then ld.shared.u8), and splitting at them would lose the data between the parts.
+// Whether a load, store or memory intrinsic reached from GV by constant offsets spans one of Offsets, or
+// GV's address is held as an integer: then these are not separate buffers packed in one arena, but one
+// variable read another way (PTX st.shared.v4.u32 then ld.shared.u8), and splitting at them would lose
+// the data between the parts.
 static bool accessCrossesOffsets(GlobalVariable *GV, ArrayRef<int64_t> Offsets, const DataLayout &DL) {
   auto Crosses = [&](int64_t Start, uint64_t Size) {
     return any_of(Offsets, [&](int64_t O) { return Start < O && O < Start + int64_t(Size); });
   };
   std::function<bool(Value *, int64_t)> Walk = [&](Value *V, int64_t At) {
     for (User *U : V->users()) {
+      // An address held as an integer can reach any byte of the variable by arithmetic.
+      if (isa<PtrToIntInst>(U) || (isa<ConstantExpr>(U) && cast<ConstantExpr>(U)->getOpcode() == Instruction::PtrToInt))
+        return true;
+      if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        if (CE->getOpcode() == Instruction::GetElementPtr) {
+          APInt Off(64, 0);
+          if (cast<GEPOperator>(CE)->accumulateConstantOffset(DL, Off) && Walk(CE, At + Off.getSExtValue()))
+            return true;
+        } else if (Walk(CE, At)) {
+          return true;
+        }
+        continue;
+      }
       if (auto *L = dyn_cast<LoadInst>(U)) {
         if (Crosses(At, DL.getTypeStoreSize(L->getType())))
           return true;
