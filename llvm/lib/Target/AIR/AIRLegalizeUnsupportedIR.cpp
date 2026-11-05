@@ -1516,8 +1516,35 @@ void expandVariableMemIntrinsics(Module &M) {
 // its uses: two byte GEPs of it storing a float and an i32 made Metal's reader
 // reject the library ("Unexpected bitcode file", PTX-formalization
 // half-oob-set and half-cmp-pk2). Each address then has its own pointee.
+// The types accessed through P, also through GEPs of it.
+static void accessedTypes(const Value *P, SmallPtrSetImpl<Type *> &Types, unsigned Depth = 0) {
+  if (Depth > 8)
+    return;
+  for (const User *U : P->users()) {
+    if (auto *L = dyn_cast<LoadInst>(U))
+      Types.insert(L->getType());
+    else if (auto *S = dyn_cast<StoreInst>(U)) {
+      if (S->getPointerOperand() == P)
+        Types.insert(S->getValueOperand()->getType());
+    } else if (isa<GetElementPtrInst, BitCastInst>(U))
+      accessedTypes(U, Types, Depth + 1);
+  }
+}
+
 void gepsOfIntToPtrAsIntegers(Module &M) {
   const DataLayout &DL = M.getDataLayout();
+  // Only an address used with different pointees: as GEPs, the others keep the addressing Metal's
+  // compiler optimizes (as integers, spc took 2.4 times as long on an M2 Max).
+  DenseMap<const IntToPtrInst *, bool> Mixed;
+  auto mixed = [&](const IntToPtrInst *Base) {
+    auto [It, New] = Mixed.try_emplace(Base, false);
+    if (New) {
+      SmallPtrSet<Type *, 4> Types;
+      accessedTypes(Base, Types);
+      It->second = Types.size() > 1;
+    }
+    return It->second;
+  };
   for (Function &F : M) {
     bool Changed = true;
     while (Changed) {
@@ -1529,7 +1556,7 @@ void gepsOfIntToPtrAsIntegers(Module &M) {
         auto *GEP = dyn_cast<GetElementPtrInst>(&I);
         auto *Base =
             GEP ? dyn_cast<IntToPtrInst>(GEP->getPointerOperand()) : nullptr;
-        if (!Base || GEP->getType()->isVectorTy())
+        if (!Base || GEP->getType()->isVectorTy() || !mixed(Base))
           continue;
         IRBuilder<> B(GEP);
         Type *IntTy = DL.getIntPtrType(GEP->getType());
