@@ -166,9 +166,15 @@ class Checker {
         add(F, "the calling convention agx_kernel");
       if (F.isDeclaration())
         continue;
-      for (const Instruction &I : instructions(F))
+      for (const Instruction &I : instructions(F)) {
         if (auto *C = dyn_cast<CallBase>(&I))
           checkCall(F, *C);
+        // (not a rejection: the writer has no atomic load or store, so one reaching it
+        // would lose its atomicity and a load polling for a write may never see it)
+        if (isMetal() && ((isa<LoadInst>(I) && cast<LoadInst>(I).isAtomic()) ||
+                          (isa<StoreInst>(I) && cast<StoreInst>(I).isAtomic())))
+          add(F, "an atomic load or store that was not lowered");
+      }
     }
   }
 

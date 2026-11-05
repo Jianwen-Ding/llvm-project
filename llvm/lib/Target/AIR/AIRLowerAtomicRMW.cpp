@@ -595,6 +595,64 @@ static bool lowerAtomicRMW(Module &M, bool OrderingHints) {
     }
   }
 
+  // Atomic loads and stores for Metal: the writer has no atomic form of them, and a plain
+  // load polling for another thread's write may never see it. 32-bit ones are AIR's
+  // functions, relaxed with fences for their order; other widths have none, and stay
+  // accesses that are at least volatile.
+  if (!OrderingHints) {
+    SmallVector<Instruction *, 8> Accesses;
+    for (Function &F : M)
+      for (Instruction &I : instructions(F))
+        if ((isa<LoadInst>(I) && cast<LoadInst>(I).isAtomic()) ||
+            (isa<StoreInst>(I) && cast<StoreInst>(I).isAtomic()))
+          Accesses.push_back(&I);
+    for (Instruction *I : Accesses) {
+      auto *L = dyn_cast<LoadInst>(I);
+      auto *St = dyn_cast<StoreInst>(I);
+      Value *Ptr = L ? L->getPointerOperand() : St->getPointerOperand();
+      Type *T = L ? L->getType() : St->getValueOperand()->getType();
+      unsigned AS = Ptr->getType()->getPointerAddressSpace();
+      AtomicOrdering Order = L ? L->getOrdering() : St->getOrdering();
+      SyncScope::ID SSID = L ? L->getSyncScopeID() : St->getSyncScopeID();
+      bool Space = AS == metal::AS::Device || AS == metal::AS::Threadgroup;
+      if (!Space || !(T->isIntegerTy(32) || T->isFloatTy())) {
+        if (L) {
+          L->setAtomic(AtomicOrdering::NotAtomic);
+          L->setVolatile(true);
+        } else {
+          St->setAtomic(AtomicOrdering::NotAtomic);
+          St->setVolatile(true);
+        }
+        Changed = true;
+        continue;
+      }
+      IRBuilder<> B(I);
+      unsigned Scope = getScope(Ctx, AS, SSID);
+      std::string Name = (AS == metal::AS::Threadgroup ? "air.atomic.local." : "air.atomic.global.");
+      Name += L ? "load." : "store.";
+      Name += T->isFloatTy() ? "f32" : "i32";
+      Value *Relaxed = B.getInt32(OrderRelaxed), *ScopeV = B.getInt32(Scope), *Vol = B.getTrue();
+      bool Ordered = Order != AtomicOrdering::Monotonic && Order != AtomicOrdering::Unordered;
+      if (L) {
+        FunctionCallee Fn = M.getOrInsertFunction(
+            Name, FunctionType::get(T, {Ptr->getType(), I32, I32, I1}, false));
+        CallInst *C = B.CreateCall(Fn, {Ptr, Relaxed, ScopeV, Vol});
+        C->takeName(L);
+        L->replaceAllUsesWith(C);
+        if (Ordered)
+          emitFence(B, M, Scope, OrderSeqCst);
+      } else {
+        if (Ordered)
+          emitFence(B, M, Scope, OrderSeqCst);
+        FunctionCallee Fn = M.getOrInsertFunction(
+            Name, FunctionType::get(Type::getVoidTy(Ctx), {Ptr->getType(), T, I32, I32, I1}, false));
+        B.CreateCall(Fn, {Ptr, St->getValueOperand(), Relaxed, ScopeV, Vol});
+      }
+      I->eraseFromParent();
+      Changed = true;
+    }
+  }
+
   SmallVector<Instruction *, 16> Atomics;
   for (Function &F : M)
     for (BasicBlock &BB : F)
