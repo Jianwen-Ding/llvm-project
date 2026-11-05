@@ -397,6 +397,7 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
     if (!AIRSkipPointerRepairs) {
       fixGlobalGEPBases(M, PTM);
       fixComparePointerTypes(M, PTM);
+      fixMemIntrinsicPointers(M, PTM);
     }
     fixKernelArgMetadata(M, PTM);
 

@@ -22,6 +22,8 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 
+#include "llvm/IR/IntrinsicInst.h"
+
 using namespace llvm;
 
 namespace llvm {
@@ -213,6 +215,21 @@ void fixGlobalGEPBases(Module &M, PointeeTypeMap &PTM) {
   for (auto *G : GEPs)
     G->setOperand(0, retypePointerVia(G->getPointerOperand(),
                                       G->getSourceElementType(), G, PTM));
+}
+
+void fixMemIntrinsicPointers(Module &M, PointeeTypeMap &PTM) {
+  Type *I8 = Type::getInt8Ty(M.getContext());
+  auto Calls = collectInsts<MemIntrinsic>(M, [](MemIntrinsic *) { return true; });
+  for (auto *MI : Calls)
+    for (unsigned J = 0, N = MI->arg_size(); J != N; ++J) {
+      Value *A = MI->getArgOperand(J);
+      if (!A->getType()->isPointerTy() || isa<ConstantPointerNull>(A))
+        continue;
+      Type *Have = isa<GlobalVariable>(A) ? cast<GlobalVariable>(A)->getValueType()
+                                          : effectivePointee(A, PTM);
+      if (Have != I8)
+        MI->setArgOperand(J, retypePointerVia(A, I8, MI, PTM));
+    }
 }
 
 void fixComparePointerTypes(Module &M, PointeeTypeMap &PTM) {

@@ -32,6 +32,8 @@ void fixAtomicPointerArgs(Module &M, PointeeTypeMap &PTM);
 /// A getelementptr on a global states the global's value type: Metal's reader
 /// rejects another ("Explicit gep type does not match pointee type").
 void fixGlobalGEPBases(Module &M, PointeeTypeMap &PTM);
+/// A memory intrinsic's pointers are byte pointers, whatever they point into.
+void fixMemIntrinsicPointers(Module &M, PointeeTypeMap &PTM);
 /// The two pointers of a comparison have one written type.
 void fixComparePointerTypes(Module &M, PointeeTypeMap &PTM);
 

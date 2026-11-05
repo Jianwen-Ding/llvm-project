@@ -5,6 +5,8 @@
 ; RUN: split-file %s %t
 ; RUN: not llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs %t/gep.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=GEP
 ; RUN: not llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs %t/cmp.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=CMP
+; RUN: not llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs %t/mem.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=MEM
+; RUN: llc -mtriple=air -filetype=obj -air-output=air %t/mem.ll -o %t/mem.air
 ; RUN: llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs -air-skip-device-checks %t/gep.ll -o /dev/null
 ; RUN: llc -mtriple=air -filetype=obj -air-output=air %t/gep.ll -o %t/gep.air
 ; RUN: opt -passes=verify -disable-output %t/gep.air
@@ -14,6 +16,7 @@
 
 ; GEP: the device would reject this library: {{.*}}a getelementptr of a type other than its base's pointee
 ; CMP: the device would reject this library: {{.*}}a comparison of pointers of different types
+; MEM: the device would reject this library: {{.*}}a memory intrinsic on a pointer other than a byte pointer
 
 ;--- gep.ll
 target triple = "air"
@@ -32,6 +35,18 @@ define void @k(ptr addrspace(1) %o) "air-kernel" {
   %c = icmp slt ptr %a, null
   %z = zext i1 %c to i32
   store i32 %z, ptr addrspace(1) %o
+  ret void
+}
+
+;--- mem.ll
+target triple = "air"
+declare void @llvm.memset.p3.i32(ptr addrspace(3), i8, i32, i1)
+@t = internal addrspace(3) global [8 x i32] undef, align 16
+define void @k(ptr addrspace(1) %o) "air-kernel" {
+  %p = getelementptr inbounds [8 x i32], ptr addrspace(3) @t, i64 0, i64 0
+  call void @llvm.memset.p3.i32(ptr addrspace(3) %p, i8 0, i32 32, i1 false)
+  %v = load i32, ptr addrspace(3) %p
+  store i32 %v, ptr addrspace(1) %o
   ret void
 }
 
