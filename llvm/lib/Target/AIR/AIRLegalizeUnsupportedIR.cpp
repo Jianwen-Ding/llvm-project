@@ -10,6 +10,7 @@
 #include "AIR.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/AIR.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -20,6 +21,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include <optional>
 #include "llvm/IR/Operator.h"
+#include "llvm/Transforms/Utils/IntegerDivision.h"
 #include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
 #include "llvm/Transforms/Utils/LowerAtomic.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -122,6 +124,24 @@ void wideAIRFunctionsToIntrinsics(Module &M) {
 // a type hint, llvm/IR/AIR.h) as two i64 limbs. The high limb of an N-bit
 // value holds its bits 64 to N - 1, zero above.
 void expandWideIntegers(Module &M) {
+  // Wide division and remainder first, as loops of the operations below (Metal has no i128).
+  {
+    SmallVector<BinaryOperator *, 4> Divs;
+    for (Function &F : M)
+      for (Instruction &I : instructions(F))
+        if (auto *BO = dyn_cast<BinaryOperator>(&I);
+            BO && BO->getType()->isIntegerTy() && BO->getType()->getIntegerBitWidth() > 64 &&
+            BO->getType()->getIntegerBitWidth() <= 128 &&
+            (BO->getOpcode() == Instruction::UDiv || BO->getOpcode() == Instruction::SDiv ||
+             BO->getOpcode() == Instruction::URem || BO->getOpcode() == Instruction::SRem))
+          Divs.push_back(BO);
+    for (BinaryOperator *BO : Divs) {
+      if (BO->getOpcode() == Instruction::UDiv || BO->getOpcode() == Instruction::SDiv)
+        expandDivision(BO);
+      else
+        expandRemainder(BO);
+    }
+  }
   auto isWide = [](Type *T) {
     return T->isIntegerTy() && T->getIntegerBitWidth() > 64 &&
            T->getIntegerBitWidth() <= 128;
@@ -134,8 +154,11 @@ void expandWideIntegers(Module &M) {
       continue;
     DenseMap<Value *, Limbs2> Limbs;
     SmallVector<Instruction *, 8> Wide;
-    for (auto &BB : F)
-      for (auto &I : BB)
+    // (in reverse post-order, where a value comes before its uses but through phis: the blocks of an
+    // expanded division are not in that order)
+    ReversePostOrderTraversal<Function *> RPOT(&F);
+    for (BasicBlock *BBP : RPOT)
+      for (auto &I : *BBP)
         if (isWide(I.getType()) || llvm::any_of(I.operands(), [&](Value *Op) {
               return isWide(Op->getType());
             }))
@@ -1717,6 +1740,10 @@ void flushHalfDenormals(Module &M) {
 }
 
 bool legalizeUnsupportedIR(Module &M) {
+  // A section means nothing to Metal, and the object writer has no place for one.
+  for (GlobalObject &GO : M.global_objects())
+    if (GO.hasSection())
+      GO.setSection("");
   genericToDevice(M);
   defineThreadgroupGlobals(M);
   stripLifetimeIntrinsics(M);

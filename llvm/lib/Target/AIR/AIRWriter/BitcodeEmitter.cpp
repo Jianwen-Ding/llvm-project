@@ -734,9 +734,11 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
         SmallVector<uint64_t, 14> Ops;
         Ops.push_back(E.globalPtrTypeIdx(G));
         Ops.push_back(G->isConstant() ? 1 : 0);
-        Ops.push_back(G->hasInitializer()
-                          ? E.moduleConstIdx(G->getInitializer()) + 1
-                          : 0);
+        // (an initializer that is the address of a global is that global's value)
+        const Constant *Init = G->hasInitializer() ? G->getInitializer() : nullptr;
+        Ops.push_back(!Init                       ? 0
+                      : isa<GlobalValue>(Init)   ? E.globalIdx(Init) + 1
+                                                 : E.moduleConstIdx(Init) + 1);
         Ops.push_back(encodeLinkage(G->getLinkage()));
         Ops.push_back(G->getAlign() ? Log2_32(G->getAlign()->value()) + 1 : 0);
         Ops.push_back(G->hasSection() ? sectionIndex(G->getSection()) : 0);

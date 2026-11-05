@@ -391,6 +391,12 @@ class Checker {
   }
 
   void checkFunctions() {
+    for (const GlobalIFunc &I : M.ifuncs())
+      add("the ifunc '" + I.getName() + "', which AIR does not have");
+    for (const Function &F : M)
+      for (const Instruction &I : instructions(F))
+        if (isa<IndirectBrInst, CallBrInst>(I))
+          add(F, std::string("the instruction ") + I.getOpcodeName() + ", which AIR does not have");
     for (const GlobalVariable &GV : M.globals())
       if (isNonAIRType(GV.getValueType()))
         add("the global '" + GV.getName() + "' has a type AIR does not have");
