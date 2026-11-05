@@ -225,8 +225,7 @@ static cl::opt<bool> AIRPortable(
 // pipeline packs them into _scalar_buf for the Triton host. AIR has no double
 // and no floating point environment: doubles and constrained intrinsics are
 // emulated first, before the passes that write AIR's functions (the soft-f64
-// library's intrinsics too). A module without them is left as it is (the
-// AIR agx-raise-to-air writes).
+// library's intrinsics too). A module without them is left as it is.
 void llvm::addAIRPortablePasses(legacy::PassManagerBase &PM) {
   PM.add(createAIRFromGenericGPULegacyPass());
   PM.add(createAIREmulateF64LegacyPass());

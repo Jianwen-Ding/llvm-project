@@ -124,10 +124,10 @@ struct Param {
   unsigned Location = 0;
   unsigned TypeSize = 0;
   StringRef TypeName;
-  /// The parameter's byref type, when the AIR kept one (agx-raise-to-air):
+  /// The parameter's byref type, when the AIR kept one:
   /// the exact size of a constant buffer.
   Type *ByRef = nullptr;
-  /// Its string attributes ("agx-hidden" from agx-raise-to-air).
+  /// Its string attributes ("agx-hidden").
   SmallVector<Attribute, 1> StringAttrs;
   // System value: its role, such as air.thread_position_in_grid.
   StringRef Role;
@@ -524,7 +524,7 @@ Function *LowerAIR::newKernel(AIRKernel &K, AIRToAGXTypes &Types) {
   Function *NewF = Function::Create(FT, F.getLinkage(), F.getAddressSpace(),
                                     F.getName() + ".agx", &M);
   NewF->setCallingConv(CallingConv::AGX_KERNEL);
-  // The kernel's own function attributes (AGX ones from agx-raise-to-air:
+  // The kernel's own function attributes (AGX ones:
   // stack size, threadgroup size limits).
   AttrBuilder FnAttrs(Ctx, F.getAttributes().getFnAttrs());
   FnAttrs.removeAttribute("air-kernel");
@@ -573,7 +573,7 @@ void LowerAIR::cloneKernel(AIRKernel &K, Function *NewF,
   MergeBlockIntoPredecessor(Body);
 
   // AIR passes the system values as parameters, whose components the body
-  // extracts where agx-raise-to-air (or AIR's own code) read them. Each
+  // extracts where the AIR reads them. Each
   // component is read at its extraction, as an AGX kernel reads it there.
   // (A scalar one stays at the entry: AIR keeps no place for it, and reading
   // it where its uses meet moved as many kernels the wrong way as the
@@ -1630,8 +1630,8 @@ void LowerAIR::lowerHints() {
   }
 }
 
-// AIR's portable forms of operations AGX has (as agx-raise-to-air writes
-// them, or any AIR producer): the hardware approximations from afn math
+// AIR's portable forms of operations AGX has (as any AIR producer writes
+// them): the hardware approximations from afn math
 // (1 / x, 1 / sqrt(x), sin and cos of x * pi / 2: AGX's take quadrants),
 // and the explicit flushes of PTX's .ftz where the f32 ALU flushes anyway.
 void LowerAIR::recoverAGXOperations(Function &F) {
@@ -1857,7 +1857,7 @@ void LowerAIR::recoverAGXOperations(Function &F) {
 // AIR may call its own functions (with return values); AGX inlines every
 // function into the kernels (AGXUsage.rst, "Kernel ABI"), so the calls become
 // their bodies here, before code generation, unless leaf calls are enabled.
-// agx-raise-to-air's software f64 (`__air_f64_*`, double as i64 bits) is the
+// AIR's software f64 (`__air_f64_*`, double as i64 bits) is the
 // portable form of double arithmetic; AGX has its own software f64
 // (AGXSoftF64), tuned for its ALU. Calls rounded to nearest (the plain names,
 // or the `_r` ones with a constant rounding of 1, FLT_ROUNDS' nearest) become
@@ -2055,8 +2055,7 @@ void LowerAIR::inlineCalls() {
 }
 
 // AGX's hidden kernel arguments ("agx-hidden") and by-value parameters are
-// passed by value; AIR has them as byref constant buffers ("air-by-value" from
-// agx-raise-to-air). A kernel that only loads them whole takes them by value
+// passed by value; AIR has them as byref constant buffers ("air-by-value"). A kernel that only loads them whole takes them by value
 // again, so that, among others, negations and absolute values of them fold
 // into source modifiers.
 Function *LowerAIR::hiddenByValue(Function &K) {

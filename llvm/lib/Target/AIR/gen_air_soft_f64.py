@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regenerates AIRSoftF64.inc: the LLVM IR of arith-emulate-f64's double
 precision library (mlir/lib/Conversion/ArithEmulateF64/SoftF64/soft_f64.c),
-which air-emulate-f64 (the AIR target) and agx-raise-to-air (the AGX target)
-put in the AIR they write as the emulation of double precision operations.
+which air-emulate-f64 (the AIR target)
+puts in the AIR it writes as the emulation of double precision operations.
 
   gen_air_soft_f64.py --clang CLANG
 

@@ -304,29 +304,3 @@ reachable from every environment). An ordered atomic reaches AGX as a relaxed on
 sequentially consistent fences, as AIR expresses it, which costs more than
 the AGX backend's own lowering of the ordered atomic.
 
-IR to AGX
-----------
-
-Lowering AIR to AGX is designed but not implemented. The design:
-
-* The upstream bitcode reader already parses this backend's ``.air``,
-  upgrading its typed pointers to opaque ones, so ``llc -mtriple=agx k.air``
-  can read it; no AIR reader is needed.
-* An ``agx-lower-air`` module pass, first in the AGX pipeline and a no-op
-  without ``!air.kernel``, reads each kernel's argument roles from
-  ``!air.kernel``; turns system-value parameters and calls into
-  ``llvm.agx.*`` special-register reads; maps AIR math back to LLVM
-  intrinsics with an inverse of ``AIRIntrinsicMappings.td`` (generated in the
-  AGX target from the same file, with ``Invertible`` excluding
-  ``llvm.minimum``/``maximum``); lowers barriers to
-  ``llvm.agx.threadgroup_barrier`` between scoped fences, AIR atomics to
-  ``atomicrmw``/``cmpxchg``, shuffles, ballots and reductions to their AGX
-  intrinsics; and diagnoses AIR functions without an AGX equivalent.
-* Address spaces are remapped by cloning with a type remapper: AIR 0
-  (thread) becomes AGX 5 (private), 2 (constant) becomes 4, 1 and 3 stay.
-  Kernels are rebuilt as ``agx_kernel`` with their buffers in location-index
-  order and the system-value parameters removed.
-* Validation: the same kernel through AIR on the M2 Max and through AGX on the
-  AGX Performance Simulator (``agx_run``, with
-  ``llvm/utils/agx-checked/run_checked.py``'s ``launch()``), compared with each
-  other and with a CPU reference.

@@ -1,5 +1,5 @@
 ; Threadgroup globals declared but not defined (PTX .shared variables, as
-; agx-raise-to-air keeps them): Metal resolves no such symbol. A sized one is
+; portable AIR keeps them): Metal resolves no such symbol. A sized one is
 ; defined; a zero-sized one (CUDA's dynamic shared memory) becomes a
 ; threadgroup argument of each kernel using it, location index 0, whose
 ; length the host sets per dispatch.

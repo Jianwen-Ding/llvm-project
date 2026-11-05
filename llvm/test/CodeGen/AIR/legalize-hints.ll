@@ -1,4 +1,4 @@
-; The Metal pipeline legalizes agx-raise-to-air's hints (llvm/IR/AIR.h) that
+; The Metal pipeline legalizes portable AIR's hints (llvm/IR/AIR.h) that
 ; Metal has no form of: generic pointers become device pointers, integers of
 ; 65 to 128 bits become two i64 limbs, and 32-bit read-modify-writes without
 ; an AIR function become compare-exchange loops.

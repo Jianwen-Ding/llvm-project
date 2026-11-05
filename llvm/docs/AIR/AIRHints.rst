@@ -5,47 +5,19 @@ Upstream AIR as an AGX backend
 .. contents::
    :local:
 
-This page describes an experiment: compiling AGX kernels through upstream
-(portable) AIR, so that one AIR module serves both Asahi Linux, where the AGX
-backend compiles it, and macOS, where the AIR target's Metal pipeline packages
-it for Metal. The direct path (an AGX module straight to the AGX backend) is
-unchanged; this path is separate and opt-in.
+One AIR module serves both Asahi Linux, where the AGX backend compiles it, and
+macOS, where the AIR target's Metal pipeline lowers it for Metal.
 
 The pipeline
 ============
 
 ::
 
-  AGX IR (ZLUDA's PTX front end, optimized)
-    -> agx-raise-to-air                 (opt -mtriple=agx -passes=agx-raise-to-air)
-    -> the AIR target's portable passes (llc -mtriple=air -air-portable)
-    =  upstream AIR, written as .air bitcode
-    -> agx-lower-air, the AGX backend   (llc -mtriple=agx)       on Asahi
-    -> the AIR target's Metal pipeline  (llc -mtriple=air -filetype=obj) for Metal
+  PTX -> AIR (ZLUDA's front end, zoc --target air; the AIR target's portable passes)
+    -> agx-lower-air, the AGX backend   (llc -mtriple=agx)              AGX code
+    -> the AIR target's Metal pipeline  (llc -mtriple=air -filetype=obj) lowered AIR, for Metal
 
-``agx-raise-to-air`` (``llvm/lib/Target/AGX/AGXRaiseToAIR.cpp``) is the
-inverse of ``agx-lower-air``. ZLUDA selects the path with
-``ZLUDA_AGX_VIA_AIR=1`` (``llvm_zluda``'s ``compile_agx``); ``zoc`` then also
-writes ``NAME.air``.
-
-What the raise writes as AIR
-----------------------------
-
-* Kernels: ``agx_kernel`` functions (or, in a module without them, the
-  uncalled external ``void`` functions) become ``"air-kernel"`` functions with
-  the C calling convention.
-* Parameters: a ``byref`` parameter in AGX's constant address space is a
-  constant buffer (address space 2) and keeps its ``byref`` type, the exact
-  size of the buffer (AIR otherwise describes a buffer by the type its uses
-  load). A by-value parameter becomes such a buffer too, marked
-  ``"air-by-value"``, keeping its string attributes (``"agx-hidden"``).
-* Address spaces: private (5) is AIR's thread (0), constant (4) AIR's
-  constant (2); device and threadgroup keep their numbers.
-* System values (``llvm.agx.thread.position.in.threadgroup.x`` and the
-  others) are calls to ``air.thread_position_in_threadgroup.v3i32`` and the
-  other AIR system values; SIMD-group shuffles, ballots, reductions and
-  exclusive scans are ``air.simd_*`` / ``air.quad_*``; the threadgroup barrier
-  is ``air.wg.barrier`` (its fences stay LLVM fences).
+AGX is never raised to AIR.
 
 Portable AIR, and the one hint
 ==============================
@@ -86,10 +58,7 @@ worth much more than its AIR form and cannot recover it from that form.
   LLVM operation AGX has; Metal does not).
 * ``llvm.agx.simdgroup.matrix.fma``: **the hint** (below).
 
-The emulations are inlined at each use by ``agx-raise-to-air`` and simplified
-there (``agx-raise-hints`` selects the hints kept; ``-agx-raise-hints=all``
-keeps every one, as the experiment first did). AIR has no floating point
-environment, so the raise drops ``strictfp``.
+AIR has no floating point environment, so ``strictfp`` is dropped.
 
 Why the hints went (agx-bench, emulating each kind against the hint, before
 the recovery above): system values +-0.01%; doubles -0.25% (the library is
@@ -118,7 +87,7 @@ matrices hold a whole 8x8 matrix as an opaque value; using them would need
 the fragments to go through threadgroup memory, which an AGX lowering would
 then have to remove again (future work).
 
-Key formats (for ``-agx-raise-hints``): ``call:<intrinsic>|<doubles>[|<metadata
+Key formats: ``call:<intrinsic>|<doubles>[|<metadata
 string>...][|+lane][|+mode][|+value]``, ``inst:<opcode>[:<predicate>]|<doubles>``,
 ``atomic:<operation>|<doubles>|<ordering>|<sync scope>|<align>``; ``<doubles>``
 has a ``d`` for the result and each operand that is a double.
@@ -130,7 +99,7 @@ PTX's rounding and flushing modifiers are AGX's floating point mode
 (``llvm.agx.set.fpmode``: bits 0-1 the rounding of float, 2-3 of the other
 formats, numbered like ``FLT_ROUNDS``; bit 4 flushes float denormals, bit 5
 half's), which the constrained intrinsics with dynamic rounding read. AIR has
-no such state, so ``agx-raise-to-air`` keeps the mode as a value: the mode AGX
+no such state, so the mode is kept as a value: the mode AGX
 starts a function with (``AGXLowerFPEnv``: rounding to nearest, the
 function's denormal modes) and then what each ``set.fpmode`` writes, promoted
 to SSA values, a constant wherever the mode is known; the emulations of the
