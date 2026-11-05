@@ -60,11 +60,9 @@ Verification so far
   check. ``tc-94b-3`` is past the 5 s compile limit. Sixteen cannot be compared with this harness:
   32-bit addressing, ``.multimem``, ``.fabric``, ``.cooplaunch``, a hidden argument and texture
   initializers. On the simulator, all 841 pass every ``.expect``.
-* Since then, with ``air_ptx_formalization_check.py``: ``addr32``, ``addr32-generic`` and
-  ``multimem`` pass. ``fabric``, ``fabric-mm-counted`` and ``optype-ext`` run and **fail**, with
-  shared memory zeroed too, and pass on the simulator: the cause is not known. In
-  ``fabric-mm-counted`` only the first word of each 16-byte unit arrives. A vector store to shared
-  memory and a byte copy to device memory, each alone, are correct.
+* Since then, with ``air_ptx_formalization_check.py``: ``addr32``, ``addr32-generic``, ``multimem``,
+  ``fabric`` and ``fabric-mm-counted`` pass. ``optype-ext`` runs and **fails**, with shared memory
+  zeroed too, and passes on the simulator: the cause is not known.
 * Those results are for strict mode. Without ``--strict-fp`` f32 follows the GPU (denormals
   flushed, NaNs as they come), by design.
 
