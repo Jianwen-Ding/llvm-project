@@ -123,8 +123,9 @@ the fix below, with the poll and the write on the two sides of a branch, in eith
 never sees the write.
 
 *Fixed:* when one side of a branch waits and the other does not, ZLUDA's module for Metal runs the
-other side first (``zludaRunWaitersLast``). **Still open:** threads that wait for each other, and a
-thread that writes after the branch the poller is on.
+other side first, and when the other side is empty, what follows the branch, in a copy of its own
+(``zludaRunWaitersLast``). **Still open:** threads that wait for each other, and code after the branch
+that has a barrier, a SIMD-group function or a call, or more than 4,096 instructions.
 
 *Tried:* running a function as a loop that executes one block per thread per iteration. Written by
 hand in PTX (private volatile next-block variable, comparisons in a chain, a loop's own branch
