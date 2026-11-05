@@ -282,6 +282,14 @@ unsigned ValueEnumerator::ptrTypeIdxForValue(const Value *V) {
   return ptrTypeIdx(V->getType(), Pointee);
 }
 
+std::optional<unsigned> ValueEnumerator::findPtrTypeIdx(Type *PtrTy,
+                                                        Type *Pointee) const {
+  auto It = typeMap.find(TypeEntry{PtrTy, Pointee});
+  if (It == typeMap.end())
+    return std::nullopt;
+  return It->second;
+}
+
 unsigned ValueEnumerator::typeIdxForValue(const Value *V) {
   if (auto *F = dyn_cast<Function>(V)) {
     auto Var = funcVariant.find(F);

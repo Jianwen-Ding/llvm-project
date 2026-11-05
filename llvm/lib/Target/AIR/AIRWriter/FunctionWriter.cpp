@@ -15,6 +15,8 @@
 
 #include "BitcodeEncoding.h"
 #include "MetadataWriter.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
 #include "AIRConstraints.h"
 #include "ValueEnumerator.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -65,8 +67,81 @@ void emitConstantsBlock(
     ArrayRef<const Constant *> Constants, unsigned CodeSize,
     const DenseMap<const Constant *, unsigned> *PoisonPtrTypeIdx = nullptr);
 
+// (for tests that show what the device itself does with such a library)
+static cl::opt<bool> AIRSkipDeviceChecks(
+    "air-skip-device-checks", cl::Hidden,
+    cl::desc("Write AIR even if the device would reject it"));
+
+/// What Metal's reader, which has typed pointers, rejects as "Unexpected bitcode
+/// file!", checked on the types this writer gives the values: the operands an
+/// instruction requires to have one type, and a getelementptr's stated type
+/// against the pointee of a global base. (Loads and stores through another pointee are
+/// accepted when the library loads.) Returns a description of the first
+/// violation, or an empty string.
+static std::string typedPointerViolation(const Function &F, ValueEnumerator &E) {
+  std::string Msg;
+  raw_string_ostream OS(Msg);
+  auto Report = [&](const Instruction &I, StringRef What) {
+    OS << "in function '" << F.getName() << "': " << What << ": " << I;
+    return Msg;
+  };
+  auto IsPoison = [](const Value *V) { return isa<UndefValue>(V); };
+  auto SameType = [&](const Value *A, const Value *B) {
+    return !A->getType()->isPointerTy() || IsPoison(A) || IsPoison(B) ||
+           E.typeIdxForValue(A) == E.typeIdxForValue(B);
+  };
+  auto Points = [&](const Value *Ptr, Type *Pointee) {
+    if (IsPoison(Ptr))
+      return true;
+    auto Want = E.findPtrTypeIdx(Ptr->getType(), Pointee);
+    return Want && *Want == E.typeIdxForValue(Ptr);
+  };
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB) {
+      if (auto *C = dyn_cast<ICmpInst>(&I)) {
+        if (!SameType(C->getOperand(0), C->getOperand(1)))
+          return Report(I, "a comparison of pointers of different types");
+      } else if (auto *S = dyn_cast<SelectInst>(&I)) {
+        if (!SameType(S->getTrueValue(), S->getFalseValue()))
+          return Report(I, "a select of pointers of different types");
+      } else if (auto *P = dyn_cast<PHINode>(&I)) {
+        for (const Value *In : P->incoming_values())
+          if (!SameType(P, In))
+            return Report(I, "a phi of pointers of different types");
+      } else if (auto *Call = dyn_cast<CallInst>(&I)) {
+        const Function *Callee = Call->getCalledFunction();
+        if (!Callee)
+          continue;
+        auto Params = E.funcTypeParamIndices.find(Callee->getFunctionType());
+        if (Params == E.funcTypeParamIndices.end())
+          continue;
+        for (unsigned J = 0, N = Call->arg_size();
+             J != N && J != Params->second.size(); ++J) {
+          const Value *Arg = Call->getArgOperand(J);
+          if (Arg->getType()->isPointerTy() && !IsPoison(Arg) &&
+              E.typeIdxForValue(Arg) != Params->second[J])
+            return Report(I, "a call with a pointer argument of another type "
+                             "than its parameter");
+        }
+      } else if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+        // (a global's written type is certain; the reader works out an
+        // instruction's own type, which need not be what the map holds)
+        if (isa<GlobalVariable>(G->getPointerOperand()) &&
+            !Points(G->getPointerOperand(), writtenGEPSourceType(G, E.PTM)))
+          return Report(I, "a getelementptr of a type other than its base's "
+                           "pointee (\"Explicit gep type does not match "
+                           "pointee type\")");
+      }
+    }
+  return Msg;
+}
+
 void emitFunctionBlock(BitstreamWriter &W, const Function &F,
                        ValueEnumerator &E, const MetadataEnumerator &MD) {
+  if (std::string Violation = AIRSkipDeviceChecks ? std::string() : typedPointerViolation(F, E); !Violation.empty())
+    report_fatal_error(Twine("AIRWriter: the device would reject this library: ") +
+                           Violation,
+                       /*gen_crash_diag=*/false);
   W.EnterSubblock(bitc::FUNCTION_BLOCK_ID, 5);
 
   SmallVector<const BasicBlock *, 8> BBOrder;

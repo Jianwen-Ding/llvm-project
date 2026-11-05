@@ -20,6 +20,9 @@
 #include "LowerPointerVectors.h"
 #include "LowerVectorSelect.h"
 #include "MetadataWriter.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Verifier.h"
 #include "AIRConstraints.h"
 #include "AIRVersion.h"
 #include "NormalizeGEPs.h"
@@ -340,6 +343,17 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
                        ValueEnumerator &E, const MetadataEnumerator &MD);
 
 std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
+  // Metal's reader takes a broken module for an unreadable file or, when it
+  // builds a pipeline, fails with "Failed to materializeAll".
+  if (!cl::getRegisteredOptions().lookup("air-skip-device-checks") ||
+      !static_cast<cl::opt<bool> *>(cl::getRegisteredOptions().lookup("air-skip-device-checks"))->getValue()) {
+    std::string Err;
+    raw_string_ostream OS(Err);
+    if (verifyModule(M, &OS))
+      report_fatal_error(Twine("AIRWriter: the device would reject this library: ") +
+                             OS.str(),
+                         /*gen_crash_diag=*/false);
+  }
   dropMetadataOutsideAIRKinds(M);
 
   SmallVector<char, 0> Buf;

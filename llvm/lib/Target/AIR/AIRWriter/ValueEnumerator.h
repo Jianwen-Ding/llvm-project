@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Module.h"
+#include <optional>
 #include <vector>
 
 namespace llvm {
@@ -85,6 +86,9 @@ public:
   unsigned ptrTypeIdxForValue(const llvm::Value *V);
 
   unsigned typeIdxForValue(const llvm::Value *V);
+  /// The index of the typed pointer type, if the type table has it.
+  std::optional<unsigned> findPtrTypeIdx(llvm::Type *PtrTy,
+                                         llvm::Type *Pointee) const;
 
   unsigned globalPtrTypeIdx(const llvm::GlobalVariable *GV);
 
