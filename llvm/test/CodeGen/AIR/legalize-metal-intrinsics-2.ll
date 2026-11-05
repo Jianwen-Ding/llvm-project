@@ -66,9 +66,9 @@ define float @sincos_f32(float %x) {
 }
 
 ; CHECK-LABEL: define i1 @umul_ovf_i64(
-; CHECK: [[M:%.*]] = mul i64 %x, %y
-; CHECK: [[Q:%.*]] = udiv i64 [[M]],
-; CHECK: icmp ne i64 [[Q]], %y
+; CHECK-NOT: udiv
+; CHECK-NOT: llvm.umul.with.overflow
+; CHECK: icmp ne i64 %{{[^,]*}}, 0
 ; LLC-LABEL: define i1 @umul_ovf_i64(
 ; LLC-NOT: with.overflow
 ; LLC: ret i1

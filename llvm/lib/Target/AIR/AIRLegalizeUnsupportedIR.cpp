@@ -1208,6 +1208,26 @@ void expandIntrinsicsMetalMishandles(Module &M) {
       Type *ITy = X->getType();
       bool Signed = CI->getIntrinsicID() == Intrinsic::smul_with_overflow;
       Value *R = B.CreateMul(X, Y);
+      // Unsigned 64 bits: the high word of the product, from 32-bit pieces. Metal's
+      // compiler crashes on some 64-bit divisions this would otherwise make (by a
+      // zero-extended value known not to be zero), and a division is far slower.
+      if (!Signed && ITy->isIntegerTy(64)) {
+        Value *M32 = ConstantInt::get(ITy, 0xffffffffu);
+        Value *S32 = ConstantInt::get(ITy, 32);
+        Value *XL = B.CreateAnd(X, M32), *XH = B.CreateLShr(X, S32);
+        Value *YL = B.CreateAnd(Y, M32), *YH = B.CreateLShr(Y, S32);
+        Value *LL = B.CreateMul(XL, YL), *LH = B.CreateMul(XL, YH);
+        Value *HL = B.CreateMul(XH, YL), *HH = B.CreateMul(XH, YH);
+        Value *Mid = B.CreateAdd(B.CreateLShr(LL, S32),
+                                 B.CreateAdd(B.CreateAnd(LH, M32),
+                                             B.CreateAnd(HL, M32)));
+        Value *Hi = B.CreateAdd(
+            HH, B.CreateAdd(B.CreateLShr(LH, S32),
+                            B.CreateAdd(B.CreateLShr(HL, S32),
+                                        B.CreateLShr(Mid, S32))));
+        replaceStructResult(CI, R, B.CreateICmpNE(Hi, Constant::getNullValue(ITy)));
+        break;
+      }
       Value *XNZ = B.CreateICmpNE(X, Constant::getNullValue(ITy));
       // a divisor of 1 where x is 0, so that the division is defined
       Value *D = B.CreateSelect(XNZ, X, ConstantInt::get(ITy, 1));
