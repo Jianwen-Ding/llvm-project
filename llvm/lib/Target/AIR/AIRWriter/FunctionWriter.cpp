@@ -459,7 +459,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         W.EmitRecord(bitc::FUNC_CODE_INST_ALLOCA, V);
       } else {
 
-        report_fatal_error(Twine("AIRWriter: unhandled instruction '") +
+        reportFatalUsageError(Twine("AIRWriter: unhandled instruction '") +
                            I.getOpcodeName() + "' in function '" + F.getName() +
                            "'");
       }
