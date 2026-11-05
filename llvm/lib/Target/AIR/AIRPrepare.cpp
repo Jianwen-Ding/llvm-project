@@ -1842,6 +1842,18 @@ static bool normalizeI1Pointers(Module &M) {
   for (Function &F : M)
     for (BasicBlock &BB : F)
       for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        // alloca i1 -> i8, like its accesses below: Metal rejects the module if they disagree.
+        if (auto *A = dyn_cast<AllocaInst>(&I)) {
+          Type *T = A->getAllocatedType();
+          if (T->isIntegerTy(1)) {
+            A->setAllocatedType(I8);
+            Changed = true;
+          } else if (auto *AT = dyn_cast<ArrayType>(T); AT && AT->getElementType()->isIntegerTy(1)) {
+            A->setAllocatedType(ArrayType::get(I8, AT->getNumElements()));
+            Changed = true;
+          }
+          continue;
+        }
         // GEP i1 element -> i8. Includes array-of-i1 source types (the
         // `__base_` preamble GEP synthesized off a `[N x i1]` global), which
         // otherwise reach the writer as an unmaterializable i1 array type.
@@ -1877,7 +1889,7 @@ static bool normalizeI1Pointers(Module &M) {
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
           if (LI->getType()->isIntegerTy(1)) {
             IRBuilder<> B(LI);
-            auto *L8 = B.CreateLoad(I8, LI->getPointerOperand());
+            auto *L8 = B.CreateLoad(I8, LI->getPointerOperand(), LI->isVolatile());
             L8->setAlignment(LI->getAlign());
             Value *Tr = B.CreateTrunc(L8, LI->getType());
             LI->replaceAllUsesWith(Tr);

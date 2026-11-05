@@ -20,6 +20,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/IR/Operator.h"
+#include <functional>
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -414,6 +416,36 @@ class Checker {
                                                : nullptr;
           if (Accessed && Accessed->isVectorTy() && Accessed->getScalarType()->isIntegerTy(1))
             add(F, "a memory access of a vector of i1");
+          if (Accessed && Accessed->isIntegerTy(1))
+            add(F, "a memory access of an i1");
+          // A pointer in private memory has one pointee type: Metal rejects the module when what is
+          // stored there and what is done with what is loaded disagree.
+          if (auto *Slot = dyn_cast<AllocaInst>(&I); Slot && Slot->getAllocatedType()->isPointerTy()) {
+            SmallPtrSet<Type *, 4> Pointees;
+            // (through the casts the module has between a pointer and its accesses)
+            std::function<void(const Value *)> Uses = [&](const Value *P) {
+              for (const User *V : P->users()) {
+                if (auto *L2 = dyn_cast<LoadInst>(V))
+                  Pointees.insert(L2->getType());
+                else if (auto *S2 = dyn_cast<StoreInst>(V)) {
+                  if (S2->getPointerOperand() == P)
+                    Pointees.insert(S2->getValueOperand()->getType());
+                } else if (auto *G = dyn_cast<GEPOperator>(V))
+                  Pointees.insert(G->getSourceElementType());
+                else if (isa<BitCastOperator>(V))
+                  Uses(V);
+              }
+            };
+            for (const User *U : Slot->users()) {
+              if (auto *St = dyn_cast<StoreInst>(U)) {
+                if (auto *G = dyn_cast<GEPOperator>(St->getValueOperand()->stripPointerCasts()))
+                  Pointees.insert(G->getSourceElementType());
+              } else if (isa<LoadInst>(U))
+                Uses(U);
+            }
+            if (Pointees.size() > 1)
+              add(F, "a pointer in private memory used with different pointee types");
+          }
           // (AIR's are 0 to 7)
           if (Ptr && Ptr->getType()->getPointerAddressSpace() > 7)
             add(F, "a memory access in address space " +
