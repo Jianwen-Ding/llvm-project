@@ -118,8 +118,13 @@ A thread that polls can starve one in its SIMD-group
 *What:* threads of a SIMD-group run under one mask, so while one polls, the others wait. ZLUDA
 keeps ``if (rank == 1) write; if (rank == 0) poll`` in order with volatile copies of the branch
 conditions (``async-generic``), but a thread that polls for what another writes *after* that
-thread's own poll has no such order. Confirmed on an M2 Max with polls bounded at 100,000: with the
-poll and the write on the two sides of a branch, in either order, the poller never sees the write.
+thread's own poll has no such order. Confirmed on an M2 Max with polls bounded at 100,000: without
+the fix below, with the poll and the write on the two sides of a branch, in either order, the poller
+never sees the write.
+
+*Fixed:* when one side of a branch waits and the other does not, ZLUDA's module for Metal runs the
+other side first (``zludaRunWaitersLast``). **Still open:** threads that wait for each other, and a
+thread that writes after the branch the poller is on.
 
 *Tried:* running a function as a loop that executes one block per thread per iteration. Written by
 hand in PTX (private volatile next-block variable, comparisons in a chain, a loop's own branch
