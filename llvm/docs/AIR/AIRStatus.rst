@@ -54,6 +54,15 @@ Verification so far
   ``.metallib`` and ``.air`` files in ``Metal.jl/test/metallib`` are built
   from ``.metal`` sources with Apple's toolchain and are deliberately unused.
 
+* ZLUDA's ``.ptx -> .air`` (2026-11-05, M2 Max, ``--strict-fp --zero-shared``,
+  ``air_agx_diff.py``, PTX-formalization 2c9bc2b): of 841 programs, 823 give the simulator's
+  results. ``legal-forms`` differs only in the bytes of a symbol's address, which it does not
+  check. ``tc-94b-3`` is past the 5 s compile limit. Sixteen cannot be compared with this harness:
+  32-bit addressing, ``.multimem``, ``.fabric``, ``.cooplaunch``, a hidden argument and texture
+  initializers. On the simulator, all 841 pass every ``.expect``.
+* Those results are for strict mode. Without ``--strict-fp`` f32 follows the GPU (denormals
+  flushed, NaNs as they come), by design.
+
 Defects found on hardware and fixed
 ===================================
 
@@ -99,6 +108,24 @@ Each of these passed the FileCheck tests of the original branch.
 
 Blockers
 ========
+
+A thread that polls can starve one in its SIMD-group
+------------------------------------------------------
+
+*What:* threads of a SIMD-group run under one mask, so while one polls, the others wait. ZLUDA
+keeps ``if (rank == 1) write; if (rank == 0) poll`` in order with volatile copies of the branch
+conditions (``async-generic``), but a thread that polls for what another writes *after* that
+thread's own poll has no such order: it can still run forever.
+
+*Unblock:* forward progress between threads of one SIMD-group, which Metal does not offer.
+
+Checking AIR cannot prove it valid
+----------------------------------
+
+*What:* ``air-verify`` finds known ways of being invalid. Apple publishes no AIR specification, so
+its rules come from reducing what the device rejects and its ``air.*`` names from the open-source
+producers. The device is not a complete judge either: it accepts ``air.sin.f32`` declared with
+``i32`` values (``verify-cases/badsig.ll``, reported anyway).
 
 The AIR service reports no diagnostics for rejected AIR
 ---------------------------------------------------------
