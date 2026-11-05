@@ -1501,7 +1501,8 @@ bool AGXStrictFP::runOnFunction(Function &F) {
     for (Instruction &I : make_early_inc_range(instructions(F))) {
       auto *S = dyn_cast<SelectInst>(&I);
       Value *V = S ? matchBitsCanonicalNaN(*S) : nullptr;
-      if (!V)
+      // (doubles have no float comparison here: AGXSoftF64 has already run)
+      if (!V || V->getType()->getScalarType()->isDoubleTy())
         continue;
       // (the value unchanged, as bits or as the float)
       Value *R = S->getFalseValue();

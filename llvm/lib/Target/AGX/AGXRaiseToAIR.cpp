@@ -1396,7 +1396,7 @@ void RaiseToAIR::emulate(Function &F, StringRef Key) {
   Intr.consume_front("call:");
   auto Afn = [&](Value *V) {
     if (auto *I = dyn_cast<Instruction>(V))
-      I->setFast(true);
+      I->setHasApproxFunc(true);
     return V;
   };
   Value *R = nullptr;

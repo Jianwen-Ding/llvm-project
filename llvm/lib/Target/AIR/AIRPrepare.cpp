@@ -248,6 +248,22 @@ static void expandConstantExprUsers(GlobalVariable *GV) {
         ToExpand.push_back({CE, I});
   }
   for (auto &[CE, I] : ToExpand) {
+    // (a phi's operand at the end of its incoming block: before the phi it
+    // would break the grouping of phis and not dominate the edge)
+    if (auto *PN = dyn_cast<PHINode>(I)) {
+      DenseMap<BasicBlock *, Instruction *> PerBlock;
+      for (unsigned J = 0, E = PN->getNumIncomingValues(); J != E; ++J) {
+        if (PN->getIncomingValue(J) != CE)
+          continue;
+        Instruction *&Inst = PerBlock[PN->getIncomingBlock(J)];
+        if (!Inst) {
+          Inst = CE->getAsInstruction();
+          Inst->insertBefore(PN->getIncomingBlock(J)->getTerminator()->getIterator());
+        }
+        PN->setIncomingValue(J, Inst);
+      }
+      continue;
+    }
     auto *Inst = CE->getAsInstruction();
     Inst->insertBefore(I->getIterator());
     I->replaceUsesOfWith(CE, Inst);
