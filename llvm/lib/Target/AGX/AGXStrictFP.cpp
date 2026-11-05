@@ -1212,7 +1212,12 @@ static bool lowerIEEE(Instruction &I) {
       Uses.push_back(&U);
     IRBuilder<> B(I.getNextNode());
     SoftFloat SF(B);
-    Value *Scaled = B.CreateIntrinsic(ID, {B.getFloatTy()}, {SF.scaleUp64(X)});
+    // (log2 of the strict mode: the precise expansion, within the rounding of the
+    // exact result where the hardware's approximation may be off by one)
+    bool Log2 = ID == Intrinsic::log2 || ID == Intrinsic::agx_log2;
+    Value *Scaled = Log2 ? AGX::expandMath(B, Intrinsic::log2, {SF.scaleUp64(X)})
+                         : B.CreateIntrinsic(ID, {B.getFloatTy()}, {SF.scaleUp64(X)});
+    Value *Normal = Log2 ? AGX::expandMath(B, Intrinsic::log2, {X}) : static_cast<Value *>(&I);
     Value *Fixed;
     if (ID == Intrinsic::agx_rcp)
       Fixed = B.CreateFMul(Scaled, SF.fconst(0x1p64f));
@@ -1220,7 +1225,7 @@ static bool lowerIEEE(Instruction &I) {
       Fixed = B.CreateFMul(Scaled, SF.fconst(0x1p32f));
     else
       Fixed = B.CreateFSub(Scaled, SF.fconst(64.0f));
-    Value *R = B.CreateSelect(SF.isDenormal(SF.bits(X)), Fixed, &I);
+    Value *R = B.CreateSelect(SF.isDenormal(SF.bits(X)), Fixed, Normal);
     for (Use *U : Uses)
       U->set(R);
     return true;
