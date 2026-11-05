@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ConstantExprLower.h"
+#include "llvm/ADT/DenseMap.h"
 #include "AIRConstraints.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
@@ -28,6 +29,7 @@ void lowerConstantExprs(Module &M) {
     if (F.isDeclaration())
       continue;
     SmallVector<std::pair<Instruction *, unsigned>, 32> Worklist;
+    DenseMap<std::pair<BasicBlock *, ConstantExpr *>, Instruction *> PhiOperands;
     bool Changed = true;
     while (Changed) {
       Changed = false;
@@ -95,6 +97,20 @@ void lowerConstantExprs(Module &M) {
           }
         }
 
+        // (before a phi it would break the grouping of phis, and not dominate
+        // the edge: it goes at the end of the incoming block, once per block,
+        // since a phi must have one value for a block it lists twice)
+        if (auto *PN = dyn_cast<PHINode>(I)) {
+          BasicBlock *In = PN->getIncomingBlock(OpIdx);
+          auto [It, New] = PhiOperands.try_emplace({In, CE}, NewI);
+          if (New)
+            NewI->insertBefore(In->getTerminator()->getIterator());
+          else
+            NewI->deleteValue();
+          PN->setIncomingValue(OpIdx, It->second);
+          Changed = true;
+          continue;
+        }
         NewI->insertBefore(I->getIterator());
         I->setOperand(OpIdx, NewI);
         Changed = true;
