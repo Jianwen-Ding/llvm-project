@@ -1427,13 +1427,11 @@ void RaiseToAIR::emulate(Function &F, StringRef Key) {
     R = Afn(B.CreateIntrinsic(Intrinsic::log2, {Ret}, {A[0]}));
   else if (Intr.starts_with("llvm.agx.sin.") ||
            Intr.starts_with("llvm.agx.cos.")) {
-    // The argument is in quadrants.
-    Value *X = Afn(B.CreateFMul(
-        A[0], ConstantFP::get(Ret, numbers::pi / 2)));
+    // (in radians, as llvm.sin: AGXISelLowering lowers them to the same node)
     R = Afn(B.CreateIntrinsic(Intr.starts_with("llvm.agx.sin.")
                                   ? Intrinsic::sin
                                   : Intrinsic::cos,
-                              {Ret}, {X}));
+                              {Ret}, {A[0]}));
   } else if (Intr.starts_with("llvm.agx.simdgroup.matrix.fma.") &&
              A.size() == 4) {
     // D = A * B + C on 8x8 matrices; thread t holds (r, c) and (r, c + 1),
