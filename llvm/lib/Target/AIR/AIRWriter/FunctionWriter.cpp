@@ -372,13 +372,16 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
     W.EnterSubblock(bitc::METADATA_ATTACHMENT_ID, 3);
     SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
     SmallVector<uint64_t, 16> Record;
+    SmallVector<StringRef, 64> KindNames;
+    F.getContext().getMDKindNames(KindNames);
     for (auto &P : Attached) {
       MDs.clear();
       P.second->getAllMetadataOtherThanDebugLoc(MDs);
       Record.clear();
       Record.push_back(P.first);
       for (auto &Att : MDs) {
-        Record.push_back(Att.first);
+        // (emitAIRBitcode has dropped the kinds the file does not have)
+        Record.push_back(*airMetadataKind(KindNames[Att.first]));
         Record.push_back(MD.globalMDID(Att.second));
       }
       W.EmitRecord(bitc::METADATA_ATTACHMENT, Record);

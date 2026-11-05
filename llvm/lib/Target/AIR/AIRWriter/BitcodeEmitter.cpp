@@ -340,6 +340,8 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
                        ValueEnumerator &E, const MetadataEnumerator &MD);
 
 std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
+  dropMetadataOutsideAIRKinds(M);
+
   SmallVector<char, 0> Buf;
 
   {

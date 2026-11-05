@@ -132,44 +132,70 @@ uint64_t MetadataEnumerator::operandID(const Metadata *Op) const {
   return 0;
 }
 
+// The metadata kinds of the module, whose order is their ID in the file. LLVM's
+// own IDs differ from these past its first kinds, and it gives others (hints
+// such as agx.atomic.ordering) IDs of their own.
+static const char *const Kinds[] = {
+    "dbg",
+    "tbaa",
+    "prof",
+    "fpmath",
+    "range",
+    "tbaa.struct",
+    "invariant.load",
+    "alias.scope",
+    "noalias",
+    "nontemporal",
+    "llvm.mem.parallel_loop_access",
+    "nonnull",
+    "dereferenceable",
+    "dereferenceable_or_null",
+    "make.implicit",
+    "unpredictable",
+    "invariant.group",
+    "align",
+    "llvm.loop",
+    "type",
+    "section_prefix",
+    "absolute_symbol",
+    "associated",
+    "callees",
+    "irr_loop",
+    "llvm.access.group",
+    "callback",
+    "llvm.preserve.access.index",
+    "vcall_visibility",
+    "noundef",
+    "annotation",
+    "heapallocsite",
+    "air.function_groups",
+};
+
+std::optional<unsigned> airMetadataKind(StringRef Name) {
+  for (unsigned I = 0; I < std::size(Kinds); I++)
+    if (Name == Kinds[I])
+      return I;
+  return std::nullopt;
+}
+
+void dropMetadataOutsideAIRKinds(Module &M) {
+  SmallVector<StringRef, 64> Names;
+  M.getContext().getMDKindNames(Names);
+  SmallVector<std::pair<unsigned, MDNode *>, 4> MDs;
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        MDs.clear();
+        I.getAllMetadataOtherThanDebugLoc(MDs);
+        for (auto &P : MDs)
+          if (!airMetadataKind(Names[P.first]))
+            I.setMetadata(P.first, nullptr);
+      }
+}
+
 void emitMetadataKindBlock(BitstreamWriter &W) {
   W.EnterSubblock(bitc::METADATA_KIND_BLOCK_ID, 3);
-  static const char *Kinds[] = {
-      "dbg",
-      "tbaa",
-      "prof",
-      "fpmath",
-      "range",
-      "tbaa.struct",
-      "invariant.load",
-      "alias.scope",
-      "noalias",
-      "nontemporal",
-      "llvm.mem.parallel_loop_access",
-      "nonnull",
-      "dereferenceable",
-      "dereferenceable_or_null",
-      "make.implicit",
-      "unpredictable",
-      "invariant.group",
-      "align",
-      "llvm.loop",
-      "type",
-      "section_prefix",
-      "absolute_symbol",
-      "associated",
-      "callees",
-      "irr_loop",
-      "llvm.access.group",
-      "callback",
-      "llvm.preserve.access.index",
-      "vcall_visibility",
-      "noundef",
-      "annotation",
-      "heapallocsite",
-      "air.function_groups",
-  };
-  for (unsigned I = 0; I < sizeof(Kinds) / sizeof(Kinds[0]); I++) {
+  for (unsigned I = 0; I < std::size(Kinds); I++) {
     SmallVector<uint64_t, 32> V;
     V.push_back(I);
     for (const char *P = Kinds[I]; *P; P++)

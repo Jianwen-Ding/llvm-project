@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Metadata.h"
+#include <optional>
 #include <vector>
 
 namespace llvm {
@@ -54,6 +55,13 @@ struct MetadataEnumerator {
     return strings.size() + values.size() + nodeMap.lookup(N);
   }
 };
+
+/// The ID in the file of a metadata kind, if the file has that kind.
+std::optional<unsigned> airMetadataKind(StringRef Name);
+
+/// Drops the attachments of kinds the file does not have (the hints for other
+/// consumers of AIR, such as agx.atomic.ordering, which Metal does not read).
+void dropMetadataOutsideAIRKinds(Module &M);
 
 } // namespace metal
 } // namespace llvm
