@@ -8,8 +8,8 @@
 //
 // AIR has no double. A module from a front end that writes AIR directly
 // (ZLUDA's PTX path) has doubles everywhere: values, arguments, globals,
-// arithmetic, conversions, atomics. This pass makes it what agx-raise-to-air
-// writes from AGX's IR (llvm/docs/AIR/AIRHints.rst):
+// arithmetic, conversions, atomics. This pass makes it portable AIR
+// (llvm/docs/AIR/AIRHints.rst):
 //
 // * every double is its bits, an i64 (vectors, arrays and structures of
 //   them likewise, constants as their bits);
@@ -27,8 +27,7 @@
 //
 // bfloat arithmetic of the constrained intrinsics is computed in float (or
 // soft-f64 for fma), with the conversions on the bits, so it leaves no
-// bfloat operation. The mapping of each operation follows agx-raise-to-air's
-// (its emulate()); a module without double or constrained intrinsics is left
+// bfloat operation. A module without double or constrained intrinsics is left
 // as it is.
 //
 //===----------------------------------------------------------------------===//
@@ -369,6 +368,13 @@ std::string doubleMask(Type *Ret, ArrayRef<Type *> Ops) {
 
 using LibFn = function_ref<Value *(StringRef, Type *, ArrayRef<Value *>)>;
 
+/// The module asks for IEEE f32 (air.ieee-fp32), at B's position.
+static bool ieeeModuleOf(IRBuilderBase &B) {
+  auto *Flag = mdconst::extract_or_null<ConstantInt>(
+      B.GetInsertBlock()->getModule()->getModuleFlag("air.ieee-fp32"));
+  return Flag && !Flag->isZero();
+}
+
 /// bfloat X (or a vector of them) as float, exactly: its bits are the high
 /// half of the float's.
 Value *bf16ToF32(IRBuilderBase &B, Value *X) {
@@ -398,8 +404,7 @@ Value *f32ToBF16(IRBuilderBase &B, Value *X) {
 /// (exact), the operation in soft-f64 rounded in that direction, then
 /// rounded to Ret in it (rounding twice in the same direction rounds once,
 /// as the values of the format are doubles). Null for an operation that does
-/// not round. agx-raise-to-air's directed(), whose float fast path this
-/// shares.
+/// not round.
 Value *directed(IRBuilderBase &B, StringRef Base, ArrayRef<Value *> A,
                 Type *Ret, Value *Rounding, LibFn Lib) {
   bool Arith = is_contained(
@@ -465,6 +470,21 @@ Value *directed(IRBuilderBase &B, StringRef Base, ArrayRef<Value *> A,
     // toward zero: down from above a positive operand, up from below a
     // negative one
     Value *XNeg = B.CreateFCmpOLT(X, ConstantFP::get(B.getFloatTy(), 0.0));
+    if (ieeeModuleOf(B)) {
+      // On the bits: a float comparison reads a subnormal operand as zero where the GPU flushes.
+      auto Order = [&](Value *V) {
+        Value *Bits = B.CreateBitCast(V, I32);
+        Value *Sign = B.CreateAShr(Bits, 31);
+        return B.CreateSub(B.CreateXor(B.CreateAnd(Bits, 0x7fffffff), Sign), Sign);
+      };
+      Value *XBits = B.CreateBitCast(X, I32);
+      Value *XMag = B.CreateAnd(XBits, 0x7fffffff);
+      Value *Num = B.CreateICmpULE(XMag, B.getInt32(0x7f800000));
+      Value *KB = Order(Back), *KX = Order(X);
+      Above = B.CreateAnd(Num, B.CreateICmpSGT(KB, KX));
+      Below = B.CreateAnd(Num, B.CreateICmpSLT(KB, KX));
+      XNeg = B.CreateICmpSLT(KX, B.getInt32(0));
+    }
     Value *RZ = B.CreateSelect(
         B.CreateAnd(Above, B.CreateNot(XNeg)), Down,
         B.CreateSelect(B.CreateAnd(Below, XNeg), Up, Bits));

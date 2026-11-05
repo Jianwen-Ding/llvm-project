@@ -20,6 +20,7 @@
 #include "LowerPointerVectors.h"
 #include "LowerVectorSelect.h"
 #include "MetadataWriter.h"
+#include "AIRVerify.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Verifier.h"
@@ -345,16 +346,16 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
 std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
   // Metal's reader takes a broken module for an unreadable file or, when it
   // builds a pipeline, fails with "Failed to materializeAll".
-  if (!cl::getRegisteredOptions().lookup("air-skip-device-checks") ||
-      !static_cast<cl::opt<bool> *>(cl::getRegisteredOptions().lookup("air-skip-device-checks"))->getValue()) {
-    std::string Err;
-    raw_string_ostream OS(Err);
-    if (verifyModule(M, &OS))
+  dropMetadataOutsideAIRKinds(M);
+  // Metal's reader takes a broken module for an unreadable file or, when it
+  // builds a pipeline, fails with "Failed to materializeAll".
+  if (!AIRSkipDeviceChecks) {
+    auto Violations = verifyAIR(M, AIRForm::Metal, /*FullVerifier=*/AIRVerifyWritten);
+    if (!Violations.empty())
       report_fatal_error(Twine("AIRWriter: the device would reject this library: ") +
-                             OS.str(),
+                             Violations.front(),
                          /*gen_crash_diag=*/false);
   }
-  dropMetadataOutsideAIRKinds(M);
 
   SmallVector<char, 0> Buf;
 
@@ -393,6 +394,11 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
 
     lowerConstantExprs(M);
     normalizeArrayGlobalGEPs(M);
+    if (!AIRSkipPointerRepairs) {
+      fixGlobalGEPBases(M, PTM);
+      fixComparePointerTypes(M, PTM);
+      fixMemIntrinsicPointers(M, PTM);
+    }
     fixKernelArgMetadata(M, PTM);
 
     if (const char *pw = getenv("METAL_DUMP_PREWRITE")) {
@@ -728,9 +734,11 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
         SmallVector<uint64_t, 14> Ops;
         Ops.push_back(E.globalPtrTypeIdx(G));
         Ops.push_back(G->isConstant() ? 1 : 0);
-        Ops.push_back(G->hasInitializer()
-                          ? E.moduleConstIdx(G->getInitializer()) + 1
-                          : 0);
+        // (an initializer that is the address of a global is that global's value)
+        const Constant *Init = G->hasInitializer() ? G->getInitializer() : nullptr;
+        Ops.push_back(!Init                       ? 0
+                      : isa<GlobalValue>(Init)   ? E.globalIdx(Init) + 1
+                                                 : E.moduleConstIdx(Init) + 1);
         Ops.push_back(encodeLinkage(G->getLinkage()));
         Ops.push_back(G->getAlign() ? Log2_32(G->getAlign()->value()) + 1 : 0);
         Ops.push_back(G->hasSection() ? sectionIndex(G->getSection()) : 0);
@@ -830,7 +838,15 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
     }
   }
 
-  return std::vector<uint8_t>(Buf.begin(), Buf.end());
+  std::vector<uint8_t> Bytes(Buf.begin(), Buf.end());
+  if (AIRVerifyWritten) {
+    std::string Problem = verifyAIRBitcode(Bytes);
+    if (!Problem.empty())
+      report_fatal_error(Twine("AIRWriter: the device would reject this library: ") +
+                             Problem,
+                         /*gen_crash_diag=*/false);
+  }
+  return Bytes;
 }
 
 }

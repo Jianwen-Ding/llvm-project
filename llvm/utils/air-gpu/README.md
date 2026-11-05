@@ -3,6 +3,9 @@
 `air_gpu_suite.py` runs kernels compiled by the AIR target on a real Apple GPU
 and compares every result with a reference computed in Python.
 `air_gpu_run.py` runs one AIR library with given buffers, for lit tests.
+`air_verify_device_check.py` checks that `llc` and the device agree on the modules in
+`verify-cases`, and `air_verify_mutants.py` breaks a valid kernel in many ways to find what
+`llc` misses.
 
 Both talk to the AIR service: a JSON file queue at `/air` (override with
 `--queue` or `AIR_QUEUE`) served by a Mac, with the client in `/air/client`

@@ -14,7 +14,7 @@
 //
 // The functions ending in _r take the rounding direction as an operand rm,
 // numbered like FLT_ROUNDS: 0 toward zero, 1 to nearest even, 2 upward, 3
-// downward (agx-raise-to-air's emulations of directed rounding).
+// downward (the emulations of directed rounding).
 //
 // The functions are branch free where it is cheap: each computes the result
 // for finite nonzero operands whatever the operands are, then selects the

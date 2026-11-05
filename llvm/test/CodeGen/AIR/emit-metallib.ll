@@ -1,6 +1,7 @@
+; (A module the device would reject: this test is about another part of the target.)
 ; End-to-end: a kernel marked with !air.kernel metadata is serialized into a
 ; full .metallib container (MTLB magic), not bare bitcode.
-; RUN: llc -mtriple=air -filetype=obj %s -o %t.metallib
+; RUN: llc -air-skip-device-checks -mtriple=air -filetype=obj %s -o %t.metallib
 ; RUN: od -An -c -N 4 %t.metallib | FileCheck %s
 
 ; CHECK: M T L B

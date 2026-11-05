@@ -259,7 +259,7 @@ unsigned ValueEnumerator::typeIdx(Type *T) {
     OS << "AIRWriter: type '" << *T
        << "' is used at emit time but was not registered; add it to "
           "ValueEnumerator's registration loop";
-    report_fatal_error(StringRef(OS.str()));
+    reportFatalUsageError(StringRef(OS.str()));
   }
   return addType(T);
 }
@@ -277,7 +277,7 @@ unsigned ValueEnumerator::ptrTypeIdxForValue(const Value *V) {
        << "' resolves to an unregistered typed-pointer entry at emit time; "
           "its producing instruction was not enumerated (would desync the "
           "frozen type table). Add it to ValueEnumerator's registration loop.";
-    report_fatal_error(StringRef(OS.str()));
+    reportFatalUsageError(StringRef(OS.str()));
   }
   return ptrTypeIdx(V->getType(), Pointee);
 }

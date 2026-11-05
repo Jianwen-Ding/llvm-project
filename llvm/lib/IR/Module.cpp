@@ -360,7 +360,11 @@ Metadata *Module::getModuleFlag(StringRef Key) const {
   if (!ModFlags)
     return nullptr;
   for (const MDNode *Flag : ModFlags->operands()) {
-    if (Key == cast<MDString>(Flag->getOperand(1))->getString())
+    // (a malformed flag is the verifier's to report: llc reads flags before verifying the module)
+    if (Flag->getNumOperands() < 3)
+      continue;
+    auto *Name = dyn_cast_or_null<MDString>(Flag->getOperand(1));
+    if (Name && Key == Name->getString())
       return Flag->getOperand(2);
   }
   return nullptr;

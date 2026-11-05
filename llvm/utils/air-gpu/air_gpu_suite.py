@@ -487,7 +487,8 @@ def run_group_air(cases, data, llc, queue, tmp, log, gname='?', raw_out=None):
         if air is None or rejected_together:
             mine, err = compile_air(llc, module_ir([c]), tmp, c.name)
             if mine is None:
-                results[c.name] = {'status': 'COMPILE', 'detail': err}
+                # (llc's checks report a function AIR does not have before the device can)
+                results[c.name] = {'status': 'ABSENT' if c.absent else 'COMPILE', 'detail': err}
                 continue
         values = data[c.name]
         reply = run_case(c, mine, [pack(t, v) for t, v in zip(c.ins, values)], queue, label='%s %s' % (gname, c.name))
@@ -2661,10 +2662,22 @@ def group_llvm_int_narrow():
     def s128(x):
         x &= M128
         return x - (1 << 128) if x >> 127 else x
+
+    def sdiv128(a, b):
+        # (toward zero; b == 0 and the overflowing quotient are not generated)
+        if b == 0:
+            return 0
+        q = abs(a) // abs(b)
+        return q if (a < 0) == (b < 0) else -q
     for name, inst, ref, decl in (
             ('add', 'add i128 %A, %B', lambda a, b: a + b, None),
             ('sub', 'sub i128 %A, %B', lambda a, b: a - b, None),
             ('mul', 'mul i128 %A, %B', lambda a, b: a * b, None),
+            # (division: expanded to a loop, whose blocks are not in reverse post-order)
+            ('udiv', 'udiv i128 %A, %B', lambda a, b: a // b if b else 0, None),
+            ('urem', 'urem i128 %A, %B', lambda a, b: a % b if b else 0, None),
+            ('sdiv', 'sdiv i128 %A, %B', lambda a, b: sdiv128(s128(a), s128(b)), None),
+            ('srem', 'srem i128 %A, %B', lambda a, b: s128(a) - sdiv128(s128(a), s128(b)) * s128(b), None),
             ('xor', 'xor i128 %A, %B', lambda a, b: a ^ b, None),
             ('shl', 'shl i128 %A, %sh', lambda a, b: a << (b & 127), None),
             ('lshr', 'lshr i128 %A, %sh', lambda a, b: a >> (b & 127), None),

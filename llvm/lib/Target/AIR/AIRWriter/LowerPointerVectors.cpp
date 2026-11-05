@@ -139,7 +139,7 @@ void lowerVectorPointerToInt(Module &M) {
         }
         Repl = B.CreateAdd(Base, Off);
       } else {
-        report_fatal_error(Twine("AIRWriter: unhandled vector-of-pointer "
+        reportFatalUsageError(Twine("AIRWriter: unhandled vector-of-pointer "
                                  "producer '") +
                            I->getOpcodeName() + "' in function '" +
                            F.getName() + "'");

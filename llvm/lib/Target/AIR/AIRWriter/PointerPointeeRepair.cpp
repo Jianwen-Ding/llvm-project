@@ -22,6 +22,8 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Instructions.h"
 
+#include "llvm/IR/IntrinsicInst.h"
+
 using namespace llvm;
 
 namespace llvm {
@@ -202,6 +204,71 @@ void fixAtomicPointerArgs(Module &M, PointeeTypeMap &PTM) {
     if (!Have || Have == Want)
       continue;
     CI->setArgOperand(0, retypePointerVia(Ptr, Want, CI, PTM));
+  }
+}
+
+void fixGlobalGEPBases(Module &M, PointeeTypeMap &PTM) {
+  auto GEPs = collectInsts<GetElementPtrInst>(M, [](GetElementPtrInst *G) {
+    auto *GV = dyn_cast<GlobalVariable>(G->getPointerOperand());
+    return GV && GV->getValueType() != G->getSourceElementType();
+  });
+  for (auto *G : GEPs)
+    G->setOperand(0, retypePointerVia(G->getPointerOperand(),
+                                      G->getSourceElementType(), G, PTM));
+}
+
+void fixMemIntrinsicPointers(Module &M, PointeeTypeMap &PTM) {
+  Type *I8 = Type::getInt8Ty(M.getContext());
+  auto Calls = collectInsts<MemIntrinsic>(M, [](MemIntrinsic *) { return true; });
+  for (auto *MI : Calls)
+    for (unsigned J = 0, N = MI->arg_size(); J != N; ++J) {
+      Value *A = MI->getArgOperand(J);
+      if (!A->getType()->isPointerTy() || isa<ConstantPointerNull>(A))
+        continue;
+      Type *Have = isa<GlobalVariable>(A) ? cast<GlobalVariable>(A)->getValueType()
+                                          : effectivePointee(A, PTM);
+      if (Have != I8)
+        MI->setArgOperand(J, retypePointerVia(A, I8, MI, PTM));
+    }
+}
+
+void fixComparePointerTypes(Module &M, PointeeTypeMap &PTM) {
+  auto Cmps = collectInsts<ICmpInst>(M, [](ICmpInst *C) {
+    return C->getOperand(0)->getType()->isPointerTy();
+  });
+  auto PointeeOf = [&](Value *V) -> Type * {
+    if (auto *GV = dyn_cast<GlobalVariable>(V))
+      return GV->getValueType();
+    return effectivePointee(V, PTM);
+  };
+  for (auto *C : Cmps) {
+    Value *A = C->getOperand(0), *B = C->getOperand(1);
+    // (a constant has its one written type: null takes the other's with an
+    // inttoptr of zero, as a phi's does)
+    auto NullAs = [&](Value *Other) -> Value * {
+      Type *Pointee = PointeeOf(Other);
+      if (!Pointee)
+        return nullptr;
+      auto *Zero = ConstantInt::get(Type::getInt64Ty(C->getContext()), 0);
+      auto *I2P = new IntToPtrInst(Zero, Other->getType(), "", C->getIterator());
+      PTM.set(I2P, Pointee);
+      return I2P;
+    };
+    if (isa<ConstantPointerNull>(A) && isa<ConstantPointerNull>(B))
+      continue;
+    if (isa<ConstantPointerNull>(B)) {
+      if (Value *N = NullAs(A))
+        C->setOperand(1, N);
+      continue;
+    }
+    if (isa<ConstantPointerNull>(A)) {
+      if (Value *N = NullAs(B))
+        C->setOperand(0, N);
+      continue;
+    }
+    Type *PA = PointeeOf(A), *PB = PointeeOf(B);
+    if (PA && PB && PA != PB)
+      C->setOperand(1, retypePointerVia(B, PA, C, PTM));
   }
 }
 

@@ -9,7 +9,7 @@
 /// \file
 /// AIR has no double: every double of the module becomes its bits (i64) and
 /// every double precision operation a call of arith-emulate-f64's library
-/// (AIRSoftF64.inc), as agx-raise-to-air writes them. Constrained floating
+/// (AIRSoftF64.inc). Constrained floating
 /// point intrinsics of every format become AIR operations, rounded in their
 /// static direction through the same library.
 ///

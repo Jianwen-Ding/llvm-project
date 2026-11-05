@@ -15,6 +15,7 @@
 
 #include "BitcodeEncoding.h"
 #include "MetadataWriter.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "AIRConstraints.h"
@@ -68,9 +69,17 @@ void emitConstantsBlock(
     const DenseMap<const Constant *, unsigned> *PoisonPtrTypeIdx = nullptr);
 
 // (for tests that show what the device itself does with such a library)
-static cl::opt<bool> AIRSkipDeviceChecks(
+cl::opt<bool> AIRSkipDeviceChecks(
     "air-skip-device-checks", cl::Hidden,
     cl::desc("Write AIR even if the device would reject it"));
+cl::opt<bool> AIRVerifyWritten(
+    "air-verify-written", cl::Hidden,
+    cl::desc("Read the written file back and verify it (slower: for tests and "
+             "checks of the writer)"));
+cl::opt<bool> AIRSkipPointerRepairs(
+    "air-skip-pointer-repairs", cl::Hidden,
+    cl::desc("Do not give pointers the written types the device requires (to "
+             "test the checks that report them)"));
 
 /// What Metal's reader, which has typed pointers, rejects as "Unexpected bitcode
 /// file!", checked on the types this writer gives the values: the operands an
@@ -86,9 +95,20 @@ static std::string typedPointerViolation(const Function &F, ValueEnumerator &E) 
     return Msg;
   };
   auto IsPoison = [](const Value *V) { return isa<UndefValue>(V); };
+  // The type the reader gives a value: a getelementptr's follows from its operands,
+  // whatever the map of pointees holds.
+  auto Written = [&](const Value *V) -> unsigned {
+    if (auto *G = dyn_cast<GetElementPtrInst>(V)) {
+      Type *Pointee = G->getNumIndices() == 1 ? writtenGEPSourceType(G, E.PTM)
+                                              : G->getResultElementType();
+      if (auto Idx = E.findPtrTypeIdx(G->getType(), Pointee))
+        return *Idx;
+    }
+    return E.typeIdxForValue(V);
+  };
   auto SameType = [&](const Value *A, const Value *B) {
     return !A->getType()->isPointerTy() || IsPoison(A) || IsPoison(B) ||
-           E.typeIdxForValue(A) == E.typeIdxForValue(B);
+           Written(A) == Written(B);
   };
   auto Points = [&](const Value *Ptr, Type *Pointee) {
     if (IsPoison(Ptr))
@@ -112,6 +132,16 @@ static std::string typedPointerViolation(const Function &F, ValueEnumerator &E) 
         const Function *Callee = Call->getCalledFunction();
         if (!Callee)
           continue;
+        // (their declarations take their pointee types from a use, so that the
+        // argument agrees with the parameter; the intrinsic itself takes bytes)
+        if (auto *MI = dyn_cast<MemIntrinsic>(Call))
+          for (const Value *Arg : MI->args())
+            if (Arg->getType()->isPointerTy() && !IsPoison(Arg)) {
+              auto Bytes = E.findPtrTypeIdx(Arg->getType(), Type::getInt8Ty(F.getContext()));
+              if (!Bytes || Written(Arg) != *Bytes)
+                return Report(I, "a memory intrinsic on a pointer other than a byte "
+                                 "pointer");
+            }
         auto Params = E.funcTypeParamIndices.find(Callee->getFunctionType());
         if (Params == E.funcTypeParamIndices.end())
           continue;
@@ -119,7 +149,7 @@ static std::string typedPointerViolation(const Function &F, ValueEnumerator &E) 
              J != N && J != Params->second.size(); ++J) {
           const Value *Arg = Call->getArgOperand(J);
           if (Arg->getType()->isPointerTy() && !IsPoison(Arg) &&
-              E.typeIdxForValue(Arg) != Params->second[J])
+              Written(Arg) != Params->second[J])
             return Report(I, "a call with a pointer argument of another type "
                              "than its parameter");
         }
@@ -429,7 +459,7 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
         W.EmitRecord(bitc::FUNC_CODE_INST_ALLOCA, V);
       } else {
 
-        report_fatal_error(Twine("AIRWriter: unhandled instruction '") +
+        reportFatalUsageError(Twine("AIRWriter: unhandled instruction '") +
                            I.getOpcodeName() + "' in function '" + F.getName() +
                            "'");
       }

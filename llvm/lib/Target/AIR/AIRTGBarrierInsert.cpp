@@ -7,6 +7,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "AIRTGBarrierInsert.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Metadata.h"
 #include "AIR.h"
 #include "AIRAddressSpaces.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -91,6 +93,58 @@ static void ensureBarrierBeforeConditionalBranch(CondBrInst *BI, Module &M,
   Changed = true;
 }
 
+/// The parameters of kernel F that !air.kernel describes as the thread's index
+/// (not the threadgroup's: that is one value for all the threads a barrier syncs).
+static SmallVector<unsigned, 2> perThreadKernelArgs(Function &F, Module &M) {
+  SmallVector<unsigned, 2> Out;
+  NamedMDNode *Kernels = M.getNamedMetadata("air.kernel");
+  if (!Kernels)
+    return Out;
+  for (MDNode *K : Kernels->operands()) {
+    if (K->getNumOperands() < 3 || mdconst::dyn_extract_or_null<Function>(K->getOperand(0)) != &F)
+      continue;
+    auto *Args = dyn_cast_or_null<MDNode>(K->getOperand(K->getNumOperands() - 1));
+    if (!Args)
+      continue;
+    for (const MDOperand &A : Args->operands()) {
+      auto *Node = dyn_cast_or_null<MDNode>(A);
+      if (!Node || Node->getNumOperands() < 2)
+        continue;
+      auto *Idx = mdconst::dyn_extract_or_null<ConstantInt>(Node->getOperand(0));
+      auto *Role = dyn_cast_or_null<MDString>(Node->getOperand(1));
+      if (!Idx || !Role || Idx->getZExtValue() >= F.arg_size())
+        continue;
+      StringRef R = Role->getString();
+      if (R == "air.thread_position_in_threadgroup" ||
+          R == "air.thread_position_in_grid" ||
+          R == "air.thread_index_in_threadgroup" ||
+          R == "air.thread_index_in_simdgroup")
+        Out.push_back(Idx->getZExtValue());
+    }
+  }
+  return Out;
+}
+
+/// A value that may differ between the threads of a threadgroup whatever its
+/// operands: the thread's index, what a SIMD-group function or an atomic returns,
+/// and what is read from memory that threads write. (Constant buffers are the same
+/// for all of them.)
+static bool mayDifferBetweenThreads(const Instruction &I) {
+  if (auto *L = dyn_cast<LoadInst>(&I))
+    return L->getPointerAddressSpace() != metal::AS::Constant;
+  if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I))
+    return true;
+  auto *CI = dyn_cast<CallInst>(&I);
+  if (!CI)
+    return false;
+  const Function *Callee = CI->getCalledFunction();
+  if (!Callee)
+    return true;
+  StringRef N = Callee->getName();
+  return N.contains("thread_position") || N.contains("thread_index") ||
+         N.starts_with("air.simd") || N.starts_with("air.atomic.");
+}
+
 static bool tgBarrierInsert(Module &M) {
   bool Changed = false;
 
@@ -132,40 +186,56 @@ static bool tgBarrierInsert(Module &M) {
     PostDominatorTree PDT;
     PDT.recalculate(F);
     SmallPtrSet<const Value *, 32> Tainted;
+    SmallPtrSet<BasicBlock *, 16> Divergent;
     {
-      SmallVector<const Instruction *, 32> Work;
+      SmallVector<const Value *, 32> Work;
+      auto Seed = [&](const Value *V) {
+        if (Tainted.insert(V).second)
+          Work.push_back(V);
+      };
+      // The thread's index as a kernel parameter that !air.kernel describes
+      // (a module that has already been through the portable passes).
+      for (unsigned Idx : perThreadKernelArgs(F, M))
+        Seed(F.getArg(Idx));
       for (BasicBlock &BB : F)
         for (Instruction &I : BB)
-          if (auto *CI = dyn_cast<CallInst>(&I))
-            if (Function *Callee = CI->getCalledFunction())
-              if (Callee->getName().contains("thread_position") ||
-                  Callee->getName().contains("thread_index"))
-                if (Tainted.insert(CI).second)
-                  Work.push_back(CI);
-      while (!Work.empty()) {
-        const Instruction *I = Work.pop_back_val();
-        for (const User *U : I->users())
-          if (auto *UI = dyn_cast<Instruction>(U))
-            if (Tainted.insert(UI).second)
-              Work.push_back(UI);
-      }
-    }
-    SmallPtrSet<BasicBlock *, 16> Divergent;
-    for (BasicBlock &BB : F) {
-      auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
-      if (!BI || !Tainted.count(BI->getCondition()))
-        continue;
-      BasicBlock *Reconv = nullptr;
-      if (auto *Node = PDT.getNode(&BB))
-        if (auto *IPDom = Node->getIDom())
-          Reconv = IPDom->getBlock();
-      SmallVector<BasicBlock *, 8> Stack(succ_begin(&BB), succ_end(&BB));
-      while (!Stack.empty()) {
-        BasicBlock *Cur = Stack.pop_back_val();
-        if (Cur == Reconv || !Divergent.insert(Cur).second)
-          continue;
-        for (BasicBlock *S : successors(Cur))
-          Stack.push_back(S);
+          if (mayDifferBetweenThreads(I))
+            Seed(&I);
+      // To a fixed point: a divergent branch makes the blocks up to its
+      // reconvergence point divergent, and a phi that merges paths of different
+      // threads holds a value that differs between them.
+      for (bool Grew = true; Grew;) {
+        Grew = false;
+        while (!Work.empty()) {
+          const Value *V = Work.pop_back_val();
+          for (const User *U : V->users())
+            if (auto *UI = dyn_cast<Instruction>(U))
+              Seed(UI);
+        }
+        for (BasicBlock &BB : F) {
+          auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+          if (!BI || !Tainted.count(BI->getCondition()))
+            continue;
+          BasicBlock *Reconv = nullptr;
+          if (auto *Node = PDT.getNode(&BB))
+            if (auto *IPDom = Node->getIDom())
+              Reconv = IPDom->getBlock();
+          SmallVector<BasicBlock *, 8> Stack(succ_begin(&BB), succ_end(&BB));
+          while (!Stack.empty()) {
+            BasicBlock *Cur = Stack.pop_back_val();
+            if (Cur == Reconv || !Divergent.insert(Cur).second)
+              continue;
+            Grew = true;
+            for (BasicBlock *S : successors(Cur))
+              Stack.push_back(S);
+          }
+          if (Reconv)
+            for (PHINode &P : Reconv->phis())
+              if (!Tainted.count(&P)) {
+                Seed(&P);
+                Grew = true;
+              }
+        }
       }
     }
     auto uniformlyExecuted = [&](BasicBlock *BB) {

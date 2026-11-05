@@ -33,6 +33,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/SCCPSolver.h"
 #include <cstdlib>
+#include "llvm/IR/IntrinsicInst.h"
 #include <functional>
 
 using namespace llvm;
@@ -166,6 +167,53 @@ static void collectTGByteGlobals(Module &M,
 // scalar, 16-byte vec, and 4-byte sub-element gaps. The signal is the presence
 // of a large gap, not stride irregularity. `Offsets` must be sorted+deduped and
 // exclude 0.
+// Whether a load, store or memory intrinsic reached from GV by constant offsets spans one of Offsets, or
+// GV's address is held as an integer: then these are not separate buffers packed in one arena, but one
+// variable read another way (PTX st.shared.v4.u32 then ld.shared.u8), and splitting at them would lose
+// the data between the parts.
+static bool accessCrossesOffsets(GlobalVariable *GV, ArrayRef<int64_t> Offsets, const DataLayout &DL) {
+  auto Crosses = [&](int64_t Start, uint64_t Size) {
+    return any_of(Offsets, [&](int64_t O) { return Start < O && O < Start + int64_t(Size); });
+  };
+  std::function<bool(Value *, int64_t)> Walk = [&](Value *V, int64_t At) {
+    for (User *U : V->users()) {
+      // An address held as an integer can reach any byte of the variable by arithmetic.
+      if (isa<PtrToIntInst>(U) || (isa<ConstantExpr>(U) && cast<ConstantExpr>(U)->getOpcode() == Instruction::PtrToInt))
+        return true;
+      if (auto *CE = dyn_cast<ConstantExpr>(U)) {
+        if (CE->getOpcode() == Instruction::GetElementPtr) {
+          APInt Off(64, 0);
+          if (cast<GEPOperator>(CE)->accumulateConstantOffset(DL, Off) && Walk(CE, At + Off.getSExtValue()))
+            return true;
+        } else if (Walk(CE, At)) {
+          return true;
+        }
+        continue;
+      }
+      if (auto *L = dyn_cast<LoadInst>(U)) {
+        if (Crosses(At, DL.getTypeStoreSize(L->getType())))
+          return true;
+      } else if (auto *S = dyn_cast<StoreInst>(U)) {
+        if (S->getPointerOperand() == V && Crosses(At, DL.getTypeStoreSize(S->getValueOperand()->getType())))
+          return true;
+      } else if (auto *M = dyn_cast<MemIntrinsic>(U)) {
+        auto *Len = dyn_cast<ConstantInt>(M->getLength());
+        if (!Len || Crosses(At, Len->getZExtValue()))
+          return true;
+      } else if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+        APInt Off(64, 0);
+        if (G->accumulateConstantOffset(DL, Off) && Walk(G, At + Off.getSExtValue()))
+          return true;
+      } else if (isa<BitCastInst, AddrSpaceCastInst>(U)) {
+        if (Walk(U, At))
+          return true;
+      }
+    }
+    return false;
+  };
+  return Walk(GV, 0);
+}
+
 static bool offsetsAreBufferBoundaries(ArrayRef<int64_t> Offsets) {
   if (Offsets.empty())
     return false;
@@ -648,7 +696,7 @@ splitMixedByteGlobals(Module &M,
     // not the dense uniformly-strided run the mid-end emits when it unrolls a
     // strided access (splitting that would allocate a tail-sized global per
     // element slot — a ~30x threadgroup budget explosion).
-    if (!offsetsAreBufferBoundaries(ConstOffsets))
+    if (!offsetsAreBufferBoundaries(ConstOffsets) || accessCrossesOffsets(GV, ConstOffsets, DL))
       continue;
 
     // Size of the base (offset-0) typed global. Normally it ends at the first
@@ -1122,8 +1170,11 @@ static bool retypeByteGlobals(Module &M) {
     // global survives next to its .typed twin and double-counts the 32KB
     // threadgroup budget.
     GV->removeDeadConstantUsers();
-    if (GV->use_empty())
-      GV->eraseFromParent();
+    // What rewriteByteGEPs leaves (a ptrtoint of the global, a constant
+    // getelementptr) moves too: on the old global it would be a second array,
+    // and the same address would name different memory.
+    GV->replaceAllUsesWith(NewGV);
+    GV->eraseFromParent();
 
     // Clean up residual i8 GEPs: aligned ones become typed (index / ElemSize),
     // unaligned ones stay as i8 GEPs but rebase on an i8* alias of NewGV so
@@ -1196,7 +1247,7 @@ static bool retypeByteGlobals(Module &M) {
 
     // Same boundary-vs-unrolled-addressing discriminator as the mixed-byte
     // path above: only split on genuine sub-buffer boundaries.
-    if (!offsetsAreBufferBoundaries(Offsets))
+    if (!offsetsAreBufferBoundaries(Offsets) || accessCrossesOffsets(GV, Offsets, DL))
       continue;
 
     DenseMap<int64_t, GlobalVariable *> SplitMap;
@@ -1279,8 +1330,10 @@ static bool retypeByteGlobals(Module &M) {
 
       Changed |= rewriteByteGEPs(SplitGV, TypedGV, SplitOldAT, TypedAT, ElemTy,
                                  ESize, Ctx);
-      if (SplitGV->use_empty())
-        SplitGV->eraseFromParent();
+      // (one array: see the retyping above)
+      SplitGV->removeDeadConstantUsers();
+      SplitGV->replaceAllUsesWith(TypedGV);
+      SplitGV->eraseFromParent();
     }
   }
   return Changed;
@@ -1789,6 +1842,18 @@ static bool normalizeI1Pointers(Module &M) {
   for (Function &F : M)
     for (BasicBlock &BB : F)
       for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        // alloca i1 -> i8, like its accesses below: Metal rejects the module if they disagree.
+        if (auto *A = dyn_cast<AllocaInst>(&I)) {
+          Type *T = A->getAllocatedType();
+          if (T->isIntegerTy(1)) {
+            A->setAllocatedType(I8);
+            Changed = true;
+          } else if (auto *AT = dyn_cast<ArrayType>(T); AT && AT->getElementType()->isIntegerTy(1)) {
+            A->setAllocatedType(ArrayType::get(I8, AT->getNumElements()));
+            Changed = true;
+          }
+          continue;
+        }
         // GEP i1 element -> i8. Includes array-of-i1 source types (the
         // `__base_` preamble GEP synthesized off a `[N x i1]` global), which
         // otherwise reach the writer as an unmaterializable i1 array type.
@@ -1824,7 +1889,7 @@ static bool normalizeI1Pointers(Module &M) {
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
           if (LI->getType()->isIntegerTy(1)) {
             IRBuilder<> B(LI);
-            auto *L8 = B.CreateLoad(I8, LI->getPointerOperand());
+            auto *L8 = B.CreateLoad(I8, LI->getPointerOperand(), LI->isVolatile());
             L8->setAlignment(LI->getAlign());
             Value *Tr = B.CreateTrunc(L8, LI->getType());
             LI->replaceAllUsesWith(Tr);

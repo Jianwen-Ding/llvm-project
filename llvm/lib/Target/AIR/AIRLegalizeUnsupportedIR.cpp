@@ -10,6 +10,7 @@
 #include "AIR.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/AIR.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -17,8 +18,10 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/Utils/Local.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include <optional>
 #include "llvm/IR/Operator.h"
+#include "llvm/Transforms/Utils/IntegerDivision.h"
 #include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
 #include "llvm/Transforms/Utils/LowerAtomic.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -117,10 +120,28 @@ void wideAIRFunctionsToIntrinsics(Module &M) {
   }
 }
 
-// Integers of 65 to 128 bits (AIR has none; agx-raise-to-air keeps them as
+// Integers of 65 to 128 bits (AIR has none; portable AIR keeps them as
 // a type hint, llvm/IR/AIR.h) as two i64 limbs. The high limb of an N-bit
 // value holds its bits 64 to N - 1, zero above.
 void expandWideIntegers(Module &M) {
+  // Wide division and remainder first, as loops of the operations below (Metal has no i128).
+  {
+    SmallVector<BinaryOperator *, 4> Divs;
+    for (Function &F : M)
+      for (Instruction &I : instructions(F))
+        if (auto *BO = dyn_cast<BinaryOperator>(&I);
+            BO && BO->getType()->isIntegerTy() && BO->getType()->getIntegerBitWidth() > 64 &&
+            BO->getType()->getIntegerBitWidth() <= 128 &&
+            (BO->getOpcode() == Instruction::UDiv || BO->getOpcode() == Instruction::SDiv ||
+             BO->getOpcode() == Instruction::URem || BO->getOpcode() == Instruction::SRem))
+          Divs.push_back(BO);
+    for (BinaryOperator *BO : Divs) {
+      if (BO->getOpcode() == Instruction::UDiv || BO->getOpcode() == Instruction::SDiv)
+        expandDivision(BO);
+      else
+        expandRemainder(BO);
+    }
+  }
   auto isWide = [](Type *T) {
     return T->isIntegerTy() && T->getIntegerBitWidth() > 64 &&
            T->getIntegerBitWidth() <= 128;
@@ -133,8 +154,11 @@ void expandWideIntegers(Module &M) {
       continue;
     DenseMap<Value *, Limbs2> Limbs;
     SmallVector<Instruction *, 8> Wide;
-    for (auto &BB : F)
-      for (auto &I : BB)
+    // (in reverse post-order, where a value comes before its uses but through phis: the blocks of an
+    // expanded division are not in that order)
+    ReversePostOrderTraversal<Function *> RPOT(&F);
+    for (BasicBlock *BBP : RPOT)
+      for (auto &I : *BBP)
         if (isWide(I.getType()) || llvm::any_of(I.operands(), [&](Value *Op) {
               return isWide(Op->getType());
             }))
@@ -502,7 +526,7 @@ void stripDisjointFlags(Module &M) {
             BO->setIsDisjoint(false);
 }
 
-// Generic pointers (agx-raise-to-air's address-space hint, llvm/IR/AIR.h),
+// Generic pointers (portable AIR's address-space hint, llvm/IR/AIR.h),
 // emulated: Metal has no generic address space. A generic address is an
 // integer in ZLUDA's AGX encoding, which its isspacep already tests as bits:
 // threadgroup addresses with bit 63 set, private (thread) addresses with bits
@@ -567,6 +591,25 @@ Value *pointerOperand(Instruction *I) {
   return nullptr;
 }
 
+// A front end that numbers threadgroup memory itself ("air-shared-block" names the
+// kernel's block; ZLUDA's AGX layout) holds offsets in it as integers, and so in generic
+// addresses: the block's address is subtracted going to generic and added coming back.
+// Numbers from 0x80000000 are dynamic shared memory, which keeps Metal's ("air-shared-dynamic").
+Value *rebaseShared(IRBuilder<> &B, Value *X, bool Add) {
+  Function *F = B.GetInsertBlock()->getParent();
+  Attribute Block = F->getFnAttribute("air-shared-block");
+  if (!Block.isStringAttribute())
+    return X;
+  GlobalVariable *GV = F->getParent()->getNamedGlobal(Block.getValueAsString());
+  if (!GV)
+    return X;
+  Value *Base = B.CreatePtrToInt(GV, B.getInt64Ty());
+  Value *R = Add ? B.CreateAdd(X, Base) : B.CreateSub(X, Base);
+  if (!F->hasFnAttribute("air-shared-dynamic"))
+    return R;
+  return B.CreateSelect(B.CreateICmpUGE(X, B.getInt64(0x80000000)), X, R);
+}
+
 // P, a generic pointer, as a pointer into address space AS (its tag cleared).
 Value *untag(IRBuilder<> &B, Value *P, unsigned AS) {
   auto *PT = PointerType::get(B.getContext(), AS);
@@ -574,6 +617,8 @@ Value *untag(IRBuilder<> &B, Value *P, unsigned AS) {
     return B.CreateAddrSpaceCast(P, PT);
   Value *I = B.CreatePtrToInt(P, B.getInt64Ty());
   I = B.CreateAnd(I, ~(AS == 3 ? SharedTag : PrivateTag));
+  if (AS == 3)
+    I = rebaseShared(B, I, /*Add=*/true);
   return B.CreateIntToPtr(I, PT);
 }
 
@@ -741,6 +786,8 @@ void emulate(Module &M) {
     Value *R = nullptr;
     if (To == air::GenericHintAS && (From == 3 || From == 0)) {
       Value *I = B.CreatePtrToInt(ASC->getOperand(0), B.getInt64Ty());
+      if (From == 3)
+        I = rebaseShared(B, I, /*Add=*/false);
       R = B.CreateIntToPtr(B.CreateOr(I, From == 3 ? SharedTag : PrivateTag),
                            ASC->getType());
     } else if (From == air::GenericHintAS && (To == 3 || To == 0)) {
@@ -755,7 +802,7 @@ void emulate(Module &M) {
 }
 } // namespace generic
 
-// Generic pointers (agx-raise-to-air's address-space hint) as device
+// Generic pointers (portable AIR's address-space hint) as device
 // pointers, after generic::emulate has made their accesses and casts
 // explicit.
 void genericToDevice(Module &M) {
@@ -1168,6 +1215,22 @@ void expandIntrinsicsMetalMishandles(Module &M) {
       Value *MM = B.CreateBinaryIntrinsic(
           Min ? Intrinsic::minnum : Intrinsic::maxnum, X, Y, CI);
       Value *XB = B.CreateBitCast(X, ITy), *YB = B.CreateBitCast(Y, ITy);
+      // .ftz half: the encodings of the flushed operands. flushHalfDenormals flushes the
+      // comparison's and the min's, but the OR of a zero and a subnormal would keep the subnormal
+      // (PTX-formalization stress half-0: min.ftz.f16 of 0 and 0x8300).
+      DenormalMode HalfMode =
+          CI->getFunction()->getDenormalMode(APFloat::IEEEhalf());
+      if (FTy->getScalarType()->isHalfTy() &&
+          HalfMode.Input != DenormalMode::IEEE &&
+          HalfMode.Input != DenormalMode::Dynamic) {
+        auto FlushBits = [&](Value *Bits) -> Value * {
+          Value *Small = B.CreateICmpULT(B.CreateAnd(Bits, ConstantInt::get(ITy, 0x7fff)),
+                                         ConstantInt::get(ITy, 0x0400));
+          return B.CreateSelect(Small, B.CreateAnd(Bits, ConstantInt::get(ITy, 0x8000)), Bits);
+        };
+        XB = FlushBits(XB);
+        YB = FlushBits(YB);
+      }
       Value *Eq =
           B.CreateBitCast(Min ? B.CreateOr(XB, YB) : B.CreateAnd(XB, YB), FTy);
       Value *R = B.CreateSelect(B.CreateFCmpOEQ(X, Y), Eq, MM);
@@ -1208,6 +1271,26 @@ void expandIntrinsicsMetalMishandles(Module &M) {
       Type *ITy = X->getType();
       bool Signed = CI->getIntrinsicID() == Intrinsic::smul_with_overflow;
       Value *R = B.CreateMul(X, Y);
+      // Unsigned 64 bits: the high word of the product, from 32-bit pieces. Metal's
+      // compiler crashes on some 64-bit divisions this would otherwise make (by a
+      // zero-extended value known not to be zero), and a division is far slower.
+      if (!Signed && ITy->isIntegerTy(64)) {
+        Value *M32 = ConstantInt::get(ITy, 0xffffffffu);
+        Value *S32 = ConstantInt::get(ITy, 32);
+        Value *XL = B.CreateAnd(X, M32), *XH = B.CreateLShr(X, S32);
+        Value *YL = B.CreateAnd(Y, M32), *YH = B.CreateLShr(Y, S32);
+        Value *LL = B.CreateMul(XL, YL), *LH = B.CreateMul(XL, YH);
+        Value *HL = B.CreateMul(XH, YL), *HH = B.CreateMul(XH, YH);
+        Value *Mid = B.CreateAdd(B.CreateLShr(LL, S32),
+                                 B.CreateAdd(B.CreateAnd(LH, M32),
+                                             B.CreateAnd(HL, M32)));
+        Value *Hi = B.CreateAdd(
+            HH, B.CreateAdd(B.CreateLShr(LH, S32),
+                            B.CreateAdd(B.CreateLShr(HL, S32),
+                                        B.CreateLShr(Mid, S32))));
+        replaceStructResult(CI, R, B.CreateICmpNE(Hi, Constant::getNullValue(ITy)));
+        break;
+      }
       Value *XNZ = B.CreateICmpNE(X, Constant::getNullValue(ITy));
       // a divisor of 1 where x is 0, so that the division is defined
       Value *D = B.CreateSelect(XNZ, X, ConstantInt::get(ITy, 1));
@@ -1248,7 +1331,7 @@ void expandIntrinsicsMetalMishandles(Module &M) {
       F.eraseFromParent();
 }
 
-// Threadgroup globals declared, not defined (agx-raise-to-air keeps PTX's
+// Threadgroup globals declared, not defined (portable AIR keeps PTX's
 // .shared variables so; AGX lays them out itself). Metal resolves no
 // threadgroup symbol: a sized one is defined here (undefined contents, as
 // threadgroup memory is), and a zero-sized one, CUDA's dynamic shared memory
@@ -1354,14 +1437,114 @@ void defineThreadgroupGlobals(Module &M) {
       GV->eraseFromParent();
 }
 
+// memcpy, memset and memmove of a length known only at run time as loops of loads
+// and stores. Metal's own lowering of them, with lengths that differ between the
+// threads of a SIMD-group, never finishes if a threadgroup barrier follows (an M2
+// Max; PTX cp.async with an ignore-src predicate). A length known at compile time,
+// or a function without a barrier, keeps Metal's faster lowering.
+void expandVariableMemIntrinsics(Module &M) {
+  SmallVector<MemIntrinsic *, 4> Ops, Always;
+  for (Function &F : M) {
+    bool HasBarrier = false;
+    SmallVector<MemIntrinsic *, 4> Here;
+    for (Instruction &I : instructions(F)) {
+      if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+        // A threadgroup byte array may be retyped by AIRPrepare, which the intrinsic's i8 pointer
+        // would no longer match: as a loop of accesses, which follow the retyping.
+        auto OnByteGlobal = [](Value *P) {
+          auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(P));
+          auto *AT = GV && GV->getAddressSpace() == 3 ? dyn_cast<ArrayType>(GV->getValueType()) : nullptr;
+          if (!AT || !AT->getElementType()->isIntegerTy(8))
+            return false;
+          // (retyped only for accesses wider than a byte)
+          SmallVector<const Value *, 8> Work{GV};
+          SmallPtrSet<const Value *, 8> Seen;
+          while (!Work.empty()) {
+            const Value *V = Work.pop_back_val();
+            if (!Seen.insert(V).second)
+              continue;
+            for (const User *U : V->users()) {
+              if (auto *L = dyn_cast<LoadInst>(U)) {
+                if (!L->getType()->isIntegerTy(8))
+                  return true;
+              } else if (auto *S = dyn_cast<StoreInst>(U)) {
+                if (!S->getValueOperand()->getType()->isIntegerTy(8))
+                  return true;
+              } else if (isa<GEPOperator, BitCastOperator, AddrSpaceCastOperator, PtrToIntOperator, IntToPtrInst>(U) ||
+                         isa<BinaryOperator>(U)) {
+                Work.push_back(U);
+              }
+            }
+          }
+          return false;
+        };
+        bool Byte = OnByteGlobal(MI->getDest());
+        if (auto *MT = dyn_cast<MemTransferInst>(MI))
+          Byte |= OnByteGlobal(MT->getSource());
+        if (Byte)
+          Always.push_back(MI);
+        else if (!isa<ConstantInt>(MI->getLength()))
+          Here.push_back(MI);
+      } else if (auto *C = dyn_cast<CallBase>(&I)) {
+        const Function *Callee = C->getCalledFunction();
+        HasBarrier |= !Callee || Callee->getName().contains("barrier");
+      }
+    }
+    if (HasBarrier)
+      append_range(Ops, Here);
+  }
+  append_range(Ops, Always);
+  if (Ops.empty())
+    return;
+  TargetTransformInfo TTI(M.getDataLayout());
+  for (MemIntrinsic *MI : Ops) {
+    if (auto *MC = dyn_cast<MemCpyInst>(MI))
+      expandMemCpyAsLoop(MC, TTI);
+    else if (auto *MS = dyn_cast<MemSetInst>(MI))
+      expandMemSetAsLoop(MS);
+    else if (auto *MM = dyn_cast<MemMoveInst>(MI))
+      expandMemMoveAsLoop(MM, TTI);
+    else
+      continue;
+    MI->eraseFromParent();
+  }
+}
+
 // A GEP of an address made by inttoptr as integer arithmetic and an inttoptr
 // of its own. ZLUDA forms device addresses so (pointer parameters arrive as
 // integers), and the AIR writer gives such an address one pointee type from
 // its uses: two byte GEPs of it storing a float and an i32 made Metal's reader
 // reject the library ("Unexpected bitcode file", PTX-formalization
 // half-oob-set and half-cmp-pk2). Each address then has its own pointee.
+// The types accessed through P, also through GEPs of it.
+static void accessedTypes(const Value *P, SmallPtrSetImpl<Type *> &Types, unsigned Depth = 0) {
+  if (Depth > 8)
+    return;
+  for (const User *U : P->users()) {
+    if (auto *L = dyn_cast<LoadInst>(U))
+      Types.insert(L->getType());
+    else if (auto *S = dyn_cast<StoreInst>(U)) {
+      if (S->getPointerOperand() == P)
+        Types.insert(S->getValueOperand()->getType());
+    } else if (isa<GetElementPtrInst, BitCastInst>(U))
+      accessedTypes(U, Types, Depth + 1);
+  }
+}
+
 void gepsOfIntToPtrAsIntegers(Module &M) {
   const DataLayout &DL = M.getDataLayout();
+  // Only an address used with different pointees: as GEPs, the others keep the addressing Metal's
+  // compiler optimizes (as integers, spc took 2.4 times as long on an M2 Max).
+  DenseMap<const IntToPtrInst *, bool> Mixed;
+  auto mixed = [&](const IntToPtrInst *Base) {
+    auto [It, New] = Mixed.try_emplace(Base, false);
+    if (New) {
+      SmallPtrSet<Type *, 4> Types;
+      accessedTypes(Base, Types);
+      It->second = Types.size() > 1;
+    }
+    return It->second;
+  };
   for (Function &F : M) {
     bool Changed = true;
     while (Changed) {
@@ -1373,7 +1556,7 @@ void gepsOfIntToPtrAsIntegers(Module &M) {
         auto *GEP = dyn_cast<GetElementPtrInst>(&I);
         auto *Base =
             GEP ? dyn_cast<IntToPtrInst>(GEP->getPointerOperand()) : nullptr;
-        if (!Base || GEP->getType()->isVectorTy())
+        if (!Base || GEP->getType()->isVectorTy() || !mixed(Base))
           continue;
         IRBuilder<> B(GEP);
         Type *IntTy = DL.getIntPtrType(GEP->getType());
@@ -1584,13 +1767,24 @@ void flushHalfDenormals(Module &M) {
 }
 
 bool legalizeUnsupportedIR(Module &M) {
+  // A section means nothing to Metal, and the object writer has no place for one.
+  for (GlobalObject &GO : M.global_objects())
+    if (GO.hasSection())
+      GO.setSection("");
   genericToDevice(M);
   defineThreadgroupGlobals(M);
   stripLifetimeIntrinsics(M);
+  // Metal reads a constant-space array marked externally_initialized wrongly, without an error:
+  // [4 x i16] { 10, 20, 30, 40 } gave 10, 30, 40, 0 on an M2 Max (PTX .const, which ZLUDA marks so).
+  // The library holds the values.
+  for (GlobalVariable &GV : M.globals())
+    if (GV.getAddressSpace() == 2 && GV.isExternallyInitialized())
+      GV.setExternallyInitialized(false);
   expandIntrinsicsMetalMishandles(M);
   wideAIRFunctionsToIntrinsics(M);
   expandWideIntegers(M);
   gepsOfIntToPtrAsIntegers(M);
+  expandVariableMemIntrinsics(M);
   flushHalfDenormals(M);
   lowerFreezeInsts(M);
   canonicalizeNNegZExt(M);

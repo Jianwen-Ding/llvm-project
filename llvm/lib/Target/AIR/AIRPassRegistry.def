@@ -42,6 +42,8 @@ MODULE_PASS("air-simd-divergence-guard", AIRSimdDivergenceGuardPass())
 MODULE_PASS("air-cross-buffer-store-separate", AIRCrossBufferStoreSeparatePass())
 MODULE_PASS("air-embed", AIREmbedderPass())
 MODULE_PASS("air-portable", AIRPortablePass())
+MODULE_PASS("air-verify", AIRVerifyPass(metal::AIRForm::Portable))
+MODULE_PASS("air-verify-metal", AIRVerifyPass(metal::AIRForm::Metal))
 #undef MODULE_PASS
 
 #ifndef FUNCTION_PASS

@@ -1,4 +1,4 @@
-; The Metal pipeline legalizes agx-raise-to-air's hints (llvm/IR/AIR.h) that
+; The Metal pipeline legalizes portable AIR's hints (llvm/IR/AIR.h) that
 ; Metal has no form of: generic pointers become device pointers, integers of
 ; 65 to 128 bits become two i64 limbs, and 32-bit read-modify-writes without
 ; an AIR function become compare-exchange loops.
@@ -7,10 +7,9 @@
 ; RUN: llc -mtriple=air -filetype=obj %s -o /dev/null
 
 ; CHECK-LABEL: define void @generic(
-; (a GEP of an inttoptr address is integer arithmetic, gep-of-inttoptr.ll)
+; (a GEP of an inttoptr address used at one type stays a GEP, gep-of-inttoptr.ll)
 ; CHECK: %p = inttoptr i64 %a to ptr addrspace(1)
-; CHECK: [[A:%.*]] = add i64 %a, 4
-; CHECK: %q = inttoptr i64 [[A]] to ptr addrspace(1)
+; CHECK: %q = getelementptr i32, ptr addrspace(1) %{{.*}}, i64 1
 ; CHECK: load i32, ptr addrspace(1) %q
 ; CHECK: store i32 %v, ptr addrspace(1) %p
 ; CHECK-NOT: addrspace(4)

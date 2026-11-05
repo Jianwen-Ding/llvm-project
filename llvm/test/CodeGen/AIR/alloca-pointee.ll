@@ -13,7 +13,8 @@
 ; CHECK: %g = getelementptr inbounds i8, ptr %[[C1]], i64 8
 ; CHECK: %[[C2:.*]] = bitcast ptr %g to ptr
 ; CHECK: store i32 %v, ptr %[[C2]], align 4
-; CHECK: call void @llvm.memset.p0.i32(ptr align 4 %arr, i8 7, i32 %n, i1 false)
+; CHECK: %[[C3:.*]] = bitcast ptr %arr to ptr
+; CHECK: call void @llvm.memset.p0.i32(ptr align 4 %[[C3]], i8 7, i32 %n, i1 false)
 ; CHECK: %e = getelementptr [16 x i32], ptr %arr, i32 0, i32 %v
 define void @k(ptr addrspace(1) %in, ptr addrspace(1) %out) {
   %v = load i32, ptr addrspace(1) %in

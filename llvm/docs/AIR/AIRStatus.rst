@@ -54,6 +54,18 @@ Verification so far
   ``.metallib`` and ``.air`` files in ``Metal.jl/test/metallib`` are built
   from ``.metal`` sources with Apple's toolchain and are deliberately unused.
 
+* ZLUDA's ``.ptx -> .air`` (2026-11-05, M2 Max, ``--strict-fp --zero-shared``,
+  ``air_agx_diff.py``, PTX-formalization 2c9bc2b): of 841 programs, 823 give the simulator's
+  results. ``legal-forms`` differs only in the bytes of a symbol's address, which it does not
+  check. ``tc-94b-3`` is past the 5 s compile limit. Sixteen cannot be compared with this harness:
+  32-bit addressing, ``.multimem``, ``.fabric``, ``.cooplaunch``, a hidden argument and texture
+  initializers. On the simulator, all 841 pass every ``.expect``.
+* Since then, with ``air_ptx_formalization_check.py``: ``addr32``, ``addr32-generic``, ``multimem``,
+  ``fabric``, ``fabric-mm-counted`` and ``optype-ext`` pass, the last four with
+  ``LLVMZludaAirTablesInGlobals`` in place of the fixed table addresses.
+* Those results are for strict mode. Without ``--strict-fp`` f32 follows the GPU (denormals
+  flushed, NaNs as they come), by design.
+
 Defects found on hardware and fixed
 ===================================
 
@@ -100,6 +112,35 @@ Each of these passed the FileCheck tests of the original branch.
 Blockers
 ========
 
+A thread that polls can starve one in its SIMD-group
+------------------------------------------------------
+
+*What:* threads of a SIMD-group run under one mask, so while one polls, the others wait. ZLUDA
+keeps ``if (rank == 1) write; if (rank == 0) poll`` in order with volatile copies of the branch
+conditions (``async-generic``), but a thread that polls for what another writes *after* that
+thread's own poll has no such order. Confirmed on an M2 Max with polls bounded at 100,000: without
+the fix below, with the poll and the write on the two sides of a branch, in either order, the poller
+never sees the write.
+
+*Fixed:* when one side of a branch waits and the other does not, ZLUDA's module for Metal runs the
+other side first, and when the other side is empty, what follows the branch, in a copy of its own up
+to the first barrier or SIMD-group function, where all threads meet again (``zludaRunWaitersLast``). Threads that wait for each other take turns block by block in one loop with
+a single branch back to its head (``zludaRunThreadsInTurn``).
+
+**Still open:** a write after that barrier or SIMD-group function, or more than 4,096 instructions
+before it; threads that wait for each other in a function over 64 blocks or 1,024 instructions, or
+with SIMD-group functions. Each can still run forever.
+
+*Unblock:* forward progress between threads of one SIMD-group, which Metal does not offer.
+
+Checking AIR cannot prove it valid
+----------------------------------
+
+*What:* ``air-verify`` finds known ways of being invalid. Apple publishes no AIR specification, so
+its rules come from reducing what the device rejects and its ``air.*`` names from the open-source
+producers. The device is not a complete judge either: it accepts ``air.sin.f32`` declared with
+``i32`` values (``verify-cases/badsig.ll``, reported anyway).
+
 The AIR service reports no diagnostics for rejected AIR
 ---------------------------------------------------------
 
@@ -127,8 +168,9 @@ magic, so they pass, but the service rejects such a module (``Tool failed``)
 even for an empty kernel. Without a pre-baked node the pass synthesizes the
 full form and the device accepts it.
 
-*Unblock:* either complete bare entries in ``AIRSystemValues`` or reject
-them with a diagnostic, and move the tests to unmarked kernels.
+*Status:* ``llc`` now reports such an entry as an error (see "Checking AIR" in
+``AIRTarget.rst``); the tests that keep one write with
+``-air-skip-device-checks``.
 
 Apple's ``metallib`` tool cannot be run here
 --------------------------------------------
@@ -303,29 +345,3 @@ reachable from every environment). An ordered atomic reaches AGX as a relaxed on
 sequentially consistent fences, as AIR expresses it, which costs more than
 the AGX backend's own lowering of the ordered atomic.
 
-IR to AGX
-----------
-
-Lowering AIR to AGX is designed but not implemented. The design:
-
-* The upstream bitcode reader already parses this backend's ``.air``,
-  upgrading its typed pointers to opaque ones, so ``llc -mtriple=agx k.air``
-  can read it; no AIR reader is needed.
-* An ``agx-lower-air`` module pass, first in the AGX pipeline and a no-op
-  without ``!air.kernel``, reads each kernel's argument roles from
-  ``!air.kernel``; turns system-value parameters and calls into
-  ``llvm.agx.*`` special-register reads; maps AIR math back to LLVM
-  intrinsics with an inverse of ``AIRIntrinsicMappings.td`` (generated in the
-  AGX target from the same file, with ``Invertible`` excluding
-  ``llvm.minimum``/``maximum``); lowers barriers to
-  ``llvm.agx.threadgroup_barrier`` between scoped fences, AIR atomics to
-  ``atomicrmw``/``cmpxchg``, shuffles, ballots and reductions to their AGX
-  intrinsics; and diagnoses AIR functions without an AGX equivalent.
-* Address spaces are remapped by cloning with a type remapper: AIR 0
-  (thread) becomes AGX 5 (private), 2 (constant) becomes 4, 1 and 3 stay.
-  Kernels are rebuilt as ``agx_kernel`` with their buffers in location-index
-  order and the system-value parameters removed.
-* Validation: the same kernel through AIR on the M2 Max and through AGX on the
-  AGX Performance Simulator (``agx_run``, with
-  ``llvm/utils/agx-checked/run_checked.py``'s ``launch()``), compared with each
-  other and with a CPU reference.
