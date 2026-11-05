@@ -629,7 +629,22 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   SmallVector<std::pair<Instruction *, unsigned>, 4> Wide;
   SmallVector<Instruction *, 4> CASLoops;
   SmallVector<LoadInst *, 4> NarrowLoads;
+  bool PrivateChanged = false;
   for (Instruction &I : instructions(F)) {
+    // Private memory belongs to one thread (ld.volatile.local, st.volatile.local): the
+    // chip has no atomics on it, and none are needed, at any width.
+    if (auto *LI = dyn_cast<LoadInst>(&I);
+        LI && LI->isAtomic() && LI->getPointerAddressSpace() == AGX::PRIVATE_ADDRESS) {
+      LI->setAtomic(AtomicOrdering::NotAtomic);
+      PrivateChanged = true;
+      continue;
+    }
+    if (auto *SI = dyn_cast<StoreInst>(&I);
+        SI && SI->isAtomic() && SI->getPointerAddressSpace() == AGX::PRIVATE_ADDRESS) {
+      SI->setAtomic(AtomicOrdering::NotAtomic);
+      PrivateChanged = true;
+      continue;
+    }
     // 16-bit compare-and-swaps (AtomicExpand's partword loops)
     if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I);
         CASBatch && CX && TM && !TM->getSubtargetImpl(F)->hasMesaISA() &&
@@ -701,7 +716,7 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   for (Instruction *CAS : CASLoops)
     expandCASBatch(*CAS);
   if (Wide.empty())
-    return !CASLoops.empty() || !NarrowLoads.empty();
+    return PrivateChanged || !CASLoops.empty() || !NarrowLoads.empty();
   GlobalVariable *Locks = getLocks(*F.getParent());
   for (auto [I, Bits] : Wide)
     expand(*I, Bits, Locks);
