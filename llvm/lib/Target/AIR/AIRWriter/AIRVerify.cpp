@@ -71,6 +71,32 @@ static bool isKnownAIRFunction(StringRef Name) {
   return Functions.contains(Fn);
 }
 
+/// Whether Role is an argument role of AIR: what the open-source producers use, as for
+/// the function names above. Metal's compiler fails internally on another.
+static bool isKnownAIRArgumentRole(StringRef Role) {
+  static const StringSet<> Roles = {
+      "air.barycentric_coord", "air.base_instance", "air.base_vertex", "air.buffer",
+      "air.clip_distance", "air.depth", "air.dispatch_threads_per_threadgroup", "air.fragment_input",
+      "air.front_facing", "air.grid_origin", "air.grid_size", "air.imageblock_data",
+      "air.indirect_argument", "air.indirect_buffer", "air.instance_id", "air.mesh", "air.mesh_grid_properties",
+      "air.object_data", "air.patch_id", "air.payload", "air.point_coord", "air.point_size", "air.position",
+      "air.position_in_patch", "air.primitive_id", "air.quad_grid_properties", "air.render_target",
+      "air.render_target_array_index", "air.sample_id", "air.sample_mask", "air.sample_mask_in",
+      "air.sampler", "air.simdgroup_index_in_threadgroup", "air.simdgroups_per_threadgroup",
+      "air.stage_in", "air.stencil", "air.texture", "air.thread_index_in_quadgroup",
+      "air.thread_index_in_simdgroup", "air.thread_index_in_threadgroup", "air.thread_position_in_grid",
+      "air.thread_position_in_threadgroup", "air.threadgroup_position_in_grid", "air.threadgroups_per_grid",
+      "air.threads_per_grid", "air.threads_per_simdgroup", "air.threads_per_threadgroup",
+      "air.vertex_id", "air.vertex_input", "air.vertex_output", "air.viewport_array_index"};
+  return Roles.contains(Role);
+}
+
+/// A floating point type no AIR has, at any depth of a vector (Metal's reader: "Invalid bitcode file").
+static bool isNonAIRFloat(Type *T) {
+  T = T->getScalarType();
+  return T->isFP128Ty() || T->isX86_FP80Ty() || T->isPPC_FP128Ty();
+}
+
 /// Whether the type of air.<fn>.<suffix>, for a floating point function of one
 /// format (not sincos, frexp or ldexp), is what the suffix says: each parameter and
 /// the result are of that format. A name that is not such a function has no rule.
@@ -130,6 +156,15 @@ class Checker {
       for (StringRef Name : {"air.version", "air.language_version"})
         if (!M.getNamedMetadata(Name))
           add("the module has no !" + Name);
+      // (which minor version an OS takes is not known here: only that there is no other major one)
+      if (NamedMDNode *V = M.getNamedMetadata("air.version"); V && V->getNumOperands()) {
+        const MDNode *N = V->getOperand(0);
+        auto *Major = N->getNumOperands()
+                          ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(0))
+                          : nullptr;
+        if (!Major || !Major->equalsInt(2))
+          add("!air.version is not an AIR 2 version");
+      }
     }
   }
 
@@ -186,6 +221,9 @@ class Checker {
         if (!Role->getString().starts_with("air."))
           add(*F, "argument " + Twine(I) + " has the role '" + Role->getString() +
                       "', which is not AIR's");
+        else if (!isKnownAIRArgumentRole(Role->getString()))
+          add(*F, "argument " + Twine(I) + " has the role '" + Role->getString() +
+                      "', which AIR does not have");
         if (Role->getString() != "air.buffer")
           continue;
         if (!F->getArg(I)->getType()->isPointerTy())
@@ -200,6 +238,10 @@ class Checker {
             continue;
           bool Threadgroup = F->getArg(I)->getType()->isPointerTy() &&
                              F->getArg(I)->getType()->getPointerAddressSpace() == 3;
+          // (the 31 of !air.max_device_buffers and !air.max_threadgroup_buffers)
+          if (Key->getString() == "air.location_index" && Value->getValue().uge(31))
+            add(*F, "a buffer argument at location " + Twine(Value->getSExtValue()) +
+                        ", outside 0..30");
           if (Key->getString() == "air.location_index" &&
               !(Threadgroup ? ThreadgroupLocations : Locations)
                    .insert(Value->getZExtValue())
@@ -244,9 +286,15 @@ class Checker {
     for (const Function &F : M) {
       if (F.getCallingConv() == CallingConv::AGX_KERNEL)
         add(F, "the calling convention agx_kernel");
+      if (any_of(F.getFunctionType()->params(), isNonAIRFloat) ||
+          isNonAIRFloat(F.getReturnType()))
+        add(F, "a floating point type AIR does not have");
       if (F.isDeclaration())
         continue;
       for (const Instruction &I : instructions(F)) {
+        if (isNonAIRFloat(I.getType()) ||
+            any_of(I.operands(), [](const Use &U) { return isNonAIRFloat(U->getType()); }))
+          add(F, "a floating point type AIR does not have");
         if (auto *C = dyn_cast<CallBase>(&I))
           checkCall(F, *C);
         // (not a rejection: the writer has no atomic load or store, so one reaching it

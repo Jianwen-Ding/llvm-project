@@ -47,7 +47,7 @@ for path in sorted(glob.glob(os.path.join(here, 'verify-cases', '*.ll'))):
         reply = request({'op': 'execute', 'air': data, 'functionality': 'AIR check: ' + name,
                          'gpu_timeout_ms': 2000, 'compile_timeout_ms': 20000,
                          'buffers': [{'size': 256}, {'size': 256}],
-                         'commands': [{'kernel': 'k', 'bindings': [{'index': 0, 'buffer': 0}, {'index': 1, 'buffer': 1}],
+                         'commands': [{'kernel': 'k', 'bindings': [{'index': 0, 'buffer': 0}, {'index': 1, 'buffer': 1}, {'index': 30, 'buffer': 0}],
                                        'grid': [1, 1, 1], 'group': [1, 1, 1]}], 'readback': [0]})
         device = bool(reply.get('ok'))
         # (a "stricter" case: not valid AIR although the device takes it, without an error)
