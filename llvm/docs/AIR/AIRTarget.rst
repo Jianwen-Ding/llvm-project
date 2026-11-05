@@ -184,13 +184,20 @@ Checking AIR
 
 ``llc`` reports what the device would reject instead of writing it: a module
 LLVM's verifier rejects, kernels that ``!air.kernel`` does not fully describe,
-two buffers at one location, calls of AGX's functions or of ones nothing defines,
+two buffers at one location, calls of AGX's functions, of ones nothing defines or of
+``air.*`` names AIR does not have,
 and, on the typed pointers it writes, comparisons, selects and phis of different
 pointer types, call arguments of another type than their parameter and
 ``getelementptr`` on a global of a type other than its pointee.
 ``-air-verify-written`` also reads the written file back (the checks add a few
 percent to compile time; this much more, so it is for tests). ``opt -mtriple=air -passes=air-verify`` (portable AIR) and
 ``-passes=air-verify-metal`` run the module checks on any module or ``.air`` file.
+ZLUDA's ``zoc`` runs ``air-verify`` on every AIR module it writes.
+
+These checks find known ways of being invalid; passing them does not prove a module valid.
+Apple publishes no AIR specification, so the rules come from what the device rejects, and
+the list of ``air.*`` names from the open-source producers (it checks a name's first
+component, not its types).
 
 A rule stands only if the device behaves so:
 ``llvm/utils/air-gpu/air_verify_device_check.py`` runs the modules in

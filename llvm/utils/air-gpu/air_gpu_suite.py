@@ -487,7 +487,8 @@ def run_group_air(cases, data, llc, queue, tmp, log, gname='?', raw_out=None):
         if air is None or rejected_together:
             mine, err = compile_air(llc, module_ir([c]), tmp, c.name)
             if mine is None:
-                results[c.name] = {'status': 'COMPILE', 'detail': err}
+                # (llc's checks report a function AIR does not have before the device can)
+                results[c.name] = {'status': 'ABSENT' if c.absent else 'COMPILE', 'detail': err}
                 continue
         values = data[c.name]
         reply = run_case(c, mine, [pack(t, v) for t, v in zip(c.ins, values)], queue, label='%s %s' % (gname, c.name))

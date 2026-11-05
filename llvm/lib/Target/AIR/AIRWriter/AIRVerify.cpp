@@ -18,7 +18,10 @@
 
 #include "AIRVerify.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constants.h"
@@ -39,6 +42,74 @@
 
 using namespace llvm;
 using namespace llvm::metal;
+
+/// Whether the first component of an air.* name is a function of AIR. Apple publishes
+/// no list: this is what the open-source AIR producers and llvm/utils/air-gpu use
+/// (llvm/docs/AIR/AIRFunctionality.rst). It finds names that do not exist, for example
+/// air.copysign, which Metal reports as an undefined symbol; it does not check types.
+static bool isKnownAIRFunction(StringRef Name) {
+  StringRef Fn = Name.drop_front(strlen("air.")).split('.').first;
+  // Families whose names are built from the resource they act on.
+  for (StringRef Prefix :
+       {"atomic", "calculate_", "convert", "fence", "gather_", "get_", "interpolate_",
+        "mesh", "quad_", "read_", "sample_", "set_", "simd_", "simdgroup", "thread",
+        "wait_simdgroup_events", "wg", "write_"})
+    if (Fn.starts_with(Prefix))
+      return true;
+  if (Fn.ends_with("_private_tensor"))
+    return true;
+  Fn.consume_front("fast_");
+  static const StringSet<> Functions = {
+      "abs",   "acos",  "acosh", "asin",  "asinh", "atan",  "atan2",  "atanh", "ceil",
+      "clamp", "clz",   "cos",   "cosh",  "cospi", "ctz",   "dfdx",   "dfdy",
+      "discard_fragment", "dot", "exp",   "exp10", "exp2",  "fabs",   "floor", "fma",
+      "fmax",  "fmin",  "fmod",  "fract", "frexp", "fwidth", "is_function_constant_defined",
+      "ldexp", "load",  "log",   "log10", "log2",  "max",   "min",    "mul_hi",
+      "nextafter", "os_log", "pack", "popcount", "pow", "powr", "reverse_bits", "rint",
+      "round", "rsqrt", "sin",   "sincos", "sinh", "sinpi", "sqrt",   "store", "tan",
+      "tanh",  "tanpi", "trunc", "unpack"};
+  return Functions.contains(Fn);
+}
+
+/// Whether the type of air.<fn>.<suffix>, for a floating point function of one
+/// format (not sincos, frexp or ldexp), is what the suffix says: each parameter and
+/// the result are of that format. A name that is not such a function has no rule.
+static bool floatMathTypeMatches(StringRef Name, const FunctionType *FT) {
+  SmallVector<StringRef, 3> Parts;
+  Name.split(Parts, '.');
+  if (Parts.size() != 3)
+    return true;
+  StringRef Fn = Parts[1];
+  Fn.consume_front("fast_");
+  static const StringSet<> Math = {
+      "acos",  "acosh", "asin",  "asinh", "atan", "atan2", "atanh", "ceil",  "cos",
+      "cosh",  "cospi", "exp",   "exp10", "exp2", "fabs",  "floor", "fma",   "fmax",
+      "fmin",  "fmod",  "log",   "log10", "log2", "pow",   "powr",  "rint",  "round",
+      "rsqrt", "sin",   "sinh",  "sinpi", "sqrt", "tan",   "tanh",  "tanpi", "trunc"};
+  if (!Math.contains(Fn))
+    return true;
+  StringRef Suffix = Parts[2];
+  unsigned Lanes = 0;
+  if (Suffix.consume_front("v"))
+    if (Suffix.consumeInteger(10, Lanes))
+      return true;
+  auto Matches = [&](Type *T) {
+    if (Lanes) {
+      auto *VT = dyn_cast<FixedVectorType>(T);
+      if (!VT || VT->getNumElements() != Lanes)
+        return false;
+      T = VT->getElementType();
+    }
+    if (Suffix == "f32")
+      return T->isFloatTy();
+    if (Suffix == "f16")
+      return T->isHalfTy();
+    if (Suffix == "bf16")
+      return T->isBFloatTy();
+    return true;
+  };
+  return Matches(FT->getReturnType()) && all_of(FT->params(), Matches);
+}
 
 namespace {
 class Checker {
@@ -148,6 +219,11 @@ class Checker {
     if (!Callee)
       return;
     StringRef N = Callee->getName();
+    if (Callee->isDeclaration() && N.starts_with("air.") && !isKnownAIRFunction(N))
+      add(F, "a call of '" + N + "', which AIR does not have");
+    if (Callee->isDeclaration() && N.starts_with("air.") &&
+        !floatMathTypeMatches(N, Callee->getFunctionType()))
+      add(F, "a call of '" + N + "' with parameters or a result of another type than its name says");
     if (N.starts_with("llvm.agx.") || N.starts_with("__agx") ||
         N.starts_with("agx."))
       add(F, "a call of '" + N + "', which is AGX's and not AIR's");

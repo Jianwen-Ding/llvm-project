@@ -5,7 +5,7 @@ Each module in verify-cases/ is written with -air-skip-device-checks and run on 
 device behind the AIR service (one request at a time, under the device lock, with
 the GPU timeout), and written normally, when llc's checks may report it. A rule of
 AIRVerify.cpp is right only if the device rejects what it reports, and the other
-way round. The output is one line per module, and the exit status is 1 on a
+way round, but for cases marked "stricter": invalid AIR the device takes anyway. The output is one line per module, and the exit status is 1 on a
 disagreement.
 
     python3 air_verify_device_check.py --llc build/bin/llc
@@ -50,7 +50,9 @@ for path in sorted(glob.glob(os.path.join(here, 'verify-cases', '*.ll'))):
                          'commands': [{'kernel': 'k', 'bindings': [{'index': 0, 'buffer': 0}, {'index': 1, 'buffer': 1}],
                                        'grid': [1, 1, 1], 'group': [1, 1, 1]}], 'readback': [0]})
         device = bool(reply.get('ok'))
-        agree = device == backend
+        # (a "stricter" case: not valid AIR although the device takes it, without an error)
+        stricter = open(path).readline().startswith('; stricter:')
+        agree = device == backend or (stricter and device and not backend)
         bad += not agree
         print(f'{name:14} device={"ok" if device else "REJECT"} backend={"ok" if backend else "error"} '
               f'{"" if agree else "DISAGREE "}'
