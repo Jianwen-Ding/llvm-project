@@ -17,3 +17,16 @@ define i32 @f(ptr addrspace(1) %p) {
   %e = call i32 @air.atomic.global.add.s.i32(ptr addrspace(1) %p, i32 1, i32 0, i32 2, i1 false)
   ret i32 %e
 }
+
+; RUN: not opt -mtriple=air -passes=air-verify-metal -disable-output %s 2>&1 | FileCheck %s --check-prefix=METAL
+; METAL-DAG: a call of 'llvm.stacksave.p0', which Metal does not take
+; METAL-DAG: a call through an address made from an integer
+; METAL-DAG: the global 'q' has a type AIR does not have
+@q = addrspace(2) constant fp128 0xL0
+declare ptr @llvm.stacksave.p0()
+define void @g() {
+  %s = call ptr @llvm.stacksave.p0()
+  %f = inttoptr i64 8 to ptr
+  call void %f()
+  ret void
+}

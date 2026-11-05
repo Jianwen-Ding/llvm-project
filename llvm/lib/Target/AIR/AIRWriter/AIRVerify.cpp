@@ -113,6 +113,27 @@ static bool isKnownAIRArgumentRole(StringRef Role) {
   return Roles.contains(Role);
 }
 
+/// A role of an argument of a graphics stage, not of a kernel's.
+static bool isGraphicsArgumentRole(StringRef Role) {
+  static const StringSet<> Roles = {
+      "air.barycentric_coord", "air.base_instance", "air.base_vertex", "air.clip_distance", "air.depth",
+      "air.fragment_input", "air.front_facing", "air.instance_id", "air.patch_id", "air.point_coord",
+      "air.point_size", "air.position", "air.position_in_patch", "air.primitive_id", "air.render_target",
+      "air.render_target_array_index", "air.sample_id", "air.sample_mask", "air.sample_mask_in",
+      "air.stage_in", "air.stencil", "air.vertex_id", "air.vertex_input", "air.vertex_output",
+      "air.viewport_array_index"};
+  return Roles.contains(Role);
+}
+
+/// An LLVM intrinsic that Metal's compiler fails on or reports undefined. Only those seen to fail: an
+/// allowlist rejected valid modules (llvm.umul.with.overflow.i32).
+static bool isLLVMIntrinsicMetalRejects(StringRef Name) {
+  for (StringRef Prefix : {"llvm.readcyclecounter", "llvm.stacksave", "llvm.stackrestore", "llvm.ubsantrap"})
+    if (Name.starts_with(Prefix))
+      return true;
+  return false;
+}
+
 /// A type no AIR has, at any depth of a vector (Metal's reader: "Invalid bitcode file").
 static bool isNonAIRType(Type *T) {
   if (T->isScalableTy())
@@ -261,6 +282,25 @@ class Checker {
         else if (!isKnownAIRArgumentRole(Role->getString()))
           add(*F, "argument " + Twine(I) + " has the role '" + Role->getString() +
                       "', which AIR does not have");
+        if (isGraphicsArgumentRole(Role->getString()))
+          add(*F, "argument " + Twine(I) + " has the role '" + Role->getString() +
+                      "', of a graphics stage, in a kernel");
+        if ((Role->getString() == "air.texture" || Role->getString() == "air.sampler") &&
+            F->getArg(I)->getType()->isPointerTy() &&
+            F->getArg(I)->getType()->getPointerAddressSpace() == 1)
+          add(*F, "argument " + Twine(I) + " has the role '" + Role->getString() +
+                      "' on a device pointer");
+        for (unsigned J = 2; J + 1 < Node->getNumOperands(); ++J) {
+          auto *Key = dyn_cast_or_null<MDString>(Node->getOperand(J));
+          if (!Key)
+            continue;
+          const Metadata *V = Node->getOperand(J + 1);
+          if (Key->getString() == "air.location_index" && !mdconst::dyn_extract_or_null<ConstantInt>(V))
+            add(*F, "the location of argument " + Twine(I) + " is not an integer");
+          if ((Key->getString() == "air.arg_name" || Key->getString() == "air.arg_type_name") &&
+              !isa_and_nonnull<MDString>(V))
+            add(*F, "a name of argument " + Twine(I) + " is not a string");
+        }
         if (Role->getString() != "air.buffer")
           continue;
         if (!F->getArg(I)->getType()->isPointerTy())
@@ -296,8 +336,13 @@ class Checker {
   void checkCall(const Function &F, const CallBase &C) {
     // (getCalledFunction() is null for a call of another function type than the callee's)
     const auto *Callee = dyn_cast<Function>(C.getCalledOperand());
-    if (!Callee)
+    if (!Callee) {
+      // (Metal's reader: "Unexpected bitcode file"; AIR calls through a function table)
+      const auto *CE = dyn_cast<ConstantExpr>(C.getCalledOperand());
+      if (isa<IntToPtrInst>(C.getCalledOperand()) || (CE && CE->getOpcode() == Instruction::IntToPtr))
+        add(F, "a call through an address made from an integer");
       return;
+    }
     StringRef N = Callee->getName();
     // (Metal's reader: "Unexpected bitcode file")
     if (C.getFunctionType() != Callee->getFunctionType())
@@ -316,6 +361,8 @@ class Checker {
       add(F, "a call of '" + N + "', which is AGX's and not AIR's");
     if (!isMetal() || !Callee->isDeclaration())
       return;
+    if (isLLVMIntrinsicMetalRejects(N))
+      add(F, "a call of '" + N + "', which Metal does not take");
     // Metal has no function of these names, and takes an unresolved one for an
     // error when it builds the pipeline.
     if (!N.starts_with("air.") && !N.starts_with("llvm.") &&
@@ -324,6 +371,9 @@ class Checker {
   }
 
   void checkFunctions() {
+    for (const GlobalVariable &GV : M.globals())
+      if (isNonAIRType(GV.getValueType()))
+        add("the global '" + GV.getName() + "' has a type AIR does not have");
     for (const Function &F : M) {
       if (F.getCallingConv() == CallingConv::AGX_KERNEL)
         add(F, "the calling convention agx_kernel");
