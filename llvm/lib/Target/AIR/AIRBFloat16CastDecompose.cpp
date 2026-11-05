@@ -13,6 +13,9 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/ADT/iterator_range.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
@@ -22,6 +25,74 @@ using namespace llvm;
 #define DEBUG_TYPE "air-bfloat16-cast-decompose"
 
 static constexpr StringLiteral kAIRConvertPrefix("air.convert");
+
+/// Under air.ieee-fp32, AIR's functions that take a subnormal for a zero on the M2 Max
+/// (air.ceil.f32 of the smallest subnormal gives 0, air.log2.f32 -inf) are told apart on the
+/// bits: a float comparison would read the flushed value too.
+static bool strictSubnormals(Module &M) {
+  auto *Flag = mdconst::extract_or_null<ConstantInt>(M.getModuleFlag("air.ieee-fp32"));
+  if (!Flag || Flag->isZero())
+    return false;
+  // The precise functions: strict mode has no error margin to spend.
+  for (auto [Fast, Precise] : {std::pair{"air.fast_exp2.f32", "air.exp2.f32"},
+                               std::pair{"air.fast_log2.f32", "air.log2.f32"}})
+    if (Function *Fn = M.getFunction(Fast)) {
+      Fn->setName(Precise);
+      Fn->removeFnAttr(Attribute::NoBuiltin);
+    }
+  SmallVector<CallInst *, 8> Calls;
+  for (StringRef Name : {"air.ceil.f32", "air.floor.f32", "air.trunc.f32", "air.rint.f32",
+                         "air.sin.f32", "air.fast_sin.f32", "air.log2.f32", "air.exp2.f32"})
+    if (Function *Fn = M.getFunction(Name))
+      for (User *U : Fn->users())
+        if (auto *CI = dyn_cast<CallInst>(U); CI && CI->getCalledFunction() == Fn)
+          Calls.push_back(CI);
+  for (CallInst *CI : Calls) {
+    StringRef Name = CI->getCalledFunction()->getName();
+    SmallVector<Use *, 4> Uses(make_pointer_range(CI->uses()));
+    IRBuilder<> B(CI->getNextNode());
+    Type *F32 = B.getFloatTy();
+    Value *X = CI->getArgOperand(0);
+    Value *Bits = B.CreateBitCast(X, B.getInt32Ty());
+    Value *Neg = B.CreateICmpSLT(Bits, B.getInt32(0));
+    Value *Mag = B.CreateAnd(Bits, 0x7fffffff);
+    // (nonzero and below the normal numbers)
+    Value *Sub = B.CreateICmpULT(B.CreateSub(Mag, B.getInt32(1)), B.getInt32(0x7fffff));
+    auto Const = [&](float V) { return ConstantFP::get(F32, V); };
+    Value *Signed0 = B.CreateBitCast(B.CreateAnd(Bits, 0x80000000), F32);
+    Value *R;
+    if (Name == "air.ceil.f32") {
+      R = B.CreateSelect(Sub, B.CreateSelect(Neg, Const(-0.0f), Const(1.0f)), CI);
+    } else if (Name == "air.floor.f32") {
+      R = B.CreateSelect(Sub, B.CreateSelect(Neg, Const(-1.0f), Const(0.0f)), CI);
+    } else if (Name == "air.trunc.f32" || Name == "air.rint.f32") {
+      R = B.CreateSelect(Sub, Signed0, CI);
+    } else if (Name == "air.exp2.f32") {
+      // 2^n of an integer n has an exact result (air.exp2.f32 of -1 is 2 ulps below 0.5): its bits.
+      Value *Small = B.CreateICmpULE(Mag, B.getInt32(0x42FE0000)); // |x| <= 127
+      Value *In = B.CreateSelect(Small, X, Const(0.5f));
+      Value *N = B.CreateFPToSI(In, B.getInt32Ty());
+      Value *Int = B.CreateFCmpOEQ(B.CreateSIToFP(N, F32), In);
+      Value *Normal = B.CreateICmpSGE(N, B.getInt32(-126));
+      Value *Exact = B.CreateBitCast(B.CreateShl(B.CreateAdd(N, B.getInt32(127)), 23), F32);
+      R = B.CreateSelect(B.CreateAnd(B.CreateAnd(Small, Int), Normal), Exact, CI);
+    } else if (Name.ends_with("sin.f32")) {
+      // sin x = x below the normal numbers, and for both zeros
+      R = B.CreateSelect(B.CreateICmpULT(Mag, B.getInt32(0x800000)), X, CI);
+    } else {
+      // A subnormal is its mantissa, exact as a normal float, times 2^-149.
+      auto *Log = cast<CallInst>(CI->clone());
+      Log->setArgOperand(0, B.CreateUIToFP(Mag, F32));
+      B.Insert(Log);
+      Value *Pos = B.CreateFAdd(Log, Const(-149.0f));
+      Value *NaN = B.CreateBitCast(B.getInt32(0x7fffffff), F32);
+      R = B.CreateSelect(Sub, B.CreateSelect(Neg, NaN, Pos), CI);
+    }
+    for (Use *U : Uses)
+      U->set(R);
+  }
+  return !Calls.empty();
+}
 
 static bool bfloat16CastDecompose(Module &M) {
   bool Changed = false;
@@ -434,12 +505,15 @@ static bool bfloat16CastDecompose(Module &M) {
 
 PreservedAnalyses
 AIRBFloat16CastDecomposePass::run(Module &M, ModuleAnalysisManager &AM) {
-  return bfloat16CastDecompose(M) ? PreservedAnalyses::none()
-                                  : PreservedAnalyses::all();
+  bool Changed = bfloat16CastDecompose(M);
+  Changed |= strictSubnormals(M);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
 bool AIRBFloat16CastDecomposeLegacy::runOnModule(Module &M) {
-  return bfloat16CastDecompose(M);
+  bool Changed = bfloat16CastDecompose(M);
+  Changed |= strictSubnormals(M);
+  return Changed;
 }
 
 char AIRBFloat16CastDecomposeLegacy::ID = 0;

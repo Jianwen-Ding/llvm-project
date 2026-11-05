@@ -528,6 +528,25 @@ static bool lowerAtomicRMW(Module &M, bool OrderingHints) {
   // (AGX).
   if (!OrderingHints) {
     Changed |= AtomicEmulation(M).run();
+    // Under air.ieee-fp32, a float add the portable passes lowered returns a flushed subnormal too:
+    // back to an atomicrmw, for the loop below. (They write it relaxed, with fences for its order.)
+    auto *StrictFlag = mdconst::extract_or_null<ConstantInt>(M.getModuleFlag("air.ieee-fp32"));
+    if (StrictFlag && !StrictFlag->isZero())
+      if (Function *Add = M.getFunction("air.atomic.global.add.f32"))
+        for (User *U : make_early_inc_range(Add->users())) {
+          auto *CI = dyn_cast<CallInst>(U);
+          auto *Order = CI ? dyn_cast<ConstantInt>(CI->getArgOperand(2)) : nullptr;
+          if (!Order || !Order->isZero())
+            continue;
+          IRBuilder<> B(CI);
+          auto *RMW = B.CreateAtomicRMW(
+              AtomicRMWInst::FAdd, CI->getArgOperand(0), CI->getArgOperand(1), Align(4),
+              AtomicOrdering::Monotonic, Ctx.getOrInsertSyncScopeID("agent-one-as"));
+          RMW->takeName(CI);
+          CI->replaceAllUsesWith(RMW);
+          CI->eraseFromParent();
+          Changed = true;
+        }
     SmallVector<AtomicRMWInst *, 4> Loops;
     for (Function &F : M)
       for (BasicBlock &BB : F)
@@ -555,7 +574,12 @@ static bool lowerAtomicRMW(Module &M, bool OrderingHints) {
                 T->isFloatTy() && AS == metal::AS::Threadgroup &&
                 (RMW->getOperation() == AtomicRMWInst::FAdd ||
                  RMW->getOperation() == AtomicRMWInst::FSub);
-            if (!Native || LocalFloatArith ||
+            // (Metal's float add flushes the subnormal it returns; the loop's old value is its bits)
+            auto *Strict = mdconst::extract_or_null<ConstantInt>(M.getModuleFlag("air.ieee-fp32"));
+            bool StrictFloatArith = Strict && !Strict->isZero() && T->isFloatTy() &&
+                                    (RMW->getOperation() == AtomicRMWInst::FAdd ||
+                                     RMW->getOperation() == AtomicRMWInst::FSub);
+            if (!Native || LocalFloatArith || StrictFloatArith ||
                 buildAtomicName(AS != metal::AS::Threadgroup,
                                 RMW->getOperation(), T->isFloatTy())
                     .empty())
