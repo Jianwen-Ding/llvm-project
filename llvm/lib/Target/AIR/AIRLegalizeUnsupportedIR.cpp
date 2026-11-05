@@ -1357,15 +1357,25 @@ void defineThreadgroupGlobals(Module &M) {
 // memcpy, memset and memmove of a length known only at run time as loops of loads
 // and stores. Metal's own lowering of them, with lengths that differ between the
 // threads of a SIMD-group, never finishes if a threadgroup barrier follows (an M2
-// Max; PTX cp.async with an ignore-src predicate). A length known at compile time
-// keeps Metal's lowering.
+// Max; PTX cp.async with an ignore-src predicate). A length known at compile time,
+// or a function without a barrier, keeps Metal's faster lowering.
 void expandVariableMemIntrinsics(Module &M) {
   SmallVector<MemIntrinsic *, 4> Ops;
-  for (Function &F : M)
-    for (Instruction &I : instructions(F))
-      if (auto *MI = dyn_cast<MemIntrinsic>(&I))
+  for (Function &F : M) {
+    bool HasBarrier = false;
+    SmallVector<MemIntrinsic *, 4> Here;
+    for (Instruction &I : instructions(F)) {
+      if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
         if (!isa<ConstantInt>(MI->getLength()))
-          Ops.push_back(MI);
+          Here.push_back(MI);
+      } else if (auto *C = dyn_cast<CallBase>(&I)) {
+        const Function *Callee = C->getCalledFunction();
+        HasBarrier |= !Callee || Callee->getName().contains("barrier");
+      }
+    }
+    if (HasBarrier)
+      append_range(Ops, Here);
+  }
   if (Ops.empty())
     return;
   TargetTransformInfo TTI(M.getDataLayout());
