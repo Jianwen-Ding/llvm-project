@@ -41,6 +41,7 @@
 #include "AIRSplitI64Shuffle.h"
 #include "AIRSubtarget.h"
 #include "AIRTGBarrierInsert.h"
+#include "AIRWriter/AIRVerify.h"
 #include "AIRTGGlobalCoalesce.h"
 #include "AIRTargetTransformInfo.h"
 #include "TargetInfo/AIRTargetInfo.h"

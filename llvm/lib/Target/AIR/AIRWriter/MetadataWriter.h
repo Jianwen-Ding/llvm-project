@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/Support/CommandLine.h"
 #include <optional>
 #include <vector>
 
@@ -55,6 +56,10 @@ struct MetadataEnumerator {
     return strings.size() + values.size() + nodeMap.lookup(N);
   }
 };
+
+extern llvm::cl::opt<bool> AIRSkipDeviceChecks;
+extern llvm::cl::opt<bool> AIRSkipPointerRepairs;
+extern llvm::cl::opt<bool> AIRVerifyWritten;
 
 /// The ID in the file of a metadata kind, if the file has that kind.
 std::optional<unsigned> airMetadataKind(StringRef Name);

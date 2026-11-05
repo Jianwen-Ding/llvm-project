@@ -15,6 +15,7 @@ add_llvm_component_library(LLVMAIRWriter
   PointerPointeeRepair.cpp
   AIREmbedderPass.cpp
   AIRLibWriter.cpp
+  AIRVerify.cpp
   AIRWriterPass.cpp
   PointeeTypeMap.cpp
   TypeTableWriter.cpp
@@ -24,6 +25,7 @@ add_llvm_component_library(LLVMAIRWriter
   intrinsics_gen
 
   LINK_COMPONENTS
+    BitReader
   Analysis
   BitWriter
   Core

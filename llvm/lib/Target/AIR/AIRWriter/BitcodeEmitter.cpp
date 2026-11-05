@@ -20,6 +20,7 @@
 #include "LowerPointerVectors.h"
 #include "LowerVectorSelect.h"
 #include "MetadataWriter.h"
+#include "AIRVerify.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Verifier.h"
@@ -345,16 +346,16 @@ void emitFunctionBlock(BitstreamWriter &W, const Function &F,
 std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
   // Metal's reader takes a broken module for an unreadable file or, when it
   // builds a pipeline, fails with "Failed to materializeAll".
-  if (!cl::getRegisteredOptions().lookup("air-skip-device-checks") ||
-      !static_cast<cl::opt<bool> *>(cl::getRegisteredOptions().lookup("air-skip-device-checks"))->getValue()) {
-    std::string Err;
-    raw_string_ostream OS(Err);
-    if (verifyModule(M, &OS))
+  dropMetadataOutsideAIRKinds(M);
+  // Metal's reader takes a broken module for an unreadable file or, when it
+  // builds a pipeline, fails with "Failed to materializeAll".
+  if (!AIRSkipDeviceChecks) {
+    auto Violations = verifyAIR(M, AIRForm::Metal, /*FullVerifier=*/AIRVerifyWritten);
+    if (!Violations.empty())
       report_fatal_error(Twine("AIRWriter: the device would reject this library: ") +
-                             OS.str(),
+                             Violations.front(),
                          /*gen_crash_diag=*/false);
   }
-  dropMetadataOutsideAIRKinds(M);
 
   SmallVector<char, 0> Buf;
 
@@ -393,6 +394,10 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
 
     lowerConstantExprs(M);
     normalizeArrayGlobalGEPs(M);
+    if (!AIRSkipPointerRepairs) {
+      fixGlobalGEPBases(M, PTM);
+      fixComparePointerTypes(M, PTM);
+    }
     fixKernelArgMetadata(M, PTM);
 
     if (const char *pw = getenv("METAL_DUMP_PREWRITE")) {
@@ -830,7 +835,15 @@ std::vector<uint8_t> emitAIRBitcode(Module &M, PointeeTypeMap &PTM) {
     }
   }
 
-  return std::vector<uint8_t>(Buf.begin(), Buf.end());
+  std::vector<uint8_t> Bytes(Buf.begin(), Buf.end());
+  if (AIRVerifyWritten) {
+    std::string Problem = verifyAIRBitcode(Bytes);
+    if (!Problem.empty())
+      report_fatal_error(Twine("AIRWriter: the device would reject this library: ") +
+                             Problem,
+                         /*gen_crash_diag=*/false);
+  }
+  return Bytes;
 }
 
 }

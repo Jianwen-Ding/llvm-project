@@ -1,12 +1,13 @@
+; (A module the device would reject: this test is about another part of the target.)
 ; The Metal pipeline expands what Metal miscompiles, crashes on or leaves
 ; undefined (found on hardware, llvm/utils/air-gpu): frem, llvm.round's sign
 ; of zero, roundeven/nearbyint, signed add/sub with overflow, saturating
 ; conversions, ldexp, frexp and is.fpclass. The portable passes, whose AIR
 ; the AGX backend compiles, keep them.
-; RUN: opt -mtriple=air -passes=air-legalize-unsupported-ir -S %s | FileCheck %s
-; RUN: llc -mtriple=air %s -o - | FileCheck %s --check-prefixes=LLC,NOLLVM
-; RUN: llc -mtriple=air -air-portable %s -o - | FileCheck %s --check-prefix=PORTABLE
-; RUN: llc -mtriple=air -filetype=obj %s -o /dev/null
+; RUN: opt -air-skip-device-checks -mtriple=air -passes=air-legalize-unsupported-ir -S %s | FileCheck %s
+; RUN: llc -air-skip-device-checks -mtriple=air %s -o - | FileCheck %s --check-prefixes=LLC,NOLLVM
+; RUN: llc -air-skip-device-checks -mtriple=air -air-portable %s -o - | FileCheck %s --check-prefix=PORTABLE
+; RUN: llc -air-skip-device-checks -mtriple=air -filetype=obj %s -o /dev/null
 
 ; CHECK-LABEL: define float @frem_f32(
 ; CHECK: %r = call float @air.fmod.f32(float %a, float %b)

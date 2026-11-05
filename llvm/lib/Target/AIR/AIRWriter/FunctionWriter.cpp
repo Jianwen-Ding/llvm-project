@@ -68,9 +68,17 @@ void emitConstantsBlock(
     const DenseMap<const Constant *, unsigned> *PoisonPtrTypeIdx = nullptr);
 
 // (for tests that show what the device itself does with such a library)
-static cl::opt<bool> AIRSkipDeviceChecks(
+cl::opt<bool> AIRSkipDeviceChecks(
     "air-skip-device-checks", cl::Hidden,
     cl::desc("Write AIR even if the device would reject it"));
+cl::opt<bool> AIRVerifyWritten(
+    "air-verify-written", cl::Hidden,
+    cl::desc("Read the written file back and verify it (slower: for tests and "
+             "checks of the writer)"));
+cl::opt<bool> AIRSkipPointerRepairs(
+    "air-skip-pointer-repairs", cl::Hidden,
+    cl::desc("Do not give pointers the written types the device requires (to "
+             "test the checks that report them)"));
 
 /// What Metal's reader, which has typed pointers, rejects as "Unexpected bitcode
 /// file!", checked on the types this writer gives the values: the operands an

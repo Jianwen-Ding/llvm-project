@@ -1,10 +1,15 @@
 ; What the device rejects is an error here, not a library that fails on the device
 ; ("Unexpected bitcode file!"). Each rule was found by reducing a library the device
-; rejected; -air-skip-device-checks writes the library anyway, to show that again.
+; rejected. The writer repairs these two; -air-skip-pointer-repairs shows the checks
+; report them, and -air-skip-device-checks writes such a library anyway.
 ; RUN: split-file %s %t
-; RUN: not llc -mtriple=air -filetype=obj -air-output=air %t/gep.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=GEP
-; RUN: not llc -mtriple=air -filetype=obj -air-output=air %t/cmp.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=CMP
-; RUN: llc -mtriple=air -filetype=obj -air-output=air -air-skip-device-checks %t/gep.ll -o /dev/null
+; RUN: not llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs %t/gep.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=GEP
+; RUN: not llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs %t/cmp.ll -o /dev/null 2>&1 | FileCheck %s --check-prefix=CMP
+; RUN: llc -mtriple=air -filetype=obj -air-output=air -air-skip-pointer-repairs -air-skip-device-checks %t/gep.ll -o /dev/null
+; RUN: llc -mtriple=air -filetype=obj -air-output=air %t/gep.ll -o %t/gep.air
+; RUN: opt -passes=verify -disable-output %t/gep.air
+; RUN: llc -mtriple=air -filetype=obj -air-output=air %t/cmp.ll -o %t/cmp.air
+; RUN: opt -passes=verify -disable-output %t/cmp.air
 ; RUN: llc -mtriple=air -filetype=obj -air-output=air %t/ok.ll -o /dev/null
 
 ; GEP: the device would reject this library: {{.*}}a getelementptr of a type other than its base's pointee

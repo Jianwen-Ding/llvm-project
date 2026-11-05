@@ -127,8 +127,9 @@ magic, so they pass, but the service rejects such a module (``Tool failed``)
 even for an empty kernel. Without a pre-baked node the pass synthesizes the
 full form and the device accepts it.
 
-*Unblock:* either complete bare entries in ``AIRSystemValues`` or reject
-them with a diagnostic, and move the tests to unmarked kernels.
+*Status:* ``llc`` now reports such an entry as an error (see "Checking AIR" in
+``AIRTarget.rst``); the tests that keep one write with
+``-air-skip-device-checks``.
 
 Apple's ``metallib`` tool cannot be run here
 --------------------------------------------

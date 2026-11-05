@@ -1,3 +1,4 @@
+; (A module the device would reject: this test is about another part of the target.)
 ; Smoke test: an MMA kernel that reads i8 device inputs, runs a float
 ; simdgroup-matrix accumulate, and writes a genuinely i32 device output (the
 ; int8-dot pattern, where the f32 accumulator is fptosi'd to i32). The AIRWriter
@@ -5,7 +6,7 @@
 ; device pointer in an MMA kernel to float*; otherwise the emitted GEP source
 ; type disagrees with the pointer pointee and the AIR reader rejects the module.
 ; Serializing to a valid metallib container (MTLB magic) exercises that path.
-; RUN: llc -mtriple=air -filetype=obj %s -o %t.metallib
+; RUN: llc -air-skip-device-checks -mtriple=air -filetype=obj %s -o %t.metallib
 ; RUN: od -An -c -N 4 %t.metallib | FileCheck %s
 
 ; CHECK: M T L B
