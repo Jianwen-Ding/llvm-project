@@ -117,7 +117,7 @@ void wideAIRFunctionsToIntrinsics(Module &M) {
   }
 }
 
-// Integers of 65 to 128 bits (AIR has none; agx-raise-to-air keeps them as
+// Integers of 65 to 128 bits (AIR has none; portable AIR keeps them as
 // a type hint, llvm/IR/AIR.h) as two i64 limbs. The high limb of an N-bit
 // value holds its bits 64 to N - 1, zero above.
 void expandWideIntegers(Module &M) {
@@ -502,7 +502,7 @@ void stripDisjointFlags(Module &M) {
             BO->setIsDisjoint(false);
 }
 
-// Generic pointers (agx-raise-to-air's address-space hint, llvm/IR/AIR.h),
+// Generic pointers (portable AIR's address-space hint, llvm/IR/AIR.h),
 // emulated: Metal has no generic address space. A generic address is an
 // integer in ZLUDA's AGX encoding, which its isspacep already tests as bits:
 // threadgroup addresses with bit 63 set, private (thread) addresses with bits
@@ -567,6 +567,25 @@ Value *pointerOperand(Instruction *I) {
   return nullptr;
 }
 
+// A front end that numbers threadgroup memory itself ("air-shared-block" names the
+// kernel's block; ZLUDA's AGX layout) holds offsets in it as integers, and so in generic
+// addresses: the block's address is subtracted going to generic and added coming back.
+// Numbers from 0x80000000 are dynamic shared memory, which keeps Metal's ("air-shared-dynamic").
+Value *rebaseShared(IRBuilder<> &B, Value *X, bool Add) {
+  Function *F = B.GetInsertBlock()->getParent();
+  Attribute Block = F->getFnAttribute("air-shared-block");
+  if (!Block.isStringAttribute())
+    return X;
+  GlobalVariable *GV = F->getParent()->getNamedGlobal(Block.getValueAsString());
+  if (!GV)
+    return X;
+  Value *Base = B.CreatePtrToInt(GV, B.getInt64Ty());
+  Value *R = Add ? B.CreateAdd(X, Base) : B.CreateSub(X, Base);
+  if (!F->hasFnAttribute("air-shared-dynamic"))
+    return R;
+  return B.CreateSelect(B.CreateICmpUGE(X, B.getInt64(0x80000000)), X, R);
+}
+
 // P, a generic pointer, as a pointer into address space AS (its tag cleared).
 Value *untag(IRBuilder<> &B, Value *P, unsigned AS) {
   auto *PT = PointerType::get(B.getContext(), AS);
@@ -574,6 +593,8 @@ Value *untag(IRBuilder<> &B, Value *P, unsigned AS) {
     return B.CreateAddrSpaceCast(P, PT);
   Value *I = B.CreatePtrToInt(P, B.getInt64Ty());
   I = B.CreateAnd(I, ~(AS == 3 ? SharedTag : PrivateTag));
+  if (AS == 3)
+    I = rebaseShared(B, I, /*Add=*/true);
   return B.CreateIntToPtr(I, PT);
 }
 
@@ -741,6 +762,8 @@ void emulate(Module &M) {
     Value *R = nullptr;
     if (To == air::GenericHintAS && (From == 3 || From == 0)) {
       Value *I = B.CreatePtrToInt(ASC->getOperand(0), B.getInt64Ty());
+      if (From == 3)
+        I = rebaseShared(B, I, /*Add=*/false);
       R = B.CreateIntToPtr(B.CreateOr(I, From == 3 ? SharedTag : PrivateTag),
                            ASC->getType());
     } else if (From == air::GenericHintAS && (To == 3 || To == 0)) {
@@ -755,7 +778,7 @@ void emulate(Module &M) {
 }
 } // namespace generic
 
-// Generic pointers (agx-raise-to-air's address-space hint) as device
+// Generic pointers (portable AIR's address-space hint) as device
 // pointers, after generic::emulate has made their accesses and casts
 // explicit.
 void genericToDevice(Module &M) {
@@ -1268,7 +1291,7 @@ void expandIntrinsicsMetalMishandles(Module &M) {
       F.eraseFromParent();
 }
 
-// Threadgroup globals declared, not defined (agx-raise-to-air keeps PTX's
+// Threadgroup globals declared, not defined (portable AIR keeps PTX's
 // .shared variables so; AGX lays them out itself). Metal resolves no
 // threadgroup symbol: a sized one is defined here (undefined contents, as
 // threadgroup memory is), and a zero-sized one, CUDA's dynamic shared memory
