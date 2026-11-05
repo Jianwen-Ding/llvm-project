@@ -656,6 +656,13 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
     // Set PGO options based on command line flags
     setPGOOptions(*Target);
 
+    // AIR read for AGX keeps AIR's layout until agx-lower-air gives the module
+    // AGX's: bitcode leaves out an alloca's address space when it is the layout's
+    // default, so with AGX's the reader would put AIR's allocas in address space
+    // 5 and reject the calls that take them.
+    if (TheTriple.isAGX() && Triple(DataLayoutTargetTriple).isAIR())
+      return std::nullopt;
+
     return TheTriple.computeDataLayout(Options.MCOptions.getABIName());
   };
   if (InputLanguage == "mir" ||
@@ -674,6 +681,11 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
   }
 
   M->setTargetTriple(TheTriple);
+
+  // (agx-lower-air gives a module that describes AIR kernels AGX's layout; it
+  // leaves any other as it is, so one read with AIR's layout takes it here.)
+  if (TheTriple.isAGX() && !MIR && !M->getNamedMetadata("air.kernel"))
+    M->setDataLayout(Target->createDataLayout());
 
   std::optional<CodeModel::Model> CM_IR = M->getCodeModel();
   if (!CM && CM_IR)
