@@ -192,6 +192,45 @@ rx('lang-name-int',r'!\{!"Metal", i32 4',r'!{i32 7, i32 4')
 rx('lang-short',r'!\{!"Metal", i32 4, i32 0, i32 0\}',r'!{!"Metal"}')
 rx('version-strings',r'!\{i32 2, i32 8, i32 0\}',r'!{!"2", !"8", !"0"}')
 rx('alias-scope-bad',r'!alias\.scope !18',r'!alias.scope !7')
+# Systematic, on a kernel with a constant buffer, threadgroup memory, an atomic and a barrier: without each
+# metadata entry and key, and with each integer changed.
+rich = """target triple = "air"
+@tg = internal addrspace(3) global [4 x i32] undef, align 16
+@c = internal addrspace(2) constant [2 x i32] [i32 3, i32 5], align 4
+declare void @air.wg.barrier(i32, i32)
+declare i32 @air.atomic.global.add.s.i32(ptr addrspace(1), i32, i32, i32, i1)
+define void @k(ptr addrspace(1) %o, ptr addrspace(2) byref(i64) %p) "air-kernel" {
+  %v = load i32, ptr addrspace(2) @c
+  store i32 %v, ptr addrspace(3) @tg
+  call void @air.wg.barrier(i32 2, i32 1)
+  %w = load i32, ptr addrspace(3) @tg
+  %a = call i32 @air.atomic.global.add.s.i32(ptr addrspace(1) %o, i32 %w, i32 0, i32 2, i1 false)
+  %q = load i64, ptr addrspace(2) %p
+  store i32 %a, ptr addrspace(1) %o
+  ret void
+}
+"""
+open('rich.ll', 'w').write(rich)
+subprocess.run([args.llc, '-mtriple=air', 'rich.ll', '-o', 'rich.low.ll'], check=True)
+base = re.sub(r'^; ModuleID.*\n|^source_filename.*\n', '', open('rich.low.ll').read(), flags=re.M)
+M['rich-control'] = base
+lines=base.split('\n') 
+for i,l in enumerate(lines):
+    if re.match(r'^!(air\.[a-z_]+|llvm\.module\.flags) = ',l):
+        M['del-named-'+l.split()[0][1:]]='\n'.join(lines[:i]+lines[i+1:])
+    m=re.match(r'^(!\d+) = (distinct )?!\{(.*)\}$',l)
+    if not m or 'distinct' in l: continue
+    tag=m.group(1)[1:]
+    toks=m.group(3)
+    for k in re.finditer(r'!"(air\.[a-z_.]+)"(?:, (i32 -?\d+|!"[^"]*"))?',toks):
+        new=toks[:k.start()]+toks[k.end():]
+        new=re.sub(r'^, |, $','',new).replace(', , ',', ')
+        M['del-%s-%s'%(tag,k.group(1))]='\n'.join(lines[:i]+['%s = !{%s}'%(m.group(1),new)]+lines[i+1:])
+    for k in re.finditer(r'i32 (-?\d+)',toks):
+        n=int(k.group(1))
+        for v,lab in ((n+100,'p100'),(-1,'neg')):
+            new=toks[:k.start()]+'i32 %d'%v+toks[k.end():]
+            M['int-%s-%d-%s'%(tag,k.start(),lab)]='\n'.join(lines[:i]+['%s = !{%s}'%(m.group(1),new)]+lines[i+1:])
 res=[]
 for n,src in M.items():
     open(n+'.ll','w').write(src)

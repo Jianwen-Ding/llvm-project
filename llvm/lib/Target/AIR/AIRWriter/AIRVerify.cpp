@@ -211,8 +211,11 @@ class Checker {
         auto *Minor = N->getNumOperands() == 3
                           ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1))
                           : nullptr;
-        if (!Major || !Minor || !Major->equalsInt(2) || Minor->uge(10))
-          add("!air.version is not an AIR version: 2.0 to 2.9");
+        auto *Patch = N->getNumOperands() == 3
+                          ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(2))
+                          : nullptr;
+        if (!Major || !Minor || !Patch || !Major->equalsInt(2) || Minor->uge(10) || !Patch->isZero())
+          add("!air.version is not an AIR version: 2.0.0 to 2.9.0");
       }
       // (<name>, major, minor, patch; 4 is the newest Metal this backend knows)
       if (NamedMDNode *L = M.getNamedMetadata("air.language_version"); L && L->getNumOperands()) {
@@ -220,9 +223,17 @@ class Checker {
         auto *Major = N->getNumOperands() >= 2
                           ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1))
                           : nullptr;
-        if (!Major || Major->uge(5))
+        auto *Minor = N->getNumOperands() >= 3
+                          ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(2))
+                          : nullptr;
+        if (!Major || !Minor || Major->uge(5) || Minor->uge(10))
           add("!air.language_version is not a Metal version this backend knows");
       }
+      // (an empty entry crashes Metal's linker)
+      if (NamedMDNode *O = M.getNamedMetadata("air.compile_options"))
+        for (const MDNode *N : O->operands())
+          if (N->getNumOperands() != 1 || !isa_and_nonnull<MDString>(N->getOperand(0)))
+            add("an !air.compile_options entry does not name an option");
     }
   }
 
@@ -319,6 +330,13 @@ class Checker {
           if (Key->getString() == "air.location_index" && Value->getValue().uge(31))
             add(*F, "a buffer argument at location " + Twine(Value->getSExtValue()) +
                         ", outside 0..30");
+          // (the location is followed by how many it takes)
+          if (Key->getString() == "air.location_index" && J + 2 < Node->getNumOperands()) {
+            auto *Count = mdconst::dyn_extract_or_null<ConstantInt>(Node->getOperand(J + 2));
+            if (!Count || Count->isZero() || Count->getValue().uge(32) ||
+                Value->getValue().getLimitedValue(32) + Count->getLimitedValue(32) > 31)
+              add(*F, "a buffer argument whose location and count are outside 0..30");
+          }
           if (Key->getString() == "air.location_index" &&
               !(Threadgroup ? ThreadgroupLocations : Locations)
                    .insert(Value->getZExtValue())
