@@ -215,10 +215,14 @@ class Checker {
   }
 
   void checkCall(const Function &F, const CallBase &C) {
-    const Function *Callee = C.getCalledFunction();
+    // (getCalledFunction() is null for a call of another function type than the callee's)
+    const auto *Callee = dyn_cast<Function>(C.getCalledOperand());
     if (!Callee)
       return;
     StringRef N = Callee->getName();
+    // (Metal's reader: "Unexpected bitcode file")
+    if (C.getFunctionType() != Callee->getFunctionType())
+      add(F, "a call of '" + N + "' with another function type than its declaration");
     if (Callee->isDeclaration() && N.starts_with("air.") && !isKnownAIRFunction(N))
       add(F, "a call of '" + N + "', which AIR does not have");
     if (Callee->isDeclaration() && N.starts_with("air.") &&
