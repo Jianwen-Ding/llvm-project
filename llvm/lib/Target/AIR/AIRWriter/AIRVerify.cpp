@@ -48,11 +48,33 @@ using namespace llvm::metal;
 /// (llvm/docs/AIR/AIRFunctionality.rst). It finds names that do not exist, for example
 /// air.copysign, which Metal reports as an undefined symbol; it does not check types.
 static bool isKnownAIRFunction(StringRef Name) {
-  StringRef Fn = Name.drop_front(strlen("air.")).split('.').first;
+  StringRef Rest = Name.drop_front(strlen("air."));
+  StringRef Fn = Rest.split('.').first;
+  // air.atomic.fence and air.atomic.<space>.<operation>...
+  if (Fn == "atomic") {
+    SmallVector<StringRef, 4> Parts;
+    Rest.split(Parts, '.');
+    if (Parts.size() >= 2 && Parts[1] == "fence")
+      return true;
+    static const StringSet<> Ops = {"add", "and", "cmpxchg", "exchange", "load", "max", "min",
+                                    "or",  "store", "sub", "xchg", "xor"};
+    return Parts.size() >= 3 && (Parts[1] == "global" || Parts[1] == "local") &&
+           Ops.contains(Parts[2]);
+  }
+  if (Fn.starts_with("simd_")) {
+    static const StringSet<> Simd = {
+        "simd_active_threads_mask", "simd_and", "simd_ballot", "simd_broadcast",
+        "simd_broadcast_first", "simd_is_first", "simd_matrix_fmadd", "simd_max", "simd_min", "simd_or",
+        "simd_prefix_exclusive_product", "simd_prefix_exclusive_sum", "simd_prefix_inclusive_product",
+        "simd_prefix_inclusive_sum", "simd_product", "simd_reduce", "simd_shuffle",
+        "simd_shuffle_and_fill_down", "simd_shuffle_and_fill_up", "simd_shuffle_down", "simd_shuffle_up",
+        "simd_shuffle_xor", "simd_sum", "simd_vote_all", "simd_vote_any", "simd_xor"};
+    return Simd.contains(Fn);
+  }
   // Families whose names are built from the resource they act on.
   for (StringRef Prefix :
-       {"atomic", "calculate_", "convert", "fence", "gather_", "get_", "interpolate_",
-        "mesh", "quad_", "read_", "sample_", "set_", "simd_", "simdgroup", "thread",
+       {"atomic_", "calculate_", "convert", "fence", "gather_", "get_", "interpolate_",
+        "mesh", "quad_", "read_", "sample_", "set_", "simdgroup", "thread",
         "wait_simdgroup_events", "wg", "write_"})
     if (Fn.starts_with(Prefix))
       return true;
@@ -91,10 +113,13 @@ static bool isKnownAIRArgumentRole(StringRef Role) {
   return Roles.contains(Role);
 }
 
-/// A floating point type no AIR has, at any depth of a vector (Metal's reader: "Invalid bitcode file").
-static bool isNonAIRFloat(Type *T) {
+/// A type no AIR has, at any depth of a vector (Metal's reader: "Invalid bitcode file").
+static bool isNonAIRType(Type *T) {
+  if (T->isScalableTy())
+    return true;
   T = T->getScalarType();
-  return T->isFP128Ty() || T->isX86_FP80Ty() || T->isPPC_FP128Ty();
+  return T->isFP128Ty() || T->isX86_FP80Ty() || T->isPPC_FP128Ty() || T->isTokenTy() ||
+         T->isX86_AMXTy();
 }
 
 /// Whether the type of air.<fn>.<suffix>, for a floating point function of one
@@ -162,8 +187,20 @@ class Checker {
         auto *Major = N->getNumOperands()
                           ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(0))
                           : nullptr;
-        if (!Major || !Major->equalsInt(2))
-          add("!air.version is not an AIR 2 version");
+        auto *Minor = N->getNumOperands() == 3
+                          ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1))
+                          : nullptr;
+        if (!Major || !Minor || !Major->equalsInt(2) || Minor->uge(10))
+          add("!air.version is not an AIR version: 2.0 to 2.9");
+      }
+      // (<name>, major, minor, patch; 4 is the newest Metal this backend knows)
+      if (NamedMDNode *L = M.getNamedMetadata("air.language_version"); L && L->getNumOperands()) {
+        const MDNode *N = L->getOperand(0);
+        auto *Major = N->getNumOperands() >= 2
+                          ? mdconst::dyn_extract_or_null<ConstantInt>(N->getOperand(1))
+                          : nullptr;
+        if (!Major || Major->uge(5))
+          add("!air.language_version is not a Metal version this backend knows");
       }
     }
   }
@@ -267,6 +304,10 @@ class Checker {
       add(F, "a call of '" + N + "' with another function type than its declaration");
     if (Callee->isDeclaration() && N.starts_with("air.") && !isKnownAIRFunction(N))
       add(F, "a call of '" + N + "', which AIR does not have");
+    // (a SIMD-group function works on a value, but for these two)
+    if (Callee->isDeclaration() && N.starts_with("air.simd_") && Callee->arg_empty() &&
+        !N.starts_with("air.simd_active_threads_mask") && !N.starts_with("air.simd_is_first"))
+      add(F, "a call of '" + N + "' without operands");
     if (Callee->isDeclaration() && N.starts_with("air.") &&
         !floatMathTypeMatches(N, Callee->getFunctionType()))
       add(F, "a call of '" + N + "' with parameters or a result of another type than its name says");
@@ -286,17 +327,34 @@ class Checker {
     for (const Function &F : M) {
       if (F.getCallingConv() == CallingConv::AGX_KERNEL)
         add(F, "the calling convention agx_kernel");
-      if (any_of(F.getFunctionType()->params(), isNonAIRFloat) ||
-          isNonAIRFloat(F.getReturnType()))
-        add(F, "a floating point type AIR does not have");
+      if (any_of(F.getFunctionType()->params(), isNonAIRType) ||
+          isNonAIRType(F.getReturnType()))
+        add(F, "a type AIR does not have");
       if (F.isDeclaration())
         continue;
       for (const Instruction &I : instructions(F)) {
-        if (isNonAIRFloat(I.getType()) ||
-            any_of(I.operands(), [](const Use &U) { return isNonAIRFloat(U->getType()); }))
-          add(F, "a floating point type AIR does not have");
+        auto *Alloca = dyn_cast<AllocaInst>(&I);
+        if (isNonAIRType(I.getType()) || (Alloca && isNonAIRType(Alloca->getAllocatedType())) ||
+            any_of(I.operands(), [](const Use &U) { return isNonAIRType(U->getType()); }))
+          add(F, "a type AIR does not have");
         if (auto *C = dyn_cast<CallBase>(&I))
           checkCall(F, *C);
+        if (isMetal()) {
+          const Value *Ptr = getLoadStorePointerOperand(&I);
+          Type *Accessed = isa<LoadInst>(I)    ? I.getType()
+                           : isa<StoreInst>(I) ? cast<StoreInst>(I).getValueOperand()->getType()
+                                               : nullptr;
+          if (Accessed && Accessed->isVectorTy() && Accessed->getScalarType()->isIntegerTy(1))
+            add(F, "a memory access of a vector of i1");
+          // (AIR's are 0 to 7)
+          if (Ptr && Ptr->getType()->getPointerAddressSpace() > 7)
+            add(F, "a memory access in address space " +
+                       Twine(Ptr->getType()->getPointerAddressSpace()) + ", which AIR does not have");
+          // (no typed pointer points to itself)
+          if (auto *St = dyn_cast<StoreInst>(&I); St && St->getValueOperand()->stripPointerCasts() ==
+                             St->getPointerOperand()->stripPointerCasts())
+            add(F, "a pointer stored through itself");
+        }
         // (not a rejection: the writer has no atomic load or store, so one reaching it
         // would lose its atomicity and a load polling for a write may never see it)
         if (isMetal() && ((isa<LoadInst>(I) && cast<LoadInst>(I).isAtomic()) ||
