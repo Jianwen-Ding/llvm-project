@@ -1354,6 +1354,34 @@ void defineThreadgroupGlobals(Module &M) {
       GV->eraseFromParent();
 }
 
+// memcpy, memset and memmove of a length known only at run time as loops of loads
+// and stores. Metal's own lowering of them, with lengths that differ between the
+// threads of a SIMD-group, never finishes if a threadgroup barrier follows (an M2
+// Max; PTX cp.async with an ignore-src predicate). A length known at compile time
+// keeps Metal's lowering.
+void expandVariableMemIntrinsics(Module &M) {
+  SmallVector<MemIntrinsic *, 4> Ops;
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *MI = dyn_cast<MemIntrinsic>(&I))
+        if (!isa<ConstantInt>(MI->getLength()))
+          Ops.push_back(MI);
+  if (Ops.empty())
+    return;
+  TargetTransformInfo TTI(M.getDataLayout());
+  for (MemIntrinsic *MI : Ops) {
+    if (auto *MC = dyn_cast<MemCpyInst>(MI))
+      expandMemCpyAsLoop(MC, TTI);
+    else if (auto *MS = dyn_cast<MemSetInst>(MI))
+      expandMemSetAsLoop(MS);
+    else if (auto *MM = dyn_cast<MemMoveInst>(MI))
+      expandMemMoveAsLoop(MM, TTI);
+    else
+      continue;
+    MI->eraseFromParent();
+  }
+}
+
 // A GEP of an address made by inttoptr as integer arithmetic and an inttoptr
 // of its own. ZLUDA forms device addresses so (pointer parameters arrive as
 // integers), and the AIR writer gives such an address one pointee type from
@@ -1591,6 +1619,7 @@ bool legalizeUnsupportedIR(Module &M) {
   wideAIRFunctionsToIntrinsics(M);
   expandWideIntegers(M);
   gepsOfIntToPtrAsIntegers(M);
+  expandVariableMemIntrinsics(M);
   flushHalfDenormals(M);
   lowerFreezeInsts(M);
   canonicalizeNNegZExt(M);
