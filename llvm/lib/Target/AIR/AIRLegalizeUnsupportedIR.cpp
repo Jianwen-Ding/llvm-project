@@ -1191,6 +1191,22 @@ void expandIntrinsicsMetalMishandles(Module &M) {
       Value *MM = B.CreateBinaryIntrinsic(
           Min ? Intrinsic::minnum : Intrinsic::maxnum, X, Y, CI);
       Value *XB = B.CreateBitCast(X, ITy), *YB = B.CreateBitCast(Y, ITy);
+      // .ftz half: the encodings of the flushed operands. flushHalfDenormals flushes the
+      // comparison's and the min's, but the OR of a zero and a subnormal would keep the subnormal
+      // (PTX-formalization stress half-0: min.ftz.f16 of 0 and 0x8300).
+      DenormalMode HalfMode =
+          CI->getFunction()->getDenormalMode(APFloat::IEEEhalf());
+      if (FTy->getScalarType()->isHalfTy() &&
+          HalfMode.Input != DenormalMode::IEEE &&
+          HalfMode.Input != DenormalMode::Dynamic) {
+        auto FlushBits = [&](Value *Bits) -> Value * {
+          Value *Small = B.CreateICmpULT(B.CreateAnd(Bits, ConstantInt::get(ITy, 0x7fff)),
+                                         ConstantInt::get(ITy, 0x0400));
+          return B.CreateSelect(Small, B.CreateAnd(Bits, ConstantInt::get(ITy, 0x8000)), Bits);
+        };
+        XB = FlushBits(XB);
+        YB = FlushBits(YB);
+      }
       Value *Eq =
           B.CreateBitCast(Min ? B.CreateOr(XB, YB) : B.CreateAnd(XB, YB), FTy);
       Value *R = B.CreateSelect(B.CreateFCmpOEQ(X, Y), Eq, MM);
@@ -1668,6 +1684,12 @@ bool legalizeUnsupportedIR(Module &M) {
   genericToDevice(M);
   defineThreadgroupGlobals(M);
   stripLifetimeIntrinsics(M);
+  // Metal reads a constant-space array marked externally_initialized wrongly, without an error:
+  // [4 x i16] { 10, 20, 30, 40 } gave 10, 30, 40, 0 on an M2 Max (PTX .const, which ZLUDA marks so).
+  // The library holds the values.
+  for (GlobalVariable &GV : M.globals())
+    if (GV.getAddressSpace() == 2 && GV.isExternallyInitialized())
+      GV.setExternallyInitialized(false);
   expandIntrinsicsMetalMishandles(M);
   wideAIRFunctionsToIntrinsics(M);
   expandWideIntegers(M);
