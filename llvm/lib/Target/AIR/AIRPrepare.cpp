@@ -1122,8 +1122,11 @@ static bool retypeByteGlobals(Module &M) {
     // global survives next to its .typed twin and double-counts the 32KB
     // threadgroup budget.
     GV->removeDeadConstantUsers();
-    if (GV->use_empty())
-      GV->eraseFromParent();
+    // What rewriteByteGEPs leaves (a ptrtoint of the global, a constant
+    // getelementptr) moves too: on the old global it would be a second array,
+    // and the same address would name different memory.
+    GV->replaceAllUsesWith(NewGV);
+    GV->eraseFromParent();
 
     // Clean up residual i8 GEPs: aligned ones become typed (index / ElemSize),
     // unaligned ones stay as i8 GEPs but rebase on an i8* alias of NewGV so
@@ -1279,8 +1282,10 @@ static bool retypeByteGlobals(Module &M) {
 
       Changed |= rewriteByteGEPs(SplitGV, TypedGV, SplitOldAT, TypedAT, ElemTy,
                                  ESize, Ctx);
-      if (SplitGV->use_empty())
-        SplitGV->eraseFromParent();
+      // (one array: see the retyping above)
+      SplitGV->removeDeadConstantUsers();
+      SplitGV->replaceAllUsesWith(TypedGV);
+      SplitGV->eraseFromParent();
     }
   }
   return Changed;
