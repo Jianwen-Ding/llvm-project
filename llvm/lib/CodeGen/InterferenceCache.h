@@ -133,8 +133,12 @@ class LLVM_LIBRARY_VISIBILITY InterferenceCache {
 
   // We don't keep a cache entry for every physical register, that would use too
   // much memory. Instead, a fixed number of cache entries are used in a round-
-  // robin manner.
-  enum { CacheEntries = 32 };
+  // robin manner. (128: RAGreedy's region splitting tries each register of
+  // the allocation order in turn, and with more of them than entries, as on
+  // AGX, every entry was evicted before its register came round again; a
+  // Blender Cycles kernel's allocation took 11.2 s with 32, 7.5 s with 128.
+  // An entry used holds a slot per basic block.)
+  enum { CacheEntries = 128 };
 
   const TargetRegisterInfo *TRI = nullptr;
   LiveIntervalUnion *LIUArray = nullptr;
