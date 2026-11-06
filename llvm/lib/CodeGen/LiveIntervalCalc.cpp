@@ -89,10 +89,11 @@ void LiveIntervalCalc::calculate(LiveInterval &LI, bool TrackSubRegs) {
   // Step 2: Extend live segments to all uses, constructing SSA form as
   // necessary.
   if (LI.hasSubRanges()) {
-    LiveIntervalCalc SubLIC;
+    if (!SubLIC)
+      SubLIC = std::make_unique<LiveIntervalCalc>();
     for (LiveInterval::SubRange &S : LI.subranges()) {
-      SubLIC.reset(MF, Indexes, DomTree, Alloc);
-      SubLIC.extendToUses(S, Reg, S.LaneMask, &LI);
+      SubLIC->reset(MF, Indexes, DomTree, Alloc);
+      SubLIC->extendToUses(S, Reg, S.LaneMask, &LI);
     }
     LI.clear();
     constructMainRangeFromSubranges(LI);

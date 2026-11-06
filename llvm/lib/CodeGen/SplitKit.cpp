@@ -1445,11 +1445,13 @@ void SplitEditor::rewriteAssigned(bool ExtendRanges) {
     }
   }
 
+  // (one calculator for all of them, reset for each subrange: its map has an
+  // entry per block, which a calculator per use allocated and filled anew)
+  LiveIntervalCalc SubLIC;
   for (ExtPoint &EP : ExtPoints) {
     LiveInterval &LI = LIS.getInterval(Edit->get(EP.RegIdx));
     assert(LI.hasSubRanges());
 
-    LiveIntervalCalc SubLIC;
     Register Reg = EP.MO.getReg();
     unsigned Sub = EP.MO.getSubReg();
     LaneBitmask LM = Sub != 0 ? TRI.getSubRegIndexLaneMask(Sub)

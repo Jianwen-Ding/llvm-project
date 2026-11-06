@@ -19,6 +19,7 @@
 
 #include "llvm/CodeGen/LiveRangeCalc.h"
 #include "llvm/Support/Compiler.h"
+#include <memory>
 
 namespace llvm {
 
@@ -39,6 +40,13 @@ class LiveIntervalCalc : public LiveRangeCalc {
   /// LaneBitmask::getAll().
   LLVM_ABI void extendToUses(LiveRange &LR, Register Reg, LaneBitmask LaneMask,
                              LiveInterval *LI = nullptr);
+
+  /// The calculator of subranges, kept across calls: its map of live-out
+  /// values has an entry per block, whose allocation and initialization for
+  /// each register with subranges was quadratic in large functions (as the
+  /// main calculator does, a reset leaves the stale entries behind its Seen
+  /// bits).
+  std::unique_ptr<LiveIntervalCalc> SubLIC;
 
 public:
   LiveIntervalCalc() = default;

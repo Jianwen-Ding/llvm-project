@@ -160,6 +160,19 @@ namespace {
       return is_contained(It->second, MBB);
     }
 
+    // Exiting blocks of each Loop (IsGuaranteedToExecute's cache is per
+    // block, and recomputing these for each block of a large loop was
+    // quadratic).
+    DenseMap<MachineLoop *, SmallVector<MachineBasicBlock *, 8>>
+        ExitingBlockMap;
+
+    ArrayRef<MachineBasicBlock *> getExitingBlocks(MachineLoop *CurLoop) {
+      auto [It, Inserted] = ExitingBlockMap.try_emplace(CurLoop);
+      if (Inserted)
+        CurLoop->getExitingBlocks(It->second);
+      return It->second;
+    }
+
     // Track 'estimated' register pressure.
     SmallDenseSet<Register> RegSeen;
     SmallVector<unsigned, 8> RegPressure;
@@ -199,6 +212,7 @@ namespace {
       BackTrace.clear();
       CSEMap.clear();
       ExitBlockMap.clear();
+      ExitingBlockMap.clear();
     }
 
   private:
@@ -771,9 +785,7 @@ bool MachineLICMImpl::IsGuaranteedToExecute(MachineBasicBlock *BB,
 
   if (BB != CurLoop->getHeader()) {
     // Check loop exiting blocks.
-    SmallVector<MachineBasicBlock*, 8> CurrentLoopExitingBlocks;
-    CurLoop->getExitingBlocks(CurrentLoopExitingBlocks);
-    for (MachineBasicBlock *CurrentLoopExitingBlock : CurrentLoopExitingBlocks)
+    for (MachineBasicBlock *CurrentLoopExitingBlock : getExitingBlocks(CurLoop))
       if (!MDTU->getDomTree().dominates(BB, CurrentLoopExitingBlock)) {
         It->second = false;
         return false;
