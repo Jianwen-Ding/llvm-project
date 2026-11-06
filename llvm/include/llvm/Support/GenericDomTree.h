@@ -492,9 +492,13 @@ public:
       return B->DominatedBy(A);
 
     // If we end up with too many slow queries, just update the
-    // DFS numbers on the theory that we are going to keep querying.
-    SlowQueries++;
-    if (SlowQueries > 32) {
+    // DFS numbers on the theory that we are going to keep querying. Counted
+    // as the levels the slow walks climb, against the tree's size (what a
+    // renumbering walks): a caller that changes the tree between a few
+    // queries each time (StructurizeCFG, region by region) would otherwise
+    // renumber the whole tree after every change.
+    SlowQueries += B->getLevel() - A->getLevel();
+    if (SlowQueries > std::max<size_t>(32, DomTreeNodes.size())) {
       updateDFSNumbers();
       return B->DominatedBy(A);
     }

@@ -121,6 +121,9 @@ void SSAUpdaterBulk::RewriteAllUses(DominatorTree *DT,
     // this set for computing iterated dominance frontier (IDF).
     // The IDF blocks are the blocks where we need to insert new phi-nodes.
     ForwardIDFCalculator IDF(*DT);
+    // (the IDF's order is not the phis' meaning; the DFS numbers of a tree
+    // that changed since they were computed would be a walk of all of it)
+    IDF.setOrderByBlockNumber();
     LLVM_DEBUG(dbgs() << "SSAUpdater: rewriting " << R.Uses.size()
                       << " use(s)\n");
 

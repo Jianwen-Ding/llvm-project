@@ -102,10 +102,20 @@ public:
   /// would be dead.
   void calculate(SmallVectorImpl<NodeTy *> &IDFBlocks);
 
+  /// Order and index the dominator tree's nodes by their blocks' numbers
+  /// instead of the tree's DFS numbers. The IDF is the same set of blocks, in
+  /// another (still deterministic) order, and the tree's DFS numbers are not
+  /// recomputed: after each change to the tree, that is a walk of the whole
+  /// tree, which a caller that changes the tree between many small
+  /// calculations (StructurizeCFG through SSAUpdaterBulk, region by region)
+  /// pays again for each.
+  void setOrderByBlockNumber(bool V = true) { OrderByBlockNumber = V; }
+
 private:
   DominatorTreeBase<NodeTy, IsPostDom> &DT;
   ChildrenGetterTy ChildrenGetter;
   bool useLiveIn = false;
+  bool OrderByBlockNumber = false;
   const SmallPtrSetImpl<NodeTy *> *LiveInBlocks;
   const SmallPtrSetImpl<NodeTy *> *DefBlocks;
 };
@@ -142,13 +152,28 @@ void IDFCalculatorBase<NodeTy, IsPostDom>::calculate(
 
   IDFPriorityQueue PQ;
 
-  DT.updateDFSNumbers();
-
   // The DFS in-numbers are unique and dense in [0, number of nodes), with the
   // root's DFS out-number being the number of nodes. Use them to index the
-  // visited sets.
-  const DomTreeNodeBase<NodeTy> *RootNode = DT.getRootNode();
-  unsigned NumNodes = RootNode ? RootNode->getDFSNumOut() : 0;
+  // visited sets. With OrderByBlockNumber, the blocks' numbers (below the
+  // function's maximum; 0 for a post-dominator tree's virtual root) instead.
+  unsigned NumNodes = 0;
+  if (OrderByBlockNumber) {
+    if (DefBlocks->empty())
+      return;
+    NumNodes = GraphTraits<decltype((*DefBlocks->begin())->getParent())>::
+                   getMaxNumber((*DefBlocks->begin())->getParent()) +
+               IsPostDom;
+  } else {
+    DT.updateDFSNumbers();
+    const DomTreeNodeBase<NodeTy> *RootNode = DT.getRootNode();
+    NumNodes = RootNode ? RootNode->getDFSNumOut() : 0;
+  }
+  auto Index = [&](const DomTreeNodeBase<NodeTy> *N) -> unsigned {
+    if (!OrderByBlockNumber)
+      return N->getDFSNumIn();
+    const NodeTy *B = N->getBlock();
+    return B ? GraphTraits<const NodeTy *>::getNumber(B) + IsPostDom : 0;
+  };
 
   SmallVector<DomTreeNodeBase<NodeTy> *, 32> Worklist;
   SmallVector<bool, 32> VisitedPQ(NumNodes, false);
@@ -156,8 +181,8 @@ void IDFCalculatorBase<NodeTy, IsPostDom>::calculate(
 
   for (NodeTy *BB : *DefBlocks)
     if (DomTreeNodeBase<NodeTy> *Node = DT.getNode(BB)) {
-      PQ.push({Node, std::make_pair(Node->getLevel(), Node->getDFSNumIn())});
-      VisitedWorklist[Node->getDFSNumIn()] = true;
+      PQ.push({Node, std::make_pair(Node->getLevel(), Index(Node))});
+      VisitedWorklist[Index(Node)] = true;
     }
 
   while (!PQ.empty()) {
@@ -186,7 +211,7 @@ void IDFCalculatorBase<NodeTy, IsPostDom>::calculate(
         if (SuccLevel > RootLevel)
           return;
 
-        if (std::exchange(VisitedPQ[SuccNode->getDFSNumIn()], true))
+        if (std::exchange(VisitedPQ[Index(SuccNode)], true))
           return;
 
         NodeTy *SuccBB = SuccNode->getBlock();
@@ -196,14 +221,14 @@ void IDFCalculatorBase<NodeTy, IsPostDom>::calculate(
         IDFBlocks.emplace_back(SuccBB);
         if (!DefBlocks->count(SuccBB))
           PQ.push(std::make_pair(
-              SuccNode, std::make_pair(SuccLevel, SuccNode->getDFSNumIn())));
+              SuccNode, std::make_pair(SuccLevel, Index(SuccNode))));
       };
 
       for (auto *Succ : ChildrenGetter.get(BB))
         DoWork(Succ);
 
       for (auto DomChild : *Node) {
-        if (!std::exchange(VisitedWorklist[DomChild->getDFSNumIn()], true))
+        if (!std::exchange(VisitedWorklist[Index(DomChild)], true))
           Worklist.push_back(DomChild);
       }
     }

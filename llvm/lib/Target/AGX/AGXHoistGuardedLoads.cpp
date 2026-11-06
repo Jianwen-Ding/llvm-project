@@ -152,16 +152,21 @@ bool AGXHoistGuardedLoads::runOnLoop(
       if (I.mayWriteToMemory() || I.mayHaveSideEffects())
         return false;
 
-  // the loads before the loop (they dominate its header)
+  // the loads before the loop (they dominate its header: the blocks up its
+  // chain of immediate dominators), found once a guarded load needs them (a
+  // walk of the whole function for every loop was most of this pass's time
+  // in large kernels)
   SmallVector<LoadInst *, 16> Before;
-  for (BasicBlock &BB : *Header->getParent())
-    if (!L->contains(&BB) && DT.dominates(&BB, Header))
-      for (Instruction &I : BB)
-        if (auto *LI = dyn_cast<LoadInst>(&I))
-          if (LI->isSimple())
-            Before.push_back(LI);
-  if (Before.empty())
-    return false;
+  bool BeforeFound = false;
+  auto GetBefore = [&]() -> ArrayRef<LoadInst *> {
+    if (!std::exchange(BeforeFound, true))
+      for (DomTreeNode *N = DT.getNode(Header)->getIDom(); N; N = N->getIDom())
+        for (Instruction &I : *N->getBlock())
+          if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (LI->isSimple())
+              Before.push_back(LI);
+    return Before;
+  };
 
   bool Changed = false;
   // copies of address instructions in the header, shared by the loads (the
@@ -195,7 +200,7 @@ bool AGXHoistGuardedLoads::runOnLoop(
       const DataLayout &DL = LI->getDataLayout();
       uint64_t Size = DL.getTypeStoreSize(LI->getType());
       // the element of C was loaded before the loop, at least as wide
-      bool Safe = any_of(Before, [&](LoadInst *B0) {
+      bool Safe = any_of(GetBefore(), [&](LoadInst *B0) {
         return DL.getTypeStoreSize(B0->getType()) >= Size &&
                B0->getAlign() >= LI->getAlign() &&
                sameWithXAsC(Ptr, B0->getPointerOperand(), X, C);
