@@ -607,22 +607,37 @@ SDValue AGXTargetLowering::LowerCall(CallLoweringInfo &CLI,
     if (auto *G = dyn_cast<GlobalAddressSDNode>(CLI.Callee)) {
       if (const auto *F = dyn_cast<Function>(G->getGlobal())) {
         const Function &Caller = DAG.getMachineFunction().getFunction();
-        bool HasCall = false;
-        for (const BasicBlock &BB : Caller)
-          for (const Instruction &I : BB)
-            if (const auto *CB = dyn_cast<CallBase>(&I))
-              if (CB->getCalledFunction() == F)
-                HasCall = true;
-        bool Supported = true;
-        unsigned Returns = 0;
-        for (const BasicBlock &BB : *F)
-          for (const Instruction &I : BB)
-            if (isa<ReturnInst>(I))
-              ++Returns;
-            else if (const auto *AI = dyn_cast<AllocaInst>(&I))
-              Supported &= AI->isStaticAlloca();
-            else if (const auto *CB = dyn_cast<CallBase>(&I))
-              Supported &= CB->getCalledFunction() != nullptr;
+        // (the call lowered is the caller's call of F, when it has one: no
+        // walk of the whole caller for each of its calls)
+        bool HasCall = CLI.CB && CLI.CB->getCalledFunction() == F;
+        if (!HasCall)
+          for (const BasicBlock &BB : Caller)
+            for (const Instruction &I : BB)
+              if (const auto *CB = dyn_cast<CallBase>(&I))
+                if (CB->getCalledFunction() == F)
+                  HasCall = true;
+        // F's returns and whether its allocas and calls are supported, once
+        // per callee while one caller is selected (only the caller's IR
+        // changes meanwhile): a walk of F for each call was quadratic in
+        // large modules with calls.
+        auto &CalleeShapes = DAG.getMachineFunction()
+                                 .getInfo<AGXMachineFunctionInfo>()
+                                 ->CalleeShapes;
+        auto [ShapeIt, NewShape] = CalleeShapes.try_emplace(F);
+        if (NewShape) {
+          bool Supported = true;
+          unsigned Returns = 0;
+          for (const BasicBlock &BB : *F)
+            for (const Instruction &I : BB)
+              if (isa<ReturnInst>(I))
+                ++Returns;
+              else if (const auto *AI = dyn_cast<AllocaInst>(&I))
+                Supported &= AI->isStaticAlloca();
+              else if (const auto *CB = dyn_cast<CallBase>(&I))
+                Supported &= CB->getCalledFunction() != nullptr;
+          ShapeIt->second = {Returns, Supported};
+        }
+        auto [Returns, Supported] = ShapeIt->second;
         bool Signature = !F->isVarArg() && !CLI.IsVarArg &&
                          !CLI.IsTailCall &&
                          CLI.Outs.empty() == F->arg_empty() &&
