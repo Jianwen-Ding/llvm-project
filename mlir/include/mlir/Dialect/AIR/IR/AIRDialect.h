@@ -9,7 +9,9 @@
 #ifndef MLIR_DIALECT_AIR_IR_AIRDIALECT_H_
 #define MLIR_DIALECT_AIR_IR_AIRDIALECT_H_
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/GPU/IR/CompilationInterfaces.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
 
