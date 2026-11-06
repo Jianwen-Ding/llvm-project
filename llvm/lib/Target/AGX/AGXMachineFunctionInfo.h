@@ -69,6 +69,12 @@ class AGXMachineFunctionInfo : public MachineFunctionInfo {
   /// agxEstimatePressure of the function, once asked for.
   std::optional<unsigned> EstimatedPressure;
 
+public:
+  /// LowerCall's shape of each callee (its returns, whether its allocas and
+  /// calls are supported), walked once per callee for this function's calls.
+  DenseMap<const Function *, std::pair<unsigned, bool>> CalleeShapes;
+
+private:
   /// Threadgroup memory: offset of each __shared__ style variable.
   DenseMap<const GlobalVariable *, unsigned> ThreadgroupOffsets;
   unsigned ThreadgroupSize = 0;
