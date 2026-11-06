@@ -33,7 +33,9 @@
 
 #include "AGX.h"
 #include "Utils/AGXBaseInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -41,6 +43,7 @@
 #include "llvm/IR/ReplaceConstant.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
@@ -137,6 +140,159 @@ static Value *genericPointer(Instruction &I) {
     P = X->getPointerOperand();
   return P && P->getType()->getPointerAddressSpace() == Generic ? P : nullptr;
 }
+
+static cl::opt<bool> AGXGenericDeviceProvenance(
+    "agx-generic-device-provenance", cl::init(true), cl::Hidden,
+    cl::desc("Access generic pointers that can only hold device addresses "
+             "(read from constant memory or kernel arguments) without "
+             "testing their tags"));
+
+static cl::opt<bool> AGXGenericProvenanceReport(
+    "agx-generic-provenance-report", cl::init(false), cl::Hidden,
+    cl::desc("Print, for each generic access still testing tags, the value "
+             "its device provenance stopped at"));
+
+namespace {
+/// Whether a generic pointer (or the 64-bit integer holding one) can only be a
+/// device address: it comes from a value no thread could have tagged. The host
+/// writes constant memory and kernel arguments, and it knows device addresses
+/// alone (kernels cannot write constant memory); device pointers and globals
+/// are untagged by construction. GEPs, phis, selects, casts between pointers and
+/// integers, and integer offsets keep it so: an offset moves a device address
+/// within its allocation (anything else is undefined), unless the offset itself
+/// came from a pointer (`q + (p - q)`), which is not followed.
+class DeviceProvenance {
+  DenseMap<const Value *, bool> Done;
+  SmallPtrSet<const Value *, 32> Active;
+
+public:
+  /// The first value found not to be a device pointer (for the report).
+  const Value *Stop = nullptr;
+  void forget() { Done.clear(); }
+
+private:
+
+  /// Whether integer \p V is free of pointer-derived values (an offset).
+  static bool isPlainOffset(const Value *V, unsigned Depth = 0) {
+    if (isa<Constant>(V) && !isa<ConstantExpr>(V))
+      return true;
+    if (isa<PtrToIntOperator>(V) || Depth > 16)
+      return false;
+    if (isa<Argument>(V) || isa<LoadInst>(V) || isa<CallBase>(V) ||
+        isa<PHINode>(V))
+      // a loaded or computed index; a 64-bit one could in principle hold a
+      // pointer difference, which no compiler forms for indexing
+      return true;
+    if (const auto *O = dyn_cast<Operator>(V)) {
+      for (const Value *Op : O->operands())
+        if (!isPlainOffset(Op, Depth + 1))
+          return false;
+      return true;
+    }
+    return false;
+  }
+
+public:
+  bool isDevice(const Value *V, const Function &F, unsigned Depth = 0) {
+    if (auto It = Done.find(V); It != Done.end())
+      return It->second;
+    // a value met again on a cycle (a loop's phi) is device if the rest is
+    if (!Active.insert(V).second)
+      return true;
+    bool R = compute(V, F, Depth);
+    if (!R && !Stop && !isa<PHINode, SelectInst>(V)) {
+      // (the leaf a derivation stopped at, not the arithmetic over it)
+      const auto *O = dyn_cast<Operator>(V);
+      switch (O ? O->getOpcode() : 0) {
+      case Instruction::GetElementPtr: case Instruction::BitCast:
+      case Instruction::IntToPtr: case Instruction::PtrToInt:
+      case Instruction::Freeze: case Instruction::ExtractElement:
+      case Instruction::ExtractValue: case Instruction::AddrSpaceCast:
+      case Instruction::Add: case Instruction::Or: case Instruction::Sub:
+      case Instruction::Shl: case Instruction::Mul: case Instruction::SExt:
+      case Instruction::ZExt:
+        break;
+      default:
+        Stop = V;
+      }
+    }
+    Active.erase(V);
+    // (results reached through a value still in progress are optimistic; only
+    // the outermost one is final, but a false is final everywhere)
+    if (!R || Active.empty())
+      Done[V] = R;
+    return R;
+  }
+
+private:
+  bool compute(const Value *V, const Function &F, unsigned Depth) {
+    if (Depth > 32)
+      return false;
+    if (auto *T = dyn_cast<PointerType>(V->getType())) {
+      unsigned AS = T->getAddressSpace();
+      if (AS == AGX::DEVICE_ADDRESS || AS == AGX::CONSTANT_ADDRESS)
+        return true;
+      if (AS != Generic)
+        return false;
+    }
+    if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V) ||
+        isa<PoisonValue>(V))
+      return true;
+    if (const auto *A = dyn_cast<Argument>(V))
+      return A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL;
+    if (const auto *L = dyn_cast<LoadInst>(V)) {
+      unsigned AS = L->getPointerAddressSpace();
+      if (AS == AGX::CONSTANT_ADDRESS)
+        return true;
+      // a kernel's by-reference argument block (the host wrote it)
+      const Value *Base = getUnderlyingObject(L->getPointerOperand());
+      if (const auto *A = dyn_cast<Argument>(Base))
+        return A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL &&
+               A->hasByRefAttr();
+      return false;
+    }
+    if (const auto *Phi = dyn_cast<PHINode>(V)) {
+      for (const Value *In : Phi->incoming_values())
+        if (!isDevice(In, F, Depth + 1))
+          return false;
+      return true;
+    }
+    if (const auto *S = dyn_cast<SelectInst>(V))
+      return isDevice(S->getTrueValue(), F, Depth + 1) &&
+             isDevice(S->getFalseValue(), F, Depth + 1);
+    const auto *O = dyn_cast<Operator>(V);
+    if (!O)
+      return false;
+    switch (O->getOpcode()) {
+    case Instruction::GetElementPtr:
+    case Instruction::BitCast:
+    case Instruction::IntToPtr:
+    case Instruction::PtrToInt:
+    case Instruction::Freeze:
+    // (an element of a vector or aggregate read whole: two pointers loaded
+    // from constant memory at once)
+    case Instruction::ExtractElement:
+    case Instruction::ExtractValue:
+      return isDevice(O->getOperand(0), F, Depth + 1);
+    case Instruction::AddrSpaceCast:
+      return !tagOf(cast<PointerType>(O->getOperand(0)->getType())
+                        ->getAddressSpace()) &&
+             isDevice(O->getOperand(0), F, Depth + 1);
+    case Instruction::Add:
+    case Instruction::Or:
+      return (isDevice(O->getOperand(0), F, Depth + 1) &&
+              isPlainOffset(O->getOperand(1))) ||
+             (isDevice(O->getOperand(1), F, Depth + 1) &&
+              isPlainOffset(O->getOperand(0)));
+    case Instruction::Sub:
+      return isDevice(O->getOperand(0), F, Depth + 1) &&
+             isPlainOffset(O->getOperand(1));
+    default:
+      return false;
+    }
+  }
+};
+} // namespace
 
 static void setPointer(Instruction &I, Value *P) {
   if (auto *L = dyn_cast<LoadInst>(&I))
@@ -255,11 +411,28 @@ bool AGXLowerGenericAddresses::runOnFunction(Function &F) {
   AllSpaces.push_back(AGX::DEVICE_ADDRESS);
 
   SmallVector<Instruction *, 16> Accesses;
+  DeviceProvenance Provenance;
   for (Instruction &I : instructions(F))
     if (genericPointer(I))
       Accesses.push_back(&I);
   for (Instruction *I : Accesses) {
     Value *P = genericPointer(*I);
+    // A pointer only the host could have made: a device access, no tag test.
+    Provenance.Stop = nullptr;
+    if (AGXGenericProvenanceReport)
+      Provenance.forget();
+    if (AGXGenericDeviceProvenance && Provenance.isDevice(P, F)) {
+      IRBuilder<> B(I);
+      setPointer(*I, B.CreateIntToPtr(B.CreatePtrToInt(P, I64), DevicePtr));
+      continue;
+    }
+    if (AGXGenericProvenanceReport) {
+      errs() << "generic access in " << F.getName() << ": " << *I
+             << "\n  stops at: ";
+      if (Provenance.Stop)
+        errs() << *Provenance.Stop;
+      errs() << "\n";
+    }
     // PTX leaves atomics on generic addresses of local memory undefined.
     SmallVector<unsigned, 3> Spaces(AllSpaces);
     if (isa<AtomicRMWInst, AtomicCmpXchgInst>(I))
