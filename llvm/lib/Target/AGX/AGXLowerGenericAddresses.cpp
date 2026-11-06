@@ -34,6 +34,7 @@
 #include "AGX.h"
 #include "Utils/AGXBaseInfo.h"
 #include "llvm/ADT/DenseMap.h"
+#include <algorithm>
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
@@ -159,8 +160,8 @@ namespace {
 /// alone (kernels cannot write constant memory); device pointers and globals
 /// are untagged by construction. GEPs, phis, selects, casts between pointers and
 /// integers, and integer offsets keep it so: an offset moves a device address
-/// within its allocation (anything else is undefined), unless the offset itself
-/// came from a pointer (`q + (p - q)`), which is not followed.
+/// within its allocation (anything else is undefined) when the offset cannot
+/// itself be a pointer (see isPlainOffset).
 class DeviceProvenance {
   DenseMap<const Value *, bool> Done;
   SmallPtrSet<const Value *, 32> Active;
@@ -172,25 +173,53 @@ public:
 
 private:
 
-  /// Whether integer \p V is free of pointer-derived values (an offset).
-  static bool isPlainOffset(const Value *V, unsigned Depth = 0) {
-    if (isa<Constant>(V) && !isa<ConstantExpr>(V))
-      return true;
-    if (isa<PtrToIntOperator>(V) || Depth > 16)
-      return false;
-    if (isa<Argument>(V) || isa<LoadInst>(V) || isa<CallBase>(V) ||
-        isa<PHINode>(V))
-      // a loaded or computed index; a 64-bit one could in principle hold a
-      // pointer difference, which no compiler forms for indexing
-      return true;
-    if (const auto *O = dyn_cast<Operator>(V)) {
-      for (const Value *Op : O->operands())
-        if (!isPlainOffset(Op, Depth + 1))
-          return false;
-      return true;
+  /// The number of bits that bound the magnitude of integer \p V when it can
+  /// only be an offset, or 64 when it may be anything (a pointer: PTX keeps
+  /// pointers in 64-bit integers, so a 64-bit value loaded, passed or returned
+  /// could be one, and a private pointer argument plus an offset read from
+  /// constant memory is a private address). Constants, values of at most 32
+  /// bits, their extensions, and shifts, products, sums and masks of these
+  /// are bounded.
+  static unsigned offsetBits(const Value *V, unsigned Depth = 0) {
+    if (const auto *C = dyn_cast<ConstantInt>(V))
+      return C->getValue().isNegative()
+                 ? C->getValue().getSignificantBits()
+                 : C->getValue().getActiveBits();
+    auto *T = dyn_cast<IntegerType>(V->getType());
+    if (!T || Depth > 16 || isa<PtrToIntOperator>(V) || isa<ConstantExpr>(V))
+      return 64;
+    if (T->getBitWidth() <= 32)
+      return T->getBitWidth();
+    const auto *O = dyn_cast<Operator>(V);
+    if (!O)
+      return 64;
+    auto Bits = [&](unsigned I) { return offsetBits(O->getOperand(I), Depth + 1); };
+    switch (O->getOpcode()) {
+    case Instruction::SExt:
+    case Instruction::ZExt:
+      return Bits(0);
+    case Instruction::Shl: {
+      const auto *C = dyn_cast<ConstantInt>(O->getOperand(1));
+      return C ? std::min<uint64_t>(64, Bits(0) + C->getZExtValue()) : 64;
     }
-    return false;
+    case Instruction::Mul:
+      return std::min(64u, Bits(0) + Bits(1));
+    case Instruction::Add:
+    case Instruction::Sub:
+      return std::min(64u, std::max(Bits(0), Bits(1)) + 1);
+    case Instruction::And:
+      return std::min(Bits(0), Bits(1));
+    case Instruction::Or:
+    case Instruction::Xor:
+      return std::max(Bits(0), Bits(1));
+    default:
+      return 64;
+    }
   }
+
+  /// Whether \p V is an offset that cannot carry an address below 2^48 into
+  /// the tag bits (62 and 63).
+  static bool isPlainOffset(const Value *V) { return offsetBits(V) <= 48; }
 
 public:
   bool isDevice(const Value *V, const Function &F, unsigned Depth = 0) {
@@ -238,6 +267,11 @@ private:
     if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V) ||
         isa<PoisonValue>(V))
       return true;
+    // a constant below 2^48 is a device address by the tagged representation
+    // itself (device addresses folded in from constant memory); an offset
+    // added to it is bounded too (isPlainOffset)
+    if (const auto *C = dyn_cast<ConstantInt>(V))
+      return C->getBitWidth() == 64 && !(C->getZExtValue() >> 48);
     if (const auto *A = dyn_cast<Argument>(V))
       return A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL;
     if (const auto *L = dyn_cast<LoadInst>(V)) {

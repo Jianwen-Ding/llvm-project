@@ -20,6 +20,10 @@
 ; CHECK: lshr i32 %{{.*}}, 30
 ; CHECK: store i32 %{{.*}}, ptr addrspace(5)
 ; CHECK: store i32 %{{.*}}, ptr addrspace(1)
+; A 64-bit offset read from constant memory added to a pointer argument (PTX
+; keeps pointers in integers: either could be the pointer) still tests.
+; CHECK: lshr i32 %{{.*}}, 30
+; CHECK: store i32 %{{.*}}, ptr addrspace(5)
 ; OFF-LABEL: define internal void @use(
 ; OFF: lshr i32 %{{.*}}, 30
 ; OFF: lshr i32 %{{.*}}, 30
@@ -53,5 +57,10 @@ loop:
   br i1 %c, label %loop, label %exit
 exit:
   store i32 %v, ptr %p, align 4
+  %poff = load i64, ptr addrspace(4) getelementptr (i8, ptr addrspace(4) @table, i64 16), align 8
+  %pi = ptrtoint ptr %p to i64
+  %pa = add i64 %pi, %poff
+  %pp = inttoptr i64 %pa to ptr
+  store i32 %v, ptr %pp, align 4
   ret void
 }
