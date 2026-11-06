@@ -16,10 +16,9 @@
 ; CHECK-NEXT: load i32, ptr addrspace(1) %[[A]]
 ; CHECK: loop:
 ; CHECK: load <4 x float>, ptr addrspace(1)
-; CHECK-NOT: generic.test
-; CHECK: lshr i32 %{{.*}}, 30
+; CHECK-NOT: lshr
+; The argument only ever receives the kernel's private pointer: a stack store.
 ; CHECK: store i32 %{{.*}}, ptr addrspace(5)
-; CHECK: store i32 %{{.*}}, ptr addrspace(1)
 ; A 64-bit offset read from constant memory added to a pointer argument (PTX
 ; keeps pointers in integers: either could be the pointer) still tests.
 ; CHECK: lshr i32 %{{.*}}, 30

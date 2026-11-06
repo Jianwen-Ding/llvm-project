@@ -68,7 +68,11 @@ private:
   // or private memory, scanned at the first function (doInitialization runs
   // before AGXLowerAIR has given the module AGX's address spaces).
   bool Scanned = false, ModuleHasShared = false, ModuleHasPrivate = false;
+  // The memories each pointer argument (generic, or a 64-bit integer) of a
+  // function whose every use is a direct call may receive from its callers.
+  DenseMap<const Argument *, unsigned> ParamKinds;
   void scanModule(const Module &M);
+  void computeParamKinds(const Module &M);
 };
 
 } // namespace
@@ -144,34 +148,56 @@ static Value *genericPointer(Instruction &I) {
 
 static cl::opt<bool> AGXGenericDeviceProvenance(
     "agx-generic-device-provenance", cl::init(true), cl::Hidden,
-    cl::desc("Access generic pointers that can only hold device addresses "
-             "(read from constant memory or kernel arguments) without "
-             "testing their tags"));
+    cl::desc("Test a generic access only for the memories its pointer can "
+             "name (from where it comes from and, for called functions, what "
+             "their callers pass), and not at all when that is one memory"));
 
 static cl::opt<bool> AGXGenericProvenanceReport(
     "agx-generic-provenance-report", cl::init(false), cl::Hidden,
-    cl::desc("Print, for each generic access still testing tags, the value "
-             "its device provenance stopped at"));
+    cl::desc("Print each generic access that still tests tags, with the "
+             "memories it may reach"));
 
 namespace {
-/// Whether a generic pointer (or the 64-bit integer holding one) can only be a
-/// device address: it comes from a value no thread could have tagged. The host
-/// writes constant memory and kernel arguments, and it knows device addresses
-/// alone (kernels cannot write constant memory); device pointers and globals
-/// are untagged by construction. GEPs, phis, selects, casts between pointers and
-/// integers, and integer offsets keep it so: an offset moves a device address
-/// within its allocation (anything else is undefined) when the offset cannot
-/// itself be a pointer (see isPlainOffset).
-class DeviceProvenance {
-  DenseMap<const Value *, bool> Done;
+/// The memories a generic pointer may name, as a set.
+enum : unsigned { KDevice = 1, KPrivate = 2, KShared = 4, KAll = 7 };
+
+static unsigned kindOfSpace(unsigned AS) {
+  switch (AS) {
+  case AGX::DEVICE_ADDRESS:
+  case AGX::CONSTANT_ADDRESS:
+    return KDevice;
+  case AGX::PRIVATE_ADDRESS:
+    return KPrivate;
+  case AGX::THREADGROUP_ADDRESS:
+    return KShared;
+  default:
+    return KAll;
+  }
+}
+
+/// The memories a generic pointer (or the 64-bit integer holding one, as PTX
+/// keeps them) may name, from where it comes from:
+/// - a cast from a specific address space names that memory;
+/// - a pointer read from constant memory or a kernel's argument block, or a
+///   kernel argument, is a device address: the host wrote it, and it knows no
+///   tagged address (kernels cannot write constant memory); so is a constant
+///   below 2^48 (device addresses folded in from constant memory);
+/// - an argument of a function whose every call is known has what its callers
+///   pass (ParamKinds, a fixed point over the call graph);
+/// - GEPs, phis, selects, casts between pointers and integers, element
+///   extraction and offsets bounded to 48 bits keep the memory: an offset moves
+///   an address within its allocation (anything else is undefined) when the
+///   offset cannot itself be a pointer (see isPlainOffset);
+/// - anything else (a pointer read from device or private memory, returned by
+///   a call) may name any.
+class AddressKinds {
+  const DenseMap<const Argument *, unsigned> &ParamKinds;
+  DenseMap<const Value *, unsigned> Done;
   SmallPtrSet<const Value *, 32> Active;
 
 public:
-  /// The first value found not to be a device pointer (for the report).
-  const Value *Stop = nullptr;
-  void forget() { Done.clear(); }
-
-private:
+  explicit AddressKinds(const DenseMap<const Argument *, unsigned> &PK)
+      : ParamKinds(PK) {}
 
   /// The number of bits that bound the magnitude of integer \p V when it can
   /// only be an offset, or 64 when it may be anything (a pointer: PTX keeps
@@ -193,7 +219,9 @@ private:
     const auto *O = dyn_cast<Operator>(V);
     if (!O)
       return 64;
-    auto Bits = [&](unsigned I) { return offsetBits(O->getOperand(I), Depth + 1); };
+    auto Bits = [&](unsigned I) {
+      return offsetBits(O->getOperand(I), Depth + 1);
+    };
     switch (O->getOpcode()) {
     case Instruction::SExt:
     case Instruction::ZExt:
@@ -221,82 +249,64 @@ private:
   /// the tag bits (62 and 63).
   static bool isPlainOffset(const Value *V) { return offsetBits(V) <= 48; }
 
-public:
-  bool isDevice(const Value *V, const Function &F, unsigned Depth = 0) {
+  unsigned of(const Value *V, unsigned Depth = 0) {
     if (auto It = Done.find(V); It != Done.end())
       return It->second;
-    // a value met again on a cycle (a loop's phi) is device if the rest is
+    // a value met again on a cycle (a loop's phi) adds nothing of its own
     if (!Active.insert(V).second)
-      return true;
-    bool R = compute(V, F, Depth);
-    if (!R && !Stop && !isa<PHINode, SelectInst>(V)) {
-      // (the leaf a derivation stopped at, not the arithmetic over it)
-      const auto *O = dyn_cast<Operator>(V);
-      switch (O ? O->getOpcode() : 0) {
-      case Instruction::GetElementPtr: case Instruction::BitCast:
-      case Instruction::IntToPtr: case Instruction::PtrToInt:
-      case Instruction::Freeze: case Instruction::ExtractElement:
-      case Instruction::ExtractValue: case Instruction::AddrSpaceCast:
-      case Instruction::Add: case Instruction::Or: case Instruction::Sub:
-      case Instruction::Shl: case Instruction::Mul: case Instruction::SExt:
-      case Instruction::ZExt:
-        break;
-      default:
-        Stop = V;
-      }
-    }
+      return 0;
+    unsigned R = compute(V, Depth);
     Active.erase(V);
-    // (results reached through a value still in progress are optimistic; only
-    // the outermost one is final, but a false is final everywhere)
-    if (!R || Active.empty())
+    // (a result reached through a value still in progress is optimistic: only
+    // the outermost one is final, and any that already names every memory)
+    if (R == KAll || Active.empty())
       Done[V] = R;
     return R;
   }
 
 private:
-  bool compute(const Value *V, const Function &F, unsigned Depth) {
+  unsigned compute(const Value *V, unsigned Depth) {
     if (Depth > 32)
-      return false;
-    if (auto *T = dyn_cast<PointerType>(V->getType())) {
-      unsigned AS = T->getAddressSpace();
-      if (AS == AGX::DEVICE_ADDRESS || AS == AGX::CONSTANT_ADDRESS)
-        return true;
-      if (AS != Generic)
-        return false;
-    }
+      return KAll;
+    if (auto *T = dyn_cast<PointerType>(V->getType()))
+      if (T->getAddressSpace() != Generic)
+        return kindOfSpace(T->getAddressSpace());
     if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V) ||
         isa<PoisonValue>(V))
-      return true;
-    // a constant below 2^48 is a device address by the tagged representation
-    // itself (device addresses folded in from constant memory); an offset
-    // added to it is bounded too (isPlainOffset)
+      return 0;
     if (const auto *C = dyn_cast<ConstantInt>(V))
-      return C->getBitWidth() == 64 && !(C->getZExtValue() >> 48);
-    if (const auto *A = dyn_cast<Argument>(V))
-      return A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL;
+      return C->getBitWidth() == 64 && !(C->getZExtValue() >> 48) ? KDevice
+                                                                   : KAll;
+    if (const auto *A = dyn_cast<Argument>(V)) {
+      if (A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL)
+        return KDevice;
+      auto It = ParamKinds.find(A);
+      return It == ParamKinds.end() ? KAll : It->second;
+    }
     if (const auto *L = dyn_cast<LoadInst>(V)) {
-      unsigned AS = L->getPointerAddressSpace();
-      if (AS == AGX::CONSTANT_ADDRESS)
-        return true;
+      if (L->getPointerAddressSpace() == AGX::CONSTANT_ADDRESS)
+        return KDevice;
       // a kernel's by-reference argument block (the host wrote it)
       const Value *Base = getUnderlyingObject(L->getPointerOperand());
       if (const auto *A = dyn_cast<Argument>(Base))
-        return A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL &&
-               A->hasByRefAttr();
-      return false;
+        if (A->getParent()->getCallingConv() == CallingConv::AGX_KERNEL &&
+            A->hasByRefAttr())
+          return KDevice;
+      return KAll;
     }
     if (const auto *Phi = dyn_cast<PHINode>(V)) {
+      unsigned R = 0;
       for (const Value *In : Phi->incoming_values())
-        if (!isDevice(In, F, Depth + 1))
-          return false;
-      return true;
+        if ((R |= of(In, Depth + 1)) == KAll)
+          break;
+      return R;
     }
     if (const auto *S = dyn_cast<SelectInst>(V))
-      return isDevice(S->getTrueValue(), F, Depth + 1) &&
-             isDevice(S->getFalseValue(), F, Depth + 1);
+      return of(S->getTrueValue(), Depth + 1) |
+             of(S->getFalseValue(), Depth + 1);
     const auto *O = dyn_cast<Operator>(V);
     if (!O)
-      return false;
+      return KAll;
     switch (O->getOpcode()) {
     case Instruction::GetElementPtr:
     case Instruction::BitCast:
@@ -307,22 +317,28 @@ private:
     // from constant memory at once)
     case Instruction::ExtractElement:
     case Instruction::ExtractValue:
-      return isDevice(O->getOperand(0), F, Depth + 1);
-    case Instruction::AddrSpaceCast:
-      return !tagOf(cast<PointerType>(O->getOperand(0)->getType())
-                        ->getAddressSpace()) &&
-             isDevice(O->getOperand(0), F, Depth + 1);
+      return of(O->getOperand(0), Depth + 1);
+    case Instruction::AddrSpaceCast: {
+      unsigned Src =
+          cast<PointerType>(O->getOperand(0)->getType())->getAddressSpace();
+      return Src == Generic ? of(O->getOperand(0), Depth + 1)
+                            : kindOfSpace(Src);
+    }
     case Instruction::Add:
-    case Instruction::Or:
-      return (isDevice(O->getOperand(0), F, Depth + 1) &&
-              isPlainOffset(O->getOperand(1))) ||
-             (isDevice(O->getOperand(1), F, Depth + 1) &&
-              isPlainOffset(O->getOperand(0)));
+    case Instruction::Or: {
+      // either operand may be the address; each bound is sound, so both hold
+      unsigned R = KAll;
+      if (isPlainOffset(O->getOperand(1)))
+        R &= of(O->getOperand(0), Depth + 1);
+      if (isPlainOffset(O->getOperand(0)))
+        R &= of(O->getOperand(1), Depth + 1);
+      return R;
+    }
     case Instruction::Sub:
-      return isDevice(O->getOperand(0), F, Depth + 1) &&
-             isPlainOffset(O->getOperand(1));
+      return isPlainOffset(O->getOperand(1)) ? of(O->getOperand(0), Depth + 1)
+                                             : KAll;
     default:
-      return false;
+      return KAll;
     }
   }
 };
@@ -357,6 +373,7 @@ static void noteToGeneric(const Value *V, bool &HasShared, bool &HasPrivate) {
 
 bool AGXLowerGenericAddresses::doInitialization(Module &M) {
   Scanned = ModuleHasShared = ModuleHasPrivate = false;
+  ParamKinds.clear();
   return false;
 }
 
@@ -380,10 +397,65 @@ void AGXLowerGenericAddresses::scanModule(const Module &M) {
   }
 }
 
+/// A fixed point over the call graph: an argument of a function called only
+/// directly (all its calls known) may receive what any of its calls passes,
+/// which may in turn be its caller's arguments. Starts from nothing and only
+/// grows; computed on the module before any function's casts are lowered.
+void AGXLowerGenericAddresses::computeParamKinds(const Module &M) {
+  SmallVector<const Function *, 32> Known;
+  for (const Function &F : M) {
+    if (F.isDeclaration() || !F.hasLocalLinkage() ||
+        F.getCallingConv() == CallingConv::AGX_KERNEL)
+      continue;
+    bool AllCalls = all_of(F.uses(), [&](const Use &U) {
+      const auto *CB = dyn_cast<CallBase>(U.getUser());
+      return CB && CB->isCallee(&U) && CB->getFunctionType() == F.getFunctionType();
+    });
+    if (!AllCalls)
+      continue;
+    Known.push_back(&F);
+    for (const Argument &A : F.args()) {
+      Type *T = A.getType();
+      if ((T->isPointerTy() && T->getPointerAddressSpace() == Generic) ||
+          T->isIntegerTy(64))
+        ParamKinds[&A] = 0;
+    }
+  }
+  for (unsigned Round = 0;; ++Round) {
+    if (Round == 64) {
+      // (no fixed point in time: every argument may receive anything)
+      for (auto &[A, K] : ParamKinds)
+        K = KAll;
+      return;
+    }
+    bool Changed = false;
+    AddressKinds Kinds(ParamKinds);
+    for (const Function *F : Known)
+      for (const Use &U : F->uses()) {
+        const auto *CB = cast<CallBase>(U.getUser());
+        for (const Argument &A : F->args()) {
+          auto It = ParamKinds.find(&A);
+          if (It == ParamKinds.end() || It->second == KAll)
+            continue;
+          unsigned K = It->second | Kinds.of(CB->getArgOperand(A.getArgNo()));
+          if (K != It->second) {
+            It->second = K;
+            Changed = true;
+          }
+        }
+      }
+    if (!Changed)
+      return;
+  }
+}
+
 bool AGXLowerGenericAddresses::runOnFunction(Function &F) {
   // (at the first function, before any function's casts are lowered)
-  if (agxExperimentalLeafCallsEnabled() && !Scanned)
+  if (agxExperimentalLeafCallsEnabled() && !Scanned) {
     scanModule(*F.getParent());
+    if (AGXGenericDeviceProvenance)
+      computeParamKinds(*F.getParent());
+  }
   bool Called = agxExperimentalLeafCallsEnabled() &&
                 F.getCallingConv() != CallingConv::AGX_KERNEL;
 
@@ -415,6 +487,15 @@ bool AGXLowerGenericAddresses::runOnFunction(Function &F) {
   if (ToGeneric.empty() && FromGeneric.empty() && !HasShared && !HasPrivate)
     return Changed;
 
+  // The memories each access may reach, found before the casts change form.
+  DenseMap<const Instruction *, unsigned> AccessKinds;
+  if (AGXGenericDeviceProvenance) {
+    AddressKinds Kinds(ParamKinds);
+    for (Instruction &I : instructions(F))
+      if (Value *P = genericPointer(I))
+        AccessKinds[&I] = Kinds.of(P);
+  }
+
   LLVMContext &Ctx = F.getContext();
   Type *I64 = Type::getInt64Ty(Ctx), *I32 = Type::getInt32Ty(Ctx);
   PointerType *GenericPtr = PointerType::get(Ctx, Generic);
@@ -445,32 +526,36 @@ bool AGXLowerGenericAddresses::runOnFunction(Function &F) {
   AllSpaces.push_back(AGX::DEVICE_ADDRESS);
 
   SmallVector<Instruction *, 16> Accesses;
-  DeviceProvenance Provenance;
   for (Instruction &I : instructions(F))
     if (genericPointer(I))
       Accesses.push_back(&I);
   for (Instruction *I : Accesses) {
     Value *P = genericPointer(*I);
-    // A pointer only the host could have made: a device access, no tag test.
-    Provenance.Stop = nullptr;
-    if (AGXGenericProvenanceReport)
-      Provenance.forget();
-    if (AGXGenericDeviceProvenance && Provenance.isDevice(P, F)) {
+    auto KI = AccessKinds.find(I);
+    unsigned K = KI == AccessKinds.end() ? KAll : KI->second;
+    // Only the memories the pointer may name (PTX leaves atomics on generic
+    // addresses of local memory undefined); device memory when none.
+    SmallVector<unsigned, 3> Spaces;
+    for (unsigned AS : AllSpaces)
+      if ((kindOfSpace(AS) & K) &&
+          !(AS == AGX::PRIVATE_ADDRESS && isa<AtomicRMWInst, AtomicCmpXchgInst>(I)))
+        Spaces.push_back(AS);
+    if (Spaces.empty())
+      Spaces.push_back(AGX::DEVICE_ADDRESS);
+    if (Spaces.size() == 1) {
+      // one memory: its access, without a test
       IRBuilder<> B(I);
-      setPointer(*I, B.CreateIntToPtr(B.CreatePtrToInt(P, I64), DevicePtr));
+      Value *Bits = B.CreatePtrToInt(P, I64);
+      unsigned AS = Spaces[0];
+      setPointer(*I, AS == AGX::DEVICE_ADDRESS
+                         ? B.CreateIntToPtr(Bits, DevicePtr)
+                         : B.CreateIntToPtr(B.CreateTrunc(Bits, I32),
+                                            PointerType::get(Ctx, AS)));
       continue;
     }
-    if (AGXGenericProvenanceReport) {
-      errs() << "generic access in " << F.getName() << ": " << *I
-             << "\n  stops at: ";
-      if (Provenance.Stop)
-        errs() << *Provenance.Stop;
-      errs() << "\n";
-    }
-    // PTX leaves atomics on generic addresses of local memory undefined.
-    SmallVector<unsigned, 3> Spaces(AllSpaces);
-    if (isa<AtomicRMWInst, AtomicCmpXchgInst>(I))
-      llvm::erase(Spaces, AGX::PRIVATE_ADDRESS);
+    if (AGXGenericProvenanceReport)
+      errs() << "generic access in " << F.getName() << " (memories " << K
+             << "): " << *I << "\n";
     BasicBlock *Head = I->getParent();
     BasicBlock *Tail = Head->splitBasicBlock(I, "generic.join");
     Head->getTerminator()->eraseFromParent();
