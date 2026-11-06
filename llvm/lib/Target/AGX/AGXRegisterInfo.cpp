@@ -26,8 +26,9 @@ using namespace llvm;
 AGXRegisterInfo::AGXRegisterInfo(const AGXSubtarget &ST)
     : AGXGenRegisterInfo(AGX::R1), ST(ST) {}
 
+// (16 under the call-tree cap of 72: 48 left a function with calls almost nothing free; Cycles 1-5% better)
 static cl::opt<unsigned> CalleeSaved(
-    "agx-callee-saved", cl::init(48), cl::Hidden,
+    "agx-callee-saved", cl::init(16), cl::Hidden,
     cl::desc("How many registers, the highest every function may use, called "
              "functions keep"));
 
@@ -107,14 +108,22 @@ static cl::opt<unsigned> SchedTargetGPRs(
     cl::desc("Registers the pre-RA scheduler tries to stay under (0: what is "
              "allocatable)"));
 
+static cl::opt<unsigned> CallTreeSchedTargetGPRs(
+    "agx-call-tree-sched-target-gprs", cl::init(48), cl::Hidden,
+    cl::desc("-agx-sched-target-gprs for functions with real calls or called "
+             "(agx-call-tree), where it is not set"));
+
 unsigned AGXRegisterInfo::getRegPressureSetLimit(const MachineFunction &MF,
                                                  unsigned Idx) const {
   unsigned Limit = AGXGenRegisterInfo::getRegPressureSetLimit(MF, Idx);
   // RegisterClassInfo takes the reserved registers, which include those above
   // the cap, off this: take the difference from the cap only.
   unsigned Cap = ST.getMaxGPRs(MF.getFunction());
-  if (SchedTargetGPRs && SchedTargetGPRs < Cap)
-    Limit -= 2 * (Cap - SchedTargetGPRs);
+  unsigned Target = SchedTargetGPRs;
+  if (!Target && MF.getFunction().hasFnAttribute("agx-call-tree"))
+    Target = CallTreeSchedTargetGPRs;
+  if (Target && Target < Cap)
+    Limit -= 2 * (Cap - Target);
   return Limit;
 }
 

@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=48 -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-callee-saved=48 -agx-call-tree-max-gprs=0 -verify-machineinstrs < %s | FileCheck %s
 ; Called functions keep r80 and up. What is live across a call stays in such a
 ; register, with no spill in the caller. A callee that uses them saves them on
 ; entry and restores them before it returns, and a kernel with calls declares

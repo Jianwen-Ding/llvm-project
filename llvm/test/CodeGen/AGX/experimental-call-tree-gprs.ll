@@ -1,5 +1,5 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-declare-tree-gprs -verify-machineinstrs < %s -o - | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -verify-machineinstrs < %s -o - | FileCheck %s --check-prefix=ALL
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-call-tree-max-gprs=0 -agx-declare-tree-gprs -verify-machineinstrs < %s -o - | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-call-tree-max-gprs=0 -verify-machineinstrs < %s -o - | FileCheck %s --check-prefix=ALL
 ; With -agx-declare-tree-gprs a kernel's record has the registers its call tree
 ; uses, even with its callee emitted after it; otherwise every register.
 

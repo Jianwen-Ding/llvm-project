@@ -309,6 +309,18 @@ bool AGXAlwaysInline::runOnModule(Module &M) {
   for (Function *F : Dead)
     F->eraseFromParent();
   Changed |= !Dead.empty();
+  // A module with real calls: its functions form call trees, which declare registers for the whole tree
+  // (AGXSubtarget's -agx-call-tree-max-gprs)
+  if (agxExperimentalLeafCallsEnabled() && CallsWithinLimit &&
+      any_of(M, [](const Function &F) {
+        return !F.isDeclaration() && F.getCallingConv() != CallingConv::AGX_KERNEL &&
+               F.hasFnAttribute(Attribute::NoInline) && !F.use_empty();
+      }))
+    for (Function &F : M)
+      if (!F.isDeclaration() && F.hasFnAttribute("agx-call-depth")) {
+        F.addFnAttr("agx-call-tree");
+        Changed = true;
+      }
   // Called functions after every kernel: a kernel's program runs from its
   // symbol to the end of .text, which must hold what it calls (a module from
   // AIR lists its functions before its kernels).

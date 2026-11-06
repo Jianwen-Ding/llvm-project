@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGXSubtarget.h"
+#include "AGX.h"
 #include "llvm/Support/CommandLine.h"
 #include "AGXTargetMachine.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -55,9 +56,23 @@ static cl::opt<unsigned> DefaultMaxGPRs(
     cl::desc("At most this many 32-bit general purpose registers in every "
              "function: more threads resident on a core, against spills"));
 
+// Code with real calls (-agx-experimental-leaf-calls) declares registers for what its callees may use, all of what
+// such functions may use: without a cap 128, so the fewest threads per core. A cap trades spills for threads:
+// Blender Cycles (M2 Max, samples per minute, with constant-memory specialization) 819 at 128, 1033 at 80, 1054
+// at 72 over its three Open Data scenes. Leaf kernels declare what they use, and a cap only spills there (llama.cpp
+// 44% slower at 72), so it applies to call trees only (the agx-call-tree attribute, AGXCodeGenPrepare).
+static cl::opt<unsigned> CallTreeMaxGPRs(
+    "agx-call-tree-max-gprs", cl::init(72), cl::Hidden,
+    cl::desc("At most this many 32-bit general purpose registers in functions "
+             "with real calls or called (0: no cap)"));
+
 unsigned AGXSubtarget::getMaxGPRsOfAllFunctions() const {
-  return DefaultMaxGPRs ? std::min(getMaxGPRs(), std::max(DefaultMaxGPRs.getValue(), 16u))
-                        : getMaxGPRs();
+  unsigned Max = DefaultMaxGPRs ? std::min(getMaxGPRs(), std::max(DefaultMaxGPRs.getValue(), 16u))
+                                : getMaxGPRs();
+  // (used only where there are calls: the callee-saved set, what a kernel with calls declares)
+  if (CallTreeMaxGPRs && agxExperimentalLeafCallsEnabled())
+    Max = std::min(Max, std::max(CallTreeMaxGPRs.getValue(), 16u));
+  return Max;
 }
 
 unsigned AGXSubtarget::getMaxGPRs(const Function &F) const {
@@ -66,6 +81,8 @@ unsigned AGXSubtarget::getMaxGPRs(const Function &F) const {
   unsigned Max = getMaxGPRs();
   if (DefaultMaxGPRs)
     Max = std::min(Max, std::max<unsigned>(DefaultMaxGPRs, MinGPRs));
+  if (CallTreeMaxGPRs && F.hasFnAttribute("agx-call-tree"))
+    Max = std::min(Max, std::max<unsigned>(CallTreeMaxGPRs, MinGPRs));
   if (unsigned N = F.getFnAttributeAsParsedInteger("agx-max-gprs", 0))
     Max = std::min(Max, std::max(N, MinGPRs));
   if (unsigned T = F.getFnAttributeAsParsedInteger(
