@@ -160,6 +160,10 @@ namespace {
       return is_contained(It->second, MBB);
     }
 
+    // Registers none of whose uses has a kill flag (EliminateCSE cleared
+    // them, and nothing in this pass sets them since).
+    DenseSet<Register> KillFlagsCleared;
+
     // Exiting blocks of each Loop (IsGuaranteedToExecute's cache is per
     // block, and recomputing these for each block of a large loop was
     // quadratic).
@@ -213,6 +217,7 @@ namespace {
       CSEMap.clear();
       ExitBlockMap.clear();
       ExitingBlockMap.clear();
+      KillFlagsCleared.clear();
     }
 
   private:
@@ -1440,6 +1445,8 @@ MachineInstr *MachineLICMImpl::ExtractHoistableLoad(MachineInstr *MI,
   MachineBasicBlock::iterator Pos = MI;
   MBB->insert(Pos, NewMIs[0]);
   MBB->insert(Pos, NewMIs[1]);
+  // (the unfolded instructions take MI's operands with their kill flags)
+  KillFlagsCleared.clear();
   // If unfolding produced a load that wasn't loop-invariant or profitable to
   // hoist, discard the new instructions and bail.
   if (!IsLoopInvariantInst(*NewMIs[0], CurLoop) ||
@@ -1574,8 +1581,17 @@ bool MachineLICMImpl::EliminateCSE(
     for (unsigned Idx : Defs) {
       Register Reg = MI->getOperand(Idx).getReg();
       Register DupReg = Dup->getOperand(Idx).getReg();
-      MRI->replaceRegWith(Reg, DupReg);
-      MRI->clearKillFlags(DupReg);
+      // (no kill flags may stay on DupReg's uses: a register CSE'd into many
+      // times, whose uses all lost theirs at the first time, needs only Reg's
+      // cleared, before they become DupReg's)
+      if (KillFlagsCleared.contains(DupReg)) {
+        MRI->clearKillFlags(Reg);
+        MRI->replaceRegWith(Reg, DupReg);
+      } else {
+        MRI->replaceRegWith(Reg, DupReg);
+        MRI->clearKillFlags(DupReg);
+        KillFlagsCleared.insert(DupReg);
+      }
       // Clear Dup dead flag if any, we reuse it for Reg.
       if (!MRI->use_nodbg_empty(DupReg))
         Dup->getOperand(Idx).setIsDead(false);

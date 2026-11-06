@@ -274,14 +274,18 @@ public:
 /// matrix operations) their latency ordering kept dozens more values live.
 class AGXScheduleDAGMILive : public ScheduleDAGMILive {
   int GPRSet = -1;
+  /// The tracker of regionHalves, kept across regions: a new one's set of
+  /// live registers is allocated and zeroed for all the function's virtual
+  /// registers, twice per region (quadratic in large functions); init resets
+  /// a kept one.
+  IntervalPressure P;
+  RegPressureTracker RPT{P};
 
   /// The peak of the 16-bit GPR halves pressure set over the region, in its
   /// current order (live-through values included).
   unsigned regionHalves() {
     if (GPRSet < 0 || RegionBegin == RegionEnd)
       return 0;
-    IntervalPressure P;
-    RegPressureTracker RPT(P);
     RPT.init(&MF, RegClassInfo, LIS, BB, RegionEnd, ShouldTrackLaneMasks,
              /*TrackUntiedDefs=*/false);
     while (RPT.getPos() != RegionBegin)
