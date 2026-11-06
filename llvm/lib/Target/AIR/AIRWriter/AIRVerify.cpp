@@ -328,12 +328,14 @@ class Checker {
             continue;
           bool Threadgroup = F->getArg(I)->getType()->isPointerTy() &&
                              F->getArg(I)->getType()->getPointerAddressSpace() == 3;
-          // (the 31 of !air.max_device_buffers and !air.max_threadgroup_buffers)
-          if (Key->getString() == "air.location_index" && Value->getValue().uge(31))
+          // (the 31 of !air.max_device_buffers and !air.max_threadgroup_buffers: Metal's limits, for the AIR
+          // given to Metal only; portable AIR also feeds the AGX backend, which binds any number of buffers, as
+          // CUDA kernels with many pointer arguments need, llama.cpp's k_bin_bcast_unravel)
+          if (isMetal() && Key->getString() == "air.location_index" && Value->getValue().uge(31))
             add(*F, "a buffer argument at location " + Twine(Value->getSExtValue()) +
                         ", outside 0..30");
           // (the location is followed by how many it takes)
-          if (Key->getString() == "air.location_index" && J + 2 < Node->getNumOperands()) {
+          if (isMetal() && Key->getString() == "air.location_index" && J + 2 < Node->getNumOperands()) {
             auto *Count = mdconst::dyn_extract_or_null<ConstantInt>(Node->getOperand(J + 2));
             if (!Count || Count->isZero() || Count->getValue().uge(32) ||
                 Value->getValue().getLimitedValue(32) + Count->getLimitedValue(32) > 31)
