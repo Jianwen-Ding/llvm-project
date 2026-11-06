@@ -315,6 +315,9 @@ private:
 
   DenseMap<const BlockT *, std::unique_ptr<DivergenceDescriptor>>
       CachedControlDivDescs;
+
+  // The block labels of each propagation (DivergencePropagator::BlockLabels).
+  SmallVector<const BlockT *, 0> BlockLabels;
 };
 
 /// \brief Analysis that identifies uniform values in a data-parallel
@@ -545,19 +548,33 @@ public:
   // * label(B) == B        : B is a join of disjoint paths, an immediate
   //                          successor of the divergent term, or the term
   //                          itself
-  SmallVector<const BlockT *> BlockLabels;
+  // The analysis' array, all null between propagations (one per divergent
+  // branch: a new array each time, for every block of the function, was
+  // quadratic in large functions), and the blocks this one labels, cleared
+  // when it is done.
+  SmallVectorImpl<const BlockT *> &BlockLabels;
+  SmallVector<unsigned, 32> Labeled;
 
   const BlockT *&label(const BlockT *BB) {
     return BlockLabels[GraphTraits<const BlockT *>::getNumber(BB)];
   }
 
   DivergencePropagator(const ModifiedPO &CyclePOT, const DominatorTreeT &DT,
-                       const CycleInfoT &CI, const BlockT &DivTermBlock)
+                       const CycleInfoT &CI, const BlockT &DivTermBlock,
+                       SmallVectorImpl<const BlockT *> &Labels)
       : CyclePOT(CyclePOT), DT(DT), CI(CI), DivTermBlock(DivTermBlock),
         Context(CI.getSSAContext()), DivDesc(new DivergenceDescriptorT),
-        BlockLabels(
-            GraphTraits<const FunctionT *>::getMaxNumber(CI.getFunction()),
-            nullptr) {}
+        BlockLabels(Labels) {
+    unsigned N =
+        GraphTraits<const FunctionT *>::getMaxNumber(CI.getFunction());
+    if (BlockLabels.size() < N)
+      BlockLabels.resize(N, nullptr);
+  }
+
+  ~DivergencePropagator() {
+    for (unsigned I : Labeled)
+      BlockLabels[I] = nullptr;
+  }
 
   void printDefs(raw_ostream &Out) {
     Out << "Propagator::BlockLabels {\n";
@@ -600,6 +617,7 @@ public:
       LLVM_DEBUG(dbgs() << "\tnew label: " << Context.print(&PushedLabel)
                         << "\n");
       label(&SuccBlock) = &PushedLabel;
+      Labeled.push_back(GraphTraits<const BlockT *>::getNumber(&SuccBlock));
       return false;
     }
 
@@ -791,7 +809,8 @@ auto llvm::GenericSyncDependenceAnalysis<ContextT>::getJoinBlocks(
     return *ItCached->second;
 
   // compute all join points
-  DivergencePropagatorT Propagator(CyclePO, DT, CI, *DivTermBlock);
+  DivergencePropagatorT Propagator(CyclePO, DT, CI, *DivTermBlock,
+                                   BlockLabels);
   auto DivDesc = Propagator.computeJoinPoints();
 
   auto PrintBlockSet = [&](ConstBlockSet &Blocks) {
