@@ -64,6 +64,11 @@
 
 using namespace llvm;
 
+cl::opt<bool> llvm::AIRLookupTables(
+    "air-lookup-tables", cl::init(true), cl::Hidden,
+    cl::desc("Let SimplifyCFG turn switches into lookup tables in AIR "
+             "(off: ZLUDA_AGX_LOOKUP_TABLES=0 in zoc, an experiment)"));
+
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAIRTarget() {
   RegisterTargetMachine<AIRTargetMachine> X(getTheAIRTarget());
   auto *PR = PassRegistry::getPassRegistry();

@@ -12,10 +12,15 @@
 #include "AIRSubtarget.h"
 #include "AIRTargetMachine.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 
 namespace llvm {
+/// -air-lookup-tables (AIRTargetMachine.cpp): whether SimplifyCFG may turn
+/// switches into lookup tables (private constant arrays) in portable AIR.
+extern cl::opt<bool> AIRLookupTables;
+
 class AIRTTIImpl final : public BasicTTIImplBase<AIRTTIImpl> {
   using BaseT = BasicTTIImplBase<AIRTTIImpl>;
   using TTI = TargetTransformInfo;
@@ -43,6 +48,12 @@ public:
   bool hasBranchDivergence(const Function *F = nullptr) const override {
     return true;
   }
+
+  // -air-lookup-tables=false: no switch lookup tables (constant arrays). On
+  // AGX they are in the module's global data, where they move the device
+  // variables of a single-kernel recompilation; zoc keeps them by default (the
+  // table loads beat the select chains: ZLUDA's AIR_EXPERIMENTS 2026-11-07).
+  bool shouldBuildLookupTables() const override { return AIRLookupTables; }
   ValueUniformity getValueUniformity(const Value *V) const override {
     if (const auto *CI = dyn_cast<CallInst>(V)) {
       const Function *F = CI->getCalledFunction();

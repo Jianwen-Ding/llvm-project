@@ -447,7 +447,12 @@ bool AGXDAGToDAGISel::SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods) {
   unsigned M = 0;
   while (true) {
     if (N.getOpcode() == ISD::FNEG) {
-      M ^= AGX::SRC_MOD_NEG;
+      // A negation inside an absolute value changes nothing: fabs(fneg x) is
+      // |x|, not -|x| (the modifiers apply abs, then neg). Folding it gave
+      // `fcmpsel lt, x.abs.neg, min_normal` for neg.ftz.f16's flush test, so
+      // every negated half became a signed zero (llama.cpp's q4_K / q5_K).
+      if (!(M & AGX::SRC_MOD_ABS))
+        M ^= AGX::SRC_MOD_NEG;
       N = N.getOperand(0);
     } else if (N.getOpcode() == ISD::FABS) {
       // |-x| = |x|, and an outer negation applies after the absolute value.
