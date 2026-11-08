@@ -52,6 +52,23 @@ multiplications commute with: the conversion computes such an index's arithmetic
 result (`narrow-indices`, on; alive2: `tests/alive-tv/gpu/narrow-memref-index`). AGX's integer ALU is 32-bit,
 where a 64-bit multiplication takes several instructions.
 
+An `scf.for` over `index` whose iterations each reach a `memref.load` or `memref.store` of a static dimension of
+S <= 2^31 elements indexed by `x + iv` or `x - iv` (`x` loop invariant) keeps its offsets `iv - lb` below S: the
+accessed indices step by `step` within `[0, S)`, so a step of S or more allows one iteration. A constant extent
+`ub - lb <= 2^31` bounds them too. The conversion runs such a loop over an unsigned `i32` offset from 0 to
+`umin(ub - lb, S)` (0 for `ub <= lb`) by `umin(step, S)`, with `iv = lb + offset` (`narrow-loops`, on; alive2:
+`tests/alive-tv/gpu/narrow-loop*`, at an eighth of the widths, unrolled past the most iterations): the trip count
+is the original's, and the index arithmetic of `iv` that `narrow-indices` computes becomes 32-bit, such as the
+grid-stride loop's addresses. LLVM's IndVarSimplify widens such a counter back to `i64` when an address
+zero-extends it, since the AGX data layout makes `i64` a native integer.
+
+| Kernel | `narrow-loops=0` | `narrow-loops` |
+| --- | --- | --- |
+| `grid_stride` (grid-stride loop) | 646.3 cycles, 36 instructions | 542.3 cycles, 40 instructions |
+| `softmax_rows` (strided row loops) | 3460.8 cycles, 179 instructions | 3349.7 cycles, 164 instructions |
+| `gemm_smem_tile` (K loop of tiles) | 5832.8 cycles, 95 instructions | 5679.8 cycles, 95 instructions |
+| `matmul` (K loop) | 5617.5 cycles, 37 instructions | 5609.3 cycles, 32 instructions |
+
 `mlir/utils/agx-kernels/bench/bench.py` costs the kernels of that directory on AGX with the AGX Performance
 Simulator (`agx_cost`, one SIMD-group's cycles), against another `mlir-opt` with `--base`. Against this
 conversion before these changes (the last two rows also gain from the AGX backend's 64-bit widening as a

@@ -748,6 +748,10 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
     Option<"narrowIndices", "narrow-indices", "bool", /*default=*/"true",
            "Compute the indices of memref loads and stores of static "
            "dimensions of at most 2^32 elements in 32 bits">,
+    Option<"narrowLoops", "narrow-loops", "bool", /*default=*/"true",
+           "Run scf.for loops over index whose iterations an in-bounds "
+           "memref access or constant bounds keep below 2^31 over an "
+           "unsigned i32 offset from the lower bound">,
   ];
 }
 

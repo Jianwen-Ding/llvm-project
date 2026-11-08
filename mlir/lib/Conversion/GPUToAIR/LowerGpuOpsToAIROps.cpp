@@ -52,6 +52,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -813,6 +814,124 @@ static void narrowMemRefIndices(gpu::GPUModuleOp m) {
   });
 }
 
+/// The coefficient of the induction variable of `loop` in index `v`, a tree
+/// of additions and subtractions of it and of values defined outside the
+/// loop.
+static std::optional<int64_t> ivCoefficient(scf::ForOp loop, Value v,
+                                            unsigned depth = 0) {
+  if (v == loop.getInductionVar())
+    return 1;
+  if (loop.isDefinedOutsideOfLoop(v) || matchPattern(v, m_Constant()))
+    return 0;
+  Operation *def = v.getDefiningOp();
+  if (!def || depth >= 16 || !isa<arith::AddIOp, arith::SubIOp>(def))
+    return std::nullopt;
+  std::optional<int64_t> l = ivCoefficient(loop, def->getOperand(0), depth + 1);
+  std::optional<int64_t> r = ivCoefficient(loop, def->getOperand(1), depth + 1);
+  if (!l || !r)
+    return std::nullopt;
+  return isa<arith::AddIOp>(def) ? *l + *r : *l - *r;
+}
+
+/// A bound B <= 2^31 on the offsets o = iv - lb of the iterations that
+/// `loop` executes (without undefined behaviour): its constant extent
+/// ub - lb, or the size of a static dimension that a memref.load or
+/// memref.store each iteration executes indexes by x + iv or x - iv, x loop
+/// invariant. (The accessed indices x + lb + o, o = 0, step, 2 step, ...,
+/// are below the size S, which keeps a step of S or more to one iteration
+/// and the offsets of more below S.)
+static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
+  constexpr uint64_t kMax = uint64_t(1) << 31;
+  std::optional<uint64_t> bound;
+  auto tighten = [&](uint64_t b) {
+    if (b >= 1 && b <= kMax)
+      bound = bound ? std::min(*bound, b) : b;
+  };
+  std::optional<int64_t> lb = getConstantIntValue(loop.getLowerBound());
+  std::optional<int64_t> ub = getConstantIntValue(loop.getUpperBound());
+  if (lb && ub && *ub > *lb && uint64_t(*ub) - uint64_t(*lb) <= kMax)
+    tighten(uint64_t(*ub) - uint64_t(*lb));
+  // The accesses every iteration reaches: those of the body before any op
+  // that has regions or calls (which might not return).
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    if (op.getNumRegions() || isa<CallOpInterface>(op))
+      break;
+    MemRefType type;
+    ValueRange indices;
+    if (auto load = dyn_cast<memref::LoadOp>(op))
+      type = load.getMemRefType(), indices = load.getIndices();
+    else if (auto store = dyn_cast<memref::StoreOp>(op))
+      type = store.getMemRefType(), indices = store.getIndices();
+    else
+      continue;
+    for (auto [size, index] : llvm::zip(type.getShape(), indices)) {
+      if (ShapedType::isDynamic(size))
+        continue;
+      std::optional<int64_t> c = ivCoefficient(loop, index);
+      if (c && (*c == 1 || *c == -1))
+        tighten(size);
+    }
+  }
+  return bound;
+}
+
+/// An scf.for over index whose offsets o = iv - lb are below a bound B <=
+/// 2^31 (loopOffsetBound) is a loop over o in i32, unsigned: from 0 to
+/// umin(ub - lb, B) (0 for ub <= lb) by umin(step, B), with iv = lb + o.
+/// The trip count is the original's: with two iterations or more, step < B,
+/// so the offsets are the same and the original's that reach B would be out
+/// of bounds; with one, the second offset min(step, B) is past the extent
+/// too. The offsets, below B + B <= 2^32, do not wrap. Index arithmetic of
+/// the iv that narrow-indices computes in i32 becomes lb + o in i32.
+static void narrowLoops(gpu::GPUModuleOp m) {
+  SmallVector<scf::ForOp> loops;
+  m.walk([&](scf::ForOp loop) {
+    if (loop.getInductionVar().getType().isIndex() && !loop.getUnsignedCmp())
+      loops.push_back(loop);
+  });
+  IRRewriter rewriter(m.getContext());
+  for (scf::ForOp loop : loops) {
+    std::optional<uint64_t> bound = loopOffsetBound(loop);
+    if (!bound)
+      continue;
+    Location loc = loop.getLoc();
+    rewriter.setInsertionPoint(loop);
+    Type i32 = rewriter.getI32Type();
+    Value lb = loop.getLowerBound(), ub = loop.getUpperBound();
+    Value b = arith::ConstantIndexOp::create(rewriter, loc, *bound);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value extent = rewriter.createOrFold<arith::SelectOp>(
+        loc,
+        rewriter.createOrFold<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
+                                             ub, lb),
+        rewriter.createOrFold<arith::MinUIOp>(
+            loc, rewriter.createOrFold<arith::SubIOp>(loc, ub, lb), b),
+        zero);
+    Value step =
+        rewriter.createOrFold<arith::MinUIOp>(loc, loop.getStep(), b);
+    auto narrow = [&](Value v) {
+      return rewriter.createOrFold<arith::IndexCastUIOp>(loc, i32, v);
+    };
+    auto newLoop = scf::ForOp::create(
+        rewriter, loc, arith::ConstantIntOp::create(rewriter, loc, i32, 0),
+        narrow(extent), narrow(step), loop.getInitArgs(),
+        /*bodyBuilder=*/nullptr, /*unsignedCmp=*/true);
+    Block *body = newLoop.getBody();
+    if (!body->empty())
+      rewriter.eraseOp(body->getTerminator());
+    rewriter.setInsertionPointToStart(body);
+    Value iv = arith::IndexCastUIOp::create(rewriter, loc,
+                                            rewriter.getIndexType(),
+                                            newLoop.getInductionVar());
+    if (!matchPattern(lb, m_Zero()))
+      iv = arith::AddIOp::create(rewriter, loc, lb, iv);
+    SmallVector<Value> args{iv};
+    llvm::append_range(args, newLoop.getRegionIterArgs());
+    rewriter.mergeBlocks(loop.getBody(), body, args);
+    rewriter.replaceOp(loop, newLoop.getResults());
+  }
+}
+
 struct LowerGpuOpsToAIROpsPass final
     : public impl::ConvertGpuOpsToAIROpsBase<LowerGpuOpsToAIROpsPass> {
   using Base::Base;
@@ -872,6 +991,8 @@ struct LowerGpuOpsToAIROpsPass final
       op.replaceAllUsesWith(v);
       op.erase();
     });
+    if (narrowLoops)
+      ::narrowLoops(m);
     if (narrowIndices)
       narrowMemRefIndices(m);
     // In-dialect lowering of gpu.all_reduce and friends first.

@@ -1,4 +1,5 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0" --split-input-file | FileCheck %s --check-prefix=OFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -319,3 +320,87 @@ gpu.module @narrow_indices {
     gpu.return
   }
 }
+
+// -----
+
+// An scf.for whose iterations index a static dimension of S <= 2^31
+// elements by x + iv (or x - iv) keeps its offsets iv - lb below S (out of
+// bounds is undefined), so it runs over an unsigned i32 offset from 0 to
+// umin(ub - lb, S) by umin(step, S), and iv is lb + the offset
+// (narrow-loops); index arithmetic of iv is then 32-bit.
+gpu.module @narrow_loops {
+  // CHECK-LABEL: llvm.func @grid_stride(
+  // CHECK-SAME: %[[A:.*]]: !llvm.ptr<1>, %[[LB:.*]]: i64, %[[UB:.*]]: i64, %[[ST:.*]]: i64)
+  // OFF-LABEL: llvm.func @grid_stride(
+  gpu.func @grid_stride(%a: memref<1024xf32, 1>, %lb: index, %ub: index, %st: index) kernel {
+    // CHECK-DAG: %[[LB32:.*]] = llvm.trunc %[[LB]] : i64 to i32
+    // CHECK-DAG: %[[GT:.*]] = llvm.icmp "sgt" %[[UB]], %[[LB]] : i64
+    // CHECK-DAG: %[[D:.*]] = llvm.sub %[[UB]], %[[LB]] : i64
+    // CHECK-DAG: %[[DM:.*]] = llvm.intr.umin(%[[D]], %{{.*}})
+    // CHECK-DAG: %[[E:.*]] = llvm.select %[[GT]], %[[DM]], %{{.*}} : i1, i64
+    // CHECK-DAG: %[[STM:.*]] = llvm.intr.umin(%[[ST]], %{{.*}})
+    // CHECK-DAG: %[[E32:.*]] = llvm.trunc %[[E]] : i64 to i32
+    // CHECK-DAG: %[[ST32:.*]] = llvm.trunc %[[STM]] : i64 to i32
+    // CHECK: ^bb1(%[[O:.*]]: i32):
+    // CHECK: llvm.icmp "ult" %[[O]], %[[E32]] : i32
+    // CHECK: %[[I:.*]] = llvm.add %[[LB32]], %[[O]] : i32
+    // CHECK: llvm.zext %[[I]] : i32 to i64
+    // CHECK: llvm.add %[[O]], %[[ST32]] overflow<nuw> : i32
+    // OFF: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    scf.for %i = %lb to %ub step %st {
+      %v = memref.load %a[%i] : memref<1024xf32, 1>
+      %f = arith.addf %v, %v : f32
+      memref.store %f, %a[%i] : memref<1024xf32, 1>
+    }
+    gpu.return
+  }
+  // A constant extent bounds the offsets too; the results are the loop's.
+  // CHECK-LABEL: llvm.func @extent(
+  gpu.func @extent(%a: memref<1048576xf32, 1>, %x: index, %c: i1) kernel {
+    // CHECK: %[[C:.*]] = llvm.mlir.constant(64 : i32) : i32
+    // CHECK: ^bb1(%[[O:.*]]: i32, %[[ACC:.*]]: f32):
+    // CHECK: llvm.icmp "ult" %[[O]], %[[C]] : i32
+    // CHECK: llvm.add %{{.*}}, %[[O]] : i32
+    // CHECK: llvm.add %[[O]], %{{.*}} overflow<nuw> : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c64 = arith.constant 64 : index
+    %zero = arith.constant 0.0 : f32
+    %s = scf.for %k = %c0 to %c64 step %c1 iter_args(%acc = %zero) -> f32 {
+      %y = scf.if %c -> f32 {
+        scf.yield %acc : f32
+      } else {
+        scf.yield %zero : f32
+      }
+      %j = arith.addi %x, %k : index
+      %v = memref.load %a[%j] : memref<1048576xf32, 1>
+      %r = arith.addf %y, %v : f32
+      scf.yield %r : f32
+    }
+    memref.store %s, %a[%x] : memref<1048576xf32, 1>
+    gpu.return
+  }
+  // An access after an op with regions might not be reached, one of a
+  // dynamic dimension or by 2 * iv bounds nothing: index loops.
+  // CHECK-LABEL: llvm.func @unbounded(
+  gpu.func @unbounded(%a: memref<1024xf32, 1>, %ub: index, %c: i1) kernel {
+    // CHECK: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    // CHECK: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    // CHECK-NOT: llvm.icmp "ult"
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %f = arith.constant 1.0 : f32
+    scf.for %i = %c0 to %ub step %c1 {
+      scf.if %c {
+        gpu.barrier
+      }
+      memref.store %f, %a[%i] : memref<1024xf32, 1>
+    }
+    scf.for %i = %c0 to %ub step %c1 {
+      %j = arith.addi %i, %i : index
+      memref.store %f, %a[%j] : memref<1024xf32, 1>
+    }
+    gpu.return
+  }
+}
+
