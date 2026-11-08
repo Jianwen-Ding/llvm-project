@@ -76,6 +76,13 @@ static cl::opt<bool> MergeBarrierFences(
              "barrier that one right before it already orders"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> RegisterOnlyBetweenFences(
+    "agx-merge-barrier-fences-across-alu",
+    cl::desc("Also remove the fence after a threadgroup barrier when "
+             "register-only instructions separate it, the barrier and the "
+             "fence before, and a fence right after the same fence"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<unsigned> MaxUnskippedInstrs(
     "agx-max-unskipped-instrs",
     cl::desc("Most ALU instructions an if or else body may have and still be "
@@ -269,7 +276,19 @@ static bool isThreadgroupFence(const MachineInstr &MI) {
 /// CUDA's __syncthreads compiles to (PTX bar.sync: one fence, then the
 /// barrier). The fence after still orders the IR around the barrier
 /// (llvm.agx.threadgroup.barrier touches no memory there), and the barrier
-/// orders the machine code.
+/// orders the machine code. Instructions that only compute in registers
+/// (which the scheduler moves between them) may come between the fences and
+/// the barrier: without a memory access between the two fences, the second
+/// orders nothing the first does not. For the same reason a fence right
+/// after the same fence goes (a seq_cst atomic's fence before a barrier's).
+static bool isRegisterOnly(const MachineInstr &MI) {
+  return !MI.mayLoadOrStore() && !MI.hasUnmodeledSideEffects() &&
+         !MI.isCall() && !MI.isTerminator() && !MI.isBranch() &&
+         !AGXInstrInfo::isExecMaskOp(MI) && !MI.isInlineAsm() &&
+         MI.getOpcode() != AGX::MEMORY_BARRIER &&
+         MI.getOpcode() != AGX::THREADGROUP_BARRIER;
+}
+
 static bool removeFencesAfterBarriers(MachineFunction &MF) {
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {
@@ -278,11 +297,14 @@ static bool removeFencesAfterBarriers(MachineFunction &MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
       if (MI.isMetaInstruction())
         continue;
+      if (State && RegisterOnlyBetweenFences && isRegisterOnly(MI))
+        continue;
       if (isThreadgroupFence(MI)) {
-        if (State == 2) {
+        // After the barrier, or right after the same fence.
+        if (State == 2 || (State == 1 && RegisterOnlyBetweenFences)) {
           MI.eraseFromParent();
           Changed = true;
-          State = 0;
+          State = State == 2 ? 0 : 1;
           continue;
         }
         State = 1;
