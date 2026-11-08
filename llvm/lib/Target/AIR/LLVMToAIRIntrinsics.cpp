@@ -117,10 +117,12 @@ static bool lowerToAIRFunctions(Module &M) {
   return Changed;
 }
 
-// Lower __mulhi(a, b) -> (i32)((zext64(a) * zext64(b)) >> 32).
-static bool lowerMulHi(Module &M) {
-  Function *F = M.getFunction("__mulhi");
-  if (!F)
+// Lower CUDA's __mulhi(a, b), the high word of the signed product,
+// -> (i32)((sext64(a) * sext64(b)) >> 32), and __umulhi, of the unsigned
+// one, with zext.
+static bool lowerMulHi(Module &M, StringRef Name, bool Signed) {
+  Function *F = M.getFunction(Name);
+  if (!F || F->arg_size() != 2 || !F->getReturnType()->isIntegerTy(32))
     return false;
 
   Type *I32 = Type::getInt32Ty(M.getContext());
@@ -133,8 +135,8 @@ static bool lowerMulHi(Module &M) {
 
   for (CallInst *CI : Calls) {
     IRBuilder<> B(CI);
-    Value *A = B.CreateZExt(CI->getArgOperand(0), I64);
-    Value *Bv = B.CreateZExt(CI->getArgOperand(1), I64);
+    Value *A = B.CreateIntCast(CI->getArgOperand(0), I64, Signed);
+    Value *Bv = B.CreateIntCast(CI->getArgOperand(1), I64, Signed);
     Value *Mul = B.CreateMul(A, Bv);
     Value *Hi = B.CreateLShr(Mul, 32);
     Value *Result = B.CreateTrunc(Hi, I32);
@@ -149,7 +151,8 @@ static bool lowerMulHi(Module &M) {
 
 static bool llvmToAIRIntrinsics(Module &M) {
   bool Changed = lowerToAIRFunctions(M);
-  Changed |= lowerMulHi(M);
+  Changed |= lowerMulHi(M, "__mulhi", /*Signed=*/true);
+  Changed |= lowerMulHi(M, "__umulhi", /*Signed=*/false);
   return Changed;
 }
 
