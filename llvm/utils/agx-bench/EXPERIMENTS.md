@@ -284,4 +284,4 @@ seconds on a single large kernel) is not enabled by default: it gets its own `ll
 5. Uniform registers (A15): the model charges nothing for a uniform source or for more preloaded uniforms. Does a
    larger uniform count slow the dispatch, or limit resident workgroups?
 
-The AGX-Performance-Simulator's follow-up task list gives the same gaps from the simulator's side.
+AGX-Performance-Simulator `tasks/ptx-frontend-agx-followups.md` lists the same gaps from the simulator's side.
