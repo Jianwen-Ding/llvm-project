@@ -1,5 +1,9 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g13g -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs \
+; RUN:   -agx-fold-shared-branch-compares=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g13g -verify-machineinstrs \
+; RUN:   -agx-fold-shared-branch-compares=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s \
+; RUN:   | FileCheck %s --check-prefix=FOLD
 
 ; Both switches test n == 2 in a leaf block of an else side. MachineCSE's PRE
 ; hoists the two compares into their common dominator, the flow block that
@@ -13,6 +17,20 @@
 ; CHECK: if_icmp r0l, nueq
 ; CHECK-NOT: icmpsel ueq, {{r[0-9]+}}, {{r[0-9]+}}, 2, 0, 1
 ; CHECK: stop
+
+; By default the switches' n > 3 and n > 7, which only branches read, are
+; each branch's own comparison of n; n == 2, which a select reads too, stays
+; an icmpsel, which the flow block computes for the threads of both sides.
+; FOLD-LABEL: k:
+; FOLD-NOT: icmpsel
+; FOLD: if_icmp r0l, sgt, [[N:r[0-9]+]], 3, 1
+; FOLD: if_icmp r0l, sgt, [[N]], 7, 1
+; FOLD: icmpsel ueq, [[C:r[0-9]+]], [[N]], 2, 0, 1
+; FOLD-NEXT: else_fcmp
+; FOLD-NEXT: icmpsel ueq, [[C]], [[N]], 2, 0, 1
+; FOLD: if_icmp r0l, sgt, [[N]], 3, 1
+; FOLD-NOT: icmpsel ueq, {{r[0-9]+}}, {{r[0-9]+}}, 2, 0, 1
+; FOLD: stop
 
 declare i32 @llvm.agx.thread.index.in.threadgroup()
 define void @k(ptr addrspace(1) %p, ptr addrspace(1) %src) {
