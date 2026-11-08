@@ -23,6 +23,33 @@ SIMD-group executes them with the same operands.
   result another: the same, or f16 or bf16 A and B with f32 C (`: vector<64xf16>, vector<64xf32>`).
 - `air.simdgroup_matrix_fill %v`: every element `v`.
 
+`--canonicalize` folds element-wise operations of fills: an `arith` or `math` operation whose matrix operands are
+all `air.simdgroup_matrix_fill`s (and whose other operands are scalars) is the fill of the operation on their values,
+`arith.addf(fill(x), fill(y))` is `fill(arith.addf(x, y))`, as every element of a fill is its value.
+
+## What the conversion knows
+
+`convert-gpu-to-air` declares each AIR function with what its calls do, so that LLVM can fold, hoist and sink them:
+the system values (`air.thread_position_in_grid` ...) touch no memory, the SIMD-group functions (shuffles, ballots,
+reductions, matrices) are `convergent` as well (the matrix loads read and the stores write their pointer operand
+only), and the barriers are `convergent` calls that may touch any memory.
+
+From the launch bounds the kernel knows (`known_block_size`, `known_grid_size`, the ops' `upper_bound`):
+
+- a threadgroup or grid size it fixes is a constant (`gpu.block_dim`, `gpu.grid_dim`), as is the SIMD-group count
+  (`gpu.num_subgroups`, `ceil(threads / 32)`) and, for a threadgroup of one SIMD-group, `gpu.subgroup_id`;
+- the other system values carry their `range` (`llvm.range`): a lane is in `[0, 32)`, a thread position below the
+  threadgroup size, a SIMD-group index below the SIMD-group count.
+
+`gpu.shuffle` by a constant offset within the SIMD-group is AIR's own `shuffle_xor` (within any power-of-two width),
+`shuffle_up` or `shuffle_down` (over the whole SIMD-group), whose source lanes are those and whose valid flag is
+known (xor) or one comparison of the lane; the other shuffles compute the source lane and use the index shuffle.
+`gpu.subgroup_reduce` over clusters of 4 lanes is AIR's quad-group reduction (`air.quad_sum` ...), over 32 the
+SIMD-group's.
+
+alive2 (its AIR and AGX semantics, `tests/alive-tv/gpu/shuffles-native`) proves the native shuffles equal to the
+lane arithmetic they replace.
+
 ## Target and pipeline
 
 `#air.target<O, triple, chip, features>` on a `gpu.module` (`air-attach-target` attaches it):

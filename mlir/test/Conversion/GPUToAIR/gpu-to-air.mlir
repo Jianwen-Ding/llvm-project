@@ -2,8 +2,11 @@
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
-// pointers in AIR's address spaces.
+// pointers in AIR's address spaces. The functions of system values touch no
+// memory, so that LLVM folds their calls together.
 gpu.module @ids {
+  // CHECK-DAG: llvm.func @air.thread_index_in_simdgroup() -> i32 attributes {memory_effects = #llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, {{.*}}>, no_unwind, will_return}
+  // CHECK-DAG: llvm.func @air.thread_position_in_threadgroup.v3i32() -> vector<3xi32> attributes {memory_effects = #llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, {{.*}}>, no_unwind, will_return}
   // CHECK-LABEL: llvm.func @ids(
   // CHECK-SAME: %{{.*}}: !llvm.ptr<1>)
   // CHECK-SAME: passthrough = ["air-kernel"]
@@ -18,9 +21,10 @@ gpu.module @ids {
     // CHECK: llvm.call @air.threads_per_threadgroup.v3i32()
     // CHECK: llvm.call @air.thread_position_in_threadgroup.v3i32()
     %g = gpu.global_id z
-    // CHECK: llvm.call @air.thread_index_in_simdgroup() : () -> i32
+    // A lane is in [0, 32), and there are at most 32 SIMD-groups.
+    // CHECK: llvm.call @air.thread_index_in_simdgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 32>})
     %l = gpu.lane_id
-    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> i32
+    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 32>})
     %s = gpu.subgroup_id : index
     // CHECK: llvm.mlir.constant(32 : i64)
     %n = gpu.subgroup_size : index
@@ -41,8 +45,10 @@ gpu.module @ids {
 // The barrier orders device and threadgroup memory, or the memory its
 // memfence names (none for `memfence []`); a subgroup-scope barrier is AIR's
 // SIMD-group barrier. Shuffles, ballots and reductions are AIR's SIMD-group
-// functions.
+// functions, convergent; the barriers may touch any memory.
 gpu.module @simd {
+  // CHECK-DAG: llvm.func @air.wg.barrier(i32, i32) attributes {convergent, no_unwind, will_return}
+  // CHECK-DAG: llvm.func @air.simd_shuffle_xor.u.i32(i32, i16) -> i32 attributes {convergent, memory_effects = #llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, {{.*}}>, no_unwind, will_return}
   // CHECK-LABEL: llvm.func @simd(
   gpu.func @simd(%out: memref<8xf32, 1>, %v: f32, %p: i1) kernel {
     // CHECK: %[[F:.*]] = llvm.mlir.constant(3 : i32)
@@ -60,17 +66,9 @@ gpu.module @simd {
     gpu.barrier scope <subgroup> memfence [#gpu.address_space<global>]
     %c1 = arith.constant 1 : i32
     %c32 = arith.constant 32 : i32
-    // CHECK: %[[LANE:.*]] = llvm.call @air.thread_index_in_simdgroup()
-    // CHECK: %[[NEGW:.*]] = llvm.sub %{{.*}}, %[[W:.*]] : i32
-    // CHECK: %[[ADD:.*]] = llvm.add %[[LANE]], %[[W]] : i32
-    // CHECK: %[[END:.*]] = llvm.and %[[ADD]], %[[NEGW]] : i32
-    // CHECK: %[[SRC:.*]] = llvm.xor %[[LANE]], %{{.*}} : i32
-    // CHECK: %[[START:.*]] = llvm.and %[[LANE]], %[[NEGW]] : i32
-    // CHECK: %[[GE:.*]] = llvm.icmp "sge" %[[SRC]], %[[START]] : i32
-    // CHECK: %[[LT:.*]] = llvm.icmp "slt" %[[SRC]], %[[END]] : i32
-    // CHECK: %[[VALID:.*]] = llvm.and %[[GE]], %[[LT]] : i1
-    // CHECK: llvm.select %[[VALID]], %[[SRC]], %[[LANE]] : i1, i32
-    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // A constant offset within the SIMD-group: AIR's shuffle_xor.
+    // CHECK: %[[MASK:.*]] = llvm.mlir.constant(1 : i16) : i16
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[MASK]]) : (i32, i16) -> i32
     %sh, %ok = gpu.shuffle xor %v, %c1, %c32 : f32
     // CHECK: llvm.call @air.simd_ballot.i64(%{{.*}}) : (i1) -> i64
     %m = gpu.ballot %p : i64
@@ -131,11 +129,117 @@ gpu.module @default_space {
 
 // -----
 
-// A known threadgroup size is an AGX hint on the kernel.
+// A known threadgroup size is an AGX hint on the kernel; the threadgroup
+// size and SIMD-group count are constants then, and the thread positions
+// and SIMD-group index are bounded by it.
 gpu.module @block_size {
   // CHECK-LABEL: llvm.func @k(
   // CHECK-SAME: passthrough = ["air-kernel", ["agx-max-threads-per-threadgroup", "128"]]
-  gpu.func @k() kernel attributes {known_block_size = array<i32: 64, 2, 1>} {
+  gpu.func @k(%out: memref<8xindex, 1>) kernel attributes {known_block_size = array<i32: 64, 2, 1>} {
+    // CHECK-NOT: @air.threads_per_threadgroup
+    // CHECK: llvm.mlir.constant(2 : i64) : i64
+    %d = gpu.block_dim y
+    // CHECK: llvm.call @air.thread_position_in_threadgroup.v3i32() : () -> (vector<3xi32> {llvm.range = #llvm.constant_range<i32, 0, 64>})
+    %t = gpu.thread_id x
+    // CHECK: llvm.mlir.constant(4 : i64) : i64
+    %n = gpu.num_subgroups : index
+    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 4>})
+    %s = gpu.subgroup_id : index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    memref.store %d, %out[%c0] : memref<8xindex, 1>
+    memref.store %t, %out[%c1] : memref<8xindex, 1>
+    memref.store %n, %out[%c2] : memref<8xindex, 1>
+    memref.store %s, %out[%c3] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A threadgroup of one SIMD-group: its index is 0. upper_bound bounds a
+// value too.
+gpu.module @one_simdgroup {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xindex, 1>) kernel attributes {known_block_size = array<i32: 32, 1, 1>} {
+    // CHECK-NOT: @air.simdgroup_index_in_threadgroup
+    // CHECK: llvm.mlir.constant(0 : i64) : i64
+    %s = gpu.subgroup_id : index
+    // CHECK: llvm.call @air.threadgroup_position_in_grid.v3i32() : () -> vector<3xi32>
+    %b = gpu.block_id x upper_bound 16
+    // CHECK: llvm.call @air.thread_index_in_simdgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 16>})
+    %l = gpu.lane_id upper_bound 16
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    memref.store %s, %out[%c0] : memref<8xindex, 1>
+    memref.store %b, %out[%c1] : memref<8xindex, 1>
+    memref.store %l, %out[%c2] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Shuffles by constant offsets within the SIMD-group are AIR's shuffle_up,
+// shuffle_down and shuffle_xor (xor within any power of two): the lanes a
+// shift leaves keep their value, which is what gpu.shuffle's valid flag
+// says; other shuffles read the lane they compute.
+gpu.module @shuffles {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xi32, 1>, %v: i32, %o: i32) kernel {
+    %c2 = arith.constant 2 : i32
+    %c8 = arith.constant 8 : i32
+    %c16 = arith.constant 16 : i32
+    %c32 = arith.constant 32 : i32
+    // CHECK: %[[LANE:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: %[[TWO:.*]] = llvm.mlir.constant(2 : i32) : i32
+    // CHECK: llvm.icmp "uge" %[[LANE]], %[[TWO]] : i32
+    // CHECK: llvm.call @air.simd_shuffle_up.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %up, %okup = gpu.shuffle up %v, %c2, %c32 : i32
+    // CHECK: %[[LANE2:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: %[[B:.*]] = llvm.mlir.constant(16 : i32) : i32
+    // CHECK: llvm.icmp "ult" %[[LANE2]], %[[B]] : i32
+    // CHECK: llvm.call @air.simd_shuffle_down.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %down, %okdown = gpu.shuffle down %v, %c16, %c32 : i32
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %x8, %okx8 = gpu.shuffle xor %v, %c2, %c8 : i32
+    // Within segments of 8 lanes, a shift needs the lane arithmetic.
+    // CHECK: llvm.icmp "sge"
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %d8, %okd8 = gpu.shuffle down %v, %c2, %c8 : i32
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %xo, %okxo = gpu.shuffle xor %v, %o, %c32 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2i = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    memref.store %up, %out[%c0] : memref<8xi32, 1>
+    memref.store %down, %out[%c1] : memref<8xi32, 1>
+    memref.store %x8, %out[%c2i] : memref<8xi32, 1>
+    memref.store %d8, %out[%c3] : memref<8xi32, 1>
+    memref.store %xo, %out[%c4] : memref<8xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A reduction over clusters of 4 lanes is AIR's quad-group reduction; one of
+// 32 is the SIMD-group's.
+gpu.module @clusters {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32, %i: i32, %o: memref<8xi32, 1>) kernel {
+    // CHECK: llvm.call @air.quad_sum.f32(%{{.*}}) : (f32) -> f32
+    %q = gpu.subgroup_reduce add %v cluster(size = 4) : (f32) -> f32
+    // CHECK: llvm.call @air.simd_max.u.i32(%{{.*}}) : (i32) -> i32
+    %m = gpu.subgroup_reduce maxui %i cluster(size = 32) : (i32) -> i32
+    %c0 = arith.constant 0 : index
+    memref.store %q, %out[%c0] : memref<8xf32, 1>
+    memref.store %m, %o[%c0] : memref<8xi32, 1>
     gpu.return
   }
 }

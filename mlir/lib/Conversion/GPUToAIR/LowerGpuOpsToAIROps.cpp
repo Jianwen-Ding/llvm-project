@@ -55,6 +55,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "../GPUCommon/GPUOpsLowering.h"
+#include "../GPUCommon/IndexIntrinsicsOpLowering.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTGPUOPSTOAIROPS
@@ -83,18 +84,79 @@ enum : unsigned {
 constexpr StringLiteral kKernelMarker = "air.kernel";
 } // namespace
 
-/// A call of the AIR function `name`, declared in the GPU module as needed.
+namespace {
+/// What a call of an AIR function does besides computing its result, which
+/// its declaration says so that LLVM can CSE, hoist and sink the calls (and
+/// keeps from moving the SIMD-group ones across control flow).
+enum class AIREffects {
+  /// A value of the thread or the launch: no memory, no side effects.
+  None,
+  /// A SIMD-group function: the threads of the SIMD-group exchange values.
+  Convergent,
+  /// A SIMD-group matrix load (reads its pointer operand) or store (writes
+  /// it).
+  ConvergentRead,
+  ConvergentWrite,
+  /// A barrier: synchronizes the threads, and orders memory.
+  Barrier,
+};
+} // namespace
+
+/// A call of the AIR function `name`, declared in the GPU module as needed
+/// with the attributes of `effects`.
 static Value callAIR(ConversionPatternRewriter &rewriter, Operation *op,
-                     StringRef name, Type result, ValueRange args) {
+                     StringRef name, Type result, ValueRange args,
+                     AIREffects effects = AIREffects::None,
+                     LLVM::ConstantRangeAttr range = nullptr) {
   Operation *module = op->getParentWithTrait<OpTrait::SymbolTable>();
+  MLIRContext *ctx = op->getContext();
   SmallVector<Type> params(args.getTypes());
-  Type resultType = result ? result : LLVM::LLVMVoidType::get(op->getContext());
+  Type resultType = result ? result : LLVM::LLVMVoidType::get(ctx);
+  bool existed = SymbolTable::lookupSymbolIn(module, name) != nullptr;
   FailureOr<LLVM::LLVMFuncOp> fn =
       LLVM::lookupOrCreateFn(rewriter, module, name, params, resultType);
   if (failed(fn))
     return Value();
+  if (!existed) {
+    using LLVM::ModRefInfo;
+    auto memory = [&](ModRefInfo arg, ModRefInfo other) {
+      constexpr ModRefInfo none = ModRefInfo::NoModRef;
+      return rewriter.getAttr<LLVM::MemoryEffectsAttr>(
+          /*other=*/other, /*argMem=*/arg, /*inaccessibleMem=*/none,
+          /*errnoMem=*/none, /*targetMem0=*/none, /*targetMem1=*/none);
+    };
+    fn->setNoUnwind(true);
+    fn->setWillReturn(true);
+    switch (effects) {
+    case AIREffects::None:
+    case AIREffects::Convergent:
+      fn->setMemoryEffectsAttr(
+          memory(ModRefInfo::NoModRef, ModRefInfo::NoModRef));
+      break;
+    case AIREffects::ConvergentRead:
+      fn->setMemoryEffectsAttr(memory(ModRefInfo::Ref, ModRefInfo::NoModRef));
+      break;
+    case AIREffects::ConvergentWrite:
+      fn->setMemoryEffectsAttr(memory(ModRefInfo::Mod, ModRefInfo::NoModRef));
+      break;
+    case AIREffects::Barrier:
+      break;
+    }
+    fn->setConvergent(effects != AIREffects::None);
+  }
   auto call = LLVM::CallOp::create(rewriter, op->getLoc(), *fn, args);
+  if (range && result)
+    call.setResAttrsAttr(rewriter.getArrayAttr({rewriter.getDictionaryAttr(
+        rewriter.getNamedAttr(LLVM::LLVMDialect::getRangeAttrName(), range))}));
   return result ? call.getResult() : Value();
+}
+
+/// The value of an integer constant, from the converted operand or the
+/// original one.
+static std::optional<int64_t> constantInt(Value converted, Value original) {
+  if (std::optional<int64_t> c = getConstantIntValue(converted))
+    return c;
+  return getConstantIntValue(original);
 }
 
 /// Extend or truncate an i32 to the index type.
@@ -121,31 +183,146 @@ static std::string typeSuffix(Type type, bool isUnsigned = false) {
 
 namespace {
 
-/// A system value: a call of the AIR function, of one component (x, y or z)
-/// of the three-dimensional ones (XYZ).
-template <typename SourceOp, bool XYZ>
+using gpu::index_lowering::IndexKind;
+using gpu::index_lowering::IntrType;
+
+/// The values a component of a system value takes, from the launch bounds
+/// the kernel knows (known_block_size, known_grid_size) and, for the op's own
+/// dimension, its upper_bound.
+template <typename SourceOp>
+static LLVM::ConstantRangeAttr systemValueRange(SourceOp op, gpu::Dimension dim,
+                                                IndexKind kind,
+                                                IntrType type) {
+  std::optional<uint32_t> bound;
+  if (std::optional<APInt> b = op.getUpperBound(); b && dim == op.getDimension())
+    bound = static_cast<uint32_t>(b->getZExtValue());
+  return gpu::index_lowering::getIndexOpRange(op, dim, bound, kind, type,
+                                              /*bitWidth=*/32);
+}
+
+/// A three-dimensional system value: a component (x, y or z) of the call of
+/// the AIR function, or a constant when the launch bounds fix it. The call
+/// carries the range of all three components when they are all bounded.
+template <typename SourceOp>
 struct GPUSystemValueLowering : ConvertOpToLLVMPattern<SourceOp> {
-  GPUSystemValueLowering(const LLVMTypeConverter &converter, StringRef function)
-      : ConvertOpToLLVMPattern<SourceOp>(converter), function(function) {}
+  GPUSystemValueLowering(const LLVMTypeConverter &converter, StringRef function,
+                         IndexKind kind, IntrType type)
+      : ConvertOpToLLVMPattern<SourceOp>(converter), function(function),
+        kind(kind), type(type) {}
 
   LogicalResult
   matchAndRewrite(SourceOp op, typename SourceOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
     Type i32 = rewriter.getI32Type();
-    Value value;
-    if constexpr (XYZ) {
-      Value xyz = callAIR(rewriter, op, (function + ".v3i32").str(),
-                          VectorType::get({3}, i32), {});
-      Value dim = LLVM::ConstantOp::create(
-          rewriter, loc, i32, static_cast<int32_t>(op.getDimension()));
-      value = LLVM::ExtractElementOp::create(rewriter, loc, xyz, dim);
-    } else {
-      value = callAIR(rewriter, op, function, i32, {});
+    unsigned indexBitwidth = this->getTypeConverter()->getIndexTypeBitwidth();
+    LLVM::ConstantRangeAttr own =
+        systemValueRange(op, op.getDimension(), kind, type);
+    // Known: a constant.
+    if (own && own.getLower() + 1 == own.getUpper()) {
+      rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(
+          op, rewriter.getIntegerType(indexBitwidth),
+          own.getLower().getZExtValue());
+      return success();
     }
-    rewriter.replaceOp(
-        op, toIndexBitwidth(rewriter, loc, value,
-                            this->getTypeConverter()->getIndexTypeBitwidth()));
+    // The range of the vector: the union of its components'.
+    LLVM::ConstantRangeAttr range;
+    std::optional<APInt> lower, upper;
+    for (gpu::Dimension d :
+         {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
+      LLVM::ConstantRangeAttr r = d == op.getDimension()
+                                      ? own
+                                      : systemValueRange(op, d, kind, type);
+      if (!r) {
+        lower.reset();
+        break;
+      }
+      lower = lower ? llvm::APIntOps::umin(*lower, r.getLower()) : r.getLower();
+      upper = upper ? llvm::APIntOps::umax(*upper, r.getUpper()) : r.getUpper();
+    }
+    if (lower && upper->ugt(*lower))
+      range = LLVM::ConstantRangeAttr::get(rewriter.getContext(), *lower,
+                                           *upper);
+    Value xyz = callAIR(rewriter, op, (function + ".v3i32").str(),
+                        VectorType::get({3}, i32), {}, AIREffects::None, range);
+    Value dim = LLVM::ConstantOp::create(
+        rewriter, loc, i32, static_cast<int32_t>(op.getDimension()));
+    Value value = LLVM::ExtractElementOp::create(rewriter, loc, xyz, dim);
+    rewriter.replaceOp(op, toIndexBitwidth(rewriter, loc, value, indexBitwidth));
+    return success();
+  }
+
+  StringRef function;
+  IndexKind kind;
+  IntrType type;
+};
+
+/// The threads of the threadgroup, when the kernel knows its size.
+static std::optional<uint64_t> knownThreadgroupThreads(Operation *op) {
+  uint64_t threads = 1;
+  for (gpu::Dimension d :
+       {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
+    std::optional<uint32_t> n =
+        gpu::getKnownDimensionSizeAround(op, gpu::DimensionKind::Block, d);
+    if (!n)
+      return std::nullopt;
+    threads *= *n;
+  }
+  return threads;
+}
+
+/// A scalar system value of the SIMD-groups: lane (in [0, 32)), SIMD-group
+/// index and SIMD-group count (a constant when the threadgroup size is
+/// known).
+template <typename SourceOp>
+struct GPUSimdgroupValueLowering : ConvertOpToLLVMPattern<SourceOp> {
+  GPUSimdgroupValueLowering(const LLVMTypeConverter &converter,
+                            StringRef function)
+      : ConvertOpToLLVMPattern<SourceOp>(converter), function(function) {}
+
+  LogicalResult
+  matchAndRewrite(SourceOp op, typename SourceOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+    Type i32 = rewriter.getI32Type();
+    unsigned indexBitwidth = this->getTypeConverter()->getIndexTypeBitwidth();
+    std::optional<uint64_t> threads = knownThreadgroupThreads(op);
+    // SIMD-groups of the threadgroup: ceil(threads / 32).
+    std::optional<uint64_t> groups;
+    if (threads)
+      groups = (*threads + 31) / 32;
+    LLVM::ConstantRangeAttr range;
+    if constexpr (std::is_same_v<SourceOp, gpu::LaneIdOp>) {
+      range = LLVM::ConstantRangeAttr::get(ctx, 32, 0, 32);
+    } else if constexpr (std::is_same_v<SourceOp, gpu::NumSubgroupsOp>) {
+      if (groups) {
+        rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(
+            op, rewriter.getIntegerType(indexBitwidth), *groups);
+        return success();
+      }
+      range = LLVM::ConstantRangeAttr::get(ctx, 32, 1, 33);
+    } else {
+      if (groups == 1u) {
+        rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(
+            op, rewriter.getIntegerType(indexBitwidth), 0);
+        return success();
+      }
+      range = LLVM::ConstantRangeAttr::get(ctx, 32, 0, groups ? *groups : 32);
+    }
+    // upper_bound: fewer lanes (SIMD-groups) than that, or (the count) at
+    // most that many.
+    if (std::optional<APInt> b = op.getUpperBound()) {
+      uint64_t upper = b->getZExtValue() +
+                       std::is_same_v<SourceOp, gpu::NumSubgroupsOp>;
+      if (upper < range.getUpper().getZExtValue() &&
+          upper > range.getLower().getZExtValue())
+        range = LLVM::ConstantRangeAttr::get(ctx, range.getLower(),
+                                             APInt(32, upper));
+    }
+    Value value =
+        callAIR(rewriter, op, function, i32, {}, AIREffects::None, range);
+    rewriter.replaceOp(op, toIndexBitwidth(rewriter, loc, value, indexBitwidth));
     return success();
   }
 
@@ -205,7 +382,7 @@ struct GPUBarrierOpLowering : ConvertOpToLLVMPattern<gpu::BarrierOp> {
             barrierScope == gpu::BarrierScope::Subgroup
                 ? "air.simdgroup.barrier"
                 : "air.wg.barrier",
-            nullptr, {flags, scope});
+            nullptr, {flags, scope}, AIREffects::Barrier);
     rewriter.eraseOp(op);
     return success();
   }
@@ -213,7 +390,13 @@ struct GPUBarrierOpLowering : ConvertOpToLLVMPattern<gpu::BarrierOp> {
 
 /// gpu.shuffle: the source lane (lane - offset, lane + offset, lane ^ offset
 /// or offset), valid within the thread's segment of `width` lanes and the
-/// thread's own lane outside of it, and an index shuffle of each 32-bit part.
+/// thread's own lane outside of it, and a shuffle of each 32-bit part.
+///
+/// With a constant offset within the segment and the whole SIMD-group as the
+/// segment (or, for xor, any power of two), the shuffle is AIR's own
+/// shuffle_xor, shuffle_up or shuffle_down, whose source lanes are those, and
+/// the lanes they leave the thread keep its value: no lane arithmetic, and
+/// for xor (and up and down validity) nothing at all.
 struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -221,43 +404,95 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
   matchAndRewrite(gpu::ShuffleOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+    Type i1 = rewriter.getI1Type();
+    Type i16 = rewriter.getI16Type();
     Type i32 = rewriter.getI32Type();
-    Value lane = callAIR(rewriter, op, "air.thread_index_in_simdgroup", i32, {});
-    Value width = adaptor.getWidth();
-    Value zero = LLVM::ConstantOp::create(rewriter, loc, i32, 0);
-    Value negWidth = LLVM::SubOp::create(rewriter, loc, i32, zero, width);
-    Value add = LLVM::AddOp::create(rewriter, loc, i32, lane, width);
-    Value segmentEnd = LLVM::AndOp::create(rewriter, loc, i32, add, negWidth);
-    Value srcLane;
-    switch (op.getMode()) {
-    case gpu::ShuffleMode::UP:
-      srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane,
-                                    adaptor.getOffset());
-      break;
-    case gpu::ShuffleMode::DOWN:
-      srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane,
-                                    adaptor.getOffset());
-      break;
-    case gpu::ShuffleMode::XOR:
-      srcLane = LLVM::XOrOp::create(rewriter, loc, i32, lane,
-                                    adaptor.getOffset());
-      break;
-    case gpu::ShuffleMode::IDX:
-      srcLane = adaptor.getOffset();
-      break;
+    auto laneRange = LLVM::ConstantRangeAttr::get(rewriter.getContext(), 32, 0,
+                                                  32);
+    std::optional<int64_t> width =
+        constantInt(adaptor.getWidth(), op.getWidth());
+    std::optional<int64_t> offset =
+        constantInt(adaptor.getOffset(), op.getOffset());
+
+    // AIR's shuffle_xor / up / down.
+    StringRef native;
+    if (width && offset && *offset >= 0 && *offset < *width && *width <= 32) {
+      switch (op.getMode()) {
+      case gpu::ShuffleMode::XOR:
+        if (llvm::isPowerOf2_64(*width))
+          native = "air.simd_shuffle_xor.u.i32";
+        break;
+      case gpu::ShuffleMode::UP:
+        if (*width == 32)
+          native = "air.simd_shuffle_up.u.i32";
+        break;
+      case gpu::ShuffleMode::DOWN:
+        if (*width == 32)
+          native = "air.simd_shuffle_down.u.i32";
+        break;
+      case gpu::ShuffleMode::IDX:
+        break;
+      }
     }
-    // The source lane must be in the thread's segment of `width` lanes.
-    Value segmentStart = LLVM::AndOp::create(rewriter, loc, i32, lane, negWidth);
-    Value valid = LLVM::AndOp::create(
-        rewriter, loc,
-        LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sge, srcLane,
-                             segmentStart),
-        LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::slt, srcLane,
-                             segmentEnd));
-    Value selected =
-        LLVM::SelectOp::create(rewriter, loc, valid, srcLane, lane);
-    Value lane16 =
-        LLVM::TruncOp::create(rewriter, loc, rewriter.getI16Type(), selected);
+
+    Value valid, lane16;
+    if (!native.empty()) {
+      lane16 = LLVM::ConstantOp::create(rewriter, loc, i16, *offset);
+      if (op.getMode() == gpu::ShuffleMode::XOR || *offset == 0) {
+        valid = LLVM::ConstantOp::create(rewriter, loc, i1, 1);
+      } else {
+        // up: lane >= offset; down: lane + offset < 32.
+        Value lane = callAIR(rewriter, op, "air.thread_index_in_simdgroup", i32,
+                             {}, AIREffects::None, laneRange);
+        bool up = op.getMode() == gpu::ShuffleMode::UP;
+        Value bound =
+            LLVM::ConstantOp::create(rewriter, loc, i32, up ? *offset
+                                                            : 32 - *offset);
+        valid = LLVM::ICmpOp::create(
+            rewriter, loc, up ? LLVM::ICmpPredicate::uge
+                              : LLVM::ICmpPredicate::ult,
+            lane, bound);
+      }
+    } else {
+      Value lane = callAIR(rewriter, op, "air.thread_index_in_simdgroup", i32,
+                           {}, AIREffects::None, laneRange);
+      Value width = adaptor.getWidth();
+      Value zero = LLVM::ConstantOp::create(rewriter, loc, i32, 0);
+      Value negWidth = LLVM::SubOp::create(rewriter, loc, i32, zero, width);
+      Value add = LLVM::AddOp::create(rewriter, loc, i32, lane, width);
+      Value segmentEnd = LLVM::AndOp::create(rewriter, loc, i32, add, negWidth);
+      Value srcLane;
+      switch (op.getMode()) {
+      case gpu::ShuffleMode::UP:
+        srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane,
+                                      adaptor.getOffset());
+        break;
+      case gpu::ShuffleMode::DOWN:
+        srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane,
+                                      adaptor.getOffset());
+        break;
+      case gpu::ShuffleMode::XOR:
+        srcLane = LLVM::XOrOp::create(rewriter, loc, i32, lane,
+                                      adaptor.getOffset());
+        break;
+      case gpu::ShuffleMode::IDX:
+        srcLane = adaptor.getOffset();
+        break;
+      }
+      // The source lane must be in the thread's segment of `width` lanes.
+      Value segmentStart =
+          LLVM::AndOp::create(rewriter, loc, i32, lane, negWidth);
+      valid = LLVM::AndOp::create(
+          rewriter, loc,
+          LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::sge,
+                               srcLane, segmentStart),
+          LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::slt,
+                               srcLane, segmentEnd));
+      Value selected =
+          LLVM::SelectOp::create(rewriter, loc, valid, srcLane, lane);
+      lane16 = LLVM::TruncOp::create(rewriter, loc, i16, selected);
+      native = "air.simd_shuffle.u.i32";
+    }
 
     SmallVector<Value> parts;
     if (failed(LLVM::decomposeValue(rewriter, loc, adaptor.getValue(), i32,
@@ -265,8 +500,8 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
       return rewriter.notifyMatchFailure(op, "cannot split value into i32");
     SmallVector<Value> shuffled;
     for (Value part : parts)
-      shuffled.push_back(callAIR(rewriter, op, "air.simd_shuffle.u.i32", i32,
-                                 {part, lane16}));
+      shuffled.push_back(callAIR(rewriter, op, native, i32, {part, lane16},
+                                 AIREffects::Convergent));
     Value result = LLVM::composeValue(rewriter, loc, shuffled,
                                       adaptor.getValue().getType());
     rewriter.replaceOp(op, {result, valid});
@@ -286,7 +521,7 @@ struct GPUBallotOpLowering : ConvertOpToLLVMPattern<gpu::BallotOp> {
       return rewriter.notifyMatchFailure(op, "result must be at least 32 bits");
     Type i64 = rewriter.getI64Type();
     Value mask = callAIR(rewriter, op, "air.simd_ballot.i64", i64,
-                         {adaptor.getPredicate()});
+                         {adaptor.getPredicate()}, AIREffects::Convergent);
     if (intType.getWidth() < 64)
       mask = LLVM::TruncOp::create(rewriter, loc, intType, mask);
     rewriter.replaceOp(op, mask);
@@ -302,8 +537,17 @@ struct GPUSubgroupReduceOpLowering
   LogicalResult
   matchAndRewrite(gpu::SubgroupReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (op.getClusterSize())
-      return rewriter.notifyMatchFailure(op, "clustered reductions");
+    // Clusters of 4 consecutive lanes are AIR's quad-groups; one of 32 is the
+    // SIMD-group.
+    StringRef group = "simd";
+    if (std::optional<uint32_t> cluster = op.getClusterSize()) {
+      if (op.getClusterStride() != 1)
+        return rewriter.notifyMatchFailure(op, "strided clusters");
+      if (*cluster == 4)
+        group = "quad";
+      else if (*cluster != 32)
+        return rewriter.notifyMatchFailure(op, "clusters of other sizes");
+    }
     Type type = adaptor.getValue().getType();
     bool isFloat = isa<FloatType>(type);
     if (!isFloat && !type.isInteger(32))
@@ -345,10 +589,12 @@ struct GPUSubgroupReduceOpLowering
     }
     if (isFloat && (fn == "and" || fn == "or" || fn == "xor"))
       return rewriter.notifyMatchFailure(op, "bitwise reduction of floats");
-    std::string name =
-        ("air.simd_" + fn + "." + typeSuffix(type, isUnsigned)).str();
+    std::string name = ("air." + group + "_" + fn + "." +
+                        typeSuffix(type, isUnsigned))
+                           .str();
     rewriter.replaceOp(op, callAIR(rewriter, op, name, type,
-                                   {adaptor.getValue()}));
+                                   {adaptor.getValue()},
+                                   AIREffects::Convergent));
     return success();
   }
 };
@@ -402,7 +648,8 @@ struct MatrixLoadOpLowering : ConvertOpToLLVMPattern<air::MatrixLoadOp> {
     std::string name = "air.simdgroup_matrix_8x8_load.v64" + elt + ".p" +
                        std::to_string(as) + elt;
     rewriter.replaceOp(op, callAIR(rewriter, op, name, op.getType(),
-                                   {ptr, shape[0], shape[1], shape[2]}));
+                                   {ptr, shape[0], shape[1], shape[2]},
+                                   AIREffects::ConvergentRead));
     return success();
   }
 };
@@ -424,7 +671,8 @@ struct MatrixStoreOpLowering : ConvertOpToLLVMPattern<air::MatrixStoreOp> {
     std::string name = "air.simdgroup_matrix_8x8_store.v64" + elt + ".p" +
                        std::to_string(as) + elt;
     callAIR(rewriter, op, name, nullptr,
-            {adaptor.getValue(), ptr, shape[0], shape[1], shape[2]});
+            {adaptor.getValue(), ptr, shape[0], shape[1], shape[2]},
+            AIREffects::ConvergentWrite);
     rewriter.eraseOp(op);
     return success();
   }
@@ -443,7 +691,8 @@ struct MatrixMultiplyAccumulateOpLowering
                        "." + ab + "." + ab + "." + cd;
     rewriter.replaceOp(op, callAIR(rewriter, op, name, op.getType(),
                                    {adaptor.getA(), adaptor.getB(),
-                                    adaptor.getC()}));
+                                    adaptor.getC()},
+                                   AIREffects::Convergent));
     return success();
   }
 };
@@ -598,21 +847,25 @@ void mlir::configureGpuToAIRConversionLegality(ConversionTarget &target) {
 
 void mlir::populateGpuToAIRConversionPatterns(
     const LLVMTypeConverter &converter, RewritePatternSet &patterns) {
-  patterns.add<GPUSystemValueLowering<gpu::ThreadIdOp, true>>(
-      converter, "air.thread_position_in_threadgroup");
-  patterns.add<GPUSystemValueLowering<gpu::BlockIdOp, true>>(
-      converter, "air.threadgroup_position_in_grid");
-  patterns.add<GPUSystemValueLowering<gpu::BlockDimOp, true>>(
-      converter, "air.threads_per_threadgroup");
-  patterns.add<GPUSystemValueLowering<gpu::GridDimOp, true>>(
-      converter, "air.threadgroups_per_grid");
-  patterns.add<GPUSystemValueLowering<gpu::GlobalIdOp, true>>(
-      converter, "air.thread_position_in_grid");
-  patterns.add<GPUSystemValueLowering<gpu::LaneIdOp, false>>(
+  patterns.add<GPUSystemValueLowering<gpu::ThreadIdOp>>(
+      converter, "air.thread_position_in_threadgroup", IndexKind::Block,
+      IntrType::Id);
+  patterns.add<GPUSystemValueLowering<gpu::BlockIdOp>>(
+      converter, "air.threadgroup_position_in_grid", IndexKind::Grid,
+      IntrType::Id);
+  patterns.add<GPUSystemValueLowering<gpu::BlockDimOp>>(
+      converter, "air.threads_per_threadgroup", IndexKind::Block,
+      IntrType::Dim);
+  patterns.add<GPUSystemValueLowering<gpu::GridDimOp>>(
+      converter, "air.threadgroups_per_grid", IndexKind::Grid, IntrType::Dim);
+  patterns.add<GPUSystemValueLowering<gpu::GlobalIdOp>>(
+      converter, "air.thread_position_in_grid", IndexKind::Other,
+      IntrType::Id);
+  patterns.add<GPUSimdgroupValueLowering<gpu::LaneIdOp>>(
       converter, "air.thread_index_in_simdgroup");
-  patterns.add<GPUSystemValueLowering<gpu::SubgroupIdOp, false>>(
+  patterns.add<GPUSimdgroupValueLowering<gpu::SubgroupIdOp>>(
       converter, "air.simdgroup_index_in_threadgroup");
-  patterns.add<GPUSystemValueLowering<gpu::NumSubgroupsOp, false>>(
+  patterns.add<GPUSimdgroupValueLowering<gpu::NumSubgroupsOp>>(
       converter, "air.simdgroups_per_threadgroup");
   patterns.add<GPUSubgroupSizeOpLowering, GPUBarrierOpLowering,
                GPUShuffleOpLowering, GPUBallotOpLowering,
