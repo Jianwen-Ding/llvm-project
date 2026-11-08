@@ -745,6 +745,9 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            /*default=*/"false",
            "Replace memref arguments in GPU functions with bare pointers. "
            "All memrefs must have static shape">,
+    Option<"narrowIndices", "narrow-indices", "bool", /*default=*/"true",
+           "Compute the indices of memref loads and stores of static "
+           "dimensions of at most 2^32 elements in 32 bits">,
   ];
 }
 

@@ -284,3 +284,38 @@ gpu.module @global_id {
     gpu.return
   }
 }
+
+// -----
+
+// The index of a memref access of a static dimension of at most 2^32
+// elements is below 2^32 (out of bounds is undefined), so the arithmetic
+// that computes it is 32-bit and the index its zero extension
+// (narrow-indices). Larger or dynamic dimensions keep index arithmetic.
+gpu.module @narrow_indices {
+  // CHECK-LABEL: llvm.func @narrow(
+  // CHECK-SAME: %[[A:.*]]: !llvm.ptr<1>, %[[I:.*]]: i64, %[[J:.*]]: i64, %[[LD:.*]]: i64)
+  gpu.func @narrow(%a: memref<1024x16xf32, 1>, %i: index, %j: index, %ld: index) kernel {
+    // CHECK-DAG: %[[I32:.*]] = llvm.trunc %[[I]] : i64 to i32
+    // CHECK-DAG: %[[LD32:.*]] = llvm.trunc %[[LD]] : i64 to i32
+    // CHECK-DAG: %[[J32:.*]] = llvm.trunc %[[J]] : i64 to i32
+    // CHECK: %[[M:.*]] = llvm.mul %[[I32]], %[[LD32]] : i32
+    // CHECK: %[[S:.*]] = llvm.add %[[M]], %[[J32]] : i32
+    // CHECK: llvm.zext %[[S]] : i32 to i64
+    %m = arith.muli %i, %ld : index
+    %r = arith.addi %m, %j : index
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%r, %c0] : memref<1024x16xf32, 1>
+    memref.store %v, %a[%c0, %c0] : memref<1024x16xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @wide(
+  gpu.func @wide(%a: memref<8589934592xf32, 1>, %i: index, %ld: index) kernel {
+    // CHECK-NOT: llvm.trunc
+    // CHECK: llvm.mul %{{.*}} : i64
+    %m = arith.muli %i, %ld : index
+    %v = memref.load %a[%m] : memref<8589934592xf32, 1>
+    %c0 = arith.constant 0 : index
+    memref.store %v, %a[%c0] : memref<8589934592xf32, 1>
+    gpu.return
+  }
+}

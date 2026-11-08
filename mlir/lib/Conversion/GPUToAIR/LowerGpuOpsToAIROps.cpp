@@ -51,6 +51,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/AttrTypeSubElements.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -743,6 +744,75 @@ static void assignDefaultMemorySpaces(gpu::GPUModuleOp m) {
                                         /*replaceTypes=*/true);
 }
 
+/// The 32-bit value of index \p v mod 2^32: additions, subtractions and
+/// multiplications commute with the reduction, so their trees are rebuilt in
+/// i32 (after the original, so that every use of the original can use it);
+/// another index is truncated, and an index widened from i32 is the i32.
+static Value narrowIndex(OpBuilder &b, Value v, DenseMap<Value, Value> &done,
+                         unsigned depth = 0) {
+  if (Value n = done.lookup(v))
+    return n;
+  Type i32 = b.getI32Type();
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPointAfterValue(v);
+  Location loc = v.getLoc();
+  Operation *def = v.getDefiningOp();
+  Value n;
+  APInt c;
+  if (def && matchPattern(v, m_ConstantInt(&c))) {
+    n = arith::ConstantIntOp::create(b, loc, i32, c.trunc(32).getSExtValue());
+  } else if (def && isa<arith::IndexCastOp, arith::IndexCastUIOp>(def) &&
+             def->getOperand(0).getType() == i32) {
+    n = def->getOperand(0);
+  } else if (def && depth < 16 &&
+             isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def)) {
+    Value l = narrowIndex(b, def->getOperand(0), done, depth + 1);
+    Value r = narrowIndex(b, def->getOperand(1), done, depth + 1);
+    b.setInsertionPointAfterValue(v);
+    if (isa<arith::AddIOp>(def))
+      n = arith::AddIOp::create(b, loc, l, r);
+    else if (isa<arith::SubIOp>(def))
+      n = arith::SubIOp::create(b, loc, l, r);
+    else
+      n = arith::MulIOp::create(b, loc, l, r);
+  } else {
+    n = arith::IndexCastOp::create(b, loc, i32, v);
+  }
+  done[v] = n;
+  return n;
+}
+
+/// A memref.load's or memref.store's index is below its dimension's size
+/// (an access out of bounds is undefined), so where the size is static and at
+/// most 2^32 the index is its value mod 2^32 zero-extended, and the
+/// arithmetic that computes it can be 32-bit (AGX's integer ALU is; its
+/// 64-bit additions and multiplications take several instructions).
+static void narrowMemRefIndices(gpu::GPUModuleOp m) {
+  OpBuilder b(m.getContext());
+  DenseMap<Value, Value> done;
+  auto narrow = [&](Operation *op, MemRefType type, unsigned first) {
+    for (auto [k, size] : llvm::enumerate(type.getShape())) {
+      if (ShapedType::isDynamic(size) || uint64_t(size) > (uint64_t(1) << 32))
+        continue;
+      OpOperand &index = op->getOpOperand(first + k);
+      Operation *def = index.get().getDefiningOp();
+      // Only arithmetic gains: a cast of i32 already is.
+      if (!def || !isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def))
+        continue;
+      Value n = narrowIndex(b, index.get(), done);
+      b.setInsertionPoint(op);
+      index.set(arith::IndexCastUIOp::create(b, op->getLoc(),
+                                             b.getIndexType(), n));
+    }
+  };
+  m.walk([&](Operation *op) {
+    if (auto load = dyn_cast<memref::LoadOp>(op))
+      narrow(op, load.getMemRefType(), 1);
+    else if (auto store = dyn_cast<memref::StoreOp>(op))
+      narrow(op, store.getMemRefType(), 2);
+  });
+}
+
 struct LowerGpuOpsToAIROpsPass final
     : public impl::ConvertGpuOpsToAIROpsBase<LowerGpuOpsToAIROpsPass> {
   using Base::Base;
@@ -802,6 +872,8 @@ struct LowerGpuOpsToAIROpsPass final
       op.replaceAllUsesWith(v);
       op.erase();
     });
+    if (narrowIndices)
+      narrowMemRefIndices(m);
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);

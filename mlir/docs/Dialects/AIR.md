@@ -46,6 +46,12 @@ where the dimension has fewer than 2^32 threads (the op's `upper_bound`, or `kno
 `known_grid_size`); without such a bound it is `block_id * block_dim + thread_id` in `index`, since the 32-bit
 register would wrap (alive2: `tests/alive-tv/gpu/global-id-32bit*`).
 
+The index of a `memref.load` or `memref.store` of a static dimension of at most 2^32 elements is below 2^32
+(an access out of bounds is undefined), so it is its value modulo 2^32, which additions, subtractions and
+multiplications commute with: the conversion computes such an index's arithmetic in `i32` and zero-extends the
+result (`narrow-indices`, on; alive2: `tests/alive-tv/gpu/narrow-memref-index`). AGX's integer ALU is 32-bit,
+where a 64-bit multiplication takes several instructions.
+
 `mlir/utils/agx-kernels/bench/bench.py` costs the kernels of that directory on AGX with the AGX Performance
 Simulator (`agx_cost`, one SIMD-group's cycles), against another `mlir-opt` with `--base`. Against this
 conversion before these changes (the last two rows also gain from the AGX backend's 64-bit widening as a
@@ -56,7 +62,7 @@ zero high half and its single fence around a threadgroup barrier, `-agx-merge-ba
 | `warp_reduce` (butterfly `gpu.shuffle xor`) | 310.5 cycles, 120 instructions | 147.8 cycles, 21 instructions |
 | `warp_scan` (`gpu.shuffle up`) | 328.1 cycles, 134 instructions | 154.2 cycles, 21 instructions |
 | `block_reduce` (subgroup sums, threadgroup memory) | 532.1 cycles, 45 instructions | 396.8 cycles, 30 instructions |
-| `tile2d` (2-D indices, `known_block_size`) | 157.4 cycles, 26 instructions | 145.9 cycles, 24 instructions |
+| `tile2d` (2-D indices, `known_block_size`) | 157.4 cycles, 26 instructions | 119.6 cycles, 12 instructions |
 
 `gpu.shuffle` by a constant offset within the SIMD-group is AIR's own `shuffle_xor` (within any power-of-two width),
 `shuffle_up` or `shuffle_down` (over the whole SIMD-group), whose source lanes are those and whose valid flag is
