@@ -70,6 +70,12 @@ FunctionPass *llvm::createAGXLowerControlFlowPass() {
   return new AGXLowerControlFlow();
 }
 
+static cl::opt<bool> MergeBarrierFences(
+    "agx-merge-barrier-fences",
+    cl::desc("Remove a threadgroup-scope fence right after a threadgroup "
+             "barrier that one right before it already orders"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<unsigned> MaxUnskippedInstrs(
     "agx-max-unskipped-instrs",
     cl::desc("Most ALU instructions an if or else body may have and still be "
@@ -247,6 +253,51 @@ static bool removeRepeatedBarriers(MachineFunction &MF) {
   return Changed;
 }
 
+/// Whether MI is the threadgroup-scope fence, memory_barrier 1, 2, 9 (f596:
+/// every ordering at that scope, llvm/docs/AGXUsage.rst, "AGX fences").
+static bool isThreadgroupFence(const MachineInstr &MI) {
+  return MI.getOpcode() == AGX::MEMORY_BARRIER &&
+         MI.getOperand(0).getImm() == 1 && MI.getOperand(1).getImm() == 2 &&
+         MI.getOperand(2).getImm() == 9;
+}
+
+/// A barrier with threadgroup fences on both sides (a release fence before
+/// it and an acquire fence after it, as agx-lower-air lowers AIR's
+/// air.wg.barrier and the gpu dialect's gpu.barrier) keeps the one before:
+/// the threads of a threadgroup share a core, where no reordering was
+/// observed, and the fence before the barrier with the barrier is what
+/// CUDA's __syncthreads compiles to (ZLUDA's bar.sync: one fence, then the
+/// barrier). The fence after still orders the IR around the barrier
+/// (llvm.agx.threadgroup.barrier touches no memory there), and the barrier
+/// orders the machine code.
+static bool removeFencesAfterBarriers(MachineFunction &MF) {
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    // 0: nothing; 1: a threadgroup fence; 2: that fence and a barrier.
+    unsigned State = 0;
+    for (MachineInstr &MI : make_early_inc_range(MBB)) {
+      if (MI.isMetaInstruction())
+        continue;
+      if (isThreadgroupFence(MI)) {
+        if (State == 2) {
+          MI.eraseFromParent();
+          Changed = true;
+          State = 0;
+          continue;
+        }
+        State = 1;
+        continue;
+      }
+      if (MI.getOpcode() == AGX::THREADGROUP_BARRIER && State == 1) {
+        State = 2;
+        continue;
+      }
+      State = 0;
+    }
+  }
+  return Changed;
+}
+
 /// Remove the r0h resets that the next shuffle index of their block
 /// overwrites before the execution mask can change.
 static void removeRedundantIndexResets(MachineFunction &MF) {
@@ -400,6 +451,8 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
   if (HasShuffleIndex)
     removeRedundantIndexResets(MF);
   removeRepeatedBarriers(MF);
+  if (MergeBarrierFences)
+    removeFencesAfterBarriers(MF);
 
   MachineBasicBlock &Entry = MF.front();
   if (HasShuffleIndex)

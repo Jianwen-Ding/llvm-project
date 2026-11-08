@@ -48,14 +48,15 @@ register would wrap (alive2: `tests/alive-tv/gpu/global-id-32bit*`).
 
 `mlir/utils/agx-kernels/bench/bench.py` costs the kernels of that directory on AGX with the AGX Performance
 Simulator (`agx_cost`, one SIMD-group's cycles), against another `mlir-opt` with `--base`. Against this
-conversion before these changes:
+conversion before these changes (the last two rows also gain from the AGX backend's 64-bit widening as a
+zero high half and its single fence around a threadgroup barrier, `-agx-merge-barrier-fences`):
 
 | Kernel | Before | Now |
 | --- | --- | --- |
 | `warp_reduce` (butterfly `gpu.shuffle xor`) | 310.5 cycles, 120 instructions | 147.8 cycles, 21 instructions |
 | `warp_scan` (`gpu.shuffle up`) | 328.1 cycles, 134 instructions | 154.2 cycles, 21 instructions |
-| `block_reduce` (subgroup sums, threadgroup memory) | 532.1 cycles, 45 instructions | 508.9 cycles, 33 instructions |
-| `tile2d` (2-D indices, `known_block_size`) | 157.4 cycles, 26 instructions | 153.0 cycles, 24 instructions |
+| `block_reduce` (subgroup sums, threadgroup memory) | 532.1 cycles, 45 instructions | 396.8 cycles, 30 instructions |
+| `tile2d` (2-D indices, `known_block_size`) | 157.4 cycles, 26 instructions | 145.9 cycles, 24 instructions |
 
 `gpu.shuffle` by a constant offset within the SIMD-group is AIR's own `shuffle_xor` (within any power-of-two width),
 `shuffle_up` or `shuffle_down` (over the whole SIMD-group), whose source lanes are those and whose valid flag is
