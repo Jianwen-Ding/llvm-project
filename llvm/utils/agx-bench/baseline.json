@@ -1,4 +1,76 @@
 {
+ "bilinear_resize.ll:bilinear_resize:agx-g13g": {
+  "bytes": 338,
+  "cycles": 227.5,
+  "gprs": 13,
+  "groups": 96,
+  "instructions": 51,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 20.8,
+  "uniform_halves": 26,
+  "waits": 2
+ },
+ "bilinear_resize.ll:bilinear_resize:agx-g14c": {
+  "bytes": 338,
+  "cycles": 227.5,
+  "gprs": 13,
+  "groups": 96,
+  "instructions": 51,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 20.8,
+  "uniform_halves": 26,
+  "waits": 2
+ },
+ "bitonic_simd32.ll:bitonic_simd32:agx-g13g": {
+  "bytes": 668,
+  "cycles": 283.3,
+  "gprs": 14,
+  "groups": 96,
+  "instructions": 96,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 35.7,
+  "uniform_halves": 10,
+  "waits": 1
+ },
+ "bitonic_simd32.ll:bitonic_simd32:agx-g14c": {
+  "bytes": 668,
+  "cycles": 283.3,
+  "gprs": 14,
+  "groups": 96,
+  "instructions": 96,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 35.7,
+  "uniform_halves": 10,
+  "waits": 1
+ },
+ "block_scan_simd.ll:block_scan_simd:agx-g13g": {
+  "bytes": 176,
+  "cycles": 407.1,
+  "gprs": 7,
+  "groups": 96,
+  "instructions": 31,
+  "launch_inputs": true,
+  "tg_bytes": 32,
+  "tput": 15.1,
+  "uniform_halves": 14,
+  "waits": 1
+ },
+ "block_scan_simd.ll:block_scan_simd:agx-g14c": {
+  "bytes": 176,
+  "cycles": 407.1,
+  "gprs": 7,
+  "groups": 96,
+  "instructions": 31,
+  "launch_inputs": true,
+  "tg_bytes": 32,
+  "tput": 15.1,
+  "uniform_halves": 14,
+  "waits": 1
+ },
  "cuda_argmax.ll:argmax:agx-g13g": {
   "bytes": 1158,
   "cycles": 14638.7,
@@ -671,6 +743,30 @@
   "uniform_halves": 20,
   "waits": 2
  },
+ "gemv_f16.ll:gemv_f16:agx-g13g": {
+  "bytes": 184,
+  "cycles": 3540.5,
+  "gprs": 9,
+  "groups": 96,
+  "instructions": 30,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 87.0,
+  "uniform_halves": 20,
+  "waits": 1
+ },
+ "gemv_f16.ll:gemv_f16:agx-g14c": {
+  "bytes": 184,
+  "cycles": 3540.5,
+  "gprs": 9,
+  "groups": 96,
+  "instructions": 30,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 87.0,
+  "uniform_halves": 20,
+  "waits": 1
+ },
  "histogram.ll:histogram:agx-g13g": {
   "bytes": 124,
   "cycles": 251.4,
@@ -694,6 +790,30 @@
   "tput": 13.1,
   "uniform_halves": 16,
   "waits": 1
+ },
+ "int8_dp4a_gemv.ll:int8_dp4a_gemv:agx-g13g": {
+  "bytes": 418,
+  "cycles": 1741.0,
+  "gprs": 17,
+  "groups": 96,
+  "instructions": 64,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 125.9,
+  "uniform_halves": 26,
+  "waits": 3
+ },
+ "int8_dp4a_gemv.ll:int8_dp4a_gemv:agx-g14c": {
+  "bytes": 418,
+  "cycles": 1741.0,
+  "gprs": 17,
+  "groups": 96,
+  "instructions": 64,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 125.9,
+  "uniform_halves": 26,
+  "waits": 3
  },
  "matrixmul.ll:matrixMul:agx-g13g": {
   "bytes": 572,
