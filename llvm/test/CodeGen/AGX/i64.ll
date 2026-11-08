@@ -126,24 +126,24 @@ define agx_kernel void @bitcount(ptr addrspace(1) %out, i64 %a) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    ffs r1, u3
+; CHECK-NEXT:    mov_imm r3, 0
 ; CHECK-NEXT:    ffs r2, u2
-; CHECK-NEXT:    bitrev r3, u3
 ; CHECK-NEXT:    isub r1, 31, r1
+; CHECK-NEXT:    bitrev r4, u3
 ; CHECK-NEXT:    isub r2, 63, r2
+; CHECK-NEXT:    popcount r5, u3
+; CHECK-NEXT:    icmpsel ueq, r2, u3, 0, r2, r1
+; CHECK-NEXT:    bitrev r1, u2
+; CHECK-NEXT:    ffs r4, r4
 ; CHECK-NEXT:    popcount r6, u2
-; CHECK-NEXT:    icmpsel ueq, r1, u3, 0, r2, r1
-; CHECK-NEXT:    bitrev r2, u2
-; CHECK-NEXT:    iadd r4_r5, r1, 0
-; CHECK-NEXT:    ffs r1, r2
-; CHECK-NEXT:    ffs r2, r3
-; CHECK-NEXT:    popcount r3, u3
+; CHECK-NEXT:    ffs r1, r1
+; CHECK-NEXT:    isub r4, 63, r4
+; CHECK-NEXT:    iadd r5, r6, r5
 ; CHECK-NEXT:    isub r1, 31, r1
-; CHECK-NEXT:    isub r2, 63, r2
-; CHECK-NEXT:    iadd r3, r6, r3
-; CHECK-NEXT:    icmpsel ueq, r1, u2, 0, r2, r1
-; CHECK-NEXT:    iadd r2_r3, r3, 0
-; CHECK-NEXT:    iadd r4_r5, r4_r5, r1
-; CHECK-NEXT:    iadd r2_r3, r4_r5, r2_r3
+; CHECK-NEXT:    icmpsel ueq, r1, u2, 0, r4, r1
+; CHECK-NEXT:    iadd r4_r5, r5, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r1
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4_r5
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
