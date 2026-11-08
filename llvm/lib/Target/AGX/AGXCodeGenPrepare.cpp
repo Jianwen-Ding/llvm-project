@@ -1474,6 +1474,10 @@ bool AGXCodeGenPrepare::unifyExits(Function &F) {
 static cl::opt<bool> AGXFoldLaneIdentities(
     "agx-fold-lane-identities", cl::init(true), cl::Hidden,
     cl::desc("Fold shuffles that undo each other (see foldLaneIdentities)"));
+// For hardware experiments only (wrong code for most divergent indices).
+static cl::opt<bool> AGXUnsplitShuffles(
+    "agx-unsplit-shuffles", cl::init(false), cl::Hidden,
+    cl::desc("Experiments: never split shuffles of divergent indices"));
 static cl::opt<bool> AGXQuadUniformShuffles(
     "agx-quad-uniform-shuffles", cl::init(true), cl::Hidden,
     cl::desc("Do not split shuffles of the thread index whose source quads "
@@ -1838,6 +1842,8 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
     }
   }
 
+  if (AGXUnsplitShuffles)
+    return false;
   // Most compute kernels have no variable shuffle indices. Do not compute
   // whole-function divergence (and its dominator/cycle analyses) for them.
   // Build it after matrix lowering, which can itself introduce shuffles.
