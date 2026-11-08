@@ -2,8 +2,9 @@
 """Cost MLIR kernels on AGX with the AGX Performance Simulator.
 
 Each kernel here goes through convert-gpu-to-air (with the given mlir-opt),
-mlir-translate, the AIR target's portable passes, agx-lower-air and llc for
-AGX; agx_cost gives one SIMD-group's cycles. With two mlir-opts, the second
+mlir-translate, the AIR target's portable passes, opt -O3 for AGX (which
+runs agx-lower-air first) and llc -O3, as agx-build-fatbin.py builds them;
+agx_cost gives one SIMD-group's cycles. With two mlir-opts, the second
 column is the second's and the change is printed.
 
   bench.py --bin BUILD/bin --cost agx_cost [--base OLD_MLIR_OPT] [KERNEL.mlir ...]
@@ -43,14 +44,17 @@ def lower(mlir_opt, bindir, src, tmp):
   return ll
 
 
-def cost(bindir, costbin, ll, tmp, cpu, args):
+def cost(bindir, costbin, ll, tmp, cpu, args, optimize=True):
   llc, opt = os.path.join(bindir, 'llc'), os.path.join(bindir, 'opt')
   air, agx = os.path.join(tmp, 'air.ll'), os.path.join(tmp, 'agx.ll')
   run([llc, '-mtriple=air', '-air-portable', ll, '-o', air])
-  run([opt, '-mtriple=agx', '-passes=agx-lower-air', '-S', air, '-o', agx])
-  asm = run([llc, '-mtriple=agx', '-mcpu=' + cpu, agx, '-o', '-'])
+  passes = ['-O3'] if optimize else ['-passes=agx-lower-air']
+  run([opt, '-mtriple=agx', '-mcpu=' + cpu] + passes + ['-S', air, '-o', agx])
+  level = ['-O3'] if optimize else []
+  asm = run([llc, '-mtriple=agx', '-mcpu=' + cpu] + level + [agx, '-o', '-'])
   obj, binf = os.path.join(tmp, 'k.o'), os.path.join(tmp, 'k.bin')
-  run([llc, '-mtriple=agx', '-mcpu=' + cpu, '-filetype=obj', agx, '-o', obj])
+  run([llc, '-mtriple=agx', '-mcpu=' + cpu] + level +
+      ['-filetype=obj', agx, '-o', obj])
   run([os.path.join(bindir, 'llvm-objcopy'), '-O', 'binary',
        '--only-section=.text', obj, binf])
   j = json.loads(run([costbin, binf, '--allow-unknown'] + args)
@@ -76,6 +80,8 @@ def main():
   ap.add_argument('--base', help='an mlir-opt to compare with')
   ap.add_argument('-mcpu', default='agx-g14c')
   ap.add_argument('--asm', help='write each assembly to this directory')
+  ap.add_argument('--no-O3', dest='optimize', action='store_false',
+                  help='only agx-lower-air between the portable passes and llc')
   ap.add_argument('kernels', nargs='*')
   a = ap.parse_args()
   kernels = a.kernels or sorted(glob.glob(os.path.join(HERE, '*.mlir')))
@@ -88,7 +94,7 @@ def main():
     for name, mo in opts:
       with tempfile.TemporaryDirectory() as tmp:
         r = cost(a.bin, a.cost, lower(mo, a.bin, k, tmp), tmp, a.mcpu,
-                 launch_args(k))
+                 launch_args(k), a.optimize)
       if a.asm:
         os.makedirs(a.asm, exist_ok=True)
         open(os.path.join(a.asm, '%s.%s.s' % (os.path.basename(k)[:-5], name)),
