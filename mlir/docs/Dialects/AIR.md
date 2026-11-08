@@ -105,6 +105,17 @@ known (xor) or one comparison of the lane; the other shuffles compute the source
 `gpu.subgroup_reduce` over clusters of 4 lanes is AIR's quad-group reduction (`air.quad_sum` ...), over 32 the
 SIMD-group's.
 
+A uniform `gpu.all_reduce` of an `f16`, `f32` or `i32` by an operation AIR's SIMD-group reductions have, in a
+kernel whose `known_block_size` is a multiple of 32 threads (whole SIMD-groups), is the SIMD-group reduction, each
+SIMD-group's partial in threadgroup memory, one barrier, and every SIMD-group's reduction of the partials: lane l
+reads partial l, and the lanes past the SIMD-group count read partial 0 (minimum, maximum, and, or) or the identity
+(`-0.0` or 0 for an addition, 1 for a multiplication, 0 for xor), which leave the result as it is (alive2:
+`tests/alive-tv/gpu/simdgroup-all-reduce-fill`). Where the reduction may run again (in a loop) a second barrier
+keeps the next partials from overwriting ones not yet read (`simdgroup-all-reduce`, on). The generic lowering,
+for any threadgroup, handles partial SIMD-groups with shuffles and broadcasts through threadgroup memory after a
+second barrier: `layernorm_rows`, two reductions of 256 threads, goes from 2626.6 cycles and 630 instructions to
+1568.4 cycles and 123 instructions.
+
 alive2 (its AIR and AGX semantics, `tests/alive-tv/gpu/shuffles-native`) proves the native shuffles equal to the
 lane arithmetic they replace.
 

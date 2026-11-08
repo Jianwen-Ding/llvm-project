@@ -757,6 +757,11 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            "With narrow-indices, linearize the indices of memref loads and "
            "stores of static multi-dimensional memrefs whose elements are "
            "within 2^32 of the base in 32 bits">,
+    Option<"simdgroupAllReduce", "simdgroup-all-reduce", "bool",
+           /*default=*/"true",
+           "Lower uniform gpu.all_reduce in kernels of a known threadgroup "
+           "size that is a multiple of 32 to SIMD-group reductions and one "
+           "round through threadgroup memory">,
   ];
 }
 

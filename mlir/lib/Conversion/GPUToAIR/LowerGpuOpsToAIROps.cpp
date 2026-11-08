@@ -53,6 +53,7 @@
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -1004,6 +1005,120 @@ static void narrowLoops(gpu::GPUModuleOp m) {
   }
 }
 
+/// Whether `op` may run again before its kernel returns: it is in a loop, or
+/// in a region of more than one block (whose branches may loop).
+static bool mayRepeat(Operation *op) {
+  for (Region *r = op->getParentRegion(); r;
+       r = r->getParentOp()->getParentRegion()) {
+    if (!r->hasOneBlock())
+      return true;
+    Operation *parent = r->getParentOp();
+    if (isa<LoopLikeOpInterface>(parent))
+      return true;
+    if (isa<gpu::GPUFuncOp>(parent))
+      return false;
+  }
+  return true;
+}
+
+/// A uniform gpu.all_reduce of an f16, f32 or i32 by an operation AIR's
+/// SIMD-group reductions have, in a kernel whose known threadgroup size is a
+/// multiple of 32 (whole SIMD-groups), is the SIMD-group reduction, the
+/// partial of each SIMD-group in a threadgroup buffer, a barrier, and each
+/// SIMD-group's reduction of the partials (lane l reads partial l; the lanes
+/// past the SIMD-group count read partial 0, or the identity of an addition,
+/// multiplication or xor): the result in every thread, without the generic
+/// lowering's partial-SIMD-group shuffles and its second round through
+/// threadgroup memory. Where the reduction may run again, a barrier after it
+/// keeps the next round's partials from overwriting ones not yet read.
+static void lowerAllReducesToSimdgroups(gpu::GPUModuleOp m) {
+  SmallVector<gpu::AllReduceOp> ops;
+  m.walk([&](gpu::AllReduceOp op) { ops.push_back(op); });
+  for (gpu::AllReduceOp op : ops) {
+    if (!op.getUniform() || !op.getOp() || !op.getBody().empty())
+      continue;
+    auto func = op->getParentOfType<gpu::GPUFuncOp>();
+    std::optional<uint64_t> threads = knownThreadgroupThreads(op);
+    if (!func || !threads || *threads == 0 || *threads % 32 ||
+        *threads > 1024)
+      continue;
+    Type type = op.getType();
+    if (!type.isF32() && !type.isF16() && !type.isInteger(32))
+      continue;
+    gpu::AllReduceOperation kind = *op.getOp();
+    TypedAttr identity;
+    OpBuilder b(op);
+    switch (kind) {
+    case gpu::AllReduceOperation::ADD:
+      identity = isa<FloatType>(type)
+                     ? TypedAttr(b.getFloatAttr(
+                           type, APFloat::getZero(
+                                     cast<FloatType>(type).getFloatSemantics(),
+                                     /*Negative=*/true)))
+                     : TypedAttr(b.getIntegerAttr(type, 0));
+      break;
+    case gpu::AllReduceOperation::MUL:
+      identity = isa<FloatType>(type) ? TypedAttr(b.getFloatAttr(type, 1.0))
+                                      : TypedAttr(b.getIntegerAttr(type, 1));
+      break;
+    case gpu::AllReduceOperation::XOR:
+      identity = b.getIntegerAttr(type, 0);
+      break;
+    case gpu::AllReduceOperation::MINSI:
+    case gpu::AllReduceOperation::MINUI:
+    case gpu::AllReduceOperation::MAXSI:
+    case gpu::AllReduceOperation::MAXUI:
+    case gpu::AllReduceOperation::MINNUMF:
+    case gpu::AllReduceOperation::MAXNUMF:
+    case gpu::AllReduceOperation::AND:
+    case gpu::AllReduceOperation::OR:
+      break;
+    default:
+      continue;
+    }
+    Location loc = op.getLoc();
+    uint64_t groups = *threads / 32;
+    Value partial = gpu::SubgroupReduceOp::create(b, loc, op.getValue(), kind,
+                                                  /*uniform=*/true);
+    if (groups == 1) {
+      op.replaceAllUsesWith(partial);
+      op.erase();
+      continue;
+    }
+    auto bufferType = MemRefType::get(
+        {int64_t(groups)}, type, MemRefLayoutAttrInterface(),
+        gpu::AddressSpaceAttr::get(b.getContext(),
+                                   gpu::AddressSpace::Workgroup));
+    Value buffer = func.addWorkgroupAttribution(bufferType, loc);
+    Value lane = gpu::LaneIdOp::create(b, loc, /*upper_bound=*/IntegerAttr());
+    Value group =
+        gpu::SubgroupIdOp::create(b, loc, /*upper_bound=*/IntegerAttr());
+    Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+    Value first =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, lane, zero);
+    scf::IfOp::create(b, loc, first, [&](OpBuilder &b, Location loc) {
+      memref::StoreOp::create(b, loc, partial, buffer, group);
+      scf::YieldOp::create(b, loc);
+    });
+    gpu::BarrierOp::create(b, loc);
+    Value inRange = arith::CmpIOp::create(
+        b, loc, arith::CmpIPredicate::ult, lane,
+        arith::ConstantIndexOp::create(b, loc, groups));
+    Value index = arith::SelectOp::create(b, loc, inRange, lane, zero);
+    Value value = memref::LoadOp::create(b, loc, buffer, index);
+    if (identity)
+      value = arith::SelectOp::create(
+          b, loc, inRange, value,
+          arith::ConstantOp::create(b, loc, identity));
+    Value result =
+        gpu::SubgroupReduceOp::create(b, loc, value, kind, /*uniform=*/true);
+    if (mayRepeat(op))
+      gpu::BarrierOp::create(b, loc);
+    op.replaceAllUsesWith(result);
+    op.erase();
+  }
+}
+
 struct LowerGpuOpsToAIROpsPass final
     : public impl::ConvertGpuOpsToAIROpsBase<LowerGpuOpsToAIROpsPass> {
   using Base::Base;
@@ -1067,6 +1182,8 @@ struct LowerGpuOpsToAIROpsPass final
       ::narrowLoops(m);
     if (narrowIndices)
       narrowMemRefIndices(m, linearizeIndices);
+    if (simdgroupAllReduce)
+      lowerAllReducesToSimdgroups(m);
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);

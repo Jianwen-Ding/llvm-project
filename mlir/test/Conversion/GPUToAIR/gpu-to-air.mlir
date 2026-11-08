@@ -1,5 +1,5 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
-// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0" --split-input-file | FileCheck %s --check-prefix=OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0 simdgroup-all-reduce=0" --split-input-file | FileCheck %s --check-prefix=OFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -435,6 +435,81 @@ gpu.module @linearize_indices {
     %v = memref.load %a[%i, %j] : memref<65536x65537xf32, 1>
     %f = arith.addf %v, %v : f32
     memref.store %f, %a[%j, %i] : memref<65536x65537xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A uniform gpu.all_reduce in a kernel of whole SIMD-groups (known_block_size
+// a multiple of 32) is the SIMD-group reduction, the partials in threadgroup
+// memory, one barrier and each SIMD-group's reduction of the partials (lanes
+// past the SIMD-group count read the identity of an addition, partial 0 of a
+// maximum), with a second barrier where it may run again
+// (simdgroup-all-reduce). One SIMD-group needs only its reduction; other
+// sizes keep the generic lowering.
+gpu.module @simdgroup_all_reduce {
+  // CHECK: llvm.mlir.global internal @[[BUF:.*]]() {addr_space = 3 : i32} : !llvm.array<4 x f32>
+  // CHECK-LABEL: llvm.func @sum(
+  // OFF-LABEL: llvm.func @sum(
+  gpu.func @sum(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK-DAG: %[[ID:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
+    // CHECK: %[[P:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 4>})
+    // CHECK: llvm.store %[[P]], %{{.*}} : f32, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: %[[IN:.*]] = llvm.icmp "ult" %{{.*}}, %{{.*}} : i64
+    // CHECK: %[[X:.*]] = llvm.load %{{.*}} : !llvm.ptr<3> -> f32
+    // CHECK: %[[Y:.*]] = llvm.select %[[IN]], %[[X]], %[[ID]] : i1, f32
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_sum.f32(%[[Y]]) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[R]], %{{.*}} : f32, !llvm.ptr<1>
+    // OFF: llvm.call @air.simd_shuffle.u.i32
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @max_loop(
+  gpu.func @max_loop(%a: memref<1024xi32, 1>, %n: index) kernel
+      attributes {known_block_size = array<i32: 16, 4, 1>} {
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: %[[X:.*]] = llvm.load %{{.*}} : !llvm.ptr<3> -> i32
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_max.s.i32(%[[X]]) : (i32) -> i32
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[R]]
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %n step %c1 {
+      %v = memref.load %a[%i] : memref<1024xi32, 1>
+      %s = gpu.all_reduce maxsi %v uniform {} : (i32) -> (i32)
+      memref.store %s, %a[%i] : memref<1024xi32, 1>
+    }
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @one_group(
+  gpu.func @one_group(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 32, 1, 1>} {
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_product.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[R]]
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce mul %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @partial(
+  gpu.func @partial(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 48, 1, 1>} {
+    // CHECK: llvm.call @air.simd_shuffle.u.i32
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
     gpu.return
   }
 }
