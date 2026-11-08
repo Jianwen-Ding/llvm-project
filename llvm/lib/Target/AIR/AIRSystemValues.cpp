@@ -396,6 +396,8 @@ static bool airSystemValues(Module &M) {
       bool HasArgBuf = false;
       if (auto *MAS = F.getMetadata("air.argbuf.member_as")) {
         HasArgBuf = true;
+        // The argument buffer takes location 0; the other buffers follow it.
+        ArgIdx = 1;
         unsigned PtrSize = M.getDataLayout().getPointerSize(/*AS=*/1);
         unsigned PtrAlign = PtrSize;
         SmallVector<Metadata *, 32> StructInfo;

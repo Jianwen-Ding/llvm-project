@@ -183,6 +183,11 @@ public:
     // Must run BEFORE AIRSystemValues so that !air.kernel metadata is
     // emitted against the post-packing signature.
     addPass(createAIRScalarBufferPackingLegacyPass());
+    // The kernels with an argument buffer keep their scalars out of
+    // _scalar_buf: each takes a constant buffer, after the argument buffer,
+    // so that !air.kernel describes it.
+    addPass(createAIRScalarArgsToConstantBuffersLegacyPass(
+        /*ArgumentBufferKernelsOnly=*/true));
     addPass(createAIRSystemValuesLegacyPass());
     // Emit Apple-style alias-scope MD + "air-buffer-no-alias" param attrs
     // after the IR shape is final but before final normalisations.
