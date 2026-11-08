@@ -30,7 +30,7 @@ class AIRNaNMinMaxLegacy : public ModulePass {
 public:
   bool runOnModule(Module &M) override;
   /// With \p SignedZeros, llvm.minimum/maximum also order -0 below +0,
-  /// which air.fmin/fmax do not on Metal (the Metal pipeline only).
+  /// which air.fmin/fmax (minnum/maxnum) do not: what llvm.minimum means.
   AIRNaNMinMaxLegacy(bool SignedZeros = false)
       : ModulePass(ID), SignedZeros(SignedZeros) {}
   static char ID;

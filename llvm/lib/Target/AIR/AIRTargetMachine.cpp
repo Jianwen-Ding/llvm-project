@@ -234,7 +234,10 @@ static cl::opt<bool> AIRPortable(
 void llvm::addAIRPortablePasses(legacy::PassManagerBase &PM) {
   PM.add(createAIRFromGenericGPULegacyPass());
   PM.add(createAIREmulateF64LegacyPass());
-  PM.add(createAIRNaNMinMaxLegacyPass());
+  // air.fmin/fmax are minnum/maxnum (AGXLowerAIR's inverse mapping), which
+  // do not order signed zeros: llvm.minimum/maximum need the zero select
+  // here as on Metal.
+  PM.add(createAIRNaNMinMaxLegacyPass(/*SignedZeros=*/true));
   PM.add(createLLVMToAIRIntrinsicsLegacyPass());
   PM.add(createAIRBarrierRenameLegacyPass());
   PM.add(createAIRLowerAtomicRMWLegacyPass(/*OrderingHints=*/true));

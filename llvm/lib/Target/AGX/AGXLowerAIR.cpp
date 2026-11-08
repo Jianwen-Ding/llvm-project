@@ -1735,9 +1735,30 @@ void LowerAIR::recoverAGXOperations(Function &F) {
                Sel && Ty->isFPOrFPVectorTy() &&
                match(Sel->getTrueValue(), m_NaN())) {
       // AIR's minimum / maximum (air-nan-min-max): fmin / fmax with a NaN
-      // check, AGX's minimum / maximum.
+      // check and, of two zeros, the OR (minimum) or AND (maximum) of their
+      // bits, AGX's minimum / maximum.
       Value *A, *C;
-      auto *MM = dyn_cast<IntrinsicInst>(Sel->getFalseValue());
+      Value *Ordered = Sel->getFalseValue();
+      auto *MM = dyn_cast<IntrinsicInst>(Ordered);
+      if (auto *ZSel = dyn_cast<SelectInst>(Ordered)) {
+        MM = dyn_cast<IntrinsicInst>(ZSel->getFalseValue());
+        Value *X, *Y, *Or;
+        bool Min = MM && MM->getIntrinsicID() == Intrinsic::minnum;
+        // zero_check: (bits(a) | bits(b)) << 1 == 0; the zero: bits(a) | bits(b)
+        // for minimum, bits(a) & bits(b) for maximum.
+        if (!MM ||
+            !match(ZSel->getCondition(),
+                   m_SpecificICmp(ICmpInst::ICMP_EQ,
+                                  m_Shl(m_Value(Or), m_One()), m_Zero())) ||
+            !match(Or, m_Or(m_BitCast(m_Value(X)), m_BitCast(m_Value(Y)))) ||
+            !((X == MM->getArgOperand(0) && Y == MM->getArgOperand(1)) ||
+              (X == MM->getArgOperand(1) && Y == MM->getArgOperand(0))) ||
+            !(Min ? match(ZSel->getTrueValue(), m_BitCast(m_Specific(Or)))
+                  : match(ZSel->getTrueValue(),
+                          m_BitCast(m_c_And(m_BitCast(m_Specific(X)),
+                                            m_BitCast(m_Specific(Y)))))))
+          MM = nullptr;
+      }
       if (MM &&
           (MM->getIntrinsicID() == Intrinsic::minnum ||
            MM->getIntrinsicID() == Intrinsic::maxnum) &&

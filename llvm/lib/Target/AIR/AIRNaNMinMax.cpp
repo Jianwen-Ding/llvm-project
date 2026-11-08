@@ -260,8 +260,8 @@ static bool nanMinMax(Module &M, bool SignedZeros) {
 
 PreservedAnalyses AIRNaNMinMaxPass::run(Module &M,
                                           ModuleAnalysisManager &AM) {
-  return nanMinMax(M, /*SignedZeros=*/false) ? PreservedAnalyses::none()
-                                              : PreservedAnalyses::all();
+  return nanMinMax(M, /*SignedZeros=*/true) ? PreservedAnalyses::none()
+                                             : PreservedAnalyses::all();
 }
 
 bool AIRNaNMinMaxLegacy::runOnModule(Module &M) {
