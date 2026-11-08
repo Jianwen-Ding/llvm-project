@@ -39,6 +39,7 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/AIR/IR/AIRDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -771,10 +772,41 @@ struct LowerGpuOpsToAIROpsPass final
 
     assignDefaultMemorySpaces(m);
 
+    // gpu.global_id is AIR's thread_position_in_grid, one 32-bit read
+    // (which an address takes as a 32-bit index), where the dimension has
+    // fewer than 2^32 threads: its upper_bound, or the known threadgroup and
+    // grid sizes, say so. Elsewhere the 32-bit register could wrap, and it is
+    // block_id * block_dim + thread_id, in index.
+    m.walk([&](gpu::GlobalIdOp op) {
+      gpu::Dimension d = op.getDimension();
+      std::optional<uint64_t> threads;
+      if (std::optional<APInt> b = op.getUpperBound())
+        threads = b->getZExtValue();
+      std::optional<uint32_t> bs = gpu::getKnownDimensionSizeAround(
+          op, gpu::DimensionKind::Block, d);
+      std::optional<uint32_t> gs = gpu::getKnownDimensionSizeAround(
+          op, gpu::DimensionKind::Grid, d);
+      if (bs && gs) {
+        uint64_t n = uint64_t(*bs) * *gs;
+        threads = threads ? std::min(*threads, n) : n;
+      }
+      if (threads && *threads <= (uint64_t(1) << 32))
+        return;
+      OpBuilder b(op);
+      Location loc = op.getLoc();
+      Value bid = gpu::BlockIdOp::create(b, loc, d);
+      Value bdim = gpu::BlockDimOp::create(b, loc, d);
+      Value tid = gpu::ThreadIdOp::create(b, loc, d);
+      Value v = arith::AddIOp::create(
+          b, loc, arith::MulIOp::create(b, loc, bid, bdim), tid);
+      op.replaceAllUsesWith(v);
+      op.erase();
+    });
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);
-      populateGpuRewritePatterns(patterns);
+      populateGpuAllReducePatterns(patterns);
+      populateGpuShufflePatterns(patterns);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
 

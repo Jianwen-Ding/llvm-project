@@ -243,3 +243,44 @@ gpu.module @clusters {
     gpu.return
   }
 }
+
+// -----
+
+// gpu.global_id is AIR's 32-bit thread_position_in_grid where the dimension
+// has fewer than 2^32 threads (upper_bound, or known_block_size times
+// known_grid_size); without a bound, block_id * block_dim + thread_id in
+// index, since the 32-bit register would wrap.
+gpu.module @global_id {
+  // CHECK-LABEL: llvm.func @bounded(
+  gpu.func @bounded(%out: memref<8xindex, 1>) kernel {
+    // CHECK: llvm.call @air.thread_position_in_grid.v3i32()
+    // CHECK-NOT: @air.threadgroup_position_in_grid
+    %g = gpu.global_id x upper_bound 65536
+    %c0 = arith.constant 0 : index
+    memref.store %g, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @known(
+  gpu.func @known(%out: memref<8xindex, 1>) kernel
+      attributes {known_block_size = array<i32: 256, 1, 1>,
+                  known_grid_size = array<i32: 4096, 1, 1>} {
+    // CHECK: llvm.call @air.thread_position_in_grid.v3i32()
+    %g = gpu.global_id x
+    %c0 = arith.constant 0 : index
+    memref.store %g, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @unbounded(
+  gpu.func @unbounded(%out: memref<8xindex, 1>) kernel {
+    // CHECK-NOT: @air.thread_position_in_grid
+    // CHECK: llvm.call @air.threadgroup_position_in_grid.v3i32()
+    // CHECK: llvm.call @air.threads_per_threadgroup.v3i32()
+    // CHECK: llvm.call @air.thread_position_in_threadgroup.v3i32()
+    // CHECK: llvm.mul %{{.*}} : i64
+    // CHECK: llvm.add %{{.*}} : i64
+    %g = gpu.global_id x
+    %c0 = arith.constant 0 : index
+    memref.store %g, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+}

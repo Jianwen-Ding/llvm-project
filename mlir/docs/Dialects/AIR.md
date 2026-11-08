@@ -41,6 +41,22 @@ From the launch bounds the kernel knows (`known_block_size`, `known_grid_size`, 
 - the other system values carry their `range` (`llvm.range`): a lane is in `[0, 32)`, a thread position below the
   threadgroup size, a SIMD-group index below the SIMD-group count.
 
+`gpu.global_id` is AIR's `thread_position_in_grid`, one 32-bit read that a memory access takes as its 32-bit index,
+where the dimension has fewer than 2^32 threads (the op's `upper_bound`, or `known_block_size` times
+`known_grid_size`); without such a bound it is `block_id * block_dim + thread_id` in `index`, since the 32-bit
+register would wrap (alive2: `tests/alive-tv/gpu/global-id-32bit*`).
+
+`mlir/utils/agx-kernels/bench/bench.py` costs the kernels of that directory on AGX with the AGX Performance
+Simulator (`agx_cost`, one SIMD-group's cycles), against another `mlir-opt` with `--base`. Against this
+conversion before these changes:
+
+| Kernel | Before | Now |
+| --- | --- | --- |
+| `warp_reduce` (butterfly `gpu.shuffle xor`) | 310.5 cycles, 120 instructions | 147.8 cycles, 21 instructions |
+| `warp_scan` (`gpu.shuffle up`) | 328.1 cycles, 134 instructions | 154.2 cycles, 21 instructions |
+| `block_reduce` (subgroup sums, threadgroup memory) | 532.1 cycles, 45 instructions | 508.9 cycles, 33 instructions |
+| `tile2d` (2-D indices, `known_block_size`) | 157.4 cycles, 26 instructions | 153.0 cycles, 24 instructions |
+
 `gpu.shuffle` by a constant offset within the SIMD-group is AIR's own `shuffle_xor` (within any power-of-two width),
 `shuffle_up` or `shuffle_down` (over the whole SIMD-group), whose source lanes are those and whose valid flag is
 known (xor) or one comparison of the lane; the other shuffles compute the source lane and use the index shuffle.
