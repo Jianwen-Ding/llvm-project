@@ -64,7 +64,9 @@ define agx_kernel void @relative(ptr addrspace(1) %out, float %x) {
   %d = and i32 %lane, 3
   %v = uitofp i32 %lane to float
   %a = call float @llvm.agx.simd.shuffle.down.f32(float %v, i32 %d)
-  %b = call float @llvm.agx.quad.shuffle.f32(float %a, i32 %d)
+  ; (not lane & 3 itself: a thread reading its own position is no shuffle)
+  %e = sub i32 3, %d
+  %b = call float @llvm.agx.quad.shuffle.f32(float %a, i32 %e)
   %p = getelementptr float, ptr addrspace(1) %out, i32 %lane
   store float %b, ptr addrspace(1) %p
   ret void
@@ -119,5 +121,49 @@ join:
   %r2 = call float @llvm.agx.simd.shuffle.f32(float %v, i32 %idx)
   %p = getelementptr float, ptr addrspace(1) %out, i32 %lane
   store float %r2, ptr addrspace(1) %p
+  ret void
+}
+
+; simd_shuffle reads from each source quad the thread at the OR of the low
+; index bits of that quad's own threads (measured on the M2 Max: the reader's
+; low bits do not matter). An index of the thread index alone whose source
+; quads all hold the position they are read at reads the thread it names with
+; one shuffle, though it differs across the SIMD-group: here thread 4q + w
+; reads 4 * (5q mod 8) + q mod 4, and quad 5q mod 8 holds 5q mod 4 = q mod 4.
+; CHECK-LABEL: quad_positions:
+; CHECK-COUNT-1: simd_shuffle {{r[0-9]+}}, {{[ru][0-9]+}}, r0h
+; CHECK-NOT:     simd_shuffle
+; CHECK:         stop
+define agx_kernel void @quad_positions(ptr addrspace(1) %out, float %x) {
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %q = lshr i32 %lane, 2
+  %q5 = mul i32 %q, 5
+  %qs = and i32 %q5, 7
+  %hi = shl i32 %qs, 2
+  %lo = and i32 %q, 3
+  %idx = or i32 %hi, %lo
+  %r = call float @llvm.agx.simd.shuffle.f32(float %x, i32 %idx)
+  %p = getelementptr float, ptr addrspace(1) %out, i32 %lane
+  store float %r, ptr addrspace(1) %p
+  ret void
+}
+
+; Low bits the same in each reading quad are not enough: thread 4q + w reads
+; quad q ^ 2 at position (q >> 1) & 3, but that quad's threads hold
+; ((q ^ 2) >> 1) & 3. (Wrong on the hardware without the split.)
+; CHECK-LABEL: reader_positions:
+; CHECK-COUNT-4: simd_shuffle {{r[0-9]+}}, {{[ru][0-9]+}}, r0h
+; CHECK-NOT:     simd_shuffle
+; CHECK:         stop
+define agx_kernel void @reader_positions(ptr addrspace(1) %out, float %x) {
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %l8 = xor i32 %lane, 8
+  %hi = and i32 %l8, 28
+  %sh = lshr i32 %lane, 3
+  %lo = and i32 %sh, 3
+  %idx = or i32 %hi, %lo
+  %r = call float @llvm.agx.simd.shuffle.f32(float %x, i32 %idx)
+  %p = getelementptr float, ptr addrspace(1) %out, i32 %lane
+  store float %r, ptr addrspace(1) %p
   ret void
 }

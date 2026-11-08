@@ -502,6 +502,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool unifyExits(Function &F);
   bool lowerConstrainedFP(Function &F);
   bool lowerDivergentShuffles(Function &F, const TargetTransformInfo &TTI);
+  bool foldLaneIdentities(Function &F);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
   bool flushHalfDenormals(Function &F);
   bool flushFloatMinMax(Function &F);
@@ -1470,9 +1471,339 @@ bool AGXCodeGenPrepare::unifyExits(Function &F) {
   return true;
 }
 
+static cl::opt<bool> AGXFoldLaneIdentities(
+    "agx-fold-lane-identities", cl::init(true), cl::Hidden,
+    cl::desc("Fold shuffles that undo each other (see foldLaneIdentities)"));
+static cl::opt<bool> AGXQuadUniformShuffles(
+    "agx-quad-uniform-shuffles", cl::init(true), cl::Hidden,
+    cl::desc("Do not split shuffles of the thread index whose source quads "
+             "hold the positions they are read at"));
+
+namespace {
+/// The value of integer expressions of the thread index and constants in a
+/// given thread of the SIMD-group (see foldLaneIdentities).
+class LaneEvaluator {
+  DenseMap<std::pair<const Value *, unsigned>, std::optional<uint64_t>> Memo;
+
+public:
+  std::optional<uint64_t> eval(const Value *V, unsigned Lane,
+                               unsigned Depth = 0) {
+    auto Key = std::make_pair(V, Lane);
+    if (auto It = Memo.find(Key); It != Memo.end())
+      return It->second;
+    std::optional<uint64_t> R = compute(V, Lane, Depth);
+    Memo[Key] = R;
+    return R;
+  }
+
+private:
+  static uint64_t mask(unsigned Bits) {
+    return Bits >= 64 ? ~0ULL : (1ULL << Bits) - 1;
+  }
+  static int64_t sext(uint64_t X, unsigned Bits) {
+    return Bits >= 64 ? (int64_t)X : (int64_t)(X << (64 - Bits)) >> (64 - Bits);
+  }
+  std::optional<uint64_t> compute(const Value *V, unsigned Lane,
+                                  unsigned Depth) {
+    Type *Ty = V->getType();
+    if (!Ty->isIntegerTy() || Ty->getIntegerBitWidth() > 64 || Depth > 24)
+      return std::nullopt;
+    unsigned Bits = Ty->getIntegerBitWidth();
+    uint64_t M = mask(Bits);
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      return C->getZExtValue() & M;
+    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::agx_thread_index_in_simdgroup:
+        return Lane & M;
+      case Intrinsic::bitreverse:
+        if (auto A = eval(II->getArgOperand(0), Lane, Depth + 1))
+          return APInt(Bits, *A).reverseBits().getZExtValue();
+        return std::nullopt;
+      case Intrinsic::bswap:
+        if (auto A = eval(II->getArgOperand(0), Lane, Depth + 1))
+          return APInt(Bits, *A).byteSwap().getZExtValue();
+        return std::nullopt;
+      default:
+        return std::nullopt;
+      }
+    }
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      return std::nullopt;
+    auto Op = [&](unsigned N) { return eval(I->getOperand(N), Lane, Depth + 1); };
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      auto A = Op(0), B = Op(1);
+      if (!A || !B)
+        return std::nullopt;
+      uint64_t X = *A, Y = *B;
+      switch (BO->getOpcode()) {
+      case Instruction::Add: return (X + Y) & M;
+      case Instruction::Sub: return (X - Y) & M;
+      case Instruction::Mul: return (X * Y) & M;
+      case Instruction::And: return X & Y;
+      case Instruction::Or: return X | Y;
+      case Instruction::Xor: return X ^ Y;
+      case Instruction::Shl: if (Y >= Bits) return std::nullopt; return (X << Y) & M;
+      case Instruction::LShr: if (Y >= Bits) return std::nullopt; return X >> Y;
+      case Instruction::AShr: if (Y >= Bits) return std::nullopt; return (uint64_t)(sext(X, Bits) >> Y) & M;
+      case Instruction::UDiv: if (!Y) return std::nullopt; return X / Y;
+      case Instruction::URem: if (!Y) return std::nullopt; return X % Y;
+      default: return std::nullopt;
+      }
+    }
+    if (auto *Cmp = dyn_cast<ICmpInst>(I)) {
+      auto A = Op(0), B = Op(1);
+      if (!A || !B)
+        return std::nullopt;
+      unsigned W = Cmp->getOperand(0)->getType()->getIntegerBitWidth();
+      int64_t SA = sext(*A, W), SB = sext(*B, W);
+      switch (Cmp->getPredicate()) {
+      case ICmpInst::ICMP_EQ: return *A == *B;
+      case ICmpInst::ICMP_NE: return *A != *B;
+      case ICmpInst::ICMP_UGT: return *A > *B;
+      case ICmpInst::ICMP_UGE: return *A >= *B;
+      case ICmpInst::ICMP_ULT: return *A < *B;
+      case ICmpInst::ICMP_ULE: return *A <= *B;
+      case ICmpInst::ICMP_SGT: return SA > SB;
+      case ICmpInst::ICMP_SGE: return SA >= SB;
+      case ICmpInst::ICMP_SLT: return SA < SB;
+      case ICmpInst::ICMP_SLE: return SA <= SB;
+      default: return std::nullopt;
+      }
+    }
+    if (isa<SelectInst>(I)) {
+      auto C = Op(0);
+      if (!C)
+        return std::nullopt;
+      return Op(*C ? 1 : 2);
+    }
+    switch (I->getOpcode()) {
+    case Instruction::ZExt:
+      return Op(0);
+    case Instruction::Trunc:
+      if (auto A = Op(0))
+        return *A & M;
+      return std::nullopt;
+    case Instruction::SExt:
+      if (auto A = Op(0))
+        return (uint64_t)sext(*A, I->getOperand(0)->getType()->getIntegerBitWidth()) & M;
+      return std::nullopt;
+    default:
+      return std::nullopt;
+    }
+  }
+};
+
+/// Where the bits of element Elt (-1: a scalar) of a value in thread Lane
+/// come from.
+struct LaneSource {
+  Value *V;
+  unsigned Lane;
+  int Elt;
+};
+} // namespace
+
+/// Follows V (element Elt, in thread Lane) back through shuffles whose index
+/// is a function of the thread index, selects whose condition is one,
+/// bitcasts that keep the elements, and constant-index element inserts and
+/// extracts, to the value it copies.
+static LaneSource traceLane(Value *V, unsigned Lane, int Elt,
+                            LaneEvaluator &LE) {
+  for (unsigned Step = 0; Step < 96; ++Step) {
+    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      Intrinsic::ID ID = II->getIntrinsicID();
+      if (ID == Intrinsic::agx_simd_shuffle ||
+          ID == Intrinsic::agx_simd_shuffle_xor ||
+          ID == Intrinsic::agx_quad_shuffle ||
+          ID == Intrinsic::agx_quad_shuffle_xor) {
+        auto Idx = LE.eval(II->getArgOperand(1), Lane);
+        bool Quad = ID == Intrinsic::agx_quad_shuffle ||
+                    ID == Intrinsic::agx_quad_shuffle_xor;
+        if (!Idx || *Idx >= (Quad ? 4u : 32u))
+          break;
+        unsigned Next;
+        if (ID == Intrinsic::agx_simd_shuffle)
+          Next = *Idx;
+        else if (ID == Intrinsic::agx_simd_shuffle_xor)
+          Next = Lane ^ *Idx;
+        else if (ID == Intrinsic::agx_quad_shuffle)
+          Next = (Lane & ~3u) | *Idx;
+        else
+          Next = Lane ^ *Idx;
+        V = II->getArgOperand(0);
+        Lane = Next;
+        continue;
+      }
+      break;
+    }
+    if (auto *Sel = dyn_cast<SelectInst>(V)) {
+      if (Sel->getCondition()->getType()->isVectorTy())
+        break;
+      auto C = LE.eval(Sel->getCondition(), Lane);
+      if (!C)
+        break;
+      V = *C ? Sel->getTrueValue() : Sel->getFalseValue();
+      continue;
+    }
+    if (auto *BC = dyn_cast<BitCastInst>(V)) {
+      Type *From = BC->getOperand(0)->getType(), *To = BC->getType();
+      auto *FV = dyn_cast<FixedVectorType>(From);
+      auto *TV = dyn_cast<FixedVectorType>(To);
+      bool Same = (!FV && !TV && From->getPrimitiveSizeInBits() == To->getPrimitiveSizeInBits() &&
+                   From->isSingleValueType()) ||
+                  (FV && TV && FV->getNumElements() == TV->getNumElements() &&
+                   FV->getScalarSizeInBits() == TV->getScalarSizeInBits());
+      if (!Same || From->isPointerTy() || To->isPointerTy())
+        break;
+      V = BC->getOperand(0);
+      continue;
+    }
+    if (auto *EE = dyn_cast<ExtractElementInst>(V)) {
+      auto *CI = dyn_cast<ConstantInt>(EE->getIndexOperand());
+      if (Elt != -1 || !CI || !isa<FixedVectorType>(EE->getVectorOperandType()))
+        break;
+      V = EE->getVectorOperand();
+      Elt = CI->getZExtValue();
+      continue;
+    }
+    if (auto *IE = dyn_cast<InsertElementInst>(V)) {
+      auto *CI = dyn_cast<ConstantInt>(IE->getOperand(2));
+      if (Elt == -1 || !CI)
+        break;
+      if (CI->getZExtValue() == (uint64_t)Elt) {
+        V = IE->getOperand(1);
+        Elt = -1;
+      } else {
+        V = IE->getOperand(0);
+      }
+      continue;
+    }
+    break;
+  }
+  return {V, Lane, Elt};
+}
+
+static bool isLaneMovement(const Value *V) {
+  if (auto *II = dyn_cast<IntrinsicInst>(V))
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::agx_simd_shuffle:
+    case Intrinsic::agx_simd_shuffle_xor:
+    case Intrinsic::agx_quad_shuffle:
+    case Intrinsic::agx_quad_shuffle_xor:
+      return true;
+    default:
+      return false;
+    }
+  return isa<SelectInst>(V) || isa<BitCastInst>(V) ||
+         isa<ExtractElementInst>(V) || isa<InsertElementInst>(V);
+}
+
+/// Shuffles that undo each other: a value whose every thread (and element)
+/// is, through shuffles, selects and element moves that depend only on the
+/// thread index, the same thread's (and element's) bits of one earlier value
+/// is that value. ZLUDA's mma emulation moves the elements of D from the
+/// matrix unit's layout to the PTX fragment layout and the next mma's C back:
+/// a chain of mmas keeps its accumulator in the unit's layout. Each candidate
+/// is checked in all 32 threads.
+bool AGXCodeGenPrepare::foldLaneIdentities(Function &F) {
+  if (!AGXFoldLaneIdentities)
+    return false;
+  bool HasShuffle = false;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (isLaneMovement(II)) {
+        HasShuffle = true;
+        break;
+      }
+  if (!HasShuffle)
+    return false;
+
+  LaneEvaluator LE;
+  SmallVector<WeakTrackingVH, 32> Roots;
+  for (Instruction &I : instructions(F)) {
+    if (!isLaneMovement(&I) || I.getType()->isPointerTy() ||
+        I.getType()->isPtrOrPtrVectorTy())
+      continue;
+    // Only the last move of a chain: its users compute with it.
+    if (llvm::all_of(I.users(), [](const User *U) { return isLaneMovement(U); }))
+      continue;
+    Roots.push_back(&I);
+  }
+
+  bool Changed = false;
+  for (WeakTrackingVH &H : Roots) {
+    auto *I = dyn_cast_or_null<Instruction>(H);
+    if (!I || I->use_empty())
+      continue;
+    auto *VT = dyn_cast<FixedVectorType>(I->getType());
+    unsigned Elts = VT ? VT->getNumElements() : 1;
+    Value *Base = nullptr;
+    int BaseElt = -2;
+    bool Identity = true, Moved = false;
+    for (unsigned E = 0; E < Elts && Identity; ++E)
+      for (unsigned L = 0; L < 32 && Identity; ++L) {
+        LaneSource S = traceLane(I, L, VT ? (int)E : -1, LE);
+        if (S.V == I || S.Lane != L || (Base && S.V != Base)) {
+          Identity = false;
+          break;
+        }
+        Base = S.V;
+        Moved |= S.V != I;
+        int Want = VT ? (int)E : S.Elt;
+        if (VT ? S.Elt != Want : (BaseElt != -2 && S.Elt != BaseElt)) {
+          Identity = false;
+          break;
+        }
+        BaseElt = S.Elt;
+      }
+    if (!Identity || !Moved || !Base || Base == I)
+      continue;
+    IRBuilder<> B(I);
+    Value *R = Base;
+    if (!VT && BaseElt != -1)
+      R = B.CreateExtractElement(Base, B.getInt64(BaseElt));
+    if (R->getType() != I->getType()) {
+      if (R->getType()->getPrimitiveSizeInBits() != I->getType()->getPrimitiveSizeInBits())
+        continue;
+      R = B.CreateBitCast(R, I->getType());
+    }
+    I->replaceAllUsesWith(R);
+    RecursivelyDeleteTriviallyDeadInstructions(I);
+    Changed = true;
+  }
+  return Changed;
+}
+
+/// Whether simd_shuffle with index Idx, a function of the thread index
+/// alone, reads the thread it names in every thread: the hardware reads from
+/// each source quad the thread at the OR of the low two index bits of that
+/// quad's own threads (measured: a reader's own low bits do not matter), so
+/// every thread of each quad that is read must hold the position its readers
+/// ask for. (Inactive threads pass 0 in r0h, which keeps this exact for any
+/// execution mask.)
+static bool readsNamedThreads(const Value *Idx, LaneEvaluator &LE) {
+  unsigned Index[32];
+  for (unsigned L = 0; L < 32; ++L) {
+    auto I = LE.eval(Idx, L);
+    if (!I || *I >= 32)
+      return false;
+    Index[L] = *I;
+  }
+  for (unsigned L = 0; L < 32; ++L) {
+    unsigned Quad = Index[L] & ~3u, Pos = Index[L] & 3;
+    for (unsigned T = Quad; T < Quad + 4; ++T)
+      if ((Index[T] & 3) != Pos)
+        return false;
+  }
+  return true;
+}
+
 /// simd_shuffle reads from each quad the thread at the OR of the low two
 /// index bits of the quad's threads (applegpu documents this, Mesa works
-/// around it). A shuffle whose index is the same in a quad (an immediate, or
+/// around it). A divergent index computed from the thread index alone whose
+/// source quads' own threads all hold the position they are read at
+/// (readsNamedThreads) reads the thread it names too. A shuffle whose index is the same in a quad (an immediate, or
 /// low bits that are uniform) reads the thread it names. Divergent indices
 /// are split into the four quad positions:
 ///
@@ -1517,8 +1848,13 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
   CI.compute(F);
   UniformityInfo UI(DT, CI, &TTI);
   UI.compute();
+  LaneEvaluator LE;
   llvm::erase_if(Worklist, [&](IntrinsicInst *II) {
-    return !UI.isDivergentAtUse(II->getArgOperandUse(1));
+    if (!UI.isDivergentAtUse(II->getArgOperandUse(1)))
+      return true;
+    return AGXQuadUniformShuffles &&
+           II->getIntrinsicID() == Intrinsic::agx_simd_shuffle &&
+           readsNamedThreads(II->getArgOperand(1), LE);
   });
 
   for (IntrinsicInst *II : Worklist) {
@@ -2296,6 +2632,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool Changed = diagnoseDoubles(F);
+  // (before the matrix FMAs become i64 operands, which the fold does not see through)
+  Changed |= foldLaneIdentities(F);
   Changed |= lowerMatrixFMA(F, ST);
   if (ST.hasQuadShuffleIndexMerge())
     Changed |= lowerDivergentShuffles(F, TTI);
