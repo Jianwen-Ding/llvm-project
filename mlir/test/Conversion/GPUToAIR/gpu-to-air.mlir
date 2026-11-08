@@ -1,5 +1,5 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
-// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0" --split-input-file | FileCheck %s --check-prefix=OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0" --split-input-file | FileCheck %s --check-prefix=OFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -301,7 +301,8 @@ gpu.module @narrow_indices {
     // CHECK-DAG: %[[J32:.*]] = llvm.trunc %[[J]] : i64 to i32
     // CHECK: %[[M:.*]] = llvm.mul %[[I32]], %[[LD32]] : i32
     // CHECK: %[[S:.*]] = llvm.add %[[M]], %[[J32]] : i32
-    // CHECK: llvm.zext %[[S]] : i32 to i64
+    // CHECK: %[[L:.*]] = llvm.mul %[[S]], %{{.*}} : i32
+    // CHECK: llvm.zext %[[L]] : i32 to i64
     %m = arith.muli %i, %ld : index
     %r = arith.addi %m, %j : index
     %c0 = arith.constant 0 : index
@@ -404,3 +405,36 @@ gpu.module @narrow_loops {
   }
 }
 
+// -----
+
+// An access of a static multi-dimensional memref whose elements are within
+// 2^32 of its base has the 32-bit index offset + sum(index_k * stride_k)
+// into the memref as one dimension (linearize-indices).
+gpu.module @linearize_indices {
+  // CHECK-LABEL: llvm.func @strided(
+  // CHECK-SAME: %[[A:.*]]: !llvm.ptr<3>, %[[I:.*]]: i64, %[[J:.*]]: i64)
+  // OFF-LABEL: llvm.func @strided(
+  gpu.func @strided(%a: memref<4x8xf32, strided<[16, 2], offset: 3>, 3>, %i: index, %j: index) kernel {
+    // CHECK-DAG: %[[I32:.*]] = llvm.trunc %[[I]] : i64 to i32
+    // CHECK-DAG: %[[J32:.*]] = llvm.trunc %[[J]] : i64 to i32
+    // CHECK: %[[A1:.*]] = llvm.mul %[[I32]], %{{.*}} : i32
+    // CHECK: %[[A2:.*]] = llvm.add %[[A1]], %{{.*}} : i32
+    // CHECK: %[[A3:.*]] = llvm.mul %[[J32]], %{{.*}} : i32
+    // CHECK: %[[L:.*]] = llvm.add %[[A2]], %[[A3]] : i32
+    // CHECK: %[[LW:.*]] = llvm.zext %[[L]] : i32 to i64
+    // CHECK: llvm.getelementptr inbounds|nuw %{{.*}}[%[[LW]]] : (!llvm.ptr<3>, i64) -> !llvm.ptr<3>, f32
+    // OFF: llvm.mul %[[I:.*]], %{{.*}} : i64
+    %v = memref.load %a[%i, %j] : memref<4x8xf32, strided<[16, 2], offset: 3>, 3>
+    %f = arith.addf %v, %v : f32
+    memref.store %f, %a[%j, %i] : memref<4x8xf32, strided<[16, 2], offset: 3>, 3>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @too_large(
+  gpu.func @too_large(%a: memref<65536x65537xf32, 1>, %i: index, %j: index) kernel {
+    // CHECK: llvm.mul %{{.*}}, %{{.*}} : i64
+    %v = memref.load %a[%i, %j] : memref<65536x65537xf32, 1>
+    %f = arith.addf %v, %v : f32
+    memref.store %f, %a[%j, %i] : memref<65536x65537xf32, 1>
+    gpu.return
+  }
+}

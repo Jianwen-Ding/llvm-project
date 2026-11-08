@@ -69,6 +69,24 @@ zero-extends it, since the AGX data layout makes `i64` a native integer.
 | `gemm_smem_tile` (K loop of tiles) | 5832.8 cycles, 95 instructions | 5679.8 cycles, 95 instructions |
 | `matmul` (K loop) | 5617.5 cycles, 37 instructions | 5609.3 cycles, 32 instructions |
 
+With `linearize-indices` (on), an access of a memref of two or more dimensions of static shape, non-negative
+static strides and offset, whose last element is within 2^32 of its base, is one of the 32-bit index
+`offset + sum(index_k * stride_k)` into the memref reinterpreted as one dimension: each index is below its size,
+so the sum is at most the last element's offset (alive2: `tests/alive-tv/gpu/linearize-memref-index`). The memref
+lowering's own linearization is 64-bit, which AGX computes in pairs of registers.
+
+| Kernel | `linearize-indices=0` | `linearize-indices` |
+| --- | --- | --- |
+| `bias_relu_2d_f16` (2-D, f16) | 176.3 cycles, 23 instructions | 127.6 cycles, 16 instructions |
+| `stencil5_2d` (2-D neighbours) | 263.4 cycles, 36 instructions | 236.8 cycles, 27 instructions |
+| `transpose_smem` (2-D, threadgroup tile) | 541.1 cycles, 69 instructions | 505.7 cycles, 46 instructions |
+| `gemm_smem_tile` (2-D tiles) | 5679.8 cycles, 95 instructions | 5495.7 cycles, 91 instructions |
+| `softmax_rows` (2-D rows) | 3349.7 cycles, 164 instructions | 3338.3 cycles, 163 instructions |
+| `layernorm_rows` (2-D rows, all-reduce) | 2439.4 cycles, 643 instructions | 2626.6 cycles, 630 instructions |
+
+`layernorm_rows` issues its device loads right after the 32-bit address additions, which the simulator holds back
+(a load after ALU work waits for the pending loads to pass the L1); the 64-bit ones happened to come earlier.
+
 `mlir/utils/agx-kernels/bench/bench.py` costs the kernels of that directory on AGX with the AGX Performance
 Simulator (`agx_cost`, one SIMD-group's cycles), against another `mlir-opt` with `--base`. Against this
 conversion before these changes (the last two rows also gain from the AGX backend's 64-bit widening as a

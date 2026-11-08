@@ -788,7 +788,14 @@ static Value narrowIndex(OpBuilder &b, Value v, DenseMap<Value, Value> &done,
 /// most 2^32 the index is its value mod 2^32 zero-extended, and the
 /// arithmetic that computes it can be 32-bit (AGX's integer ALU is; its
 /// 64-bit additions and multiplications take several instructions).
-static void narrowMemRefIndices(gpu::GPUModuleOp m) {
+///
+/// With `linearize`, an access of a memref of two or more dimensions of
+/// static shape, non-negative static strides and offset, whose elements are
+/// within 2^32 of its base, is one of index offset + sum(index_k * stride_k)
+/// computed in i32 (each index below its size, the sum is at most the last
+/// element's offset) into the memref reinterpreted as one dimension from its
+/// base, rather than the 64-bit linearization of the memref lowering.
+static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize) {
   OpBuilder b(m.getContext());
   DenseMap<Value, Value> done;
   auto narrow = [&](Operation *op, MemRefType type, unsigned first) {
@@ -806,11 +813,76 @@ static void narrowMemRefIndices(gpu::GPUModuleOp m) {
                                              b.getIndexType(), n));
     }
   };
+  // The offset of the last element, if the memref qualifies.
+  auto lastElement = [](MemRefType type) -> std::optional<uint64_t> {
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (type.getRank() < 2 || !type.hasStaticShape() ||
+        failed(type.getStridesAndOffset(strides, offset)) ||
+        ShapedType::isDynamic(offset) || offset < 0)
+      return std::nullopt;
+    uint64_t last = offset;
+    for (auto [size, stride] : llvm::zip(type.getShape(), strides)) {
+      if (size == 0 || ShapedType::isDynamic(stride) || stride < 0 ||
+          uint64_t(stride) > (uint64_t(1) << 32))
+        return std::nullopt;
+      last += uint64_t(size - 1) * uint64_t(stride);
+      if (last >= (uint64_t(1) << 32))
+        return std::nullopt;
+    }
+    return last;
+  };
+  auto flatten = [&](Operation *op, Value memref, MemRefType type,
+                     unsigned first) {
+    std::optional<uint64_t> last = lastElement(type);
+    if (!last)
+      return false;
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    (void)type.getStridesAndOffset(strides, offset);
+    Location loc = op->getLoc();
+    Type i32 = b.getI32Type();
+    Value linear;
+    b.setInsertionPoint(op);
+    if (offset)
+      linear = arith::ConstantIntOp::create(b, loc, i32, offset);
+    for (auto [k, stride] : llvm::enumerate(strides)) {
+      Value index = op->getOperand(first + k);
+      if (matchPattern(index, m_Zero()))
+        continue;
+      Value term = narrowIndex(b, index, done);
+      b.setInsertionPoint(op);
+      if (stride != 1)
+        term = arith::MulIOp::create(
+            b, loc, term, arith::ConstantIntOp::create(b, loc, i32, stride));
+      linear = linear ? arith::AddIOp::create(b, loc, linear, term) : term;
+    }
+    b.setInsertionPoint(op);
+    if (!linear)
+      linear = arith::ConstantIntOp::create(b, loc, i32, 0);
+    auto flatType =
+        MemRefType::get({int64_t(*last) + 1}, type.getElementType(),
+                        MemRefLayoutAttrInterface(), type.getMemorySpace());
+    Value flat = memref::ReinterpretCastOp::create(
+        b, loc, flatType, memref, b.getIndexAttr(0),
+        {b.getIndexAttr(*last + 1)}, {b.getIndexAttr(1)});
+    SmallVector<Value> operands(op->getOperands().take_front(first - 1));
+    operands.push_back(flat);
+    operands.push_back(
+        arith::IndexCastUIOp::create(b, loc, b.getIndexType(), linear));
+    op->setOperands(operands);
+    return true;
+  };
   m.walk([&](Operation *op) {
-    if (auto load = dyn_cast<memref::LoadOp>(op))
-      narrow(op, load.getMemRefType(), 1);
-    else if (auto store = dyn_cast<memref::StoreOp>(op))
-      narrow(op, store.getMemRefType(), 2);
+    if (auto load = dyn_cast<memref::LoadOp>(op)) {
+      if (!linearize ||
+          !flatten(op, load.getMemRef(), load.getMemRefType(), 1))
+        narrow(op, load.getMemRefType(), 1);
+    } else if (auto store = dyn_cast<memref::StoreOp>(op)) {
+      if (!linearize ||
+          !flatten(op, store.getMemRef(), store.getMemRefType(), 2))
+        narrow(op, store.getMemRefType(), 2);
+    }
   });
 }
 
@@ -994,7 +1066,7 @@ struct LowerGpuOpsToAIROpsPass final
     if (narrowLoops)
       ::narrowLoops(m);
     if (narrowIndices)
-      narrowMemRefIndices(m);
+      narrowMemRefIndices(m, linearizeIndices);
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);
