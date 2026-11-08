@@ -1,5 +1,5 @@
 ; Generic pointers (address space 4, portable AIR's hint) are emulated in
-; the Metal pipeline with ZLUDA's AGX encoding: threadgroup addresses tagged
+; the Metal pipeline with a PTX front end's AGX encoding: threadgroup addresses tagged
 ; with bit 63, private addresses with bits 63-62 = 01, device addresses as
 ; they are. An access through a generic pointer of known origin goes to that
 ; address space; of unknown origin, to the one its tag names, at run time.

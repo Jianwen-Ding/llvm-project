@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Library kernels with realistic launch inputs, for agx-bench.
 
-agx-bench costs a kernel with the uniforms its file's `; agx-cost:` line gives; ZLUDA's agx_libs kernels (compiled
+agx-bench costs a kernel with the uniforms its file's `; agx-cost:` line gives; the agx_libs kernels (compiled
 from MLIR, without such lines) otherwise run with every argument 0, which measures their prologue only. This writes
 one file per kernel listed in a shapes file (lib_shapes.txt), extracted from the compiled library IR, with an
 `; agx-cost:` line that sets the kernel's arguments:
 
-  lib_shapes.py --mlir-dir ZLUDA/agx_libs/kernels --llvm-extract BIN/llvm-extract --shapes lib_shapes.txt \\
+  lib_shapes.py --mlir-dir PTX_FRONTEND/agx_libs/kernels --llvm-extract BIN/llvm-extract --shapes lib_shapes.txt \\
       -o OUT_DIR LIB.opt.ll...
 
 The pointer arguments are 0 and a zero-filled 16 MiB buffer is mapped at address 0, which makes agx_cost trace with

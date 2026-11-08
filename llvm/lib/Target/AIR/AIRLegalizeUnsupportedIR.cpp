@@ -81,8 +81,8 @@ void lowerCmpIntrinsics(Module &M) {
 // AIR integer functions on 65- to 128-bit integers back to the LLVM
 // intrinsics they came from, which expandWideIntegers splits into limbs.
 // The portable passes name an intrinsic's AIR function after its type
-// (air.clz.i128, air.abs.s.i128: in every module ZLUDA links its i128
-// helpers into), and the AIR writer has no wide integer calls.
+// (air.clz.i128, air.abs.s.i128: in every module a PTX front end links its
+// i128 helpers into), and the AIR writer has no wide integer calls.
 void wideAIRFunctionsToIntrinsics(Module &M) {
   static constexpr std::pair<StringLiteral, Intrinsic::ID> Fns[] = {
       {"air.clz.", Intrinsic::ctlz},         {"air.ctz.", Intrinsic::cttz},
@@ -528,7 +528,7 @@ void stripDisjointFlags(Module &M) {
 
 // Generic pointers (portable AIR's address-space hint, llvm/IR/AIR.h),
 // emulated: Metal has no generic address space. A generic address is an
-// integer in ZLUDA's AGX encoding, which its isspacep already tests as bits:
+// integer in a front end's AGX encoding, which isspacep already tests as bits:
 // threadgroup addresses with bit 63 set, private (thread) addresses with bits
 // 63-62 = 01, device and constant addresses as they are (below 2^62; Metal's
 // threadgroup and private addresses are small integers, an M2 Max's device
@@ -592,7 +592,7 @@ Value *pointerOperand(Instruction *I) {
 }
 
 // A front end that numbers threadgroup memory itself ("air-shared-block" names the
-// kernel's block; ZLUDA's AGX layout) holds offsets in it as integers, and so in generic
+// kernel's block; a front end's AGX layout) holds offsets in it as integers, and so in generic
 // addresses: the block's address is subtracted going to generic and added coming back.
 // Numbers from 0x80000000 are dynamic shared memory, which keeps Metal's ("air-shared-dynamic").
 Value *rebaseShared(IRBuilder<> &B, Value *X, bool Add) {
@@ -1511,8 +1511,8 @@ void expandVariableMemIntrinsics(Module &M) {
 }
 
 // A GEP of an address made by inttoptr as integer arithmetic and an inttoptr
-// of its own. ZLUDA forms device addresses so (pointer parameters arrive as
-// integers), and the AIR writer gives such an address one pointee type from
+// of its own. Front ends form device addresses so (pointer parameters arrive
+// as integers), and the AIR writer gives such an address one pointee type from
 // its uses: two byte GEPs of it storing a float and an i32 made Metal's reader
 // reject the library ("Unexpected bitcode file", PTX-formalization
 // half-oob-set and half-cmp-pk2). Each address then has its own pointee.
@@ -1606,7 +1606,7 @@ void gepsOfIntToPtrAsIntegers(Module &M) {
 
 
 // Half denormals flushed where the function's denormal mode for half asks for
-// it (PTX .ftz on f16 / f16x2: ZLUDA gives such functions
+// it (PTX .ftz on f16 / f16x2: a front end gives such functions
 // denormal_fpenv(preservesign) for every type). The GPU keeps half denormals,
 // so the arithmetic on half reads its operands and writes its result through
 // flush(x) = |x| < 2^-14 ? +-0 : x, as AGXCodeGenPrepare does for AGX
@@ -1775,7 +1775,7 @@ bool legalizeUnsupportedIR(Module &M) {
   defineThreadgroupGlobals(M);
   stripLifetimeIntrinsics(M);
   // Metal reads a constant-space array marked externally_initialized wrongly, without an error:
-  // [4 x i16] { 10, 20, 30, 40 } gave 10, 30, 40, 0 on an M2 Max (PTX .const, which ZLUDA marks so).
+  // [4 x i16] { 10, 20, 30, 40 } gave 10, 30, 40, 0 on an M2 Max (PTX .const, which a front end marks so).
   // The library holds the values.
   for (GlobalVariable &GV : M.globals())
     if (GV.getAddressSpace() == 2 && GV.isExternallyInitialized())

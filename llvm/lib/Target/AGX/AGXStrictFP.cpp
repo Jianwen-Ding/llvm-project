@@ -1886,7 +1886,7 @@ static Constant *constantModePhi(PHINode &P) {
 /// Whether the sign bit of V (a float or its bits) is clear: constants,
 /// bitcasts, selects of such values, masks without the sign bit, fabs, and
 /// maximumnum with a non-negative operand (it returns the other operand of
-/// a NaN and orders -0 below +0). ZLUDA's emulation of ftz and of NaN
+/// a NaN and orders -0 below +0). A front end's emulation of ftz and of NaN
 /// results is selects of bit patterns, which ValueTracking does not follow.
 static bool signBitClear(const Value *V, unsigned Depth = 0) {
   if (Depth > 8)

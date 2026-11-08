@@ -266,7 +266,7 @@ static bool isThreadgroupFence(const MachineInstr &MI) {
 /// air.wg.barrier and the gpu dialect's gpu.barrier) keeps the one before:
 /// the threads of a threadgroup share a core, where no reordering was
 /// observed, and the fence before the barrier with the barrier is what
-/// CUDA's __syncthreads compiles to (ZLUDA's bar.sync: one fence, then the
+/// CUDA's __syncthreads compiles to (PTX bar.sync: one fence, then the
 /// barrier). The fence after still orders the IR around the barrier
 /// (llvm.agx.threadgroup.barrier touches no memory there), and the barrier
 /// orders the machine code.

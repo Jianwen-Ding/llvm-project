@@ -17,7 +17,7 @@ It compares the results with `baseline.json` and exits with 1 on a regression. R
 python3 llvm/utils/agx-bench/agx-bench.py --llc build/bin/llc \
     --cost AGX-Performance-Simulator/rust/target/release/agx_cost
 python3 ... --update                       # accept the new numbers
-python3 ... --zoc ZLUDA/target/debug/zoc --ptx ZLUDA/ptx/src/test/*.ptx   # also PTX through ZLUDA
+python3 ... --zoc PTX_FRONTEND/target/debug/zoc --ptx PTX_FRONTEND/ptx/src/test/*.ptx   # also PTX through zoc
 ```
 
 The kernels in `kernels/` cover the common shapes of CUDA code:
@@ -31,11 +31,11 @@ The kernels in `kernels/` cover the common shapes of CUDA code:
 | `histogram` | threadgroup and device atomics |
 | `scan` | SIMD prefix |
 | `softmax_row` | SIMD reductions + `exp` |
-| `matrixmul` | CUDA samples matrixMul through ZLUDA: threadgroup tiles, barriers, unrolled FMAs |
+| `matrixmul` | CUDA samples matrixMul through zoc: threadgroup tiles, barriers, unrolled FMAs |
 
 `kernels/cuda_*.ll` are real-world CUDA kernels written for this suite (`cuda/*.cu`), compiled to PTX by clang's NVPTX
-target (no CUDA toolkit: `cuda/bench.h` declares what they use) and to AGX IR by ZLUDA's zoc. `cuda/gen.py --zoc
-ZLUDA/target/debug/zoc` regenerates them. Every one is costed with launch inputs (sizes, grid, memory contents where
+target (no CUDA toolkit: `cuda/bench.h` declares what they use) and to AGX IR by the PTX front end's zoc. `cuda/gen.py --zoc
+PTX_FRONTEND/target/debug/zoc` regenerates them. Every one is costed with launch inputs (sizes, grid, memory contents where
 control flow depends on them):
 
 | Area | Kernels |

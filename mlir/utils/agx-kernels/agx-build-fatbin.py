@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Compile a library kernel source (a gpu.module in standard dialects and air operations) for several AGX chips, and
-pack the objects in one fat AGX object that a runtime loads with cuModuleLoadData (ZLUDA's zluda_agx picks the entry
+pack the objects in one fat AGX object that a runtime loads with cuModuleLoadData (which picks the entry
 for its device).
 
 The kernel source names no chip. It is compiled through AIR, the same for every chip up to AGX's code generation:

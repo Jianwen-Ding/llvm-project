@@ -14,7 +14,7 @@
 // Two numberings meet here. A module in AIR (the "air" triple) has AIR's:
 // thread 0, device 1, constant 2, threadgroup 3 and the generic hint 4
 // (llvm/IR/AIR.h). A module without a triple is a front end's IR on its way to
-// AIR, as ZLUDA optimizes PTX before writing AIR, in the numbering of the GPU
+// AIR, as PTX optimized before AIR is written, in the numbering of the GPU
 // targets (NVPTX, AMDGPU, AGX): generic 0, global 1, shared 3, constant 4,
 // private 5. Any other triple gets no answer from this analysis.
 //

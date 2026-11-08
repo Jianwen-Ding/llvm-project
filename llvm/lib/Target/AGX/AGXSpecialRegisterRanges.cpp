@@ -8,7 +8,7 @@
 //
 // The thread and threadgroup indices have known bounds: a threadgroup has at
 // most 1024 threads, a SIMD-group 32, and grid positions and sizes are below
-// 2^31 (CUDA's limits, within which ZLUDA launches). This pass gives the
+// 2^31 (CUDA's limits, within which CUDA launches stay). This pass gives the
 // special register reads range return attributes just before instruction
 // selection, which turns them into AssertZext nodes: signed divisions and
 // remainders of indices by powers of two then select as shifts and masks.

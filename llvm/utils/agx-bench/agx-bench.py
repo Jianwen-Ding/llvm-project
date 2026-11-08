@@ -7,12 +7,12 @@ For every kernel of the suite and every chip, compile with llc, then record:
   - waits (each one stalls the SIMD-group);
   - the estimated cycles of one SIMD-group from the AGX Performance Simulator's agx_cost.
 
-The suite is the .ll files in kernels/ and, with --ptx, ZLUDA PTX files compiled by zoc. Results are compared with
+The suite is the .ll files in kernels/ and, with --ptx, PTX files compiled by zoc. Results are compared with
 baseline.json; a metric that gets worse by more than --tolerance is a regression and makes the script exit with 1.
 --update rewrites the baseline. The JSON lines on stdout can be collected over time.
 
   agx-bench.py --llc build/bin/llc --cost path/to/agx_cost [--objcopy build/bin/llvm-objcopy]
-               [--zoc ZLUDA/target/debug/zoc --ptx a.ptx b.ptx] [--agx-strict] [--update]
+               [--zoc PTX_FRONTEND/target/debug/zoc --ptx a.ptx b.ptx] [--agx-strict] [--update]
 
 --agx-checked compiles with the agx-checked feature and costs the kernels with every check passing (the hidden
 bounds cover all memory), which shows what checked mode costs.

@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // Kernel arguments passed by reference (`ptr addrspace(4) byref(T)`, as
-// front ends like ZLUDA's emit PTX .param arguments) would cost a dependent
+// front ends that compile PTX emit .param arguments) would cost a dependent
 // device load before their first use. When every use of such an argument is
 // a load at a constant offset, this pass passes its bytes instead, in
 // consecutive uniform registers, and rebuilds each load from them.

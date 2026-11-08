@@ -93,7 +93,7 @@ mlir-opt kernel.mlir --pass-pipeline='builtin.module(air-attach-target{chip=agx-
 ```
 
 `mlir/utils/agx-kernels/agx-build-fatbin.py` compiles a library kernel source for several AGX chips and packs the
-objects into one fat AGX object (`ZAGXFAT1`), which ZLUDA's `cuModuleLoadData` picks the device's entry from.
+objects into one fat AGX object (`ZAGXFAT1`), which a runtime's `cuModuleLoadData` picks the device's entry from.
 
 ## Where the `agx` dialect went
 
@@ -109,7 +109,7 @@ chip-specific choices are the AGX backend's now, so that one AIR kernel serves e
 | `agx.fma_lane_shift` | `gpu.shuffle up` in segments, then `math.fma`; the backend is to match the G14 lane-shift FMA |
 | `agx.uniform_region` | inline code; the backend is to hoist uniform work into the preamble |
 | `agx.core_id`, `agx.simd_slot` | none (machine specific); PTX's `%smid` keeps `llvm.agx.core.id` |
-| `agx.set_fpmode`, `agx.get_fpmode` | none in MLIR; ZLUDA's PTX path keeps the `llvm.agx` intrinsics |
+| `agx.set_fpmode`, `agx.get_fpmode` | none in MLIR; the PTX path keeps the `llvm.agx` intrinsics |
 | `#agx.launch_hints` | to be kernel attributes the AGX backend reads and AIR ignores |
 
 The capability table that decided the native lowerings (`AGXChipInfo`) moves into the AGX backend's subtarget.

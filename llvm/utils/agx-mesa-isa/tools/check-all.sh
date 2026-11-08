@@ -9,13 +9,12 @@
 #   mlir       the MLIR AGX tests (ChipInfo, expand-ops in strict mode)
 #   fatbin     agx-build-fatbin.py builds the CHIP+agx-strict entries
 #   simulator  the AGX Performance Simulator's Mesa ISA tests
-#   zluda      ZLUDA's PTX tests compiled in strict mode
 #   sail       the Sail AGX model against Mesa's forms and corpus
 #   checked    agx-checked kernels on the simulator: each bug caught, correct
 #              kernels unchanged (llvm/utils/agx-checked/checked_tests.py)
-#   zchecked   checked mode through ZLUDA: PTX built by zoc --agx-checked on
-#              the simulator (llvm/utils/agx-checked/zluda_tests.py), and the
-#              runtime's record decoding and fault dump replayed in agx_run
+#   zchecked   checked mode through the PTX front end: PTX built by
+#              zoc --agx-checked on the simulator
+#              (llvm/utils/agx-checked/ptx_tests.py)
 #
 #   check-all.sh [-k CHECK,...]
 #
@@ -25,7 +24,8 @@
 #                FileCheck, mlir-opt and mlir-translate
 #   MESA         a Mesa checkout (read only)
 #   SIMULATOR    an AGX-Performance-Simulator checkout
-#   ZLUDA        a ZLUDA checkout with the AGX backend
+#   PTX_FRONTEND a checkout of the PTX front end with the AGX backend (its
+#                agx_libs kernel sources, and zoc built in target/release)
 #   SAIL_AGX     PTX-formalization's sail/agx directory, with the model built
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -103,9 +103,9 @@ mlir() {
 fatbin() {
   have "${LLVM_BUILD:-}" && [ -x "$LLVM_BUILD/bin/mlir-opt" ] || skip "no mlir-opt"
   k="$ROOT/mlir/utils/agx-kernels"
-  # ZLUDA's library kernels
-  have "${ZLUDA:-}" || skip "ZLUDA unset (the kernel sources)"
-  src="$ZLUDA/agx_libs/kernels/sgemm.mlir"
+  # the PTX front end's library kernels
+  have "${PTX_FRONTEND:-}" || skip "PTX_FRONTEND unset (the kernel sources)"
+  src="$PTX_FRONTEND/agx_libs/kernels/sgemm.mlir"
   have "$src" || skip "no $src"
   python3 -I "$k/agx-build-fatbin.py" --mlir-opt "$LLVM_BUILD/bin/mlir-opt" \
     --mlir-translate "$LLVM_BUILD/bin/mlir-translate" --llc "$LLVM_BUILD/bin/llc" \
@@ -126,13 +126,6 @@ simulator() {
   (cd "$SIMULATOR/rust" && cargo test -q --release --lib mesa)
 }
 
-zluda() {
-  have "${ZLUDA:-}" || skip "ZLUDA unset"
-  have "${LLVM_BUILD:-}" || skip "LLVM_BUILD unset"
-  (cd "$ZLUDA" && ZLUDA_LLVM_BUILD_DIR="$LLVM_BUILD" cargo test -q -p ptx \
-    --no-default-features --features agx spirv_run_kernels_compile_agx_strict)
-}
-
 sail() {
   have "${SAIL_AGX:-}" || skip "SAIL_AGX unset"
   have "${SIMULATOR:-}" || skip "SIMULATOR unset (the Mesa corpus)"
@@ -151,14 +144,13 @@ checked() {
 zchecked() {
   have "${LLVM_BUILD:-}" || skip "LLVM_BUILD unset"
   have "${SIMULATOR:-}" || skip "SIMULATOR unset"
-  have "${ZLUDA:-}" || skip "ZLUDA unset"
+  have "${PTX_FRONTEND:-}" || skip "PTX_FRONTEND unset"
+  zoc_="$PTX_FRONTEND/target/release/zoc"
+  [ -x "$zoc_" ] || skip "no $zoc_"
   run_="$SIMULATOR/rust/target/release/agx_run"
   [ -x "$run_" ] || (cd "$SIMULATOR/rust" && cargo build -q --release --bin agx_run) || exit 1
-  (cd "$ZLUDA" && ZLUDA_LLVM_BUILD_DIR="$LLVM_BUILD" cargo build -q --release -p compiler \
-    --no-default-features --features agx) || exit 1
-  python3 -I "$LLVM/utils/agx-checked/zluda_tests.py" --zoc "$ZLUDA/target/release/zoc" \
-    --llvm-build "$LLVM_BUILD" --agx-run "$run_" || exit 1
-  (cd "$ZLUDA" && AGX_RUN="$run_" cargo test -q -p agx_runtime -p zluda_agx)
+  python3 -I "$LLVM/utils/agx-checked/ptx_tests.py" --zoc "$zoc_" \
+    --llvm-build "$LLVM_BUILD" --agx-run "$run_"
 }
 
 run tables tables
@@ -168,7 +160,6 @@ run codegen codegen
 run mlir mlir
 run fatbin fatbin
 run simulator simulator
-run zluda zluda
 run sail sail
 run checked checked
 run zchecked zchecked

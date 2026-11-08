@@ -192,7 +192,7 @@ pointer types, call arguments of another type than their parameter and
 ``-air-verify-written`` also reads the written file back (the checks add a few
 percent to compile time; this much more, so it is for tests). ``opt -mtriple=air -passes=air-verify`` (portable AIR) and
 ``-passes=air-verify-metal`` run the module checks on any module or ``.air`` file.
-ZLUDA's ``zoc`` runs ``air-verify`` on every AIR module it writes.
+The PTX front end's ``zoc`` runs ``air-verify`` on every AIR module it writes.
 
 These checks find known ways of being invalid; passing them does not prove a module valid.
 Apple publishes no AIR specification, so the rules come from what the device rejects, and
