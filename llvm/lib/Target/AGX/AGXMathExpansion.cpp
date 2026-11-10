@@ -296,8 +296,13 @@ public:
   /// changes r = -0 to +0, for which expCore gives 1 either way): n =
   /// round(hi / ln 2) is split off exactly (ln 2 in two parts) and the rest
   /// goes to expCore.
-  Value *expHiLo(Value *Hi, Value *Lo) {
-    Value *C = sel(gt(Hi, 89.0), k(89.0), sel(lt(Hi, -104.0), k(-104.0), Hi));
+  /// \p Bounded: the caller clamped its argument so that hi is finite and
+  /// its n within ldexp's range (exp2, exp10), and the result over- and
+  /// underflows by itself: no clamp of hi here and no +inf / +0 selects.
+  Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false) {
+    Value *C = Bounded ? Hi
+                       : sel(gt(Hi, 89.0), k(89.0),
+                             sel(lt(Hi, -104.0), k(-104.0), Hi));
     Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
@@ -305,26 +310,36 @@ public:
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.
-    if (Lo)
+    if (Lo && !Bounded)
       E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
     // A NaN hi is a NaN r, which makes E a NaN (pow2 freezes its
     // conversion of the NaN n, which would be poison).
     return E;
   }
 
+  /// x clamped to [Lo, Hi], a little beyond where b^x overflows and rounds
+  /// to 0: no infinity whose product error would be a NaN, and the same
+  /// result for every float x as clamping e^(hi + lo) (checked exhaustively
+  /// for 2^x and 10^x, flushing and not). A NaN stays one.
+  Value *clampArg(Value *X, double Lo, double Hi) {
+    return sel(gt(X, Hi), k(Hi), sel(lt(X, Lo), k(Lo), X));
+  }
+
   Value *exp2Precise(Value *X) {
     // 2^x = e^(x ln 2), with x ln 2 as a rounded product and its error.
+    X = clampArg(X, -151.0, 130.0);
     Value *Hi = mul(X, k(M_LN2));
     Value *Lo = fma(X, k(M_LN2), B.CreateFNeg(Hi));
     Lo = fma(X, k(M_LN2 - (double)(float)M_LN2), Lo);
-    return expHiLo(Hi, Lo);
+    return expHiLo(Hi, Lo, /*Bounded=*/true);
   }
   Value *exp10Precise(Value *X) {
     constexpr double LN10 = 2.302585092994045684;
+    X = clampArg(X, -46.0, 40.0);
     Value *Hi = mul(X, k(LN10));
     Value *Lo = fma(X, k(LN10), B.CreateFNeg(Hi));
     Lo = fma(X, k(LN10 - (double)(float)LN10), Lo);
-    return expHiLo(Hi, Lo);
+    return expHiLo(Hi, Lo, /*Bounded=*/true);
   }
 
   /// A positive finite x as 2^e * (1 + f), 1 + f in [sqrt(1/2), sqrt(2)),
