@@ -746,6 +746,12 @@ static SDValue lowerLogicSelect64(SDValue Op, SelectionDAG &DAG) {
                 DAG.getNode(Opc, DL, MVT::i32, AHi, BHi));
 }
 
+static cl::opt<bool> SatConvertClamp(
+    "agx-sat-convert-clamp",
+    cl::desc("narrow saturating float conversions as the 16-bit convert and "
+             "an integer clamp"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::LowerOperation(SDValue Op,
                                           SelectionDAG &DAG) const {
   switch (Op.getOpcode()) {
@@ -876,9 +882,37 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
   case ISD::FP_TO_UINT_SAT: {
     EVT Src = Op.getOperand(0).getValueType();
     EVT Sat = cast<VTSDNode>(Op.getOperand(1))->getVT();
-    if (Sat == Op.getValueType() && (Src == MVT::f32 || Src == MVT::f16))
+    EVT VT = Op.getValueType();
+    if (Src != MVT::f32 && Src != MVT::f16)
+      return SDValue();
+    if (Sat == VT)
       return Op;
-    return SDValue();
+    // A narrower saturation (an i8 result is promoted to i16 with an i8
+    // saturation): the convert saturating to 16 bits, then for i8 the integer
+    // clamp, instead of clamping the float against both bounds, testing it
+    // for NaN and converting (the convert gives 0 for NaN, which the clamp
+    // keeps). 2 instructions unsigned, 4 signed (one bound a mov_imm),
+    // instead of 6 / 7.
+    if (!SatConvertClamp || Sat.getSizeInBits() > 16)
+      return SDValue();
+    bool Signed = Op.getOpcode() == ISD::FP_TO_SINT_SAT;
+    SDLoc DL(Op);
+    SDValue C = DAG.getNode(Op.getOpcode(), DL, MVT::i16, Op.getOperand(0),
+                            DAG.getValueType(MVT::i16));
+    unsigned W = Sat.getSizeInBits();
+    if (W < 16) {
+      if (Signed) {
+        C = DAG.getNode(ISD::SMAX, DL, MVT::i16, C,
+                        DAG.getSignedConstant(-(int64_t(1) << (W - 1)), DL,
+                                              MVT::i16));
+        C = DAG.getNode(ISD::SMIN, DL, MVT::i16, C,
+                        DAG.getConstant((1u << (W - 1)) - 1, DL, MVT::i16));
+      } else {
+        C = DAG.getNode(ISD::UMIN, DL, MVT::i16, C,
+                        DAG.getConstant((1u << W) - 1, DL, MVT::i16));
+      }
+    }
+    return Signed ? DAG.getSExtOrTrunc(C, DL, VT) : DAG.getZExtOrTrunc(C, DL, VT);
   }
   default:
     llvm_unreachable("unexpected custom lowering");

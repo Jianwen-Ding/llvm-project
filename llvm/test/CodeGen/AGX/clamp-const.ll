@@ -1,19 +1,19 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c < %s | FileCheck %s
 
 ; maximumnum / minimumnum with a nonzero constant need no fix for zeros of
-; two signs (equal operands then have the same bits): a saturating
-; conversion to s8 clamps with one compare-select per bound.
+; two signs (equal operands then have the same bits): a clamp to [-128, 127]
+; is one compare-select per bound.
 
 ; CHECK-LABEL: s8:
 ; CHECK: fcmpsel gtn
-; CHECK-NEXT: fcmpsel ltn
-; CHECK-NEXT: convert f_to_s16
-; CHECK: stop
+; CHECK-NOT: fcmpsel eq
+; CHECK: fcmpsel ltn
+; CHECK-NOT: fcmpsel eq
+; CHECK: device_store
 define agx_kernel void @s8(ptr addrspace(1) %p, float %a) {
-  %r = call float @llvm.roundeven.f32(float %a)
-  %c = call i8 @llvm.fptosi.sat.i8.f32(float %r)
-  %f = sitofp i8 %c to float
-  store float %f, ptr addrspace(1) %p
+  %l = call float @llvm.maximumnum.f32(float %a, float -128.0)
+  %c = call float @llvm.minimumnum.f32(float %l, float 127.0)
+  store float %c, ptr addrspace(1) %p
   ret void
 }
 
