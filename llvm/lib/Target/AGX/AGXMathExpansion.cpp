@@ -76,8 +76,11 @@ public:
   /// [0, tan(pi / 8)] around 0, pi / 4 or pi / 2.
   Value *atanNonNegative(Value *A) {
     Value *Big = gt(A, 2.414213562373095), *Mid = gt(A, 0.4142135623730950);
-    Value *X = sel(Big, div(k(-1.0), A),
-                   sel(Mid, div(sub(A, k(1.0)), add(A, k(1.0))), A));
+    // One division, of the operands the range picks (-1 / a or
+    // (a - 1) / (a + 1)): a select of two divisions computed both ways.
+    Value *Q = div(sel(Big, k(-1.0), sub(A, k(1.0))),
+                   sel(Big, A, add(A, k(1.0))));
+    Value *X = sel(B.CreateOr(Big, Mid), Q, A);
     Value *Y0 = sel(Big, k(M_PI_2), sel(Mid, k(M_PI_4), k(0.0)));
     Value *Z = mul(X, X);
     Value *P = poly(Z, {8.05374449538e-2, -1.38776856032e-1, 1.99777106478e-1,
