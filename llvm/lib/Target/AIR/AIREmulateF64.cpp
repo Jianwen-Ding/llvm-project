@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // AIR has no double. A module from a front end that writes AIR directly
-// (ZLUDA's PTX path) has doubles everywhere: values, arguments, globals,
+// (a PTX front end's) has doubles everywhere: values, arguments, globals,
 // arithmetic, conversions, atomics. This pass makes it portable AIR
 // (llvm/docs/AIR/AIRHints.rst):
 //
@@ -1224,7 +1224,7 @@ void EmulateF64::replaceOperations(Function &F) {
     auto *R = dyn_cast<IntrinsicInst>(CI->getArgOperand(0));
     if (!R || !R->getType()->isDoubleTy())
       continue;
-    // (NaN tests of the rounded value, as ZLUDA's NaN-to-INT_MIN select
+    // (NaN tests of the rounded value, as a front end's NaN-to-INT_MIN select
     // makes, test the value itself: rounding keeps NaNs)
     for (User *U : make_early_inc_range(R->users()))
       if (auto *C = dyn_cast<FCmpInst>(U);
@@ -2208,7 +2208,7 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
 void EmulateF64::linkSoftF64() {
   SMDiagnostic Err;
   // Textual IR has named values, which a context that discards names (a
-  // release build's, as ZLUDA's) cannot read: names are kept while it is read.
+  // release build's) cannot read: names are kept while it is read.
   bool Discards = Ctx.shouldDiscardValueNames();
   Ctx.setDiscardValueNames(false);
   std::unique_ptr<Module> Lib = parseAssemblyString(AIRSoftF64IR, Err, Ctx);

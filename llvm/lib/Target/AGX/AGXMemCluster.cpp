@@ -18,7 +18,7 @@
 // are a base and a register index, so this clusters by program order instead.
 //
 // Device loads and stores and threadgroup stores are clustered by default,
-// in runs of up to 16. In agx-bench (agx_cost) stores alone lowered the ZLUDA
+// in runs of up to 16. In agx-bench (agx_cost) stores alone lowered the
 // PTX tests by 0.8% and agx_libs by 9.5%; the real-world CUDA kernels
 // (kernels/cuda_*.ll) showed what device loads add: decode attention -34%,
 // RGBA8 blur -28%, q4_0 / q8_0 mat-vec -10% / -5%, 3.8% in total, with only

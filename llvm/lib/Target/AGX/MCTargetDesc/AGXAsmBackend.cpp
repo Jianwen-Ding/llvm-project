@@ -24,7 +24,7 @@ static cl::opt<bool> CallRelocations(
     "agx-call-relocations", cl::init(false), cl::Hidden,
     cl::desc("Calls to functions as relocations (R_AGX_CALL32) instead of "
              "offsets resolved in the object, for a linker that places the "
-             "functions (ZLUDA's object merger, which shares one copy of "
+             "functions (an object merger, which shares one copy of "
              "the functions several kernels call)"));
 
 namespace {

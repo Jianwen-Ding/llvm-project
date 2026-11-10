@@ -355,7 +355,7 @@ if(LLVM_ENABLE_PIC)
 
   if(MLIR_ENABLE_AGX_RUNNER)
     # The CUDA wrappers built against a CUDA driver API implementation for
-    # Apple GPUs (ZLUDA's zluda_agx), without a CUDA toolkit: AGXCudaCompat
+    # Apple GPUs (on Asahi Linux), without a CUDA toolkit: AGXCudaCompat
     # declares the part of cuda.h they use. Kernels are AGX objects from
     # gpu-module-to-binary with #air.target (an AGX chip).
     if(NOT MLIR_AGX_LIBCUDA)

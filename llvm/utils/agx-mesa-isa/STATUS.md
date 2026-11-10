@@ -12,7 +12,7 @@ operand values its compiler creates. Code built this way relies only on encoding
 | MLIR | `#air.target<chip = "...", features = "+agx-strict">` (the AGX backend's feature) | Jianwen-Ding/llvm-project |
 | Fat binaries | `CHIP+agx-strict` entries from `agx-build-fatbin.py` (default; `--no-agx-strict` leaves them out) | Jianwen-Ding/llvm-project, `mlir/utils/agx-kernels` |
 | Simulator | `--agx-strict GPU` on `agx_run`, `agx_dispatch`, `agx_cost`, or `AGX_STRICT=GPU` | Jianwen-Ding/AGX-Performance-Simulator (PR #8) |
-| ZLUDA | `zoc --agx-strict`; `ZLUDA_AGX_STRICT=1` for `zluda_agx` (loads the `+agx-strict` entries) | Jianwen-Ding/ZLUDA, `docs/src/agx.md` "Strict instruction mode" |
+| PTX front end | `zoc --agx-strict`; the runtime's strict switch (loads the `+agx-strict` entries) | its `docs/src/agx.md` "Strict instruction mode" |
 | Sail | `sail/agx/gen/mesacheck.py` | Jianwen-Ding/PTX-formalization |
 
 Only G13 and G14 processors are accepted; any other is a fatal error. Every encoded instruction (objects, assembly
@@ -27,12 +27,12 @@ output and `llvm-mc`) is checked, and one Mesa would not emit is an error naming
 | lit | 59 AGX CodeGen / MC / disassembler tests |
 | codegen | every CodeGen/AGX test compiles with `+agx-strict` for agx-g13g and agx-g14c |
 | mlir | the MLIR AIR, GPU-to-AIR and module-to-binary-air-agx tests |
-| fatbin | ZLUDA's sgemm builds with `agx-g13g`, `agx-g14c` and both `+agx-strict` entries; all 8 library kernel sources build in strict mode |
+| fatbin | The agx_libs sgemm builds with `agx-g13g`, `agx-g14c` and both `+agx-strict` entries; all 8 library kernel sources build in strict mode |
 | simulator | `cargo test --release` (the strict check and its corpus tests) |
-| zluda | 388 of 388 PTX test kernels compile with `--agx-strict` |
+| ptx | 388 of 388 PTX test kernels compile with `--agx-strict` |
 | sail | the Sail model decodes every non-graphics instruction of Mesa's packed corpus: g14 440 of 440 and g13 405 of 405 (85 opcodes each) |
 
-Also measured: GEMM kernels correct on the simulator for G13, G14 and both strict entries; ZLUDA conformance on
+Also measured: GEMM kernels correct on the simulator for G13, G14 and both strict entries; PTX front end conformance on
 agx-g14c and agx-g13g identical in strict and default mode (strict FP: 282 programs, all 1,728 checks). Cost on
 agx-bench: code +6.0%, cycles +0.4%.
 

@@ -1,5 +1,5 @@
 ; The portable passes name an intrinsic's AIR function after its type, so
-; i128 helpers (ZLUDA links some into every module) arrive as air.clz.i128 or
+; i128 helpers (a PTX front end links some into every module) arrive as air.clz.i128 or
 ; air.abs.s.i128, which the AIR writer cannot write ("unhandled wide integer
 ; user 'call'"; 110 PTX-formalization programs). The Metal pipeline turns
 ; them back into the intrinsics and splits those into i64 limbs.

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Checked mode through ZLUDA: PTX kernels compiled by ZLUDA's zoc with --agx-checked, run on the AGX Performance
-Simulator's agx_run through run_checked.py (which passes the hidden arguments as ZLUDA's runtime does), with the
+"""Checked mode through a PTX front end: PTX kernels compiled by its zoc with --agx-checked, run on the AGX Performance
+Simulator's agx_run through run_checked.py (which passes the hidden arguments as the runtime does), with the
 error record compared with what the access should give. Correct kernels must report nothing and compute the same
 results as unchecked builds; unchecked builds must not report the bugs.
 
-  zluda_tests.py --zoc ZOC --llvm-build BUILD --agx-run AGX_RUN [-k NAME]
+  ptx_tests.py --zoc ZOC --llvm-build BUILD --agx-run AGX_RUN [-k NAME]
 """
 
 import argparse

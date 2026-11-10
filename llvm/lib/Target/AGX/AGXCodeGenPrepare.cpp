@@ -568,7 +568,7 @@ struct Divisor {
 };
 
 /// Divisors computed once each. A divisor that is a cheap pure expression
-/// (ZLUDA's umax(y, 1), a trunc of a 64-bit value) is rebuilt right after
+/// (a front end's umax(y, 1), a trunc of a 64-bit value) is rebuilt right after
 /// the latest of its leaves, so that copies of it in different blocks (the
 /// unrolled iterations of a loop, the fast paths of 64-bit divisions) share
 /// one reciprocal.
@@ -715,15 +715,15 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   bool IsRem = Op == Instruction::URem || Op == Instruction::SRem;
   Type *I32 = B.getInt32Ty();
   Value *X = BO.getOperand(0);
-  // umax(d, 1) (ZLUDA's guard of a PTX division, which selects its own
-  // result where d is zero): the expansion of d, whose zero divisor is
+  // umax(d, 1) (a PTX front end's guard of the division, which selects its
+  // own result where d is zero): the expansion of d, whose zero divisor is
   // replaced below by the result of dividing by one, so no maximum.
   using namespace PatternMatch;
   Value *Y0 = BO.getOperand(1), *Guarded = nullptr;
   if (!IsSigned && match(Y0, m_UMax(m_Value(Guarded), m_One())))
     Y0 = Guarded;
-  // ZLUDA's guard of a signed division, d + 1 <u 2 ? 1 : d (d = 0 and -1,
-  // whose results it selects itself): the expansion of d, as above
+  // A front end's guard of a signed division, d + 1 <u 2 ? 1 : d (d = 0 and
+  // -1, whose results it selects itself): the expansion of d, as above
   // (d = -1 ? 1 : d where d is known nonzero)
   bool GuardsZero = !IsSigned;
   if (IsSigned &&
@@ -763,7 +763,7 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
     Res = B.CreateSelect(Neg, B.CreateNeg(Res), Res);
   if (Guarded) {
     // where the uses (through at most two single-use selects of which it is
-    // the false value) select another value for d = 0, as ZLUDA's do, no
+    // the false value) select another value for d = 0, as a front end's do, no
     // select
     // (signed: and for d = -1 too)
     Value *V = &BO;
@@ -801,7 +801,7 @@ struct Guard16 {
 };
 } // namespace
 
-/// ZLUDA guards a signed division's divisor as d = -1 ? 1 : d, or as
+/// A front end guards a signed division's divisor as d = -1 ? 1 : d, or as
 /// d + 1 <u 2 ? 1 : d (d = 0 and -1), and selects its results itself there:
 /// the quotient -x and all ones, the remainder 0 and x (the remainder taken
 /// as x - q d' where DivRemPairs decomposed it). The expansion gives those
@@ -1014,7 +1014,7 @@ launchDivisorSource(Value *Y) {
     return Fr ? Fr->getOperand(0) : V;
   };
   Y = Unfrozen(Y);
-  // umax(d, 1), ZLUDA's guard of a PTX division's divisor: the launch
+  // umax(d, 1), a front end's guard of a PTX division's divisor: the launch
   // computes the values of max(d, 1) (word 2 and 3 stand for words 0 and 1
   // so guarded)
   Value *Guarded;

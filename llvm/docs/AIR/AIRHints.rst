@@ -13,7 +13,7 @@ The pipeline
 
 ::
 
-  PTX -> AIR (ZLUDA's front end, zoc --target air; the AIR target's portable passes)
+  PTX -> AIR (the PTX front end, zoc --target air; the AIR target's portable passes)
     -> agx-lower-air, the AGX backend   (llc -mtriple=agx)              AGX code
     -> the AIR target's Metal pipeline  (llc -mtriple=air -filetype=obj) lowered AIR, for Metal
 
@@ -141,7 +141,7 @@ portable form keeps them for AGX.
 Testing
 -------
 
-``llc -agx-air-native-hints=false`` (``ZLUDA_AGX_LLVM_ARGS``) makes
+``llc -agx-air-native-hints=false`` (passed through the front end's ``llc`` arguments) makes
 ``agx-lower-air`` run the emulation of the hints left (the matrix FMA), as a
 consumer without the operation would; ``-agx-air-emulate-hints=<prefixes>``
 does it for some.
@@ -149,8 +149,8 @@ does it for some.
 Results (AGX Performance Simulator, 2026-10-28)
 ================================================
 
-* Correctness, PTX-formalization (413 programs) through ZLUDA with
-  ``ZLUDA_AGX_VIA_AIR=1``: 408 pass, the direct path's result (its own
+* Correctness, PTX-formalization (413 programs) through the PTX front end
+  on the AIR route: 408 pass, the direct path's result (its own
   failures), with the matrix hint compiled natively and with it emulated.
 * Speed, agx-bench against the direct path with the same ``llc`` flags (after
   agx-bench EXPERIMENTS.md L1 to L6): cycles / throughput geomean +0.48% /

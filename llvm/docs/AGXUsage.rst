@@ -236,7 +236,7 @@ debug info, ``.debug_info``); addresses are offsets in ``.text``. Debug
 sections use the two data relocations ``R_AGX_ABS32`` and ``R_AGX_ABS64``,
 which ``llvm-dwarfdump``, ``llvm-objdump -l``, ``llvm-addr2line`` and
 ``llvm-symbolizer`` resolve, so these map an AGX PC to its source line. The
-ZLUDA runtime ignores the debug sections when loading; the AGX Performance
+runtime ignores the debug sections when loading; the AGX Performance
 Simulator's ``agx_run --lines`` names the source line of a faulting
 instruction.
 
@@ -276,7 +276,7 @@ version 1, or ``-agx-checked-table=false``) it gets the null and alignment
 checks only. The search costs about 80 instructions plus 20 per doubling of
 the number of allocations, per check. Bases are
 traced through address arithmetic, including the integer form front ends
-like ZLUDA use (``inttoptr`` of a 64-bit parameter plus an offset).
+that compile PTX use (``inttoptr`` of a 64-bit parameter plus an offset).
 
 Accesses in one basic block at constant offsets from the same base are
 checked together, once, before the first of them, and an access whose bytes
@@ -329,7 +329,7 @@ memory and global data buffers), sorted by first byte, not overlapping, and
 8-byte aligned. The record gets a last extension, ``3, table half, count
 half``; a runtime of version 1, which stops at an extension it does not know,
 leaves the count 0. The table must not change while a launch that uses it
-runs (ZLUDA copies it into the launch's staging memory).
+runs (a runtime may copy it into the launch's staging memory).
 
 The *error record* is 64 bytes of device memory, 8-byte aligned, zeroed by
 the runtime:
@@ -361,11 +361,11 @@ after the launch has finished. It keeps the error until the context is reset
 <file>:<line>:<column>``, the innermost (inlined) one first, from the debug
 locations. Without debug information the frame is the kernel's name.
 
-ZLUDA's ``zluda_agx`` implements the runtime side (``zoc --agx-checked``,
-``ZLUDA_AGX_CHECKED=1``; its ``docs/src/agx.md``, "Checked mode").
+A CUDA translation layer's runtime implements the runtime side (with its PTX
+compiler's ``zoc --agx-checked``).
 ``llvm/utils/agx-checked/run_checked.py`` does the same for the AGX
 Performance Simulator's ``agx_run``; ``checked_tests.py`` (IR kernels) and
-``zluda_tests.py`` (PTX through ``zoc``) check on it that each bug is reported
+``ptx_tests.py`` (PTX through ``zoc``) check on it that each bug is reported
 with the right fields and that correct kernels are unchanged.
 
 Occupancy attributes
@@ -452,8 +452,8 @@ the driver must provide::
   // threadgroup memory: 0 bytes
   // stack size: 0 bytes
 
-Arguments passed by reference (``ptr addrspace(4) byref(T)``, as ZLUDA emits
-PTX ``.param`` arguments) whose every use is a load at a constant offset are
+Arguments passed by reference (``ptr addrspace(4) byref(T)``, as front ends
+emit PTX ``.param`` arguments) whose every use is a load at a constant offset are
 passed by value: their bytes occupy consecutive uniform registers (in 64-bit
 parts and a last 32-bit one) and the loads read the registers. Other
 by-reference arguments, and those that do not fit in what is left of the 1 KiB
@@ -511,7 +511,7 @@ The extensions are:
   ``2^32 * (2^l - d) / d + 1`` (truncated to 32 bits), kind 1 is
   ``min(l, 1)`` and kind 2 is ``max(l, 1) - 1``; kinds 3, 4 and 5 are the
   same of ``|d|`` (a signed divisor), and kinds 6, 7 and 8 the same of
-  ``max(d, 1)`` (ZLUDA's guard of a PTX division's divisor). All are 0 for
+  ``max(d, 1)`` (a PTX front end's guard of the division's divisor). All are 0 for
   ``d = 0``. The kernel
   divides as ``q = (t + ((x - t) >> s1)) >> s2``, ``t = mulhi(x, m)``,
   exact for every 32-bit ``x`` (Granlund and Montgomery, "Division by
@@ -777,7 +777,7 @@ SIMD-group may recurse to different depths. The stack is
 module flag ``!{i32 2, !"agx-stack-size", i32 N}``, else 4096), part of the
 kernel's private memory. A thread whose call would pass its end stores 1 to
 ``__agx_stack_overflow``, a 32-bit global of device memory that is 0 at load,
-and ends; the runtime reports the launch as failed (ZLUDA's ``zluda_agx``
+and ends; the runtime reports the launch as failed (a CUDA driver
 gives ``CUDA_ERROR_LAUNCH_FAILED``) and clears the word.
 
 .. _agx-apple9:
@@ -1155,12 +1155,12 @@ above) to an AGX object.
   $ mlir-opt kernel.mlir --pass-pipeline='builtin.module(air-attach-target{chip=agx-g14g},gpu.module(arith-emulate-f64,convert-gpu-to-air),gpu-module-to-binary)'
 
 Host code from ``gpu-to-llvm`` calls MLIR's GPU runtime wrappers (``mgpu*``).
-With ``-DMLIR_ENABLE_AGX_RUNNER=ON -DMLIR_AGX_LIBCUDA=<ZLUDA's
-libnvcuda_agx.so>``, ``mlir_agx_runtime`` is ``CudaRuntimeWrappers.cpp`` built
+With ``-DMLIR_ENABLE_AGX_RUNNER=ON -DMLIR_AGX_LIBCUDA=<the
+driver's libnvcuda_agx.so>``, ``mlir_agx_runtime`` is ``CudaRuntimeWrappers.cpp`` built
 without a CUDA toolkit (``lib/ExecutionEngine/AGXCudaCompat/cuda.h`` declares
-the part of the driver API it uses) against ZLUDA's CUDA driver for Asahi
+the part of the driver API it uses) against the CUDA driver for Asahi
 Linux, so ``mlir-runner --shared-libs=libmlir_agx_runtime.so`` runs
-``gpu.launch_func`` on the GPU with ZLUDA's tracing: launch records and fault
+``gpu.launch_func`` on the GPU with the driver's tracing: launch records and fault
 dumps, and with ``#air.target<chip = ..., features = "+agx-checked">`` checked
 mode, whose reports name the ``.mlir`` lines when the kernels have debug
 locations (``-ensure-debug-info-scope-on-llvm-func`` and

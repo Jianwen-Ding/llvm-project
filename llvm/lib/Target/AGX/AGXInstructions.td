@@ -321,8 +321,16 @@ def : Pat<(i32 (sub AGXIntSrc32:$a, (shl AGXIntSrc32:$b, agx_iadd_shift:$s))),
 
 def : Pat<(i32 (sext i16:$a)), (IADD_I32_FROM16 MOD_SX, $a, 0, (i16 0), 0)>;
 def : Pat<(i64 (sext i32:$a)), (IADD_I64_FROM32 MOD_SX, $a, 0, (i32 0), 0)>;
-def : Pat<(i64 (zext i32:$a)), (IADD_I64_FROM32 0, $a, 0, (i32 0), 0)>;
-def : Pat<(i64 (anyext i32:$a)), (IADD_I64_FROM32 0, $a, 0, (i32 0), 0)>;
+// A 32-bit value widened: the value itself as the low half and a zero (or,
+// for anyext, nothing) as the high one, so that a widened value whose high
+// half no instruction reads costs nothing: the low half coalesces with the
+// value, and dead-lane detection drops the zero. (A 64-bit iadd of the value
+// and 0 cannot be split, and an index value widened in one block and used as
+// 32 bits in others kept both an instruction and a register pair.)
+def : Pat<(i64 (zext i32:$a)),
+          (REG_SEQUENCE GPR64, $a, sub0, (MOV_IMM32 0), sub1)>;
+def : Pat<(i64 (anyext i32:$a)),
+          (REG_SEQUENCE GPR64, $a, sub0, (i32 (IMPLICIT_DEF)), sub1)>;
 def : Pat<(i64 (zext i16:$a)),
           (IADD_I64_FROM32 0, (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0)), 0,
                            (i32 0), 0)>;

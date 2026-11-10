@@ -1,5 +1,5 @@
 ; A module that asks for IEEE binary32 arithmetic (the module flag
-; air.ieee-fp32, as ZLUDA's strict floating point mode writes it) gets AGX's
+; air.ieee-fp32, as a PTX front end's strict floating point mode writes it) gets AGX's
 ; ieee-fp32 feature in its functions whatever the target machine's features:
 ; the bfloat addition, whose AIR emulation agx-lower-air restores as one
 ; operation, keeps denormals (it is computed exactly, not on the flushing f32

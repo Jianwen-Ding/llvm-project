@@ -17,7 +17,7 @@ It compares the results with `baseline.json` and exits with 1 on a regression. R
 python3 llvm/utils/agx-bench/agx-bench.py --llc build/bin/llc \
     --cost AGX-Performance-Simulator/rust/target/release/agx_cost
 python3 ... --update                       # accept the new numbers
-python3 ... --zoc ZLUDA/target/debug/zoc --ptx ZLUDA/ptx/src/test/*.ptx   # also PTX through ZLUDA
+python3 ... --zoc PTX_FRONTEND/target/debug/zoc --ptx PTX_FRONTEND/ptx/src/test/*.ptx   # also PTX through zoc
 ```
 
 The kernels in `kernels/` cover the common shapes of CUDA code:
@@ -31,11 +31,19 @@ The kernels in `kernels/` cover the common shapes of CUDA code:
 | `histogram` | threadgroup and device atomics |
 | `scan` | SIMD prefix |
 | `softmax_row` | SIMD reductions + `exp` |
-| `matrixmul` | CUDA samples matrixMul through ZLUDA: threadgroup tiles, barriers, unrolled FMAs |
+| `matrixmul` | CUDA samples matrixMul through zoc: threadgroup tiles, barriers, unrolled FMAs |
+| `int8_dp4a_gemv` | quantized GEMV: int8 weights and activations four to a word (`__dp4a` as sext / mul / reduce), an i32 SIMD-group sum per row |
+| `gemv_f16` | LLM decode GEMV in f16: half2 loads, float fmas, a SIMD-group per row |
+| `bitonic_simd32` | bitonic sort of 32 keys in registers: 15 shuffle-xor compare-exchange steps (warp sort, top-k) |
+| `block_scan_simd` | threadgroup inclusive scan from SIMD-group prefixes and a threadgroup array of SIMD-group totals |
+| `bilinear_resize` | image resize, bilinear (align_corners = false): 2-D grid, float to int, clamped neighbours, two lerps |
+
+The last five are hand-written IR whose results were checked on the simulator's functional runner (`agx_run`) against
+NumPy.
 
 `kernels/cuda_*.ll` are real-world CUDA kernels written for this suite (`cuda/*.cu`), compiled to PTX by clang's NVPTX
-target (no CUDA toolkit: `cuda/bench.h` declares what they use) and to AGX IR by ZLUDA's zoc. `cuda/gen.py --zoc
-ZLUDA/target/debug/zoc` regenerates them. Every one is costed with launch inputs (sizes, grid, memory contents where
+target (no CUDA toolkit: `cuda/bench.h` declares what they use) and to AGX IR by the PTX front end's zoc. `cuda/gen.py --zoc
+PTX_FRONTEND/target/debug/zoc` regenerates them. Every one is costed with launch inputs (sizes, grid, memory contents where
 control flow depends on them):
 
 | Area | Kernels |

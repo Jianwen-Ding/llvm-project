@@ -67,7 +67,7 @@ using namespace llvm;
 cl::opt<bool> llvm::AIRLookupTables(
     "air-lookup-tables", cl::init(true), cl::Hidden,
     cl::desc("Let SimplifyCFG turn switches into lookup tables in AIR "
-             "(off: ZLUDA_AGX_LOOKUP_TABLES=0 in zoc, an experiment)"));
+             "(off in zoc: an experiment)"));
 
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAIRTarget() {
   RegisterTargetMachine<AIRTargetMachine> X(getTheAIRTarget());
@@ -183,6 +183,11 @@ public:
     // Must run BEFORE AIRSystemValues so that !air.kernel metadata is
     // emitted against the post-packing signature.
     addPass(createAIRScalarBufferPackingLegacyPass());
+    // The kernels with an argument buffer keep their scalars out of
+    // _scalar_buf: each takes a constant buffer, after the argument buffer,
+    // so that !air.kernel describes it.
+    addPass(createAIRScalarArgsToConstantBuffersLegacyPass(
+        /*ArgumentBufferKernelsOnly=*/true));
     addPass(createAIRSystemValuesLegacyPass());
     // Emit Apple-style alias-scope MD + "air-buffer-no-alias" param attrs
     // after the IR shape is final but before final normalisations.
@@ -234,7 +239,10 @@ static cl::opt<bool> AIRPortable(
 void llvm::addAIRPortablePasses(legacy::PassManagerBase &PM) {
   PM.add(createAIRFromGenericGPULegacyPass());
   PM.add(createAIREmulateF64LegacyPass());
-  PM.add(createAIRNaNMinMaxLegacyPass());
+  // air.fmin/fmax are minnum/maxnum (AGXLowerAIR's inverse mapping), which
+  // do not order signed zeros: llvm.minimum/maximum need the zero select
+  // here as on Metal.
+  PM.add(createAIRNaNMinMaxLegacyPass(/*SignedZeros=*/true));
   PM.add(createLLVMToAIRIntrinsicsLegacyPass());
   PM.add(createAIRBarrierRenameLegacyPass());
   PM.add(createAIRLowerAtomicRMWLegacyPass(/*OrderingHints=*/true));

@@ -8,7 +8,7 @@
 //
 // The declarations of the CUDA driver API that CudaRuntimeWrappers.cpp uses,
 // so that the wrappers build without a CUDA toolkit against a driver that
-// implements the API, such as ZLUDA's zluda_agx on Asahi Linux
+// implements the API, such as the CUDA driver for Asahi Linux
 // (MLIR_ENABLE_AGX_RUNNER). The values and layouts are those of the driver
 // ABI. Functions that the ABI versions are declared under their versioned
 // symbol names, as the driver exports them.

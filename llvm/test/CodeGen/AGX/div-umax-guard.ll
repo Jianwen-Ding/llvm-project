@@ -1,6 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c < %s | FileCheck %s
 
-; A division by umax(d, 1) (ZLUDA's guard, with its own select for d = 0):
+; A division by umax(d, 1) (a PTX front end's guard, with its own select for d = 0):
 ; the expansion's reciprocal is of d, with no maximum, and where the only use
 ; is that select, no select of its own: one compare-select for d = 0.
 
@@ -31,7 +31,7 @@ define agx_kernel void @ur2(ptr addrspace(1) %p, i32 %a, i32 %b) {
   ret void
 }
 
-; The signed guard, d + 1 <u 2 ? 1 : d, with ZLUDA's selects for d = -1 and
+; The signed guard, d + 1 <u 2 ? 1 : d, with a front end's selects for d = -1 and
 ; d = 0: the expansion of d with no select of its own (one compare-select
 ; each for d = -1 and d = 0, after the quotient's sign).
 ; CHECK-LABEL: sd:

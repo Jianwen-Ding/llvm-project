@@ -52,7 +52,7 @@ public:
   // -air-lookup-tables=false: no switch lookup tables (constant arrays). On
   // AGX they are in the module's global data, where they move the device
   // variables of a single-kernel recompilation; zoc keeps them by default (the
-  // table loads beat the select chains: ZLUDA's AIR_EXPERIMENTS 2026-11-07).
+  // table loads beat the select chains: front end experiments, 2026-11-07).
   bool shouldBuildLookupTables() const override { return AIRLookupTables; }
   ValueUniformity getValueUniformity(const Value *V) const override {
     if (const auto *CI = dyn_cast<CallInst>(V)) {

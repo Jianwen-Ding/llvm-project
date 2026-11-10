@@ -34,7 +34,7 @@ define agx_kernel void @udiv16c(ptr addrspace(1) %p, i16 %a) {
   ret void
 }
 
-; ZLUDA's guards of a signed division (d = -1 ? 1 : d, or d + 1 <u 2 ? 1 : d,
+; A PTX front end's guards of a signed division (d = -1 ? 1 : d, or d + 1 <u 2 ? 1 : d,
 ; and selects of -x / all ones, 0 / x): the expansion divides by d itself,
 ; which gives those values, so neither the guard nor the selects remain.
 ; The conversions read the narrow values.
@@ -77,14 +77,14 @@ define agx_kernel void @srem8_guard(ptr addrspace(1) %p, i8 %a, i8 %b) {
   ret void
 }
 
-; ZLUDA's div and rem of one pair after DivRemPairs: one select (d = 0's
+; A PTX front end's div and rem of one pair after DivRemPairs: one select (d = 0's
 ; quotient)
-; CHECK-LABEL: sdivrem16_zluda:
+; CHECK-LABEL: sdivrem16_guarded:
 ; CHECK-NOT: iadd
 ; CHECK: icmpsel ueq, {{.*}}, 0,
 ; CHECK-NOT: icmpsel
 ; CHECK: stop
-define agx_kernel void @sdivrem16_zluda(ptr addrspace(1) %p, i16 %a, i16 %b) {
+define agx_kernel void @sdivrem16_guarded(ptr addrspace(1) %p, i16 %a, i16 %b) {
   %z = icmp eq i16 %b, 0
   %m1 = icmp eq i16 %b, -1
   %b1 = add i16 %b, 1

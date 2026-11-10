@@ -126,8 +126,8 @@ ModulePass *llvm::createAGXCheckedAccessesPass(const AGXTargetMachine *TM) {
 
 static Base findBase(const Value *Ptr, const DataLayout &DL, unsigned Depth = 0);
 
-/// The base of a 64-bit integer that becomes a pointer: front ends like ZLUDA
-/// load PTX pointer parameters as i64 and add offsets before inttoptr.
+/// The base of a 64-bit integer that becomes a pointer: front ends that
+/// compile PTX load pointer parameters as i64 and add offsets before inttoptr.
 static Base findIntBase(const Value *V, const DataLayout &DL, unsigned Depth) {
   if (Depth > 16)
     return Base();

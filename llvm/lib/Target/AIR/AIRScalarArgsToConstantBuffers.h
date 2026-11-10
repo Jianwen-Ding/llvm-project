@@ -37,8 +37,15 @@ public:
 class AIRScalarArgsToConstantBuffersLegacy : public ModulePass {
 public:
   bool runOnModule(Module &M) override;
-  AIRScalarArgsToConstantBuffersLegacy() : ModulePass(ID) {}
+  /// With \p ArgumentBufferKernelsOnly, only the kernels whose buffers
+  /// air-argument-buffer packed (Metal's pipeline, where
+  /// air-scalar-buffer-packing leaves them out).
+  AIRScalarArgsToConstantBuffersLegacy(bool ArgumentBufferKernelsOnly = false)
+      : ModulePass(ID), ArgumentBufferKernelsOnly(ArgumentBufferKernelsOnly) {}
   static char ID;
+
+private:
+  bool ArgumentBufferKernelsOnly;
 };
 
 } // namespace llvm

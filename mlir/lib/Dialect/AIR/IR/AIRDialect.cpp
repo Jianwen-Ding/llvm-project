@@ -11,6 +11,8 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/OpDefinition.h"
+#include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
@@ -78,6 +80,62 @@ static void printMatrixMMATypes(OpAsmPrinter &printer, Operation *, Type a,
   printer << a;
   if (a != c)
     printer << ", " << c;
+}
+
+namespace {
+/// An element-wise operation (arith, math: ElementwiseMappable) whose matrix
+/// operands are all fills is the fill of the operation on their values,
+/// since every element of a fill is its value: one scalar operation and one
+/// fill instead of an operation on the thread's elements of each matrix (and
+/// a fill per operand). For example
+///   %a = air.simdgroup_matrix_fill %x : vector<64xf32>
+///   %b = air.simdgroup_matrix_fill %y : vector<64xf32>
+///   %c = arith.addf %a, %b : vector<64xf32>
+/// is
+///   %s = arith.addf %x, %y : f32
+///   %c = air.simdgroup_matrix_fill %s : vector<64xf32>
+/// and the same for arith.extf / arith.truncf of a fill.
+struct ElementwiseOfFills : RewritePattern {
+  ElementwiseOfFills(MLIRContext *ctx)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/1, ctx) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (!op->hasTrait<OpTrait::Elementwise>() || op->getNumResults() != 1 ||
+        op->getNumRegions() != 0 || isa<MatrixFillOp>(op))
+      return failure();
+    auto resultType = dyn_cast<VectorType>(op->getResult(0).getType());
+    if (!resultType || resultType.getShape() != ArrayRef<int64_t>{64} ||
+        resultType.isScalable() ||
+        !isa<Float16Type, BFloat16Type, Float32Type>(
+            resultType.getElementType()))
+      return failure();
+    SmallVector<Value> scalars;
+    bool anyFill = false;
+    for (Value operand : op->getOperands()) {
+      if (auto fill = operand.getDefiningOp<MatrixFillOp>()) {
+        scalars.push_back(fill.getValue());
+        anyFill = true;
+      } else if (!isa<ShapedType>(operand.getType())) {
+        scalars.push_back(operand); // a scalar operand (a select's condition)
+      } else {
+        return failure();
+      }
+    }
+    if (!anyFill)
+      return failure();
+    OperationState state(op->getLoc(), op->getName(), scalars,
+                         {resultType.getElementType()}, op->getAttrs());
+    Operation *scalar = rewriter.create(state);
+    rewriter.replaceOpWithNewOp<MatrixFillOp>(op, resultType,
+                                              scalar->getResult(0));
+    return success();
+  }
+};
+} // namespace
+
+void AIRDialect::getCanonicalizationPatterns(RewritePatternSet &results) const {
+  results.add<ElementwiseOfFills>(getContext());
 }
 
 #define GET_OP_CLASSES

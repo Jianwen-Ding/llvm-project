@@ -169,7 +169,8 @@ void initializeAIRScalarArgsToConstantBuffersLegacyPass(PassRegistry &);
 
 /// Pass to turn each by-value scalar kernel argument into a constant buffer
 /// argument holding it (AIR's form of a scalar argument).
-ModulePass *createAIRScalarArgsToConstantBuffersLegacyPass();
+ModulePass *
+createAIRScalarArgsToConstantBuffersLegacyPass(bool ArgumentBufferKernelsOnly = false);
 
 /// Initializer for the AIR alias-metadata annotate pass.
 void initializeAIRAliasAnnotateLegacyPass(PassRegistry &);

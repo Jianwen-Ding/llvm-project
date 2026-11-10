@@ -54,7 +54,7 @@ Verification so far
   ``.metallib`` and ``.air`` files in ``Metal.jl/test/metallib`` are built
   from ``.metal`` sources with Apple's toolchain and are deliberately unused.
 
-* ZLUDA's ``.ptx -> .air`` (2026-11-05, M2 Max, ``--strict-fp --zero-shared``,
+* The PTX front end's ``.ptx -> .air`` (2026-11-05, M2 Max, ``--strict-fp --zero-shared``,
   ``air_agx_diff.py``, PTX-formalization 2c9bc2b): of 841 programs, 823 give the simulator's
   results. ``legal-forms`` differs only in the bytes of a symbol's address, which it does not
   check. ``tc-94b-3`` is past the 5 s compile limit. Sixteen cannot be compared with this harness:
@@ -62,7 +62,7 @@ Verification so far
   initializers. On the simulator, all 841 pass every ``.expect``.
 * Since then, with ``air_ptx_formalization_check.py``: ``addr32``, ``addr32-generic``, ``multimem``,
   ``fabric``, ``fabric-mm-counted`` and ``optype-ext`` pass, the last four with
-  ``LLVMZludaAirTablesInGlobals`` in place of the fixed table addresses.
+  the front end's tables in globals in place of the fixed table addresses.
 * Those results are for strict mode. Without ``--strict-fp`` f32 follows the GPU (denormals
   flushed, NaNs as they come), by design.
 
@@ -115,17 +115,17 @@ Blockers
 A thread that polls can starve one in its SIMD-group
 ------------------------------------------------------
 
-*What:* threads of a SIMD-group run under one mask, so while one polls, the others wait. ZLUDA
+*What:* threads of a SIMD-group run under one mask, so while one polls, the others wait. The PTX front end
 keeps ``if (rank == 1) write; if (rank == 0) poll`` in order with volatile copies of the branch
 conditions (``async-generic``), but a thread that polls for what another writes *after* that
 thread's own poll has no such order. Confirmed on an M2 Max with polls bounded at 100,000: without
 the fix below, with the poll and the write on the two sides of a branch, in either order, the poller
 never sees the write.
 
-*Fixed:* when one side of a branch waits and the other does not, ZLUDA's module for Metal runs the
+*Fixed:* when one side of a branch waits and the other does not, the front end's module for Metal runs the
 other side first, and when the other side is empty, what follows the branch, in a copy of its own up
-to the first barrier or SIMD-group function, where all threads meet again (``zludaRunWaitersLast``). Threads that wait for each other take turns block by block in one loop with
-a single branch back to its head (``zludaRunThreadsInTurn``).
+to the first barrier or SIMD-group function, where all threads meet again. Threads that wait for each other take turns block by block in one loop with
+a single branch back to its head.
 
 **Still open:** a write after that barrier or SIMD-group function, or more than 4,096 instructions
 before it; threads that wait for each other in a function over 64 blocks or 1,024 instructions, or

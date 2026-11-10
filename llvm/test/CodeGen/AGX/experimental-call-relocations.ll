@@ -2,7 +2,7 @@
 ; RUN:   | llvm-readelf -r -s - | FileCheck %s
 ; With -agx-call-relocations a call to a function is a relocation (type 3,
 ; R_AGX_CALL32: S + A - P + 2 into the call's 32-bit field, two bytes into the
-; instruction), for a linker that places the functions (ZLUDA's object merger);
+; instruction), for a linker that places the functions (an object merger);
 ; branches within a function stay resolved.
 
 ; CHECK: Relocation section '.rela.text'

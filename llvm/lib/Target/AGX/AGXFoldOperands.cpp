@@ -20,11 +20,17 @@
 #include "AGXSubtarget.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "agx-fold-operands"
+
+static cl::opt<bool> FoldSharedBranchCompares(
+    "agx-fold-shared-branch-compares",
+    cl::desc("Fold a comparison that only branches use into each branch"),
+    cl::init(true), cl::Hidden);
 
 namespace {
 
@@ -129,43 +135,101 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
   }
 
   // Branch on a comparison directly: an AGX_IF / AGX_LOOP whose condition is
-  // the only use of "icmpsel cc, a, b, T, F" with constant T and F, one of
-  // them zero, takes the comparison itself (inverted when T is the zero).
-  for (MachineBasicBlock &MBB : MF) {
-    MachineBasicBlock::iterator T = MBB.getFirstTerminator();
-    if (T == MBB.end())
-      continue;
-    MachineInstr &Br = *T;
-    bool Loop = Br.getOpcode() == AGX::AGX_LOOP;
-    if (!Loop && Br.getOpcode() != AGX::AGX_IF)
-      continue;
-    Register Cond = Br.getOperand(0).getReg();
-    if (!Cond.isVirtual() || !MRI.hasOneNonDBGUse(Cond))
-      continue;
-    MachineInstr *Def = MRI.getVRegDef(Cond);
-    if (!Def || Def->getParent() != &MBB)
-      continue;
+  // "icmpsel cc, a, b, T, F" with constant T and F, one of them zero, takes
+  // the comparison itself (inverted when T is the zero), where it is the only
+  // use in the branch's block, or where every use of it is such a branch and
+  // it reads at most one general register (the others immediates or
+  // uniforms), so that the branches keep that register live instead of the
+  // condition (MachineCSE gives two blocks' "lane == 0" branches one
+  // icmpsel, which they then test for nonzero).
+  auto Foldable = [&](const MachineInstr *Def) {
+    if (!Def)
+      return false;
     bool Float = Def->getOpcode() == AGX::FCMPSEL_F32;
     if (!Float && Def->getOpcode() != AGX::ICMPSEL_I32)
-      continue;
+      return false;
     // (dst, cc, src0_mods, src0, src1_mods, src1, src2_mods, src2, src3_mods,
     //  src3)
     const MachineOperand &X = Def->getOperand(7), &Y = Def->getOperand(9);
-    if (!X.isImm() || !Y.isImm() || Def->getOperand(6).getImm() ||
-        Def->getOperand(8).getImm() || (X.getImm() == 0) == (Y.getImm() == 0))
-      continue;
+    return X.isImm() && Y.isImm() && !Def->getOperand(6).getImm() &&
+           !Def->getOperand(8).getImm() &&
+           (X.getImm() == 0) != (Y.getImm() == 0);
+  };
+  auto IsCondBranch = [](const MachineInstr &MI) {
+    return MI.getOpcode() == AGX::AGX_IF || MI.getOpcode() == AGX::AGX_LOOP;
+  };
+  auto FoldInto = [&](MachineInstr &Br, MachineInstr &Def) {
+    bool Loop = Br.getOpcode() == AGX::AGX_LOOP;
+    bool Float = Def.getOpcode() == AGX::FCMPSEL_F32;
     // A nonzero condition takes the if / breaks the loop.
-    unsigned CC = Def->getOperand(1).getImm() ^ (X.getImm() ? 0 : 8);
+    unsigned CC =
+        Def.getOperand(1).getImm() ^ (Def.getOperand(7).getImm() ? 0 : 8);
     unsigned Opc = Loop ? (Float ? AGX::AGX_LOOP_FCMP : AGX::AGX_LOOP_ICMP)
                         : (Float ? AGX::AGX_IF_FCMP : AGX::AGX_IF_ICMP);
-    BuildMI(MBB, Br, Br.getDebugLoc(), TII->get(Opc))
-        .addImm(CC)
-        .add(Def->getOperand(2))
-        .add(Def->getOperand(3))
-        .add(Def->getOperand(4))
-        .add(Def->getOperand(5))
-        .add(Br.getOperand(1));
+    MachineInstrBuilder B =
+        BuildMI(*Br.getParent(), Br, Br.getDebugLoc(), TII->get(Opc))
+            .addImm(CC);
+    for (unsigned I = 2; I <= 5; ++I) {
+      MachineOperand Op = Def.getOperand(I);
+      if (Op.isReg())
+        Op.setIsKill(false);
+      B.add(Op);
+    }
+    B.add(Br.getOperand(1));
     Br.eraseFromParent();
+  };
+  SmallVector<MachineInstr *, 8> Defs;
+  for (MachineBasicBlock &MBB : MF) {
+    MachineBasicBlock::iterator T = MBB.getFirstTerminator();
+    if (T == MBB.end() || !IsCondBranch(*T))
+      continue;
+    Register Cond = T->getOperand(0).getReg();
+    if (!Cond.isVirtual())
+      continue;
+    MachineInstr *Def = MRI.getVRegDef(Cond);
+    if (!Foldable(Def))
+      continue;
+    if (MRI.hasOneNonDBGUse(Cond) && Def->getParent() == &MBB) {
+      FoldInto(*T, *Def);
+      Def->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    if (!is_contained(Defs, Def))
+      Defs.push_back(Def);
+  }
+  for (MachineInstr *Def : FoldSharedBranchCompares ? Defs
+                                                     : SmallVector<MachineInstr *, 8>()) {
+    Register Cond = Def->getOperand(0).getReg();
+    unsigned GPRs = 0;
+    bool Ok = true;
+    for (unsigned I : {3, 5}) {
+      const MachineOperand &Op = Def->getOperand(I);
+      if (!Op.isReg())
+        continue;
+      if (Op.getReg().isVirtual())
+        ++GPRs;
+      else if (!AGX::getRegInfo(Op.getReg(), *TRI).isUniform())
+        Ok = false;
+    }
+    if (!Ok || GPRs > 1)
+      continue;
+    SmallVector<MachineInstr *, 4> Branches;
+    for (MachineInstr &UseMI : MRI.use_nodbg_instructions(Cond)) {
+      if (!IsCondBranch(UseMI) || &*UseMI.getParent()->getFirstTerminator() !=
+                                      &UseMI) {
+        Ok = false;
+        break;
+      }
+      Branches.push_back(&UseMI);
+    }
+    if (!Ok)
+      continue;
+    for (unsigned I : {3, 5})
+      if (Def->getOperand(I).isReg() && Def->getOperand(I).getReg().isVirtual())
+        MRI.clearKillFlags(Def->getOperand(I).getReg());
+    for (MachineInstr *Br : Branches)
+      FoldInto(*Br, *Def);
     Def->eraseFromParent();
     Changed = true;
   }

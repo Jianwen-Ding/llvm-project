@@ -1,0 +1,314 @@
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=agx-lower-control-flow -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=agx-lower-control-flow -agx-merge-barrier-fences-across-alu=0 %s -o - | FileCheck %s --check-prefix=OFF
+
+# The scheduler put register-only instructions between the fence before the
+# threadgroup barrier, the barrier and the fence after: the fence after still
+# goes. A threadgroup load between them keeps it. A fence right after the
+# same fence goes too.
+# CHECK-LABEL: name: exchange
+# CHECK:       MEMORY_BARRIER 1, 2, 9
+# CHECK-NEXT:  IADD_I32
+# CHECK-NEXT:  THREADGROUP_BARRIER
+# CHECK-NEXT:  BITOP_I32
+# CHECK-NOT:   MEMORY_BARRIER
+# CHECK:       LOCAL_LOAD_32
+# CHECK-LABEL: name: load_between
+# CHECK:       THREADGROUP_BARRIER
+# CHECK-NEXT:  LOCAL_LOAD_32
+# CHECK-NEXT:  MEMORY_BARRIER 1, 2, 9
+# CHECK-LABEL: name: twice
+# CHECK:       MEMORY_BARRIER 1, 2, 9
+# CHECK-NEXT:  IADD_I32
+# CHECK-NEXT:  THREADGROUP_BARRIER
+# OFF-LABEL:   name: exchange
+# OFF:         THREADGROUP_BARRIER
+# OFF-NEXT:    BITOP_I32
+# OFF-NEXT:    MEMORY_BARRIER 1, 2, 9
+
+--- |
+  ; ModuleID = 'barrier-fences-alu.mir'
+  source_filename = "barrier-fences-alu.mir"
+  target datalayout = "e-m:e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-i1:8-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-v16:16-v32:32-v64:64-v96:32-v128:128-n16:32:64-S32-A5-G1"
+  target triple = "agx"
+  
+  @tg = internal addrspace(3) global [64 x i32] poison, align 4
+  
+  ; Function Attrs: nocallback nofree nosync nounwind speculatable willreturn memory(none)
+  declare noundef i32 @llvm.agx.thread.position.in.threadgroup.x() #0
+  
+  ; Function Attrs: convergent nocallback nofree nounwind willreturn
+  declare void @llvm.agx.threadgroup.barrier() #1
+  
+  define agx_kernel void @exchange(ptr addrspace(1) %out, i32 %v) #2 {
+    %t = call range(i32 0, 1024) i32 @llvm.agx.thread.position.in.threadgroup.x()
+    %m = and i32 %t, 63
+    %p = getelementptr i32, ptr addrspace(3) @tg, i32 %m
+    store i32 %v, ptr addrspace(3) %p, align 4
+    fence syncscope("workgroup") release
+    call void @llvm.agx.threadgroup.barrier()
+    fence syncscope("workgroup") acquire
+    %n = xor i32 %m, 1
+    %q = getelementptr i32, ptr addrspace(3) @tg, i32 %n
+    %x = load i32, ptr addrspace(3) %q, align 4
+    %o = getelementptr i32, ptr addrspace(1) %out, i32 %t
+    store i32 %x, ptr addrspace(1) %o, align 4
+    ret void
+  }
+  
+  define agx_kernel void @load_between(ptr addrspace(1) %out, i32 %v) #2 {
+    %t = call range(i32 0, 1024) i32 @llvm.agx.thread.position.in.threadgroup.x()
+    %m = and i32 %t, 63
+    %p = getelementptr i32, ptr addrspace(3) @tg, i32 %m
+    store i32 %v, ptr addrspace(3) %p, align 4
+    fence syncscope("workgroup") release
+    call void @llvm.agx.threadgroup.barrier()
+    fence syncscope("workgroup") acquire
+    %n = xor i32 %m, 1
+    %q = getelementptr i32, ptr addrspace(3) @tg, i32 %n
+    %x = load i32, ptr addrspace(3) %q, align 4
+    %o = getelementptr i32, ptr addrspace(1) %out, i32 %t
+    store i32 %x, ptr addrspace(1) %o, align 4
+    ret void
+  }
+
+  define agx_kernel void @twice(ptr addrspace(1) %out, i32 %v) #2 {
+    %t = call range(i32 0, 1024) i32 @llvm.agx.thread.position.in.threadgroup.x()
+    %m = and i32 %t, 63
+    %p = getelementptr i32, ptr addrspace(3) @tg, i32 %m
+    store i32 %v, ptr addrspace(3) %p, align 4
+    fence syncscope("workgroup") release
+    call void @llvm.agx.threadgroup.barrier()
+    fence syncscope("workgroup") acquire
+    %n = xor i32 %m, 1
+    %q = getelementptr i32, ptr addrspace(3) @tg, i32 %n
+    %x = load i32, ptr addrspace(3) %q, align 4
+    %o = getelementptr i32, ptr addrspace(1) %out, i32 %t
+    store i32 %x, ptr addrspace(1) %o, align 4
+    ret void
+  }
+
+  attributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) "target-cpu"="agx-g14c" }
+  attributes #1 = { convergent nocallback nofree nounwind willreturn "target-cpu"="agx-g14c" }
+  attributes #2 = { "target-cpu"="agx-g14c" }
+...
+---
+name:            exchange
+alignment:       2
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+failedISel:      false
+tracksRegLiveness: true
+hasWinCFI:       false
+noPhis:          true
+isSSA:           false
+noVRegs:         true
+hasFakeUses:     false
+callsEHReturn:   false
+callsUnwindInit: false
+hasEHContTarget: false
+hasEHScopes:     false
+hasEHFunclets:   false
+isOutlined:      false
+debugInstrRef:   false
+failsVerification: false
+tracksDebugUserValues: true
+registers:       []
+liveins:
+  - { reg: '$u0_u1', virtual-reg: '' }
+  - { reg: '$u2', virtual-reg: '' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    1
+  adjustsStack:    false
+  hasCalls:        false
+  framePointerPolicy: none
+  stackProtector:  ''
+  functionContext: ''
+  maxCallFrameSize: 4294967295
+  cvBytesOfCalleeSavedRegisters: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+  hasTailCall:     false
+  isCalleeSavedInfoValid: true
+  localFrameSize:  0
+fixedStack:      []
+stack:           []
+entry_values:    []
+callSites:       []
+debugValueSubstitutions: []
+constants:       []
+machineFunctionInfo: {}
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $u2, $u0_u1
+  
+    renamable $r1 = GET_SR 48
+    $r4 = BITOP_I32 10, 0, $u2, 0, 0
+    renamable $r2 = BITOP_I32 8, 0, renamable $r1, 0, 63
+    renamable $r3 = IADD_I32 0, 0, 0, renamable $r2, 2
+    renamable $r2 = BITOP_I32 6, 0, killed renamable $r2, 0, 1
+    LOCAL_STORE_32 2, 1, killed renamable $r4, killed renamable $r3l, 0 :: (store (s32) into %ir.p, addrspace 3)
+    MEMORY_BARRIER 1, 2, 9
+    renamable $r2 = IADD_I32 0, 0, 0, killed renamable $r2, 2
+    THREADGROUP_BARRIER
+    renamable $r5 = BITOP_I32 6, 0, renamable $r1, 0, 1
+    MEMORY_BARRIER 1, 2, 9
+    renamable $r2 = LOCAL_LOAD_32 2, 1, killed renamable $r2l, 0 :: (load (s32) from %ir.q, addrspace 3)
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r2, $u0_u1, killed renamable $r1, 1, 0 :: (store (s32) into %ir.o, addrspace 1)
+    AGX_STOP
+...
+---
+name:            load_between
+alignment:       2
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+failedISel:      false
+tracksRegLiveness: true
+hasWinCFI:       false
+noPhis:          true
+isSSA:           false
+noVRegs:         true
+hasFakeUses:     false
+callsEHReturn:   false
+callsUnwindInit: false
+hasEHContTarget: false
+hasEHScopes:     false
+hasEHFunclets:   false
+isOutlined:      false
+debugInstrRef:   false
+failsVerification: false
+tracksDebugUserValues: true
+registers:       []
+liveins:
+  - { reg: '$u0_u1', virtual-reg: '' }
+  - { reg: '$u2', virtual-reg: '' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    1
+  adjustsStack:    false
+  hasCalls:        false
+  framePointerPolicy: none
+  stackProtector:  ''
+  functionContext: ''
+  maxCallFrameSize: 4294967295
+  cvBytesOfCalleeSavedRegisters: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+  hasTailCall:     false
+  isCalleeSavedInfoValid: true
+  localFrameSize:  0
+fixedStack:      []
+stack:           []
+entry_values:    []
+callSites:       []
+debugValueSubstitutions: []
+constants:       []
+machineFunctionInfo: {}
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $u2, $u0_u1
+  
+    renamable $r1 = GET_SR 48
+    $r4 = BITOP_I32 10, 0, $u2, 0, 0
+    renamable $r2 = BITOP_I32 8, 0, renamable $r1, 0, 63
+    renamable $r3 = IADD_I32 0, 0, 0, renamable $r2, 2
+    renamable $r2 = BITOP_I32 6, 0, killed renamable $r2, 0, 1
+    LOCAL_STORE_32 2, 1, killed renamable $r4, killed renamable $r3l, 0 :: (store (s32) into %ir.p, addrspace 3)
+    MEMORY_BARRIER 1, 2, 9
+    renamable $r2 = IADD_I32 0, 0, 0, killed renamable $r2, 2
+    THREADGROUP_BARRIER
+    renamable $r5 = LOCAL_LOAD_32 2, 1, renamable $r2l, 0 :: (load (s32) from %ir.q, addrspace 3)
+    MEMORY_BARRIER 1, 2, 9
+    renamable $r2 = LOCAL_LOAD_32 2, 1, killed renamable $r2l, 0 :: (load (s32) from %ir.q, addrspace 3)
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r2, $u0_u1, killed renamable $r1, 1, 0 :: (store (s32) into %ir.o, addrspace 1)
+    AGX_STOP
+...
+---
+name:            twice
+alignment:       2
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+failedISel:      false
+tracksRegLiveness: true
+hasWinCFI:       false
+noPhis:          true
+isSSA:           false
+noVRegs:         true
+hasFakeUses:     false
+callsEHReturn:   false
+callsUnwindInit: false
+hasEHContTarget: false
+hasEHScopes:     false
+hasEHFunclets:   false
+isOutlined:      false
+debugInstrRef:   false
+failsVerification: false
+tracksDebugUserValues: true
+registers:       []
+liveins:
+  - { reg: '$u0_u1', virtual-reg: '' }
+  - { reg: '$u2', virtual-reg: '' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    1
+  adjustsStack:    false
+  hasCalls:        false
+  framePointerPolicy: none
+  stackProtector:  ''
+  functionContext: ''
+  maxCallFrameSize: 4294967295
+  cvBytesOfCalleeSavedRegisters: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+  hasTailCall:     false
+  isCalleeSavedInfoValid: true
+  localFrameSize:  0
+fixedStack:      []
+stack:           []
+entry_values:    []
+callSites:       []
+debugValueSubstitutions: []
+constants:       []
+machineFunctionInfo: {}
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $u2, $u0_u1
+  
+    renamable $r1 = GET_SR 48
+    $r4 = BITOP_I32 10, 0, $u2, 0, 0
+    renamable $r2 = BITOP_I32 8, 0, renamable $r1, 0, 63
+    renamable $r3 = IADD_I32 0, 0, 0, renamable $r2, 2
+    renamable $r2 = BITOP_I32 6, 0, killed renamable $r2, 0, 1
+    LOCAL_STORE_32 2, 1, killed renamable $r4, killed renamable $r3l, 0 :: (store (s32) into %ir.p, addrspace 3)
+    MEMORY_BARRIER 1, 2, 9
+    renamable $r2 = IADD_I32 0, 0, 0, killed renamable $r2, 2
+    MEMORY_BARRIER 1, 2, 9
+    THREADGROUP_BARRIER
+    renamable $r2 = LOCAL_LOAD_32 2, 1, killed renamable $r2l, 0 :: (load (s32) from %ir.q, addrspace 3)
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r2, $u0_u1, killed renamable $r1, 1, 0 :: (store (s32) into %ir.o, addrspace 1)
+    AGX_STOP
+...

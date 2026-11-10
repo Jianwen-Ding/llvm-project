@@ -1,7 +1,8 @@
 ; AIR's air.fmin/fmax drop NaN; wrap renamed calls in a NaN-propagation select.
-; On Metal they also do not order signed zeros: of two zeros, minimum is the
-; OR of the encodings (-0 if either is) and maximum their AND. The portable
-; passes (AGX) leave that out.
+; They also do not order signed zeros (they are minnum and maxnum): of two
+; zeros, minimum is the OR of the encodings (-0 if either is) and maximum
+; their AND, in the portable passes too (alive2: minimum(-0.0, +0.0) is
+; -0.0, which air.fmin alone need not return).
 ; RUN: llc -mtriple=air %s -o - | FileCheck %s
 ; RUN: llc -mtriple=air -air-portable %s -o - | FileCheck %s --check-prefix=PORTABLE
 
@@ -29,11 +30,15 @@
 
 ; PORTABLE-LABEL: define void @kernel
 ; PORTABLE: %mn = call float @air.fmin.f32(
-; PORTABLE-NEXT: %nan_check = fcmp uno float
-; PORTABLE-NEXT: %mn.nan = select i1 %nan_check, float +qnan, float %mn
+; PORTABLE: %zero_check = icmp eq i32
+; PORTABLE: %[[O:.*]] = select i1 %zero_check, float %{{.*}}, float %mn
+; PORTABLE: %nan_check = fcmp uno float
+; PORTABLE-NEXT: %mn.nan = select i1 %nan_check, float +qnan, float %[[O]]
 ; PORTABLE: %mx = call float @air.fmax.f32(
-; PORTABLE-NEXT: %nan_check1 = fcmp uno float
-; PORTABLE-NEXT: %mx.nan = select i1 %nan_check1, float +qnan, float %mx
+; PORTABLE: %zero_check1 = icmp eq i32
+; PORTABLE: %[[O1:.*]] = select i1 %zero_check1, float %{{.*}}, float %mx
+; PORTABLE: %nan_check2 = fcmp uno float
+; PORTABLE-NEXT: %mx.nan = select i1 %nan_check2, float +qnan, float %[[O1]]
 
 declare float @llvm.minimum.f32(float, float)
 declare float @llvm.maximum.f32(float, float)

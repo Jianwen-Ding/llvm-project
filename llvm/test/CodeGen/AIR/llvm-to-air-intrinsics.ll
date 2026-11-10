@@ -18,7 +18,7 @@
 ; CHECK: call i32 @air.abs.s.i32(i32 %{{[^,)]*}})
 ; CHECK: call i32 @air.popcount.i32(i32
 ; CHECK: call i32 @air.clz.i32(i32 %{{[^,]*}}, i1 false)
-; CHECK: zext i32 {{.*}} to i64
+; CHECK: sext i32 {{.*}} to i64
 ; CHECK: mul i64
 ; CHECK: lshr i64 {{.*}}, 32
 ; CHECK: trunc i64 {{.*}} to i32

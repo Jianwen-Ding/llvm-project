@@ -110,7 +110,7 @@ public:
   // accesses in the DAG combiner and the machine scheduler.
   bool useAA() const override { return true; }
   // After register allocation, top-down with AGXMemCluster (as before it):
-  // agx-bench -4% to -5% (ZLUDA PTX tests, agx_libs, real-world CUDA). The
+  // agx-bench -4% to -5% (PTX tests, agx_libs, real-world CUDA). The
   // generic post-RA scheduler alone spread clustered stores apart again.
   bool enablePostRAScheduler() const override { return true; }
   void overridePostRASchedPolicy(MachineSchedPolicy &Policy,

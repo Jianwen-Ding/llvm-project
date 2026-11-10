@@ -1,5 +1,5 @@
 ; CUDA samples matrixMul (16 x 16 threadgroup tiles in threadgroup memory, unrolled k loop), the PTX nvcc
-; emits for it compiled by ZLUDA (zoc --arch agx-g14c, the .opt.ll output).
+; emits for it compiled by zoc (zoc --arch agx-g14c, the .opt.ll output).
 ; agx-cost: --uniform 6=64 --uniform 7=64 --wg 16,16
 target triple = "agx-apple-macosx"
 

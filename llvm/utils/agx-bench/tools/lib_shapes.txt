@@ -1,4 +1,4 @@
-# Realistic launch inputs for ZLUDA's agx_libs kernels (tools/lib_shapes.py): kernel, its arguments by MLIR name,
+# Realistic launch inputs for the agx_libs kernels (tools/lib_shapes.py): kernel, its arguments by MLIR name,
 # and agx_cost's launch options. One workgroup in the middle of the launch is costed.
 #
 # cuDNN: one 1 x 64 x 56 x 56 NCHW image, 64 3 x 3 filters, padding 1 (ResNet's second stage).

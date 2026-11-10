@@ -2,11 +2,11 @@
 """Regenerate ../kernels/cuda_*.ll from the CUDA sources in this directory.
 
 Each NAME.cu is compiled to PTX by clang's NVPTX target (no CUDA toolkit: bench.h declares what the kernels use),
-the PTX to AGX LLVM IR by ZLUDA's zoc (its optimized .opt.ll output, as for kernels/matrixmul.ll), and written to
+the PTX to AGX LLVM IR by the PTX front end's zoc (its optimized .opt.ll output, as for kernels/matrixmul.ll), and written to
 kernels/cuda_NAME.ll with the source's first comment lines: `// agx-cost: ARGS` (the launch agx_cost traces) and a
 description. The data files the agx-cost lines map (`--map VA=@data/FILE`) are written to kernels/data/.
 
-  gen.py --zoc ZLUDA/target/debug/zoc [--clang clang] [NAME ...]
+  gen.py --zoc PTX_FRONTEND/target/debug/zoc [--clang clang] [NAME ...]
 """
 
 import argparse

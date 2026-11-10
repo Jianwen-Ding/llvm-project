@@ -81,7 +81,7 @@ define agx_kernel void @udiv_extended(ptr addrspace(1) %p, i32 %x, i32 %d) {
   ret void
 }
 
-; ZLUDA's guarded divisor umax(d, 1): the values of max(d, 1) (kinds 6 to
+; A PTX front end's guarded divisor umax(d, 1): the values of max(d, 1) (kinds 6 to
 ; 8), and no zero check.
 ; CHECK-LABEL: udiv_guarded:
 ; CHECK-NOT:   rcp

@@ -1,9 +1,13 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0 simdgroup-all-reduce=0" --split-input-file | FileCheck %s --check-prefix=OFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
-// pointers in AIR's address spaces.
+// pointers in AIR's address spaces. The functions of system values touch no
+// memory, so that LLVM folds their calls together.
 gpu.module @ids {
+  // CHECK-DAG: llvm.func @air.thread_index_in_simdgroup() -> i32 attributes {memory_effects = #llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, {{.*}}>, no_unwind, will_return}
+  // CHECK-DAG: llvm.func @air.thread_position_in_threadgroup.v3i32() -> vector<3xi32> attributes {memory_effects = #llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, {{.*}}>, no_unwind, will_return}
   // CHECK-LABEL: llvm.func @ids(
   // CHECK-SAME: %{{.*}}: !llvm.ptr<1>)
   // CHECK-SAME: passthrough = ["air-kernel"]
@@ -18,9 +22,10 @@ gpu.module @ids {
     // CHECK: llvm.call @air.threads_per_threadgroup.v3i32()
     // CHECK: llvm.call @air.thread_position_in_threadgroup.v3i32()
     %g = gpu.global_id z
-    // CHECK: llvm.call @air.thread_index_in_simdgroup() : () -> i32
+    // A lane is in [0, 32), and there are at most 32 SIMD-groups.
+    // CHECK: llvm.call @air.thread_index_in_simdgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 32>})
     %l = gpu.lane_id
-    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> i32
+    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 32>})
     %s = gpu.subgroup_id : index
     // CHECK: llvm.mlir.constant(32 : i64)
     %n = gpu.subgroup_size : index
@@ -41,8 +46,10 @@ gpu.module @ids {
 // The barrier orders device and threadgroup memory, or the memory its
 // memfence names (none for `memfence []`); a subgroup-scope barrier is AIR's
 // SIMD-group barrier. Shuffles, ballots and reductions are AIR's SIMD-group
-// functions.
+// functions, convergent; the barriers may touch any memory.
 gpu.module @simd {
+  // CHECK-DAG: llvm.func @air.wg.barrier(i32, i32) attributes {convergent, no_unwind, will_return}
+  // CHECK-DAG: llvm.func @air.simd_shuffle_xor.u.i32(i32, i16) -> i32 attributes {convergent, memory_effects = #llvm.memory_effects<other = none, argMem = none, inaccessibleMem = none, {{.*}}>, no_unwind, will_return}
   // CHECK-LABEL: llvm.func @simd(
   gpu.func @simd(%out: memref<8xf32, 1>, %v: f32, %p: i1) kernel {
     // CHECK: %[[F:.*]] = llvm.mlir.constant(3 : i32)
@@ -60,17 +67,9 @@ gpu.module @simd {
     gpu.barrier scope <subgroup> memfence [#gpu.address_space<global>]
     %c1 = arith.constant 1 : i32
     %c32 = arith.constant 32 : i32
-    // CHECK: %[[LANE:.*]] = llvm.call @air.thread_index_in_simdgroup()
-    // CHECK: %[[NEGW:.*]] = llvm.sub %{{.*}}, %[[W:.*]] : i32
-    // CHECK: %[[ADD:.*]] = llvm.add %[[LANE]], %[[W]] : i32
-    // CHECK: %[[END:.*]] = llvm.and %[[ADD]], %[[NEGW]] : i32
-    // CHECK: %[[SRC:.*]] = llvm.xor %[[LANE]], %{{.*}} : i32
-    // CHECK: %[[START:.*]] = llvm.and %[[LANE]], %[[NEGW]] : i32
-    // CHECK: %[[GE:.*]] = llvm.icmp "sge" %[[SRC]], %[[START]] : i32
-    // CHECK: %[[LT:.*]] = llvm.icmp "slt" %[[SRC]], %[[END]] : i32
-    // CHECK: %[[VALID:.*]] = llvm.and %[[GE]], %[[LT]] : i1
-    // CHECK: llvm.select %[[VALID]], %[[SRC]], %[[LANE]] : i1, i32
-    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // A constant offset within the SIMD-group: AIR's shuffle_xor.
+    // CHECK: %[[MASK:.*]] = llvm.mlir.constant(1 : i16) : i16
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[MASK]]) : (i32, i16) -> i32
     %sh, %ok = gpu.shuffle xor %v, %c1, %c32 : f32
     // CHECK: llvm.call @air.simd_ballot.i64(%{{.*}}) : (i1) -> i64
     %m = gpu.ballot %p : i64
@@ -131,11 +130,386 @@ gpu.module @default_space {
 
 // -----
 
-// A known threadgroup size is an AGX hint on the kernel.
+// A known threadgroup size is an AGX hint on the kernel; the threadgroup
+// size and SIMD-group count are constants then, and the thread positions
+// and SIMD-group index are bounded by it.
 gpu.module @block_size {
   // CHECK-LABEL: llvm.func @k(
   // CHECK-SAME: passthrough = ["air-kernel", ["agx-max-threads-per-threadgroup", "128"]]
-  gpu.func @k() kernel attributes {known_block_size = array<i32: 64, 2, 1>} {
+  gpu.func @k(%out: memref<8xindex, 1>) kernel attributes {known_block_size = array<i32: 64, 2, 1>} {
+    // CHECK-NOT: @air.threads_per_threadgroup
+    // CHECK: llvm.mlir.constant(2 : i64) : i64
+    %d = gpu.block_dim y
+    // CHECK: llvm.call @air.thread_position_in_threadgroup.v3i32() : () -> (vector<3xi32> {llvm.range = #llvm.constant_range<i32, 0, 64>})
+    %t = gpu.thread_id x
+    // CHECK: llvm.mlir.constant(4 : i64) : i64
+    %n = gpu.num_subgroups : index
+    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 4>})
+    %s = gpu.subgroup_id : index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    memref.store %d, %out[%c0] : memref<8xindex, 1>
+    memref.store %t, %out[%c1] : memref<8xindex, 1>
+    memref.store %n, %out[%c2] : memref<8xindex, 1>
+    memref.store %s, %out[%c3] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A threadgroup of one SIMD-group: its index is 0. upper_bound bounds a
+// value too.
+gpu.module @one_simdgroup {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xindex, 1>) kernel attributes {known_block_size = array<i32: 32, 1, 1>} {
+    // CHECK-NOT: @air.simdgroup_index_in_threadgroup
+    // CHECK: llvm.mlir.constant(0 : i64) : i64
+    %s = gpu.subgroup_id : index
+    // CHECK: llvm.call @air.threadgroup_position_in_grid.v3i32() : () -> vector<3xi32>
+    %b = gpu.block_id x upper_bound 16
+    // CHECK: llvm.call @air.thread_index_in_simdgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 16>})
+    %l = gpu.lane_id upper_bound 16
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    memref.store %s, %out[%c0] : memref<8xindex, 1>
+    memref.store %b, %out[%c1] : memref<8xindex, 1>
+    memref.store %l, %out[%c2] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Shuffles by constant offsets within the SIMD-group are AIR's shuffle_up,
+// shuffle_down and shuffle_xor (xor within any power of two): the lanes a
+// shift leaves keep their value, which is what gpu.shuffle's valid flag
+// says; other shuffles read the lane they compute.
+gpu.module @shuffles {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xi32, 1>, %v: i32, %o: i32) kernel {
+    %c2 = arith.constant 2 : i32
+    %c8 = arith.constant 8 : i32
+    %c16 = arith.constant 16 : i32
+    %c32 = arith.constant 32 : i32
+    // CHECK: %[[LANE:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: %[[TWO:.*]] = llvm.mlir.constant(2 : i32) : i32
+    // CHECK: llvm.icmp "uge" %[[LANE]], %[[TWO]] : i32
+    // CHECK: llvm.call @air.simd_shuffle_up.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %up, %okup = gpu.shuffle up %v, %c2, %c32 : i32
+    // CHECK: %[[LANE2:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: %[[B:.*]] = llvm.mlir.constant(16 : i32) : i32
+    // CHECK: llvm.icmp "ult" %[[LANE2]], %[[B]] : i32
+    // CHECK: llvm.call @air.simd_shuffle_down.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %down, %okdown = gpu.shuffle down %v, %c16, %c32 : i32
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %x8, %okx8 = gpu.shuffle xor %v, %c2, %c8 : i32
+    // Within segments of 8 lanes, a shift needs the lane arithmetic.
+    // CHECK: llvm.icmp "sge"
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %d8, %okd8 = gpu.shuffle down %v, %c2, %c8 : i32
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %xo, %okxo = gpu.shuffle xor %v, %o, %c32 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2i = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    %c4 = arith.constant 4 : index
+    memref.store %up, %out[%c0] : memref<8xi32, 1>
+    memref.store %down, %out[%c1] : memref<8xi32, 1>
+    memref.store %x8, %out[%c2i] : memref<8xi32, 1>
+    memref.store %d8, %out[%c3] : memref<8xi32, 1>
+    memref.store %xo, %out[%c4] : memref<8xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A reduction over clusters of 4 lanes is AIR's quad-group reduction; one of
+// 32 is the SIMD-group's.
+gpu.module @clusters {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32, %i: i32, %o: memref<8xi32, 1>) kernel {
+    // CHECK: llvm.call @air.quad_sum.f32(%{{.*}}) : (f32) -> f32
+    %q = gpu.subgroup_reduce add %v cluster(size = 4) : (f32) -> f32
+    // CHECK: llvm.call @air.simd_max.u.i32(%{{.*}}) : (i32) -> i32
+    %m = gpu.subgroup_reduce maxui %i cluster(size = 32) : (i32) -> i32
+    %c0 = arith.constant 0 : index
+    memref.store %q, %out[%c0] : memref<8xf32, 1>
+    memref.store %m, %o[%c0] : memref<8xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// gpu.global_id is AIR's 32-bit thread_position_in_grid where the dimension
+// has fewer than 2^32 threads (upper_bound, or known_block_size times
+// known_grid_size); without a bound, block_id * block_dim + thread_id in
+// index, since the 32-bit register would wrap.
+gpu.module @global_id {
+  // CHECK-LABEL: llvm.func @bounded(
+  gpu.func @bounded(%out: memref<8xindex, 1>) kernel {
+    // CHECK: llvm.call @air.thread_position_in_grid.v3i32()
+    // CHECK-NOT: @air.threadgroup_position_in_grid
+    %g = gpu.global_id x upper_bound 65536
+    %c0 = arith.constant 0 : index
+    memref.store %g, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @known(
+  gpu.func @known(%out: memref<8xindex, 1>) kernel
+      attributes {known_block_size = array<i32: 256, 1, 1>,
+                  known_grid_size = array<i32: 4096, 1, 1>} {
+    // CHECK: llvm.call @air.thread_position_in_grid.v3i32()
+    %g = gpu.global_id x
+    %c0 = arith.constant 0 : index
+    memref.store %g, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @unbounded(
+  gpu.func @unbounded(%out: memref<8xindex, 1>) kernel {
+    // CHECK-NOT: @air.thread_position_in_grid
+    // CHECK: llvm.call @air.threadgroup_position_in_grid.v3i32()
+    // CHECK: llvm.call @air.threads_per_threadgroup.v3i32()
+    // CHECK: llvm.call @air.thread_position_in_threadgroup.v3i32()
+    // CHECK: llvm.mul %{{.*}} : i64
+    // CHECK: llvm.add %{{.*}} : i64
+    %g = gpu.global_id x
+    %c0 = arith.constant 0 : index
+    memref.store %g, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// The index of a memref access of a static dimension of at most 2^32
+// elements is below 2^32 (out of bounds is undefined), so the arithmetic
+// that computes it is 32-bit and the index its zero extension
+// (narrow-indices). Larger or dynamic dimensions keep index arithmetic.
+gpu.module @narrow_indices {
+  // CHECK-LABEL: llvm.func @narrow(
+  // CHECK-SAME: %[[A:.*]]: !llvm.ptr<1>, %[[I:.*]]: i64, %[[J:.*]]: i64, %[[LD:.*]]: i64)
+  gpu.func @narrow(%a: memref<1024x16xf32, 1>, %i: index, %j: index, %ld: index) kernel {
+    // CHECK-DAG: %[[I32:.*]] = llvm.trunc %[[I]] : i64 to i32
+    // CHECK-DAG: %[[LD32:.*]] = llvm.trunc %[[LD]] : i64 to i32
+    // CHECK-DAG: %[[J32:.*]] = llvm.trunc %[[J]] : i64 to i32
+    // CHECK: %[[M:.*]] = llvm.mul %[[I32]], %[[LD32]] : i32
+    // CHECK: %[[S:.*]] = llvm.add %[[M]], %[[J32]] : i32
+    // CHECK: %[[L:.*]] = llvm.mul %[[S]], %{{.*}} : i32
+    // CHECK: llvm.zext %[[L]] : i32 to i64
+    %m = arith.muli %i, %ld : index
+    %r = arith.addi %m, %j : index
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%r, %c0] : memref<1024x16xf32, 1>
+    memref.store %v, %a[%c0, %c0] : memref<1024x16xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @wide(
+  gpu.func @wide(%a: memref<8589934592xf32, 1>, %i: index, %ld: index) kernel {
+    // CHECK-NOT: llvm.trunc
+    // CHECK: llvm.mul %{{.*}} : i64
+    %m = arith.muli %i, %ld : index
+    %v = memref.load %a[%m] : memref<8589934592xf32, 1>
+    %c0 = arith.constant 0 : index
+    memref.store %v, %a[%c0] : memref<8589934592xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// An scf.for whose iterations index a static dimension of S <= 2^31
+// elements by x + iv (or x - iv) keeps its offsets iv - lb below S (out of
+// bounds is undefined), so it runs over an unsigned i32 offset from 0 to
+// umin(ub - lb, S) by umin(step, S), and iv is lb + the offset
+// (narrow-loops); index arithmetic of iv is then 32-bit.
+gpu.module @narrow_loops {
+  // CHECK-LABEL: llvm.func @grid_stride(
+  // CHECK-SAME: %[[A:.*]]: !llvm.ptr<1>, %[[LB:.*]]: i64, %[[UB:.*]]: i64, %[[ST:.*]]: i64)
+  // OFF-LABEL: llvm.func @grid_stride(
+  gpu.func @grid_stride(%a: memref<1024xf32, 1>, %lb: index, %ub: index, %st: index) kernel {
+    // CHECK-DAG: %[[LB32:.*]] = llvm.trunc %[[LB]] : i64 to i32
+    // CHECK-DAG: %[[GT:.*]] = llvm.icmp "sgt" %[[UB]], %[[LB]] : i64
+    // CHECK-DAG: %[[D:.*]] = llvm.sub %[[UB]], %[[LB]] : i64
+    // CHECK-DAG: %[[DM:.*]] = llvm.intr.umin(%[[D]], %{{.*}})
+    // CHECK-DAG: %[[E:.*]] = llvm.select %[[GT]], %[[DM]], %{{.*}} : i1, i64
+    // CHECK-DAG: %[[STM:.*]] = llvm.intr.umin(%[[ST]], %{{.*}})
+    // CHECK-DAG: %[[E32:.*]] = llvm.trunc %[[E]] : i64 to i32
+    // CHECK-DAG: %[[ST32:.*]] = llvm.trunc %[[STM]] : i64 to i32
+    // CHECK: ^bb1(%[[O:.*]]: i32):
+    // CHECK: llvm.icmp "ult" %[[O]], %[[E32]] : i32
+    // CHECK: %[[I:.*]] = llvm.add %[[LB32]], %[[O]] : i32
+    // CHECK: llvm.zext %[[I]] : i32 to i64
+    // CHECK: llvm.add %[[O]], %[[ST32]] overflow<nuw> : i32
+    // OFF: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    scf.for %i = %lb to %ub step %st {
+      %v = memref.load %a[%i] : memref<1024xf32, 1>
+      %f = arith.addf %v, %v : f32
+      memref.store %f, %a[%i] : memref<1024xf32, 1>
+    }
+    gpu.return
+  }
+  // A constant extent bounds the offsets too; the results are the loop's.
+  // CHECK-LABEL: llvm.func @extent(
+  gpu.func @extent(%a: memref<1048576xf32, 1>, %x: index, %c: i1) kernel {
+    // CHECK: %[[C:.*]] = llvm.mlir.constant(64 : i32) : i32
+    // CHECK: ^bb1(%[[O:.*]]: i32, %[[ACC:.*]]: f32):
+    // CHECK: llvm.icmp "ult" %[[O]], %[[C]] : i32
+    // CHECK: llvm.add %{{.*}}, %[[O]] : i32
+    // CHECK: llvm.add %[[O]], %{{.*}} overflow<nuw> : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c64 = arith.constant 64 : index
+    %zero = arith.constant 0.0 : f32
+    %s = scf.for %k = %c0 to %c64 step %c1 iter_args(%acc = %zero) -> f32 {
+      %y = scf.if %c -> f32 {
+        scf.yield %acc : f32
+      } else {
+        scf.yield %zero : f32
+      }
+      %j = arith.addi %x, %k : index
+      %v = memref.load %a[%j] : memref<1048576xf32, 1>
+      %r = arith.addf %y, %v : f32
+      scf.yield %r : f32
+    }
+    memref.store %s, %a[%x] : memref<1048576xf32, 1>
+    gpu.return
+  }
+  // An access after an op with regions might not be reached, one of a
+  // dynamic dimension or by 2 * iv bounds nothing: index loops.
+  // CHECK-LABEL: llvm.func @unbounded(
+  gpu.func @unbounded(%a: memref<1024xf32, 1>, %ub: index, %c: i1) kernel {
+    // CHECK: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    // CHECK: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    // CHECK-NOT: llvm.icmp "ult"
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %f = arith.constant 1.0 : f32
+    scf.for %i = %c0 to %ub step %c1 {
+      scf.if %c {
+        gpu.barrier
+      }
+      memref.store %f, %a[%i] : memref<1024xf32, 1>
+    }
+    scf.for %i = %c0 to %ub step %c1 {
+      %j = arith.addi %i, %i : index
+      memref.store %f, %a[%j] : memref<1024xf32, 1>
+    }
+    gpu.return
+  }
+}
+
+// -----
+
+// An access of a static multi-dimensional memref whose elements are within
+// 2^32 of its base has the 32-bit index offset + sum(index_k * stride_k)
+// into the memref as one dimension (linearize-indices).
+gpu.module @linearize_indices {
+  // CHECK-LABEL: llvm.func @strided(
+  // CHECK-SAME: %[[A:.*]]: !llvm.ptr<3>, %[[I:.*]]: i64, %[[J:.*]]: i64)
+  // OFF-LABEL: llvm.func @strided(
+  gpu.func @strided(%a: memref<4x8xf32, strided<[16, 2], offset: 3>, 3>, %i: index, %j: index) kernel {
+    // CHECK-DAG: %[[I32:.*]] = llvm.trunc %[[I]] : i64 to i32
+    // CHECK-DAG: %[[J32:.*]] = llvm.trunc %[[J]] : i64 to i32
+    // CHECK: %[[A1:.*]] = llvm.mul %[[I32]], %{{.*}} : i32
+    // CHECK: %[[A2:.*]] = llvm.add %[[A1]], %{{.*}} : i32
+    // CHECK: %[[A3:.*]] = llvm.mul %[[J32]], %{{.*}} : i32
+    // CHECK: %[[L:.*]] = llvm.add %[[A2]], %[[A3]] : i32
+    // CHECK: %[[LW:.*]] = llvm.zext %[[L]] : i32 to i64
+    // CHECK: llvm.getelementptr inbounds|nuw %{{.*}}[%[[LW]]] : (!llvm.ptr<3>, i64) -> !llvm.ptr<3>, f32
+    // OFF: llvm.mul %[[I:.*]], %{{.*}} : i64
+    %v = memref.load %a[%i, %j] : memref<4x8xf32, strided<[16, 2], offset: 3>, 3>
+    %f = arith.addf %v, %v : f32
+    memref.store %f, %a[%j, %i] : memref<4x8xf32, strided<[16, 2], offset: 3>, 3>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @too_large(
+  gpu.func @too_large(%a: memref<65536x65537xf32, 1>, %i: index, %j: index) kernel {
+    // CHECK: llvm.mul %{{.*}}, %{{.*}} : i64
+    %v = memref.load %a[%i, %j] : memref<65536x65537xf32, 1>
+    %f = arith.addf %v, %v : f32
+    memref.store %f, %a[%j, %i] : memref<65536x65537xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A uniform gpu.all_reduce in a kernel of whole SIMD-groups (known_block_size
+// a multiple of 32) is the SIMD-group reduction, the partials in threadgroup
+// memory, one barrier and each SIMD-group's reduction of the partials (lanes
+// past the SIMD-group count read the identity of an addition, partial 0 of a
+// maximum), with a second barrier where it may run again
+// (simdgroup-all-reduce). One SIMD-group needs only its reduction; other
+// sizes keep the generic lowering.
+gpu.module @simdgroup_all_reduce {
+  // CHECK: llvm.mlir.global internal @[[BUF:.*]]() {addr_space = 3 : i32} : !llvm.array<4 x f32>
+  // CHECK-LABEL: llvm.func @sum(
+  // OFF-LABEL: llvm.func @sum(
+  gpu.func @sum(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK-DAG: %[[ID:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
+    // CHECK: %[[P:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK: llvm.call @air.simdgroup_index_in_threadgroup() : () -> (i32 {llvm.range = #llvm.constant_range<i32, 0, 4>})
+    // CHECK: llvm.store %[[P]], %{{.*}} : f32, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: %[[IN:.*]] = llvm.icmp "ult" %{{.*}}, %{{.*}} : i64
+    // CHECK: %[[X:.*]] = llvm.load %{{.*}} : !llvm.ptr<3> -> f32
+    // CHECK: %[[Y:.*]] = llvm.select %[[IN]], %[[X]], %[[ID]] : i1, f32
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_sum.f32(%[[Y]]) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[R]], %{{.*}} : f32, !llvm.ptr<1>
+    // OFF: llvm.call @air.simd_shuffle.u.i32
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @max_loop(
+  gpu.func @max_loop(%a: memref<1024xi32, 1>, %n: index) kernel
+      attributes {known_block_size = array<i32: 16, 4, 1>} {
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: %[[X:.*]] = llvm.load %{{.*}} : !llvm.ptr<3> -> i32
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_max.s.i32(%[[X]]) : (i32) -> i32
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[R]]
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %n step %c1 {
+      %v = memref.load %a[%i] : memref<1024xi32, 1>
+      %s = gpu.all_reduce maxsi %v uniform {} : (i32) -> (i32)
+      memref.store %s, %a[%i] : memref<1024xi32, 1>
+    }
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @one_group(
+  gpu.func @one_group(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 32, 1, 1>} {
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_product.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[R]]
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce mul %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @partial(
+  gpu.func @partial(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 48, 1, 1>} {
+    // CHECK: llvm.call @air.simd_shuffle.u.i32
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
     gpu.return
   }
 }

@@ -29,6 +29,8 @@ def AIR_Dialect : Dialect {
     AIR's functions.
   }];
   let useDefaultAttributePrinterParser = 1;
+  // Element-wise operations of SIMD-group matrix fills are fills.
+  let hasCanonicalizer = 1;
 
 }
 

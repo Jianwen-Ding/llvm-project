@@ -114,7 +114,8 @@ static bool rewriteKernel(Function &F) {
   return true;
 }
 
-static bool scalarArgsToConstantBuffers(Module &M) {
+static bool scalarArgsToConstantBuffers(Module &M,
+                                        bool ArgumentBufferKernelsOnly) {
   // A pre-baked !air.kernel describes the signature as it is.
   if (M.getNamedMetadata("air.kernel"))
     return false;
@@ -126,6 +127,8 @@ static bool scalarArgsToConstantBuffers(Module &M) {
   SmallVector<Function *, 4> Kernels;
   for (Function &F : M) {
     if (F.isDeclaration())
+      continue;
+    if (ArgumentBufferKernelsOnly && !F.getMetadata("air.argbuf.member_as"))
       continue;
     if (HaveKernelAttr ? F.hasFnAttribute("air-kernel")
                        : !isCalledDirectly(F))
@@ -139,12 +142,13 @@ static bool scalarArgsToConstantBuffers(Module &M) {
 
 PreservedAnalyses
 AIRScalarArgsToConstantBuffersPass::run(Module &M, ModuleAnalysisManager &AM) {
-  return scalarArgsToConstantBuffers(M) ? PreservedAnalyses::none()
-                                        : PreservedAnalyses::all();
+  return scalarArgsToConstantBuffers(M, /*ArgumentBufferKernelsOnly=*/false)
+             ? PreservedAnalyses::none()
+             : PreservedAnalyses::all();
 }
 
 bool AIRScalarArgsToConstantBuffersLegacy::runOnModule(Module &M) {
-  return scalarArgsToConstantBuffers(M);
+  return scalarArgsToConstantBuffers(M, ArgumentBufferKernelsOnly);
 }
 
 char AIRScalarArgsToConstantBuffersLegacy::ID = 0;
@@ -152,6 +156,7 @@ char AIRScalarArgsToConstantBuffersLegacy::ID = 0;
 INITIALIZE_PASS(AIRScalarArgsToConstantBuffersLegacy, DEBUG_TYPE,
                 "AIR Scalar Arguments To Constant Buffers", false, false)
 
-ModulePass *llvm::createAIRScalarArgsToConstantBuffersLegacyPass() {
-  return new AIRScalarArgsToConstantBuffersLegacy();
+ModulePass *
+llvm::createAIRScalarArgsToConstantBuffersLegacyPass(bool ArgumentBufferKernelsOnly) {
+  return new AIRScalarArgsToConstantBuffersLegacy(ArgumentBufferKernelsOnly);
 }

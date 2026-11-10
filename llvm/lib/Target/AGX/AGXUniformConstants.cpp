@@ -15,7 +15,7 @@
 // instructions that can read uniforms. The kernel's .agx.kernels record lists
 // the values (extension 6, AGXAsmPrinter), for the driver to set.
 //
-// Launch-time specialization (ZLUDA) turns arguments into constants, which
+// Launch-time specialization (runtime) turns arguments into constants, which
 // then held general purpose registers: rmsnorm specialized went from 14 to 21
 // and lost a quarter of its resident SIMD-groups (llvm/utils/agx-bench,
 // EXPERIMENTS.md R21). Off by default (-agx-uniform-constants): every driver

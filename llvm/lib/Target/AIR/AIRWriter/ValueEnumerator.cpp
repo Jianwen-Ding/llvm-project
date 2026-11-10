@@ -39,7 +39,7 @@ ValueEnumerator::ValueEnumerator(Module &M, const PointeeTypeMap &PTM)
   // A pointer pointee is skipped, as in applyPTMOverride: an opaque pointer
   // type is one Type, so a pointer loaded through an argument would make the
   // argument's type its own pointee and ptrTypeIdx -> addType recurse forever
-  // (ZLUDA's globals buffer, which holds a pointer, did).
+  // (a PTX front end's globals buffer, which holds a pointer, did).
   for (auto &F : M)
     for (auto &Arg : F.args())
       if (Arg.getType()->isPointerTy() && !inferredPointee.count(Arg.getType()))
