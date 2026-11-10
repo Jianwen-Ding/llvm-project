@@ -300,7 +300,12 @@ public:
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
     Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N);
-    E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
+    // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
+    // rounds to 0) by itself: for exp, checked for every float x, flushing
+    // and not; with a low part (exp2, exp10, pow) the selects stay.
+    if (Lo)
+      E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
+    // fptosi of a NaN n is poison: a NaN x gives itself.
     return sel(isNaN(Hi), Hi, E);
   }
 
