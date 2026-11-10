@@ -165,6 +165,12 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction({ISD::CTPOP, ISD::CTLZ, ISD::CTTZ, ISD::CTLZ_ZERO_POISON},
                      MVT::i16, Promote);
   setOperationAction({ISD::CTLZ, ISD::CTTZ}, MVT::i64, Custom);
+  // Averages without the widened addition (a 64-bit add on the wide issue
+  // slot): (a & b) + ((a ^ b) >> 1), and (a | b) - ((a ^ b) >> 1) rounding
+  // up.
+  setOperationAction({ISD::AVGFLOORU, ISD::AVGCEILU, ISD::AVGFLOORS,
+                      ISD::AVGCEILS},
+                     MVT::i32, Custom);
   setOperationAction({ISD::SHL, ISD::SRL, ISD::SRA, ISD::MUL}, MVT::i64,
                      Custom);
   setOperationAction(ISD::SETCC, MVT::i64, Custom);
@@ -793,6 +799,23 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
   case ISD::CTLZ:
   case ISD::CTTZ:
     return lowerCTLZ_CTTZ64(Op, DAG);
+  case ISD::AVGFLOORU:
+  case ISD::AVGCEILU:
+  case ISD::AVGFLOORS:
+  case ISD::AVGCEILS: {
+    SDLoc DL(Op);
+    unsigned Opc = Op.getOpcode();
+    bool Ceil = Opc == ISD::AVGCEILU || Opc == ISD::AVGCEILS;
+    bool Signed = Opc == ISD::AVGFLOORS || Opc == ISD::AVGCEILS;
+    SDValue A = Op.getOperand(0), B = Op.getOperand(1);
+    SDValue Half = DAG.getNode(Signed ? ISD::SRA : ISD::SRL, DL, MVT::i32,
+                               DAG.getNode(ISD::XOR, DL, MVT::i32, A, B),
+                               DAG.getConstant(1, DL, MVT::i32));
+    return DAG.getNode(Ceil ? ISD::SUB : ISD::ADD, DL, MVT::i32,
+                       DAG.getNode(Ceil ? ISD::OR : ISD::AND, DL, MVT::i32, A,
+                                   B),
+                       Half);
+  }
   case ISD::MULHU: {
     // With a = a1 2^32 + a0, b likewise, no sum overflows 64 bits:
     // t = a1 b0 + hi(a0 b0), u = a0 b1 + lo(t),
