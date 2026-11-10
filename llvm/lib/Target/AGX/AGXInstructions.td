@@ -746,6 +746,19 @@ foreach VT = [f16, bf16] in
 def : Pat<(VT (select i32:$c, VT:$x, VT:$y)),
           (ICMPSEL_I32_I16 IC_UEQ, 0, $c, 0, (i32 0), 0, $y, 0, $x)>;
 
+// Select on a 16-bit value widened to 32 bits (booleans shared by several
+// i16 operations, which type legalization keeps as i16): the comparison of
+// its 16 bits with 0, without the widening copy.
+def : Pat<(i32 (select (i32 (zext i16:$c)), AGXIntSrc32:$x, AGXIntSrc32:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, $c, 0, (i16 0), 0, $y, 0, $x)>;
+def : Pat<(f32 (select (i32 (zext i16:$c)), f32:$x, f32:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, $c, 0, (i16 0), 0, $y, 0, $x)>;
+def : Pat<(i16 (select (i32 (zext i16:$c)), AGXIntSrc16:$x, AGXIntSrc16:$y)),
+          (ICMPSEL_I16 IC_UEQ, 0, $c, 0, (i16 0), 0, $y, 0, $x)>;
+foreach VT = [f16, bf16] in
+def : Pat<(VT (select (i32 (zext i16:$c)), VT:$x, VT:$y)),
+          (ICMPSEL_I16 IC_UEQ, 0, $c, 0, (i16 0), 0, $y, 0, $x)>;
+
 def : Pat<(i64 (select i32:$c, i64:$x, i64:$y)),
           (REG_SEQUENCE GPR64,
             (ICMPSEL_I32 IC_UEQ, 0, $c, 0, (i32 0), 0, (EXTRACT_SUBREG $y, sub0),
