@@ -2015,6 +2015,11 @@ SDValue AGXTargetLowering::lowerMUL64(SDValue Op, SelectionDAG &DAG) const {
   return join64(DAG, DL, PLo, DAG.getNode(ISD::ADD, DL, MVT::i32, PHi, Cross));
 }
 
+static cl::opt<bool> SelectCountHalf(
+    "agx-select-count-half",
+    cl::desc("64-bit ctlz / cttz: select the half, then one ffs"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerCTLZ_CTTZ64(SDValue Op,
                                             SelectionDAG &DAG) const {
   SDLoc DL(Op);
@@ -2027,6 +2032,29 @@ SDValue AGXTargetLowering::lowerCTLZ_CTTZ64(SDValue Op,
   SDValue FirstZero =
       DAG.getSetCC(DL, MVT::i32, First, DAG.getConstant(0, DL, MVT::i32),
                    ISD::SETEQ);
+  if (SelectCountHalf &&
+      DAG.getMachineFunction()
+              .getInfo<AGXMachineFunctionInfo>()
+              ->getEstimatedPressure(DAG.getMachineFunction().getFunction()) <=
+          AGXHeadroomGPRs) {
+    // The half selected first and one ffs (the index of the highest set
+    // bit, -1 for zero, as an M2 Max gives it): 31 - ffs(first), or
+    // 63 - ffs(second) where the first half is zero (64 for x = 0), instead
+    // of counting both halves. Both halves stay live up to the select, so
+    // only where the function has register headroom (ddot, without it:
+    // 64 -> 66 GPRs, 832 -> 768 threads per threadgroup).
+    SDValue V = DAG.getSelect(DL, MVT::i32, FirstZero, Second, First);
+    if (!IsCTLZ)
+      V = DAG.getNode(ISD::BITREVERSE, DL, MVT::i32, V);
+    SDValue Off = DAG.getSelect(DL, MVT::i32, FirstZero,
+                                DAG.getConstant(63, DL, MVT::i32),
+                                DAG.getConstant(31, DL, MVT::i32));
+    SDValue F(DAG.getMachineNode(AGX::FFS_I32, DL, MVT::i32,
+                                 {DAG.getTargetConstant(0, DL, MVT::i32), V}),
+              0);
+    return DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i64,
+                       DAG.getNode(ISD::SUB, DL, MVT::i32, Off, F));
+  }
   SDValue R = DAG.getSelect(
       DL, MVT::i32, FirstZero,
       DAG.getNode(ISD::ADD, DL, MVT::i32,

@@ -518,11 +518,10 @@ define agx_kernel void @convert(ptr addrspace(1) %out, float %a, i32 %i, i64 %l)
 ; CHECK-NEXT:    mov_imm r8, -813694976
 ; CHECK-NEXT:    fmul32 r7, r6, r7
 ; CHECK-NEXT:    floor r7, r7
-; CHECK-NEXT:    ffs r1, r5
-; CHECK-NEXT:    ffs r3, r4
-; CHECK-NEXT:    isub r1, 31, r1
-; CHECK-NEXT:    isub r3, 63, r3
-; CHECK-NEXT:    icmpsel ueq, r1, r5, 0, r3, r1
+; CHECK-NEXT:    icmpsel ueq, r1, r5, 0, r4, r5
+; CHECK-NEXT:    icmpsel ueq, r3, r5, 0, 63, 31
+; CHECK-NEXT:    ffs r1, r1
+; CHECK-NEXT:    isub r1, r3, r1
 ; CHECK-NEXT:    isub r3, 64, r1
 ; CHECK-NEXT:    extr r3, 0, r4, r3
 ; CHECK-NEXT:    bfi r4, 0, r4, r1
