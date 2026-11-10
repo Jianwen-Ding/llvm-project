@@ -171,3 +171,25 @@ declare float @llvm.maximumnum.f32(float, float)
 declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)
 declare float @llvm.experimental.constrained.trunc.f32(float, metadata)
 attributes #99 = { strictfp }
+
+; -|x| is an or of the sign bit.
+; CHECK-LABEL: fnabs_f32:
+; CHECK: mov_imm [[M:r[0-9]+]], -2147483648
+; CHECK-NEXT: or [[M]], {{u[0-9]+}}, [[M]]
+; CHECK-NEXT: device_store
+; CHECK-LABEL: fnabs_f16:
+; CHECK: mov_imm [[H:r[0-9]+l]], 32768
+; CHECK-NEXT: or [[H]], {{u[0-9]+l}}, [[H]]
+; CHECK-NEXT: device_store
+define agx_kernel void @fnabs_f32(ptr addrspace(1) %p, float %x) {
+  %a = call float @llvm.fabs.f32(float %x)
+  %n = fneg float %a
+  store float %n, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @fnabs_f16(ptr addrspace(1) %p, half %x) {
+  %a = call half @llvm.fabs.f16(half %x)
+  %n = fneg half %a
+  store half %n, ptr addrspace(1) %p
+  ret void
+}
