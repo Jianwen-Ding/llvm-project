@@ -158,7 +158,12 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::BITREVERSE, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i64, Custom);
   setOperationAction(ISD::BITREVERSE, MVT::i16, Promote);
-  setOperationAction({ISD::CTPOP, ISD::CTLZ, ISD::CTTZ}, MVT::i16, Promote);
+  // (ctlz_zero_poison too: expanded it takes 10 instructions of shifts, ors
+  // and a popcount, promoted 4. cttz_zero_poison's expansion, a popcount of
+  // the low zeros, is as short as the promotion and uses the shared unit
+  // once instead of twice.)
+  setOperationAction({ISD::CTPOP, ISD::CTLZ, ISD::CTTZ, ISD::CTLZ_ZERO_POISON},
+                     MVT::i16, Promote);
   setOperationAction({ISD::CTLZ, ISD::CTTZ}, MVT::i64, Custom);
   setOperationAction({ISD::SHL, ISD::SRL, ISD::SRA, ISD::MUL}, MVT::i64,
                      Custom);

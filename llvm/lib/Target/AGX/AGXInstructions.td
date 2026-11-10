@@ -622,6 +622,17 @@ def : Pat<(i32 (add (ctlz AGXIntSrc32:$a), 32)),
 def : Pat<(i32 (add (cttz AGXIntSrc32:$a), 32)),
           (ISUB_I32 0, (i32 63), 0, (FFS_I32 0, (BITREV_I32 0, $a)), 0)>;
 def : Pat<(i32 (sub 31, (ctlz AGXIntSrc32:$a))), (FFS_I32 0, $a)>;
+// Any other added constant c with 31 + c in [0, 255] folds the same way
+// (ctlz of a 16-bit value, ctlz(zext x) - 16, is 15 - ffs(x)).
+def agx_ctlz_add : ImmLeaf<i32, [{
+  return Imm != 0 && Imm != 32 && Imm >= -31 && Imm <= 224;
+}]>;
+def agx_ctlz_add_xform : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(31 + N->getSExtValue(), SDLoc(N), MVT::i32);
+}]>;
+let AddedComplexity = 11 in  // over the subtraction of an 8-bit immediate
+def : Pat<(i32 (add (ctlz AGXIntSrc32:$a), agx_ctlz_add:$c)),
+          (ISUB_I32 0, (i32 (agx_ctlz_add_xform $c)), 0, (FFS_I32 0, $a), 0)>;
 // The count and a zero high half (a 64-bit addition of zero waited for the
 // count and took a wide issue slot; the zero goes where the high half is
 // unread).
