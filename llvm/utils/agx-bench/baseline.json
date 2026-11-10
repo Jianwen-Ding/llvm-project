@@ -1,10 +1,10 @@
 {
  "bilinear_resize.ll:bilinear_resize:agx-g13g": {
-  "bytes": 332,
-  "cycles": 226.4,
+  "bytes": 326,
+  "cycles": 225.3,
   "gprs": 13,
   "groups": 96,
-  "instructions": 50,
+  "instructions": 49,
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 20.5,
@@ -12,11 +12,11 @@
   "waits": 2
  },
  "bilinear_resize.ll:bilinear_resize:agx-g14c": {
-  "bytes": 332,
-  "cycles": 226.4,
+  "bytes": 326,
+  "cycles": 225.3,
   "gprs": 13,
   "groups": 96,
-  "instructions": 50,
+  "instructions": 49,
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 20.5,

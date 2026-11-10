@@ -904,6 +904,20 @@ multiclass SelectZeroArmPats<Instruction inst, ValueType vt,
                           (inst C.HW, $am, $a, $bm, $b, 0, $x, 0, (zt 0)))>;
   }
 }
+// min / max with +0.0 (relu): the compare's operand the float immediate 0.0
+// and the arm the integer immediate 0 (its bits), instead of a mov_imm of 0
+// shared by both (an instruction, and a register held across a loop).
+let AddedComplexity = 2 in {
+def : Pat<(f32 (fmaxnum f32:$a, (f32 agx_fpimm0))),
+          (FCMPSEL_F32 FC_GTN, 0, $a, 0, (i32 0), 0, $a, 0, (i32 0))>;
+def : Pat<(f32 (fminnum f32:$a, (f32 agx_fpimm0))),
+          (FCMPSEL_F32 FC_LTN, 0, $a, 0, (i32 0), 0, $a, 0, (i32 0))>;
+def : Pat<(f16 (fmaxnum f16:$a, (f16 agx_fpimm0))),
+          (FCMPSEL_F16 FC_GTN, 0, $a, 0, (i16 0), 0, $a, 0, (i16 0))>;
+def : Pat<(f16 (fminnum f16:$a, (f16 agx_fpimm0))),
+          (FCMPSEL_F16 FC_LTN, 0, $a, 0, (i16 0), 0, $a, 0, (i16 0))>;
+}
+
 let AddedComplexity = 2 in {
 defm : SelectZeroArmPats<FCMPSEL_F32, f32, AGXFPSrc32, i32>;
 defm : SelectZeroArmPats<FCMPSEL_F16, f16, AGXFPSrc16, i16>;
