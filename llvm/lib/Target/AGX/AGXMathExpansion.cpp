@@ -272,17 +272,18 @@ public:
     return {S, Err};
   }
 
-  /// 2^n for an integral n in [-126, 127].
-  Value *pow2(Value *N) {
+  /// 2^i for an i32 i in [-126, 127].
+  Value *pow2i(Value *I) {
+    return B.CreateBitCast(B.CreateShl(B.CreateAdd(I, ki(127)), ki(23)), Ty);
+  }
+  /// v * 2^n for an integral n in [-252, 254], in two steps. The split is
+  /// done on the integer: i >> 1 and i - (i >> 1) are both in [-126, 127].
+  Value *ldexp(Value *V, Value *N) {
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
-    Value *E = B.CreateAdd(B.CreateFreeze(B.CreateFPToSI(N, intTy())), ki(127));
-    return B.CreateBitCast(B.CreateShl(E, ki(23)), Ty);
-  }
-  /// v * 2^n for an integral n in [-252, 254], in two steps.
-  Value *ldexp(Value *V, Value *N) {
-    Value *N1 = call(Intrinsic::trunc, {mul(N, k(0.5))});
-    return mul(mul(V, pow2(N1)), pow2(sub(N, N1)));
+    Value *I = B.CreateFreeze(B.CreateFPToSI(N, intTy()));
+    Value *I1 = B.CreateAShr(I, ki(1));
+    return mul(mul(V, pow2i(I1)), pow2i(B.CreateSub(I, I1)));
   }
 
   /// e^r for |r| <= ln(2) / 2 (Cephes expf).
@@ -312,7 +313,7 @@ public:
     // and not; with a low part (exp2, exp10, pow) the selects stay.
     if (Lo && !Bounded)
       E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
-    // A NaN hi is a NaN r, which makes E a NaN (pow2 freezes its
+    // A NaN hi is a NaN r, which makes E a NaN (ldexp freezes its
     // conversion of the NaN n, which would be poison).
     return E;
   }
