@@ -57,7 +57,7 @@ public:
   }
   Value *sqrt(Value *X) { return call(Intrinsic::sqrt, {X}); }
   Value *exp(Value *X) { return call(Intrinsic::exp, {X}); }
-  Value *expPrecise(Value *X) { return expHiLo(X, k(0.0)); }
+  Value *expPrecise(Value *X) { return expHiLo(X, nullptr); }
   Value *log(Value *X) { return call(Intrinsic::log, {X}); }
   Value *sel(Value *C, Value *T, Value *F) { return B.CreateSelect(C, T, F); }
   Value *gt(Value *A, double V) { return B.CreateFCmpOGT(A, k(V)); }
@@ -290,14 +290,16 @@ public:
     return add(fma(P, mul(R, R), R), k(1.0));
   }
 
-  /// e^(hi + lo), lo a small correction: n = round(hi / ln 2) is split off
-  /// exactly (ln 2 in two parts) and the rest goes to expCore.
+  /// e^(hi + lo), lo a small correction (or none: an addition of +0.0 only
+  /// changes r = -0 to +0, for which expCore gives 1 either way): n =
+  /// round(hi / ln 2) is split off exactly (ln 2 in two parts) and the rest
+  /// goes to expCore.
   Value *expHiLo(Value *Hi, Value *Lo) {
     Value *C = sel(gt(Hi, 89.0), k(89.0), sel(lt(Hi, -104.0), k(-104.0), Hi));
     Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
-    Value *E = ldexp(expCore(add(R, Lo)), N);
+    Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N);
     E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
     return sel(isNaN(Hi), Hi, E);
   }
