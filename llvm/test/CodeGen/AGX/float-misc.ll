@@ -75,15 +75,27 @@ define agx_kernel void @vector_rz(ptr addrspace(1) %o, <2 x float> %a, <2 x floa
   ret void
 }
 
-; round(x), half away from zero: trunc(x), one away from zero more when
-; |x - trunc(x)| >= 0.5, and the sign of x.
+; round(x), half away from zero: trunc(x + copysign(0x3effffff, x)), the
+; float just below 0.5 (0.5 itself would round 0.49999997 up).
 ; CHECK-LABEL: round_f32:
-; CHECK: trunc [[T:r[0-9]+]], [[X:u[0-9]+]]
-; CHECK: fadd32 [[D:r[0-9]+]], [[X]], [[T]].neg
-; CHECK: fcmpsel gte, {{r[0-9]+}}, [[D]].abs, 0.5,
+; CHECK: mov_imm [[B:r[0-9]+]], 1056964607
+; CHECK-NEXT: bfi [[B]], [[X:u[0-9]+]], [[B]], 0, mask 0x7FFFFFFF
+; CHECK-NEXT: fadd32 [[S:r[0-9]+]], [[X]], [[B]]
+; CHECK-NEXT: trunc {{r[0-9]+}}, [[S]]
 define agx_kernel void @round_f32(ptr addrspace(1) %p, float %x) {
   %r = call float @llvm.round.f32(float %x)
   store float %r, ptr addrspace(1) %p
+  ret void
+}
+
+; CHECK-LABEL: round_f16:
+; CHECK: mov_imm [[B:r[0-9]+l]], 14335
+; CHECK-NEXT: bfi [[B]], [[X:u[0-9]+l]], [[B]], 0, mask 0x7FFF
+; CHECK-NEXT: fadd16 [[S:r[0-9]+l]], [[X]], [[B]]
+; CHECK-NEXT: trunc {{r[0-9]+l}}, [[S]]
+define agx_kernel void @round_f16(ptr addrspace(1) %p, half %x) {
+  %r = call half @llvm.round.f16(half %x)
+  store half %r, ptr addrspace(1) %p
   ret void
 }
 

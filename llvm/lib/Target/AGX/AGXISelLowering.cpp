@@ -2335,10 +2335,34 @@ SDValue AGXTargetLowering::lowerFCOPYSIGN(SDValue Op,
 /// away from zero when |x - t| >= 0.5, with the sign of x (round(-0.3) and
 /// round(-0) are -0). x - t is exact, and so is t + 1 for every x that is not
 /// an integer; infinities give x - t = NaN, so t, and NaN stays NaN.
+static cl::opt<bool> RoundBias(
+    "agx-round-bias",
+    cl::desc("round(x) as trunc(x + copysign(the float below 0.5, x))"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFROUND(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
   SDValue X = Op.getOperand(0);
+  if (RoundBias && (VT == MVT::f32 || VT == MVT::f16)) {
+    // trunc(x + copysign(b, x)) with b the float just below 0.5: a fraction
+    // of 0.5 or more carries x + b over the next integer (at exactly 0.5 the
+    // sum is a tie, rounded to the even, larger, magnitude), and less does
+    // not; at |x| >= 2^23 (2^10 for half) adding b gives x. -0, infinities
+    // and NaN stay. A mov_imm, a bfi, an add and a trunc, instead of nine.
+    // Checked for every float (flushing and not) and every half.
+    EVT IntVT = VT == MVT::f16 ? MVT::i16 : MVT::i32;
+    unsigned BW = IntVT.getSizeInBits();
+    uint64_t Bias = VT == MVT::f16 ? 0x37ff : 0x3effffff;
+    SDValue B = DAG.getNode(AGXISD::BFI_FIELD, DL, IntVT,
+                            DAG.getBitcast(IntVT, X),
+                            DAG.getConstant(Bias, DL, IntVT),
+                            DAG.getConstant(0, DL, IntVT),
+                            DAG.getTargetConstant(BW - 1, DL, MVT::i32));
+    return DAG.getNode(ISD::FTRUNC, DL, VT,
+                       DAG.getNode(ISD::FADD, DL, VT, X,
+                                   DAG.getBitcast(VT, B)));
+  }
   SDValue T = DAG.getNode(ISD::FTRUNC, DL, VT, X);
   SDValue D =
       DAG.getNode(ISD::FABS, DL, VT, DAG.getNode(ISD::FSUB, DL, VT, X, T));
