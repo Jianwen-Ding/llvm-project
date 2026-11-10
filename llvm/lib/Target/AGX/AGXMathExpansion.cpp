@@ -101,8 +101,9 @@ public:
     // Above 0.5: asin(a) = pi / 2 - 2 asin(sqrt((1 - a) / 2)).
     Value *Big = gt(A, 0.5);
     Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)));
-    Value *R = sel(Big, sub(k(M_PI_2), mul(k(2.0), asinSmall(S))),
-                   asinSmall(A));
+    // One polynomial, of the argument the range picks.
+    Value *P = asinSmall(sel(Big, S, A));
+    Value *R = sel(Big, sub(k(M_PI_2), mul(k(2.0), P)), P);
     // |x| > 1: the square root is NaN.
     R = sel(gt(A, 1.0), S, R);
     return copysign(R, X);
@@ -113,10 +114,13 @@ public:
     // |x| > 0.5: acos(|x|) = 2 asin(sqrt((1 - |x|) / 2)), and
     // acos(-|x|) = pi - acos(|x|); else pi / 2 - asin(x).
     Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)));
-    Value *Twice = mul(k(2.0), asinSmall(S));
+    Value *Big = gt(A, 0.5);
+    // One polynomial, of the argument the range picks.
+    Value *P = asinSmall(sel(Big, S, A));
+    Value *Twice = mul(k(2.0), P);
     Value *Outer = sel(lt(X, 0.0), sub(k(M_PI), Twice), Twice);
-    Value *Inner = sub(k(M_PI_2), copysign(asinSmall(A), X));
-    Value *R = sel(gt(A, 0.5), Outer, Inner);
+    Value *Inner = sub(k(M_PI_2), copysign(P, X));
+    Value *R = sel(Big, Outer, Inner);
     return sel(gt(A, 1.0), S, R);
   }
 
