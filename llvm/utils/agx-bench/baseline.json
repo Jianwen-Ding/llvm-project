@@ -216,11 +216,11 @@
   "waits": 9
  },
  "cuda_ddot.ll:ddot:agx-g13g": {
-  "bytes": 32572,
+  "bytes": 32562,
   "cycles": 12347.1,
   "gprs": 64,
   "groups": 24,
-  "instructions": 4202,
+  "instructions": 4201,
   "launch_inputs": true,
   "tg_bytes": 64,
   "tput": 2574.0,
@@ -228,11 +228,11 @@
   "waits": 2
  },
  "cuda_ddot.ll:ddot:agx-g14c": {
-  "bytes": 32572,
+  "bytes": 32562,
   "cycles": 12347.1,
   "gprs": 64,
   "groups": 24,
-  "instructions": 4202,
+  "instructions": 4201,
   "launch_inputs": true,
   "tg_bytes": 64,
   "tput": 2574.0,

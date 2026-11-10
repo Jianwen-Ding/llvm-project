@@ -1638,6 +1638,12 @@ static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
   return DAG.getNode(ISD::SUB, DL, MVT::i32, F, C(128));
 }
 
+static cl::opt<bool> SelectOfSelect(
+    "agx-select-of-select",
+    cl::desc("a select on an or / and of truth values as two nested "
+             "selects"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> SignSelect(
     "agx-sign-select",
     cl::desc("select on x > -1 as a select on x < 0, arms swapped"),
@@ -1649,10 +1655,30 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::SETCC:
     return performClassCompareCombine(N, DCI);
   case ISD::SELECT: {
+    SDValue C = N->getOperand(0);
+    // select (select (c, 1, d)), x, y -> select c, x, (select d, x, y) and
+    // select (select (c, d, 0)), x, y -> select c, (select d, x, y), y: a
+    // condition that is a truth value or another (the or / and of two
+    // compares after legalization, as one / ueq float compares expand to)
+    // takes two compare-selects instead of the inner select's truth value
+    // and a select on it.
+    if (SelectOfSelect && DCI.isAfterLegalizeDAG() &&
+        C.getOpcode() == ISD::SELECT && C.hasOneUse()) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDLoc DL(N);
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      SDValue CC = C.getOperand(0), T = C.getOperand(1), F = C.getOperand(2);
+      if (isOneConstant(T) && F.getOpcode() == ISD::SETCC)
+        return DAG.getSelect(DL, N->getValueType(0), CC, X,
+                             DAG.getSelect(DL, N->getValueType(0), F, X, Y));
+      if (isNullConstant(F) && T.getOpcode() == ISD::SETCC)
+        return DAG.getSelect(DL, N->getValueType(0), CC,
+                             DAG.getSelect(DL, N->getValueType(0), T, X, Y),
+                             Y);
+    }
     // select (x > -1), a, b -> select (x < 0), b, a: icmpsel compares with
     // an immediate 0 but needs -1 in a register (a mov_imm). x >= 0 is
     // canonicalized to x > -1.
-    SDValue C = N->getOperand(0);
     if (!SignSelect || !DCI.isAfterLegalizeDAG() ||
         C.getOpcode() != ISD::SETCC || !C.hasOneUse() ||
         !C.getOperand(0).getValueType().isScalarInteger() ||
