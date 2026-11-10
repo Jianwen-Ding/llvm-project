@@ -1948,6 +1948,38 @@ def AGX_END_CF : AGXCodeGenPseudo<(outs), (ins), [(AGXend_cf)]>;
 def AGX_LOOP_BEGIN : AGXCodeGenPseudo<(outs), (ins), [(AGXloop_begin)]>;
 }
 
+// The sign as a small mask, (x < 0) ? m : 0 for an 8-bit m, as the rounding
+// bias of a signed division or remainder by 2^k is written (the sign
+// extended by an asr, then masked or shifted down): one icmpsel with
+// immediates, instead of two shifts on the unit integer multiplies and bit
+// fields share (or an asr and an and).
+def agx_imm8 : ImmLeaf<i32, [{ return isUInt<8>(Imm); }]>;
+def agx_low_mask_shift : ImmLeaf<i32, [{ return Imm >= 24 && Imm < 32; }]>;
+def agx_low_mask_of_shift : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant((1u << (32 - N->getZExtValue())) - 1,
+                                   SDLoc(N), MVT::i32);
+}]>;
+def : Pat<(i32 (and (sra i32:$x, (i32 31)), agx_imm8:$m)),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 imm:$m), 0, (i32 0))>;
+def : Pat<(i32 (srl (sra i32:$x, (i32 31)), agx_low_mask_shift:$s)),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0,
+                       (i32 (agx_low_mask_of_shift $s)), 0, (i32 0))>;
+
+// x - ((x + b) & -2^k) (a signed remainder by 2^k, b its bias) is
+// ((x + b) & (2^k - 1)) - b: the mask an 8-bit immediate instead of a
+// mov_imm of -2^k, one subtraction fewer.
+def agx_neg_pow2_8 : ImmLeaf<i32, [{
+  return Imm < -1 && Imm >= -256 && isPowerOf2_64(uint64_t(-Imm));
+}]>;
+def agx_not_imm : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(~uint32_t(N->getZExtValue()), SDLoc(N),
+                                   MVT::i32);
+}]>;
+def : Pat<(i32 (sub i32:$x, (and (add i32:$x, i32:$b), agx_neg_pow2_8:$c))),
+          (ISUB_I32 0, (BITOP_I32 TT_AND, 0, (IADD_I32 0, $x, 0, $b, 0), 0,
+                                  (i32 (agx_not_imm $c))),
+                    0, $b, 0)>;
+
 // The sign bit as a truth value: x >= 0 (the shift of its complement, as
 // the generic combines write it) is one icmpsel instead of a not and a
 // bfeil on the shared unit, and a branch on x < 0 or x >= 0 tests the sign
