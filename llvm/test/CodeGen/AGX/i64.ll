@@ -88,16 +88,15 @@ define agx_kernel void @shifts(ptr addrspace(1) %out, i64 %a, i64 %s) {
 define agx_kernel void @compare(ptr addrspace(1) %out, i64 %a, i64 %b) {
 ; CHECK-LABEL: compare:
 ; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
-; CHECK-NEXT:    // general purpose registers: 5 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    icmpsel slt, r1, u3, u5, 1, 0
 ; CHECK-NEXT:    icmpsel ult, r2, u2, u4, 1, 0
 ; CHECK-NEXT:    icmpsel ueq, r3, u3, u5, 1, 0
-; CHECK-NEXT:    icmpsel ueq, r4, u2, u4, 1, 0
 ; CHECK-NEXT:    icmpsel ueq, r1, u3, u5, r2, r1
-; CHECK-NEXT:    and r2, r4, r3
+; CHECK-NEXT:    icmpsel ueq, r2, u2, u4, r3, 0
 ; CHECK-NEXT:    iadd r1, r1, r2
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

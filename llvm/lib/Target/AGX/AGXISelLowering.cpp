@@ -108,7 +108,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
   setTargetDAGCombine({ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
-                       ISD::SIGN_EXTEND_INREG, ISD::OR});
+                       ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1513,12 +1513,51 @@ static SDValue performBfiInsertCombine(SDNode *N,
   return SDValue();
 }
 
+static cl::opt<bool> SelectBooleanLogic(
+    "agx-select-boolean-logic",
+    cl::desc("and / or of a comparison and a 0/1 value as one select"),
+    cl::init(true), cl::Hidden);
+
+/// and(setcc, b) and or(setcc, b) of a 0/1 value b: setcc ? b : 0 and
+/// setcc ? 1 : b, one icmpsel / fcmpsel (the comparison's), instead of
+/// materializing the comparison's 0/1 and then the and / or. The select
+/// reads the compared pair and b: at most one issue cycle more than the
+/// comparison alone (three 32-bit registers), which is what the and took.
+static SDValue performBooleanLogicCombine(SDNode *N,
+                                          TargetLowering::DAGCombinerInfo &DCI) {
+  if (!SelectBooleanLogic || !DCI.isAfterLegalizeDAG() ||
+      N->getValueType(0) != MVT::i32)
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue C = N->getOperand(I), B = N->getOperand(1 - I);
+    if (C.getOpcode() != ISD::SETCC || !C.hasOneUse())
+      continue;
+    EVT CT = C.getOperand(0).getValueType();
+    if (CT != MVT::i32 && CT != MVT::f32 && CT != MVT::i16 && CT != MVT::f16)
+      continue;
+    if (DAG.computeKnownBits(B).countMinLeadingZeros() < 31)
+      continue;
+    SDLoc DL(N);
+    SDValue Zero = DAG.getConstant(0, DL, MVT::i32);
+    SDValue One = DAG.getConstant(1, DL, MVT::i32);
+    return N->getOpcode() == ISD::AND
+               ? DAG.getSelect(DL, MVT::i32, C, B, Zero)
+               : DAG.getSelect(DL, MVT::i32, C, One, B);
+  }
+  return SDValue();
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
+  case ISD::AND:
+    return performBooleanLogicCombine(N, DCI);
   case ISD::OR: {
+    if (SDValue V = performBooleanLogicCombine(N, DCI))
+      return V;
     if (SDValue V = performBfiInsertCombine(N, DCI))
       return V;
     // or(Q, P) where P is x << s (with masks around the shift) whose bits

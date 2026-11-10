@@ -348,25 +348,23 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    fcmpsel eq, r4, r22, r22, r4, r22
 ; CHECK-NEXT:    fcmpsel gt, r1, r5, 0.0, r10, r1
 ; CHECK-NEXT:    fcmpsel eq, r1, r5.abs, r10, r1, r4
+; CHECK-NEXT:    trunc r5, u3
 ; CHECK-NEXT:    fcmpsel lt, r4, r7, r6, 1, 0
-; CHECK-NEXT:    fcmpsel gt, r5, r7, r6, 1, 0
-; CHECK-NEXT:    trunc r6, u3
-; CHECK-NEXT:    or r4, r5, r4
-; CHECK-NEXT:    xor r5, r1, r2
+; CHECK-NEXT:    fcmpsel gt, r4, r7, r6, 1, r4
+; CHECK-NEXT:    xor r6, r1, r2
 ; CHECK-NEXT:    and r2, r3, r2
-; CHECK-NEXT:    icmpsel ueq, r4, r4, 0, r1, r5
+; CHECK-NEXT:    icmpsel ueq, r4, r4, 0, r1, r6
 ; CHECK-NEXT:    or r2, r2, r17
-; CHECK-NEXT:    fcmpsel eq, r4, r6, u3, r4, r1
-; CHECK-NEXT:    fcmpsel eq, r5, u3, u3, 0, 1
+; CHECK-NEXT:    fcmpsel eq, r4, r5, u3, r4, r1
 ; CHECK-NEXT:    fcmpsel lt, r1, r2, 0.0, r4, r1
-; CHECK-NEXT:    fcmpsel eq, r4, r3, r3, 0, 1
-; CHECK-NEXT:    fcmpsel eq, r2, r6, u3, r1, r20
+; CHECK-NEXT:    fcmpsel eq, r4, u3, u3, 0, 1
+; CHECK-NEXT:    fcmpsel eq, r2, r5, u3, r1, r20
 ; CHECK-NEXT:    fcmpsel lt, r2, u3.abs, r10, r2, r1
 ; CHECK-NEXT:    fcmpsel gt, r2, r3, r19, r2, r1
 ; CHECK-NEXT:    fcmpsel lt, r1, r3, 0.0, r2, r1
 ; CHECK-NEXT:    fcmpsel lt, r2, u3.abs, r10, r1, r17
 ; CHECK-NEXT:    fcmpsel eq, r1, r3.abs, 1.0, r2, r1
-; CHECK-NEXT:    or r2, r4, r5
+; CHECK-NEXT:    fcmpsel eq, r2, r3, r3, r4, 1
 ; CHECK-NEXT:    icmpsel ueq, r1, r2, 0, r1, r20
 ; CHECK-NEXT:    mov_imm r2, 1602224128
 ; CHECK-NEXT:    fcmpsel eq, r1, r3, 1.0, r17, r1
