@@ -106,7 +106,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ATOMIC_LOAD_SUB, MVT::i32, Custom);
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
-  setTargetDAGCombine({ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
+  setTargetDAGCombine({ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
@@ -1548,9 +1548,35 @@ static SDValue performBooleanLogicCombine(SDNode *N,
   return SDValue();
 }
 
+static cl::opt<bool> SignSelect(
+    "agx-sign-select",
+    cl::desc("select on x > -1 as a select on x < 0, arms swapped"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
+  case ISD::SETCC:
+    return performClassCompareCombine(N, DCI);
+  case ISD::SELECT: {
+    // select (x > -1), a, b -> select (x < 0), b, a: icmpsel compares with
+    // an immediate 0 but needs -1 in a register (a mov_imm). x >= 0 is
+    // canonicalized to x > -1.
+    SDValue C = N->getOperand(0);
+    if (!SignSelect || !DCI.isAfterLegalizeDAG() ||
+        C.getOpcode() != ISD::SETCC || !C.hasOneUse() ||
+        !C.getOperand(0).getValueType().isScalarInteger() ||
+        !isAllOnesConstant(C.getOperand(1)) ||
+        cast<CondCodeSDNode>(C.getOperand(2))->get() != ISD::SETGT)
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    SDLoc DL(N);
+    SDValue Lt = DAG.getSetCC(
+        DL, C.getValueType(), C.getOperand(0),
+        DAG.getConstant(0, DL, C.getOperand(0).getValueType()), ISD::SETLT);
+    return DAG.getSelect(DL, N->getValueType(0), Lt, N->getOperand(2),
+                         N->getOperand(1));
+  }
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
   case ISD::AND:
@@ -2329,6 +2355,64 @@ SDValue AGXTargetLowering::lowerFCOPYSIGN(SDValue Op,
   SDValue S = DAG.getNode(ISD::AND, DL, IntVT, DAG.getBitcast(IntVT, Sign),
                           DAG.getConstant(SignMask, DL, IntVT));
   return DAG.getBitcast(VT, DAG.getNode(ISD::OR, DL, IntVT, M, S));
+}
+
+static cl::opt<bool> ClassCompare(
+    "agx-fpclass-compare",
+    cl::desc("finiteness / infinity tests of a float's bits as float "
+             "compares"),
+    cl::init(true), cl::Hidden);
+
+/// The bit tests of a float's class that one float compare answers, as the
+/// generic is.fpclass expansion (and hand-written code) writes them:
+///
+///   (bits << 1) <u (all-ones exponent << 1)   finite      |x| <  inf
+///   (bits << 1) >u that - 1                   not finite  |x| >= inf (uge)
+///   (bits & ~sign) == inf                     infinite    |x| == inf
+///   (bits & ~sign) != inf                     not         |x| != inf (une)
+///
+/// An fcmpsel of x with the .abs modifier and +inf (a mov_imm, as the bit
+/// form's constant is) instead of the shift or mask on the shared unit and an
+/// icmpsel. A flushed subnormal is a zero, finite as the subnormal is.
+SDValue AGXTargetLowering::performClassCompareCombine(
+    SDNode *N, DAGCombinerInfo &DCI) const {
+  if (!ClassCompare)
+    return SDValue();
+  SDValue L = N->getOperand(0);
+  auto *C = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  ISD::CondCode CC = cast<CondCodeSDNode>(N->getOperand(2))->get();
+  EVT IntVT = L.getValueType();
+  if (!C || (IntVT != MVT::i32 && IntVT != MVT::i16))
+    return SDValue();
+  unsigned BW = IntVT.getSizeInBits();
+  EVT FVT = BW == 32 ? MVT::f32 : MVT::f16;
+  APInt Inf = APFloat::getInf(FVT.getFltSemantics()).bitcastToAPInt();
+  const APInt &K = C->getAPIntValue();
+  SDValue Bits;
+  ISD::CondCode FCC;
+  bool Shifted = (L.getOpcode() == ISD::SHL && isOneConstant(L.getOperand(1))) ||
+                 (L.getOpcode() == ISD::ADD && L.getOperand(0) == L.getOperand(1));
+  if (Shifted && CC == ISD::SETULT && K == Inf.shl(1)) {
+    Bits = L.getOperand(0);
+    FCC = ISD::SETOLT;
+  } else if (Shifted && CC == ISD::SETUGT && K == Inf.shl(1) - 1) {
+    Bits = L.getOperand(0);
+    FCC = ISD::SETUGE;
+  } else if (L.getOpcode() == ISD::AND && isa<ConstantSDNode>(L.getOperand(1)) &&
+             L.getConstantOperandAPInt(1) == ~APInt::getSignMask(BW) &&
+             K == Inf && (CC == ISD::SETEQ || CC == ISD::SETNE)) {
+    Bits = L.getOperand(0);
+    FCC = CC == ISD::SETEQ ? ISD::SETOEQ : ISD::SETUNE;
+  } else {
+    return SDValue();
+  }
+  SelectionDAG &DAG = DCI.DAG;
+  SDLoc DL(N);
+  SDValue X = DAG.getBitcast(FVT, Bits);
+  return DAG.getSetCC(DL, N->getValueType(0), DAG.getNode(ISD::FABS, DL, FVT, X),
+                      DAG.getConstantFP(APFloat::getInf(FVT.getFltSemantics()),
+                                        DL, FVT),
+                      FCC);
 }
 
 /// round(x), half away from zero (no libm on AGX): t = trunc(x), plus one

@@ -1934,6 +1934,25 @@ def AGX_END_CF : AGXCodeGenPseudo<(outs), (ins), [(AGXend_cf)]>;
 def AGX_LOOP_BEGIN : AGXCodeGenPseudo<(outs), (ins), [(AGXloop_begin)]>;
 }
 
+// The sign bit as a truth value: x >= 0 (the shift of its complement, as
+// the generic combines write it) is one icmpsel instead of a not and a
+// bfeil on the shared unit, and a branch on x < 0 or x >= 0 tests the sign
+// with an icmpsel AGXFoldOperands folds into the branch.
+def : Pat<(i32 (srl (xor i32:$x, -1), (i32 31))),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 0), 0, (i32 1))>;
+def : Pat<(AGXif (i32 (srl i32:$x, (i32 31))), bb:$t),
+          (AGX_IF (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0,
+                               (i32 0)), bb:$t)>;
+def : Pat<(AGXloop (i32 (srl i32:$x, (i32 31))), bb:$t),
+          (AGX_LOOP (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0,
+                                 (i32 0)), bb:$t)>;
+def : Pat<(AGXif (i32 (srl (xor i32:$x, -1), (i32 31))), bb:$t),
+          (AGX_IF (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 0), 0,
+                               (i32 1)), bb:$t)>;
+def : Pat<(AGXloop (i32 (srl (xor i32:$x, -1), (i32 31))), bb:$t),
+          (AGX_LOOP (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 0), 0,
+                                 (i32 1)), bb:$t)>;
+
 let isBranch = 1, isTerminator = 1, isBarrier = 1 in
 def AGX_BR : AGXCodeGenPseudo<(outs), (ins AGXBrTarget:$target), [(br bb:$target)]>;
 
