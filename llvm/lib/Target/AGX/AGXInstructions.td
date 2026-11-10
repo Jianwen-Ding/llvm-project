@@ -1802,9 +1802,34 @@ def ICMP_QUAD_BALLOT : AGXALUPseudo<ICMP_QUAD_BALLOT_g13, (outs GPR32:$dst),
                                          Src32Op:$src1), [], [WriteShuffle]>;
 }
 
+let isConvergent = 1 in
+def FCMP_BALLOT : AGXALUPseudo<FCMP_BALLOT_g13, (outs GPR32:$dst),
+                               (ins i32imm:$cc, SrcMods:$src0_mods,
+                                    Src32Op:$src0, SrcMods:$src1_mods,
+                                    Src32Op:$src1), [], [WriteShuffle]>;
+
 // ballot(c) = icmp_ballot nueq c, 0 (the inverted ueq condition is 8).
 def : Pat<(i32 (AGXballot i32:$c)),
           (ICMP_BALLOT 8, 0, $c, 0, (i32 0))>;
+// The ballot of a comparison is the comparison's ballot: one icmp_ballot /
+// fcmp_ballot instead of the comparison's truth value and its ballot (an
+// inverted condition is the hardware's with bit 3 set).
+let AddedComplexity = 1 in {
+foreach C = AGXIntConds in
+def : Pat<(i32 (AGXballot (i32 (setcc AGXIntSrc32:$a, AGXIntSrc32:$b, C.CC)))),
+          (ICMP_BALLOT !add(C.HW, !if(C.Swap, 8, 0)), 0, $a, 0, $b)>;
+foreach C = AGXIntConds in
+def : Pat<(i32 (AGXquad_ballot (i32 (setcc AGXIntSrc32:$a, AGXIntSrc32:$b,
+                                           C.CC)))),
+          (BITOP_I32 TT_AND, 0,
+                     (ICMP_QUAD_BALLOT !add(C.HW, !if(C.Swap, 8, 0)), 0, $a,
+                                       0, $b),
+                     0, (i32 15))>;
+foreach C = AGXFPConds in
+def : Pat<(i32 (AGXballot (i32 (setcc (AGXFPSrc32 f32:$a, i32:$am),
+                                      (AGXFPSrc32 f32:$b, i32:$bm), C.CC)))),
+          (FCMP_BALLOT !add(C.HW, !if(C.Swap, 8, 0)), $am, $a, $bm, $b)>;
+}
 def : Pat<(i32 (AGXquad_ballot i32:$c)),
           (BITOP_I32 TT_AND, 0, (ICMP_QUAD_BALLOT 8, 0, $c, 0, (i32 0)), 0,
                      (i32 15))>;
