@@ -331,7 +331,6 @@ def : Pat<(i32 (sub AGXIntSrc32:$a, (shl AGXIntSrc32:$b, agx_iadd_shift:$s))),
           (ISUB_I32 0, $a, 0, $b, imm:$s)>;
 
 def : Pat<(i32 (sext i16:$a)), (IADD_I32_FROM16 MOD_SX, $a, 0, (i16 0), 0)>;
-def : Pat<(i64 (sext i32:$a)), (IADD_I64_FROM32 MOD_SX, $a, 0, (i32 0), 0)>;
 // A 32-bit value widened: the value itself as the low half and a zero (or,
 // for anyext, nothing) as the high one, so that a widened value whose high
 // half no instruction reads costs nothing: the low half coalesces with the
@@ -596,6 +595,12 @@ def : Pat<(i64 (sext_inreg i64:$a, i1)),
               (BITOP_I32 TT_AND, 0, (i32 (EXTRACT_SUBREG $a, sub0)), 0, (i32 1)), 0),
             0, (i32 0), 0)>;
 
+// A 32-bit value sign-extended: the value as the low half and its sign
+// (asr 31) as the high one, which goes where the high half is unread, instead
+// of a 64-bit addition of zero on the wide issue slot.
+def : Pat<(i64 (sext i32:$a)),
+          (REG_SEQUENCE GPR64, $a, sub0, (ASR_I32 0, $a, 0, (i32 31)), sub1)>;
+
 // Count leading zeros: 31 - ffs(x); ffs(0) is -1.
 def : Pat<(i32 (ctlz AGXIntSrc32:$a)),
           (ISUB_I32 0, (i32 31), 0, (FFS_I32 0, $a), 0)>;
@@ -609,10 +614,14 @@ def : Pat<(i32 (add (ctlz AGXIntSrc32:$a), 32)),
 def : Pat<(i32 (add (cttz AGXIntSrc32:$a), 32)),
           (ISUB_I32 0, (i32 63), 0, (FFS_I32 0, (BITREV_I32 0, $a)), 0)>;
 def : Pat<(i32 (sub 31, (ctlz AGXIntSrc32:$a))), (FFS_I32 0, $a)>;
+// The count and a zero high half (a 64-bit addition of zero waited for the
+// count and took a wide issue slot; the zero goes where the high half is
+// unread).
 def : Pat<(i64 (ctpop i64:$a)),
-          (IADD_I64_FROM32 0, (IADD_I32 0, (POPCOUNT_I32 0, (EXTRACT_SUBREG $a, sub0)),
-                                        0, (POPCOUNT_I32 0, (EXTRACT_SUBREG $a, sub1)),
-                                        0), 0, (i32 0), 0)>;
+          (REG_SEQUENCE GPR64,
+            (IADD_I32 0, (POPCOUNT_I32 0, (EXTRACT_SUBREG $a, sub0)),
+                      0, (POPCOUNT_I32 0, (EXTRACT_SUBREG $a, sub1)), 0), sub0,
+            (MOV_IMM32 0), sub1)>;
 
 //===----------------------------------------------------------------------===//
 // Compare and select

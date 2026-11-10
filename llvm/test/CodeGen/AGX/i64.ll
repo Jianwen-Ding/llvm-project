@@ -120,26 +120,25 @@ define agx_kernel void @compare(ptr addrspace(1) %out, i64 %a, i64 %b) {
 define agx_kernel void @bitcount(ptr addrspace(1) %out, i64 %a) {
 ; CHECK-LABEL: bitcount:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 7 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 8 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    icmpsel ueq, r1, u3, 0, u2, u3
-; CHECK-NEXT:    popcount r4, u3
+; CHECK-NEXT:    mov_imm r5, 0
 ; CHECK-NEXT:    ffs r1, r1
-; CHECK-NEXT:    icmpsel ueq, r2, u3, 0, 63, 31
-; CHECK-NEXT:    popcount r5, u2
-; CHECK-NEXT:    isub r2, r2, r1
-; CHECK-NEXT:    icmpsel ueq, r1, u2, 0, u3, u2
-; CHECK-NEXT:    icmpsel ueq, r6, u2, 0, 63, 31
-; CHECK-NEXT:    bitrev r1, r1
-; CHECK-NEXT:    iadd r4, r5, r4
-; CHECK-NEXT:    mov_imm r3, 0
-; CHECK-NEXT:    ffs r1, r1
-; CHECK-NEXT:    iadd r4_r5, r4, 0
-; CHECK-NEXT:    isub r1, r6, r1
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r4_r5
+; CHECK-NEXT:    icmpsel ueq, r2, u2, 0, u3, u2
+; CHECK-NEXT:    icmpsel ueq, r3, u3, 0, 63, 31
+; CHECK-NEXT:    bitrev r2, r2
+; CHECK-NEXT:    isub r4, r3, r1
+; CHECK-NEXT:    popcount r3, u2
+; CHECK-NEXT:    ffs r1, r2
+; CHECK-NEXT:    icmpsel ueq, r2, u2, 0, 63, 31
+; CHECK-NEXT:    isub r1, r2, r1
+; CHECK-NEXT:    popcount r2, u3
+; CHECK-NEXT:    iadd r6_r7, r4_r5, r1
+; CHECK-NEXT:    iadd r4, r3, r2
+; CHECK-NEXT:    iadd r2_r3, r6_r7, r4_r5
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
