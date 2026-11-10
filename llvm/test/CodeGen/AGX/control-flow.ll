@@ -172,10 +172,9 @@ define agx_kernel void @nested_loops(ptr addrspace(1) %out, i32 %n, i32 %m) {
 ; CHECK-NEXT:  // %bb.5: // %loop.exit.guard
 ; CHECK-NEXT:    // in Loop: Header=BB3_1 Depth=1
 ; CHECK-NEXT:    pop_exec r0l, 1
-; CHECK-NEXT:    xor r4l, r5l, 1
-; CHECK-NEXT:    bitop 0101, r5, r4l, 0
+; CHECK-NEXT:    xor r5l, r5l, 1
 ; CHECK-NEXT:    mov_imm r4, 1
-; CHECK-NEXT:    if_icmp r0l, nueq, r5, 0, 1
+; CHECK-NEXT:    if_icmp r0l, nueq, r5l, 0, 1
 ; CHECK-NEXT:  // %bb.6: // %outer.latch
 ; CHECK-NEXT:    // in Loop: Header=BB3_1 Depth=1
 ; CHECK-NEXT:    iadd r2, r2, 1
@@ -250,21 +249,19 @@ define agx_kernel void @switch(ptr addrspace(1) %out) {
 ; CHECK-NEXT:    mov_imm r2l, 1
 ; CHECK-NEXT:  // %bb.6: // %Flow4
 ; CHECK-NEXT:    pop_exec r0l, 1
-; CHECK-NEXT:    bitop 0101, r4, r3l, 0
-; CHECK-NEXT:    mov_imm r3, 2
-; CHECK-NEXT:    if_icmp r0l, nueq, r4, 0, 1
+; CHECK-NEXT:    mov_imm r4, 2
+; CHECK-NEXT:    if_icmp r0l, nueq, r3l, 0, 1
 ; CHECK-NEXT:  // %bb.7: // %def
 ; CHECK-NEXT:    mov_imm r2l, 0
-; CHECK-NEXT:    mov_imm r3, 3
+; CHECK-NEXT:    mov_imm r4, 3
 ; CHECK-NEXT:  // %bb.8: // %Flow5
 ; CHECK-NEXT:    pop_exec r0l, 1
-; CHECK-NEXT:    bitop 0101, r2, r2l, 0
-; CHECK-NEXT:    if_icmp r0l, nueq, r2, 0, 1
+; CHECK-NEXT:    if_icmp r0l, nueq, r2l, 0, 1
 ; CHECK-NEXT:  // %bb.9: // %a
-; CHECK-NEXT:    mov_imm r3, 1
+; CHECK-NEXT:    mov_imm r4, 1
 ; CHECK-NEXT:  // %bb.10: // %join
 ; CHECK-NEXT:    pop_exec r0l, 1
-; CHECK-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed
+; CHECK-NEXT:    device_store 0, i32, x, r4, u0_u1, r1, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap

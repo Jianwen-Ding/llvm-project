@@ -138,6 +138,8 @@ static bool isControlFlowPseudo(unsigned Opc) {
   case AGX::AGX_IF_FCMP:
   case AGX::AGX_LOOP_ICMP:
   case AGX::AGX_LOOP_FCMP:
+  case AGX::AGX_IF_ICMP16:
+  case AGX::AGX_LOOP_ICMP16:
   case AGX::AGX_LOOP_BEGIN:
   case AGX::AGX_END_CF:
   case AGX::AGX_BR:
@@ -409,16 +411,22 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
       case AGX::AGX_IF_ICMP:
       case AGX::AGX_IF_FCMP:
       case AGX::AGX_LOOP_ICMP:
-      case AGX::AGX_LOOP_FCMP: {
+      case AGX::AGX_LOOP_FCMP:
+      case AGX::AGX_IF_ICMP16:
+      case AGX::AGX_LOOP_ICMP16: {
         // (cc, src0_mods, src0, src1_mods, src1, target). An if keeps the
         // threads where the comparison holds; a loop keeps those where it
         // does not (the comparison is the break condition).
         unsigned Opc = MI.getOpcode();
-        bool Loop = Opc == AGX::AGX_LOOP_ICMP || Opc == AGX::AGX_LOOP_FCMP;
+        bool Loop = Opc == AGX::AGX_LOOP_ICMP || Opc == AGX::AGX_LOOP_FCMP ||
+                    Opc == AGX::AGX_LOOP_ICMP16;
         bool Float = Opc == AGX::AGX_IF_FCMP || Opc == AGX::AGX_LOOP_FCMP;
+        bool Half = Opc == AGX::AGX_IF_ICMP16 || Opc == AGX::AGX_LOOP_ICMP16;
         unsigned CC = MI.getOperand(0).getImm() ^ (Loop ? 8 : 0);
-        unsigned Exec = Loop ? (Float ? AGX::WHILE_FCMP : AGX::WHILE_ICMP)
-                             : (Float ? AGX::IF_FCMP : AGX::IF_ICMP);
+        unsigned Exec =
+            Half ? (Loop ? AGX::WHILE_ICMP16 : AGX::IF_ICMP16)
+            : Loop ? (Float ? AGX::WHILE_FCMP : AGX::WHILE_ICMP)
+                   : (Float ? AGX::IF_FCMP : AGX::IF_ICMP);
         buildExecOp(MBB, I, DL, TII, Exec, CC)
             .add(MI.getOperand(1))
             .add(MI.getOperand(2))

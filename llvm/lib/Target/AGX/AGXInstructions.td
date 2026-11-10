@@ -1794,6 +1794,21 @@ def WHILE_ICMP : AGXPseudo<(outs), (ins i32imm:$nest, i32imm:$cc,
                                         i32imm:$n)> {
   let G13Real = WHILE_ICMP_g13;
 }
+// The same with a 16-bit first source (compared zero-extended, as every
+// integer comparison takes a 16-bit source), the second an immediate or
+// 16-bit register.
+def IF_ICMP16 : AGXPseudo<(outs), (ins i32imm:$nest, i32imm:$cc,
+                                       SrcMods:$src0_mods, Src16Op:$src0,
+                                       SrcMods:$src1_mods, Src16Op:$src1,
+                                       i32imm:$n)> {
+  let G13Real = IF_ICMP_g13;
+}
+def WHILE_ICMP16 : AGXPseudo<(outs), (ins i32imm:$nest, i32imm:$cc,
+                                          SrcMods:$src0_mods, Src16Op:$src0,
+                                          SrcMods:$src1_mods, Src16Op:$src1,
+                                          i32imm:$n)> {
+  let G13Real = WHILE_ICMP_g13;
+}
 def IF_FCMP : AGXPseudo<(outs), (ins i32imm:$nest, i32imm:$cc,
                                      SrcMods:$src0_mods, Src32Op:$src0,
                                      SrcMods:$src1_mods, Src32Op:$src1,
@@ -1857,6 +1872,14 @@ def AGX_LOOP_#Kind : AGXCodeGenPseudo<(outs),
     (ins i32imm:$cc, SrcMods:$src0_mods, Src32Op:$src0,
          SrcMods:$src1_mods, Src32Op:$src1, AGXBrTarget:$target), []>;
 }
+// The same on a 16-bit value: AGX_IF / AGX_LOOP whose condition is a 16-bit
+// register zero-extended (a boolean phi of i16) take its 16 bits.
+def AGX_IF_ICMP16 : AGXCodeGenPseudo<(outs),
+    (ins i32imm:$cc, SrcMods:$src0_mods, Src16Op:$src0,
+         SrcMods:$src1_mods, Src16Op:$src1, AGXBrTarget:$target), []>;
+def AGX_LOOP_ICMP16 : AGXCodeGenPseudo<(outs),
+    (ins i32imm:$cc, SrcMods:$src0_mods, Src16Op:$src0,
+         SrcMods:$src1_mods, Src16Op:$src1, AGXBrTarget:$target), []>;
 }
 
 let hasSideEffects = 1, Uses = [R0L], Defs = [R0L] in {
