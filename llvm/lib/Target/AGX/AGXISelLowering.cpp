@@ -2449,7 +2449,14 @@ SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
                                DAG.getBitcast(IntVT, A),
                                DAG.getBitcast(IntVT, B));
     SDValue Equal = DAG.getSetCC(DL, CCVT, A, B, ISD::SETOEQ);
-    R = DAG.getSelect(DL, VT, Equal, DAG.getBitcast(VT, Bits), R);
+    SDValue Eq = DAG.getBitcast(VT, Bits);
+    // Where f32 compares flush, two different denormals of a sign compare
+    // equal to each other (and to a zero), and the and / or of their bits
+    // would be a third denormal: flushed, it is the zero of the result's
+    // sign, which the denormal mode allows.
+    if (VT == MVT::f32 && !DAG.getSubtarget<AGXSubtarget>().hasIEEEFP32())
+      Eq = DAG.getNode(ISD::FCANONICALIZE, DL, VT, Eq);
+    R = DAG.getSelect(DL, VT, Equal, Eq, R);
   }
   if (!PropagateNaN || Op->getFlags().hasNoNaNs())
     return R;
