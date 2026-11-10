@@ -226,7 +226,6 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    mov_imm r10, 2139095040
 ; CHECK-NEXT:    fcmpsel lt, r3, r5, r6, r1, r3
 ; CHECK-NEXT:    fcmpsel gt, r3, r5, r8, r10, r3
-; CHECK-NEXT:    fcmpsel eq, r3, r5, r5, r3, r5
 ; CHECK-NEXT:    mov_imm r5, 1258291200
 ; CHECK-NEXT:    fmul32 r13, r3, r5
 ; CHECK-NEXT:    fcmpsel lt, r13, r3, r18, r13, r3
@@ -335,17 +334,16 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    iadd r7, r7, r17
 ; CHECK-NEXT:    bfi r5, 0, r5, 23
 ; CHECK-NEXT:    fmul32 r4, r4, r7
+; CHECK-NEXT:    fcmpsel eq, r7, r3.abs, r10, r13, r26
 ; CHECK-NEXT:    iadd r5, r5, r17
 ; CHECK-NEXT:    fmul32 r4, r4, r5
-; CHECK-NEXT:    fcmpsel eq, r5, r3.abs, r10, r13, r26
+; CHECK-NEXT:    fcmpsel eq, r5, r3.abs, 0.0, r19, r7
 ; CHECK-NEXT:    fcmpsel lt, r4, r22, r6, r1, r4
 ; CHECK-NEXT:    fmul32 r6, u3, 0.5
-; CHECK-NEXT:    fcmpsel eq, r5, r3.abs, 0.0, r19, r5
-; CHECK-NEXT:    trunc r7, r6
 ; CHECK-NEXT:    fcmpsel gte, r5, r3.abs, 0.0, r5, r20
-; CHECK-NEXT:    fcmpsel gt, r4, r22, r8, r10, r4
+; CHECK-NEXT:    trunc r7, r6
 ; CHECK-NEXT:    fmul32 r5, u3, r5
-; CHECK-NEXT:    fcmpsel eq, r4, r22, r22, r4, r22
+; CHECK-NEXT:    fcmpsel gt, r4, r22, r8, r10, r4
 ; CHECK-NEXT:    fcmpsel gt, r1, r5, 0.0, r10, r1
 ; CHECK-NEXT:    fcmpsel eq, r1, r5.abs, r10, r1, r4
 ; CHECK-NEXT:    trunc r5, u3

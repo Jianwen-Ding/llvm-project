@@ -274,7 +274,9 @@ public:
 
   /// 2^n for an integral n in [-126, 127].
   Value *pow2(Value *N) {
-    Value *E = B.CreateAdd(B.CreateFPToSI(N, intTy()), ki(127));
+    // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
+    // reaches the result through the value it scales, without a select.
+    Value *E = B.CreateAdd(B.CreateFreeze(B.CreateFPToSI(N, intTy())), ki(127));
     return B.CreateBitCast(B.CreateShl(E, ki(23)), Ty);
   }
   /// v * 2^n for an integral n in [-252, 254], in two steps.
@@ -305,8 +307,9 @@ public:
     // and not; with a low part (exp2, exp10, pow) the selects stay.
     if (Lo)
       E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
-    // fptosi of a NaN n is poison: a NaN x gives itself.
-    return sel(isNaN(Hi), Hi, E);
+    // A NaN hi is a NaN r, which makes E a NaN (pow2 freezes its
+    // conversion of the NaN n, which would be poison).
+    return E;
   }
 
   Value *exp2Precise(Value *X) {
