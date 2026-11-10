@@ -1548,6 +1548,62 @@ static SDValue performBooleanLogicCombine(SDNode *N,
   return SDValue();
 }
 
+static cl::opt<bool> SharedByteBias(
+    "agx-shared-byte-bias",
+    cl::desc("signed bytes of one word through one xor of the word"),
+    cl::init(true), cl::Hidden);
+
+/// Whether X is a word with two or more signed bytes taken from it (the
+/// shl / sra pairs and sign_extend_inregs of the type legalized sext of its
+/// <4 x i8>), or one already taken through x ^ 0x80808080.
+static bool hasSharedSignedBytes(SDValue X) {
+  unsigned Fields = 0;
+  for (SDNode *U : X->users()) {
+    if (U->getOpcode() == ISD::XOR && isa<ConstantSDNode>(U->getOperand(1)) &&
+        U->getConstantOperandVal(1) == 0x80808080)
+      return true;
+    auto IsByteExt = [](const SDNode *E) {
+      return E->getOpcode() == ISD::SIGN_EXTEND_INREG &&
+             cast<VTSDNode>(E->getOperand(1))->getVT() == MVT::i8;
+    };
+    if (IsByteExt(U))
+      ++Fields;
+    else if (U->getOpcode() == ISD::SRL && isa<ConstantSDNode>(U->getOperand(1)) &&
+             U->getConstantOperandVal(1) <= 24 &&
+             llvm::any_of(U->users(), IsByteExt))
+      ++Fields;
+    else if (U->getOpcode() == ISD::SHL && isa<ConstantSDNode>(U->getOperand(1)) &&
+             U->hasOneUse() && U->user_begin()->getOpcode() == ISD::SRA &&
+             isa<ConstantSDNode>(U->user_begin()->getOperand(1)) &&
+             U->user_begin()->getConstantOperandVal(1) == 24)
+      ++Fields;
+  }
+  return Fields >= 2;
+}
+
+/// The signed byte at bit P of X: ((x >> p) & 255) ^ 128) - 128 on the ALUs,
+/// or, where X gives several, ((x ^ 0x80808080) >> p & 255) - 128, the xor
+/// shared by all of them (one per word instead of one per byte).
+static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
+                             unsigned P) {
+  auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i32); };
+  bool Shared = SharedByteBias && hasSharedSignedBytes(X);
+  // Opaque, so that demanded bits do not narrow each byte's xor to its own
+  // bit (which would make one xor per byte again).
+  SDValue F =
+      Shared ? DAG.getNode(ISD::XOR, DL, MVT::i32, X,
+                           DAG.getConstant(0x80808080, DL, MVT::i32,
+                                           /*isTarget=*/false,
+                                           /*isOpaque=*/true))
+             : X;
+  if (P)
+    F = DAG.getNode(ISD::SRL, DL, MVT::i32, F, C(P));
+  F = DAG.getNode(ISD::AND, DL, MVT::i32, F, C(255));
+  if (!Shared)
+    F = DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(128));
+  return DAG.getNode(ISD::SUB, DL, MVT::i32, F, C(128));
+}
+
 static cl::opt<bool> SignSelect(
     "agx-sign-select",
     cl::desc("select on x > -1 as a select on x < 0, arms swapped"),
@@ -1662,12 +1718,15 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32 ||
         cast<VTSDNode>(N->getOperand(1))->getVT() != MVT::i8)
       return SDValue();
-    SDLoc DL(N);
-    SelectionDAG &DAG = DCI.DAG;
-    auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i32); };
-    SDValue F = DAG.getNode(ISD::AND, DL, MVT::i32, N->getOperand(0), C(255));
-    return DAG.getNode(ISD::SUB, DL, MVT::i32,
-                       DAG.getNode(ISD::XOR, DL, MVT::i32, F, C(128)), C(128));
+    SDValue X = N->getOperand(0);
+    unsigned P = 0;
+    if (X.getOpcode() == ISD::SRL && isa<ConstantSDNode>(X.getOperand(1)) &&
+        X.getConstantOperandVal(1) <= 24 && SharedByteBias &&
+        hasSharedSignedBytes(X.getOperand(0))) {
+      P = X.getConstantOperandVal(1);
+      X = X.getOperand(0);
+    }
+    return signedByteALU(DCI.DAG, SDLoc(N), X, P);
   }
   case ISD::SRA: {
     if (AGXSignedBytesALU < 2 ||
@@ -1704,6 +1763,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     if (W == 16)
       return DAG.getNode(ISD::SIGN_EXTEND_INREG, DL, MVT::i32, F,
                          DAG.getValueType(MVT::i16));
+    if (W == 8)
+      return signedByteALU(DAG, DL, X, Sh2 - Sh1);
     F = DAG.getNode(ISD::AND, DL, MVT::i32, F, C((1u << W) - 1));
     uint64_t Sign = 1u << (W - 1);
     return DAG.getNode(ISD::SUB, DL, MVT::i32,
