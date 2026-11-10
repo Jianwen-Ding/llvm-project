@@ -106,7 +106,8 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ATOMIC_LOAD_SUB, MVT::i32, Custom);
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
-  setTargetDAGCombine({ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
+  setTargetDAGCombine({ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
+                       ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
@@ -1682,6 +1683,11 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   switch (N->getOpcode()) {
   case ISD::SETCC:
     return performClassCompareCombine(N, DCI);
+  case ISD::FP_TO_SINT:
+  case ISD::FP_TO_UINT:
+  case ISD::FP_TO_SINT_SAT:
+  case ISD::FP_TO_UINT_SAT:
+    return performRoundClampConvertCombine(N, DCI);
   case ISD::SELECT: {
     SDValue C = N->getOperand(0);
     // select (select (c, 1, d)), x, y -> select c, x, (select d, x, y) and
@@ -2590,6 +2596,68 @@ SDValue AGXTargetLowering::performClassCompareCombine(
                       DAG.getConstantFP(APFloat::getInf(FVT.getFltSemantics()),
                                         DL, FVT),
                       FCC);
+}
+
+static cl::opt<bool> RoundOutOfClamp(
+    "agx-round-out-of-clamp",
+    cl::desc("move a rounding out of an integral clamp feeding a float to "
+             "integer conversion"),
+    cl::init(true), cl::Hidden);
+
+/// fptosi(clamp(rnd(x))) with integral bounds -> fptosi(rnd(clamp(x))): a
+/// monotone rounding that keeps integers commutes with min / max against an
+/// integer (also for a NaN, which the min / max replace by the bound), and
+/// outermost it is the convert's own (rint, roundeven, nearbyint: the
+/// round-to-nearest-even convert; trunc: the plain one, so it goes) or ends
+/// in a trunc that is (round). A quantization's round-then-clamp-then-convert
+/// loses its rounding instruction.
+SDValue AGXTargetLowering::performRoundClampConvertCombine(
+    SDNode *N, DAGCombinerInfo &DCI) const {
+  if (!RoundOutOfClamp)
+    return SDValue();
+  SDValue X = N->getOperand(0);
+  // The convert truncates: fptosi(trunc(y)) is fptosi(y) (round's
+  // expansion, trunc(y + bias), ends in one).
+  if (X.getOpcode() == ISD::FTRUNC) {
+    SmallVector<SDValue, 2> Ops = {X.getOperand(0)};
+    if (N->getNumOperands() > 1)
+      Ops.push_back(N->getOperand(1));
+    return DCI.DAG.getNode(N->getOpcode(), SDLoc(N), N->getValueType(0), Ops);
+  }
+  SmallVector<std::pair<unsigned, SDValue>, 4> Chain;
+  auto IntegralConst = [](SDValue V) {
+    auto *C = dyn_cast<ConstantFPSDNode>(V);
+    return C && C->getValueAPF().isInteger();
+  };
+  while (X.hasOneUse() &&
+         (X.getOpcode() == ISD::FMAXNUM || X.getOpcode() == ISD::FMINNUM ||
+          X.getOpcode() == ISD::FMAXIMUMNUM ||
+          X.getOpcode() == ISD::FMINIMUMNUM)) {
+    unsigned K = IntegralConst(X.getOperand(1)) ? 1
+                 : IntegralConst(X.getOperand(0)) ? 0
+                                                  : 2;
+    if (K == 2)
+      return SDValue();
+    Chain.push_back({X.getOpcode(), X.getOperand(K)});
+    X = X.getOperand(1 - K);
+  }
+  unsigned R = X.getOpcode();
+  if (Chain.empty() || !X.hasOneUse() ||
+      (R != ISD::FRINT && R != ISD::FROUNDEVEN && R != ISD::FNEARBYINT &&
+       R != ISD::FTRUNC && R != ISD::FROUND))
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  SDLoc DL(N);
+  EVT VT = X.getValueType();
+  SDValue V = X.getOperand(0);
+  for (auto It = Chain.rbegin(); It != Chain.rend(); ++It)
+    V = DAG.getNode(It->first, DL, VT, V, It->second);
+  if (R != ISD::FTRUNC)
+    V = DAG.getNode(R, DL, VT, V);
+  SmallVector<SDValue, 2> Ops = {V};
+  if (N->getNumOperands() > 1)
+    Ops.push_back(N->getOperand(1));
+  return DAG.getNode(N->getOpcode(), DL, N->getValueType(0), Ops);
 }
 
 /// round(x), half away from zero (no libm on AGX): t = trunc(x), plus one

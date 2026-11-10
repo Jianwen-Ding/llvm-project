@@ -48,6 +48,8 @@ class AGXTargetLowering final : public TargetLowering {
   SDValue lowerFP_TO_INT64(SDValue Op, SelectionDAG &DAG) const;
 
   SDValue performClassCompareCombine(SDNode *N, DAGCombinerInfo &DCI) const;
+  SDValue performRoundClampConvertCombine(SDNode *N,
+                                          DAGCombinerInfo &DCI) const;
   SDValue performBRCONDCombine(SDNode *N, DAGCombinerInfo &DCI) const;
 
 public:

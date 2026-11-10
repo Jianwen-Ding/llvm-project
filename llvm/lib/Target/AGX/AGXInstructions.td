@@ -1189,6 +1189,34 @@ def : Pat<(i16 (fp_to_uint f32:$a)), (CONVERT_16_32 CVT_F_TO_U16, 0, $a, ROUND_R
 def : Pat<(i16 (fp_to_sint f16:$a)), (CONVERT_16_16 CVT_F_TO_S16, 0, $a, ROUND_RTZ)>;
 def : Pat<(i16 (fp_to_uint f16:$a)), (CONVERT_16_16 CVT_F_TO_U16, 0, $a, ROUND_RTZ)>;
 // convert saturates, and NaN converts to 0 (B27).
+// A conversion of a value rounded to nearest even (rint, roundeven,
+// nearbyint: CUDA's __float2int_rn) is one convert that rounds so. The
+// convert's round field (bit 26) is the direction, 0 float to integer, and
+// mode bit 1 its rounding (the simulator's model, exact against the G14C
+// over 80 convert forms): the float-to-integer conversion rounding to
+// nearest even has the mode named for the opposite direction, with the field
+// clear.
+// (Only where the rounding has no other use, which keeps it anyway: the
+// exponentials' n = rint(x log2 e), converted and also multiplied.)
+foreach R = [frint, froundeven, fnearbyint] in {
+defvar RN = PatFrag<(ops node:$a), (R node:$a), [{ return N->hasOneUse(); }]>;
+def : Pat<(i32 (fp_to_sint (f32 (RN f32:$a)))), (CONVERT_32_32 CVT_S32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_uint (f32 (RN f32:$a)))), (CONVERT_32_32 CVT_U32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_sint (f16 (RN f16:$a)))), (CONVERT_32_16 CVT_S32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_uint (f16 (RN f16:$a)))), (CONVERT_32_16 CVT_U32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_sint (f32 (RN f32:$a)))), (CONVERT_16_32 CVT_S16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_uint (f32 (RN f32:$a)))), (CONVERT_16_32 CVT_U16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_sint (f16 (RN f16:$a)))), (CONVERT_16_16 CVT_S16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_uint (f16 (RN f16:$a)))), (CONVERT_16_16 CVT_U16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_sint_sat (f32 (RN f32:$a)), i32)), (CONVERT_32_32 CVT_S32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_uint_sat (f32 (RN f32:$a)), i32)), (CONVERT_32_32 CVT_U32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_sint_sat (f16 (RN f16:$a)), i32)), (CONVERT_32_16 CVT_S32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i32 (fp_to_uint_sat (f16 (RN f16:$a)), i32)), (CONVERT_32_16 CVT_U32_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_sint_sat (f32 (RN f32:$a)), i16)), (CONVERT_16_32 CVT_S16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_uint_sat (f32 (RN f32:$a)), i16)), (CONVERT_16_32 CVT_U16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_sint_sat (f16 (RN f16:$a)), i16)), (CONVERT_16_16 CVT_S16_TO_F, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (fp_to_uint_sat (f16 (RN f16:$a)), i16)), (CONVERT_16_16 CVT_U16_TO_F, 0, $a, ROUND_RTZ)>;
+}
 def : Pat<(i32 (fp_to_sint_sat f32:$a, i32)), (CONVERT_32_32 CVT_F_TO_S32, 0, $a, ROUND_RTZ)>;
 def : Pat<(i32 (fp_to_uint_sat f32:$a, i32)), (CONVERT_32_32 CVT_F_TO_U32, 0, $a, ROUND_RTZ)>;
 def : Pat<(i32 (fp_to_sint_sat f16:$a, i32)), (CONVERT_32_16 CVT_F_TO_S32, 0, $a, ROUND_RTZ)>;
