@@ -132,7 +132,10 @@ bool canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx);
 /// The math functions AGX has no instruction for, from the ones it has
 /// (AGXMathExpansion.cpp): the intrinsic \p ID of \p Args, or AIR's \p Fn
 /// (asinh, acosh, atanh, sinpi, cospi, tanpi) of \p X; nullptr for another.
-Value *expandMath(IRBuilderBase &B, Intrinsic::ID ID, ArrayRef<Value *> Args);
+/// \p FlushF32: f32 arithmetic flushes denormals (no ieee-fp32), so the
+/// expansion need not keep denormal operands.
+Value *expandMath(IRBuilderBase &B, Intrinsic::ID ID, ArrayRef<Value *> Args,
+                  bool FlushF32 = false);
 Value *expandMath(IRBuilderBase &B, StringRef Fn, Value *X);
 
 /// Whether a device memory access must reach memory shared with the host while

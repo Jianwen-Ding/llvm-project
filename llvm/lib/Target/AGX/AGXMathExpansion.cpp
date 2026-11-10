@@ -33,9 +33,13 @@ namespace {
 class MathBuilder {
   IRBuilderBase &B;
   Type *Ty; // float or a vector of float
+  // No float operand is a denormal the expansion must keep: f32 arithmetic
+  // flushes (no ieee-fp32), or the operands are widened halves.
+  bool NoDenormals;
 
 public:
-  MathBuilder(IRBuilderBase &B, Type *Ty) : B(B), Ty(Ty) {}
+  MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false)
+      : B(B), Ty(Ty), NoDenormals(NoDenormals) {}
 
   Value *k(double V) { return ConstantFP::get(Ty, V); }
   Value *call(Intrinsic::ID ID, ArrayRef<Value *> Args) {
@@ -349,12 +353,16 @@ public:
     Value *E, *F, *Y;
   };
   LogParts logParts(Value *X) {
-    Value *Tiny = lt(X, 1.17549435e-38);
-    Value *XS = sel(Tiny, mul(X, k(8388608.0)), X);
+    // A denormal x is scaled by 2^23 first, where it must be kept; where f32
+    // arithmetic flushes, it may be taken as the zero it compares equal to,
+    // which logSpecial's x == 0 (a flushing compare) turns into -inf.
+    Value *Tiny = NoDenormals ? nullptr : lt(X, 1.17549435e-38);
+    Value *XS = Tiny ? sel(Tiny, mul(X, k(8388608.0)), X) : X;
     Value *Bits = B.CreateBitCast(XS, intTy());
     Value *E = B.CreateSIToFP(
         B.CreateSub(B.CreateLShr(Bits, ki(23)), ki(127)), Ty);
-    E = sel(Tiny, sub(E, k(23.0)), E);
+    if (Tiny)
+      E = sel(Tiny, sub(E, k(23.0)), E);
     Value *M = B.CreateBitCast(
         B.CreateOr(B.CreateAnd(Bits, ki(0x7fffff)), ki(0x3f800000)), Ty);
     Value *Big = gt(M, 1.41421356);
@@ -499,12 +507,12 @@ public:
 /// vector of one.
 template <typename FnT>
 static Value *inFloat(IRBuilderBase &B, Type *Ty, ArrayRef<Value *> Args,
-                      FnT Fn) {
+                      FnT Fn, bool FlushF32 = false) {
   Type *F32 = Ty->getWithNewType(B.getFloatTy());
   SmallVector<Value *, 2> Ext;
   for (Value *A : Args)
     Ext.push_back(Ty == F32 ? A : B.CreateFPExt(A, F32));
-  MathBuilder M(B, F32);
+  MathBuilder M(B, F32, FlushF32 || Ty != F32);
   Value *R = Fn(M, Ext);
   return Ty == F32 ? R : B.CreateFPTrunc(R, Ty);
 }
@@ -540,7 +548,7 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 }
 
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
-                       ArrayRef<Value *> Args) {
+                       ArrayRef<Value *> Args, bool FlushF32) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
                    switch (ID) {
@@ -588,7 +596,8 @@ Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                    default:
                      llvm_unreachable("not an expanded math intrinsic");
                    }
-                 });
+                 },
+                 FlushF32);
 }
 
 Value *AGX::expandMath(IRBuilderBase &B, StringRef Fn, Value *X) {

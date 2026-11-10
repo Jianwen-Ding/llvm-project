@@ -2928,7 +2928,8 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
       IRBuilder<> B(II);
       B.setFastMathFlags(II->getFastMathFlags());
       SmallVector<Value *, 2> Args(II->args());
-      Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args);
+      Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args,
+                                 !ST.hasIEEEFP32());
       R->takeName(II);
       II->replaceAllUsesWith(R);
       II->eraseFromParent();
