@@ -143,6 +143,16 @@ public:
     return sel(lt(A, 88.0), mul(k(0.5), exp(A)), Shifted);
   }
 
+  /// 0.25 / h for h = e^a / 2 >= 0.5 (or a NaN): 0.25 times the correctly
+  /// rounded reciprocal y0 + y0 (1 - h y0) (as in tanh) while the quotient is
+  /// above the flushed range, else 0 (h > 2^124, an infinite h too, whose
+  /// reciprocal step would be a NaN), without the general division.
+  Value *quarterOver(Value *H) {
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {H});
+    Value *Y = fma(fma(B.CreateFNeg(H), Y0, k(1.0)), Y0, Y0);
+    return sel(gt(H, 0x1p124), k(0.0), mul(k(0.25), Y));
+  }
+
   Value *sinh(Value *X) {
     Value *A = abs(X);
     Value *Z = mul(X, X);
@@ -151,13 +161,13 @@ public:
                            Z),
                        X, X);
     Value *H = halfExp(A);
-    Value *Big = copysign(sub(H, div(k(0.25), H)), X);
+    Value *Big = copysign(sub(H, quarterOver(H)), X);
     return sel(gt(A, 1.0), Big, Small);
   }
 
   Value *cosh(Value *X) {
     Value *H = halfExp(abs(X));
-    return add(H, div(k(0.25), H));
+    return add(H, quarterOver(H));
   }
 
   Value *tanh(Value *X) {
