@@ -211,10 +211,11 @@ public:
                          -1.6666288134e-1}),
                 Z),
             X, X);
-    // log(2a) once a * a + 1 is a * a in float (and before it overflows).
-    Value *Huge = add(log(A), k(M_LN2));
-    Value *Mid = log(add(A, sqrt(fma(A, A, k(1.0)))));
-    Value *Big = copysign(sel(gt(A, 1500.0), Huge, Mid), X);
+    // log(2a) = log(a) + ln 2 once a * a + 1 is a * a in float (and before
+    // it overflows): one log, of the argument the range picks.
+    Value *H = gt(A, 1500.0);
+    Value *L = log(sel(H, A, add(A, sqrt(fma(A, A, k(1.0))))));
+    Value *Big = copysign(add(L, sel(H, k(M_LN2), k(0.0))), X);
     return sel(lt(A, 0.5), Small, Big);
   }
 
@@ -225,9 +226,10 @@ public:
                       poly(Z, {1.7596881071e-3, -7.5272886713e-3,
                                2.6454905019e-2, -1.1784741703e-1,
                                1.4142135263e0}));
-    Value *Huge = add(log(X), k(M_LN2));
-    Value *Mid = log(add(X, sqrt(mul(Z, add(X, k(1.0))))));
-    return sel(lt(Z, 0.5), Near, sel(gt(X, 1500.0), Huge, Mid));
+    // As in asinh: one log.
+    Value *H = gt(X, 1500.0);
+    Value *L = log(sel(H, X, add(X, sqrt(mul(Z, add(X, k(1.0)))))));
+    return sel(lt(Z, 0.5), Near, add(L, sel(H, k(M_LN2), k(0.0))));
   }
 
   Value *atanh(Value *X) {
