@@ -168,13 +168,21 @@ def : Pat<(i32 (anyext i16:$a)), (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0))>;
 // A widened 16-bit value masked by a 16-bit constant (a boolean phi's low
 // bit): the and of the 16 bits, zero-extended by the bitop, in one
 // instruction instead of the widening copy and the and.
-def agx_uimm16 : ImmLeaf<i32, [{ return isUInt<16>(Imm); }]>;
+// (The ALU immediate is 8 bits; a wider constant cannot be encoded.)
+def agx_uimm16 : ImmLeaf<i32, [{ return isUInt<8>(Imm); }]>;
 def agx_imm_to_i16 : SDNodeXForm<imm, [{
   return CurDAG->getTargetConstant(N->getZExtValue(), SDLoc(N), MVT::i16);
 }]>;
 foreach Ext = [zext, anyext] in
 def : Pat<(i32 (and (Ext i16:$a), agx_uimm16:$c)),
           (BITOP_I32_FROM16 TT_AND, 0, $a, 0, (i16 (agx_imm_to_i16 $c)))>;
+
+// A 32-bit value masked by 0xffff (too wide for the 8-bit immediate): a
+// move of its low 16 bits, zero-extended by the bitop, instead of a mov_imm
+// of the constant and the and.
+def : Pat<(i32 (and i32:$a, 65535)),
+          (BITOP_I32_FROM16 TT_MOV, 0, (i16 (EXTRACT_SUBREG $a, lo16)), 0,
+                            (i16 0))>;
 
 def : Pat<(i64 (and i64:$a, i64:$b)),
           (REG_SEQUENCE GPR64,
