@@ -142,8 +142,9 @@ public:
 
   /// e^a / 2 for a >= 0, without overflow below the largest float.
   Value *halfExp(Value *A) {
-    Value *Shifted = exp(sub(A, k(M_LN2)));
-    return sel(lt(A, 88.0), mul(k(0.5), exp(A)), Shifted);
+    // One exponential: e^a / 2, or e^(a - ln 2) from 88 on.
+    Value *Lt = lt(A, 88.0);
+    return mul(sel(Lt, k(0.5), k(1.0)), exp(sel(Lt, A, sub(A, k(M_LN2)))));
   }
 
   /// 0.25 / h for h = e^a / 2 >= 0.5 (or a NaN): 0.25 times the correctly
