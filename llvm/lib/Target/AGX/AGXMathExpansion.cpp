@@ -25,6 +25,7 @@
 #include "AGX.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsAGX.h"
 #include <cmath>
 
 using namespace llvm;
@@ -173,7 +174,15 @@ public:
     // no clamp of the argument.
     Value *S = expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
                        /*Bounded=*/true);
-    Value *Big = copysign(sub(k(1.0), div(k(2.0), add(S, k(1.0)))), X);
+    // 2 / d for d = s + 1 in [2, e^18 + 1] (or a NaN): twice the correctly
+    // rounded reciprocal y0 + y0 (1 - d y0) (lowerFDIV32's, whose rcp and
+    // fmas scale with d's exponent here, no result near the flushed or the
+    // infinite range), without the general division's exponent scaling and
+    // special cases.
+    Value *D = add(S, k(1.0));
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
+    Value *Y = fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
+    Value *Big = copysign(sub(k(1.0), mul(k(2.0), Y)), X);
     return sel(lt(A, 0.625), Small, Big);
   }
 
