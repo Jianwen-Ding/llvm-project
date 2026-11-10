@@ -168,8 +168,11 @@ public:
                          -3.33332819422e-1}),
                 Z),
             X, X);
-    // 1 - 2 / (e^2a + 1), which is 1 in float from a = 9 on.
-    Value *S = exp(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)));
+    // 1 - 2 / (e^2a + 1), which is 1 in float from a = 9 on. 2a is in
+    // [0, 18] (or a NaN, which the exponential keeps): its exponential needs
+    // no clamp of the argument.
+    Value *S = expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
+                       /*Bounded=*/true);
     Value *Big = copysign(sub(k(1.0), div(k(2.0), add(S, k(1.0)))), X);
     return sel(lt(A, 0.625), Small, Big);
   }
