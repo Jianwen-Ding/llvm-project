@@ -17,13 +17,24 @@ define agx_kernel void @s8(ptr addrspace(1) %p, float %a) {
   ret void
 }
 
-; A zero bound keeps the fix: maximumnum(-0, +0) is +0.
+; maximumnum(x, +0) is (x > 0) ? x : +0 (a NaN, -0 and +0 give +0): one
+; fcmpsel with immediates.
 ; CHECK-LABEL: z:
-; CHECK: fcmpsel gtn
-; CHECK: fcmpsel eq
-; CHECK: stop
+; CHECK: fcmpsel gt, [[R:r[0-9]+]], [[X:u[0-9]+]], 0.0, [[X]], 0
+; CHECK-NEXT: device_store
 define agx_kernel void @z(ptr addrspace(1) %p, float %a) {
   %m = call float @llvm.maximumnum.f32(float %a, float 0.0)
+  store float %m, ptr addrspace(1) %p
+  ret void
+}
+
+; A zero bound of minimumnum keeps the fix: minimumnum(-0, +0) is -0.
+; CHECK-LABEL: zmin:
+; CHECK: fcmpsel ltn
+; CHECK: fcmpsel eq
+; CHECK: stop
+define agx_kernel void @zmin(ptr addrspace(1) %p, float %a) {
+  %m = call float @llvm.minimumnum.f32(float %a, float 0.0)
   store float %m, ptr addrspace(1) %p
   ret void
 }

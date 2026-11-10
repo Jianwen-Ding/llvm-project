@@ -2401,6 +2401,11 @@ static SDValue lowerFMinimumMaximum(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
   return R;
 }
 
+static cl::opt<bool> MaxNumZeroSelect(
+    "agx-maxnum-zero-select",
+    cl::desc("maximumnum(x, +0) as one select on x > 0"), cl::init(true),
+    cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
                                            SelectionDAG &DAG) const {
   SDLoc DL(Op);
@@ -2413,6 +2418,22 @@ SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
   if (PropagateNaN && SelectMinimumMaximum && !Op->getFlags().hasNoNaNs())
     return lowerFMinimumMaximum(DAG, DL, VT, A, B, Max,
                                 Op->getFlags().hasNoSignedZeros());
+  // maximumnum(x, +0) is (x > 0) ? x : +0: a NaN, -0 and the zeros give +0
+  // (as does a positive denormal where f32 compares flush, its flushed
+  // value). One fcmpsel instead of the max and its fix for zeros.
+  if (!PropagateNaN && Max && MaxNumZeroSelect &&
+      (VT == MVT::f16 ||
+       !DAG.getSubtarget<AGXSubtarget>().hasIEEEFP32())) {
+    auto PosZero = [](SDValue V) {
+      auto *C = dyn_cast<ConstantFPSDNode>(V);
+      return C && C->isZero() && !C->isNegative();
+    };
+    if (PosZero(A))
+      std::swap(A, B);
+    if (PosZero(B))
+      return DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, ISD::SETOGT),
+                           A, B);
+  }
   SDValue R = DAG.getNode(Max ? ISD::FMAXNUM : ISD::FMINNUM, DL, VT, A, B,
                           Op->getFlags());
   // (equal operands with different bits are zeros of two signs: none where
