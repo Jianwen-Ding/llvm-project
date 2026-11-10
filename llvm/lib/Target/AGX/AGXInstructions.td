@@ -864,6 +864,28 @@ def : Pat<(f32 (fcanonicalize (AGXFPSrc32 f32:$a, i32:$am))),
 def agx_fpimm0 : FPImmLeaf<fAny, [{ return Imm.isExactlyValue(+0.0); }]>;
 def agx_fpimm1 : FPImmLeaf<fAny, [{ return Imm.isExactlyValue(+1.0); }]>;
 
+// A float select with +0.0 as an arm: the immediate 0 (its bits) there, not
+// a register holding it (relu, maximum(x, +0), is one fcmpsel).
+multiclass SelectZeroArmPats<Instruction inst, ValueType vt,
+                             ComplexPattern cpat, ValueType zt> {
+  foreach C = AGXFPConds in {
+    def : Pat<(vt (select (i32 (setcc (cpat vt:$a, i32:$am),
+                                      (cpat vt:$b, i32:$bm), C.CC)),
+                          (vt agx_fpimm0), vt:$y)),
+              !if(C.Swap, (inst C.HW, $am, $a, $bm, $b, 0, $y, 0, (zt 0)),
+                          (inst C.HW, $am, $a, $bm, $b, 0, (zt 0), 0, $y))>;
+    def : Pat<(vt (select (i32 (setcc (cpat vt:$a, i32:$am),
+                                      (cpat vt:$b, i32:$bm), C.CC)),
+                          vt:$x, (vt agx_fpimm0))),
+              !if(C.Swap, (inst C.HW, $am, $a, $bm, $b, 0, (zt 0), 0, $x),
+                          (inst C.HW, $am, $a, $bm, $b, 0, $x, 0, (zt 0)))>;
+  }
+}
+let AddedComplexity = 2 in {
+defm : SelectZeroArmPats<FCMPSEL_F32, f32, AGXFPSrc32, i32>;
+defm : SelectZeroArmPats<FCMPSEL_F16, f16, AGXFPSrc16, i16>;
+}
+
 def : Pat<(f32 (fminnum (fmaxnum (AGXFPSrc32 f32:$a, i32:$am), (f32 agx_fpimm0)),
                         (f32 agx_fpimm1))),
           (FADD32_SAT_F32 $am, $a, 0, (i32 FPIMM_NEG_ZERO))>;

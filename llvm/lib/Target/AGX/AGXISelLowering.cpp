@@ -2196,6 +2196,64 @@ SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
 /// compare equal: there the bits of both ORed (min) or ANDed (max), which
 /// orders -0 below +0 and leaves equal nonzero values as they are.
 /// minimum / maximum: the same, and the default NaN for a NaN operand.
+static cl::opt<bool> SelectMinimumMaximum(
+    "agx-select-minimum-maximum",
+    cl::desc("minimum / maximum as unordered compare-selects"),
+    cl::init(true), cl::Hidden);
+
+/// minimum / maximum (NaN if either operand is one, -0 below +0) as
+/// select(a ugt b, a, b) for maximum (ult for minimum): a NaN a is taken by
+/// the unordered comparison, a NaN b by one more select (any NaN operand is
+/// a NaN result LLVM allows, so no default NaN constant), and equal operands
+/// of two signs by the and / or of their bits. A constant goes second, a
+/// non-NaN one needs no NaN select, a nonzero one no zeros, and +0 for
+/// maximum (-0 for minimum) none either (maximum(x, +0) is x ugt 0 ? x : +0,
+/// one fcmpsel: relu).
+static SDValue lowerFMinimumMaximum(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
+                                    SDValue A, SDValue B, bool Max,
+                                    bool NoSignedZeros) {
+  EVT CCVT = MVT::i32;
+  if (isa<ConstantFPSDNode>(A) && !isa<ConstantFPSDNode>(B))
+    std::swap(A, B);
+  auto *CB = dyn_cast<ConstantFPSDNode>(B);
+  ISD::CondCode CC = Max ? ISD::SETUGT : ISD::SETULT;
+  bool Zeros = !NoSignedZeros && !(CB && !CB->isZero());
+  // maximum(a, +0) and minimum(a, -0): the strict comparison already gives
+  // b for every a that compares equal to it (+-0, and denormals, which the
+  // comparison flushes). maximum(a, -0) and minimum(a, +0) keep the and / or
+  // of the bits: an inclusive comparison would give a, a denormal one too
+  // (agx-tv: maximum(-denormal, -0) is -0, not the denormal).
+  if (Zeros && CB && Max == !CB->isNegative())
+    Zeros = false;
+  SDValue R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, CC), A, B);
+  if (Zeros) {
+    EVT IntVT = VT.changeTypeToInteger();
+    // Equal to a zero b (a = +-0 or a denormal the comparison flushes): the
+    // zero of a's sign, a & sign; a | +0 would give a denormal a back
+    // (agx-tv: minimum(+denormal, +0) is +0).
+    SDValue Bits =
+        CB ? DAG.getNode(ISD::AND, DL, IntVT, DAG.getBitcast(IntVT, A),
+                         DAG.getConstant(APInt::getSignMask(
+                                             IntVT.getSizeInBits()),
+                                         DL, IntVT))
+           : DAG.getNode(Max ? ISD::AND : ISD::OR, DL, IntVT,
+                         DAG.getBitcast(IntVT, A), DAG.getBitcast(IntVT, B));
+    SDValue Eq = DAG.getBitcast(VT, Bits);
+    // Two denormals the comparison flushes compare equal, and their and /
+    // or is a third denormal: where f32 arithmetic flushes (no ieee-fp32,
+    // the contract the backend compiles for), the canonical value of the
+    // bits (a zero of their sign; others unchanged, and no NaN is equal).
+    // agx-tv: maximum of two denormals is +-0 there.
+    if (!CB && VT == MVT::f32 && !DAG.getSubtarget<AGXSubtarget>().hasIEEEFP32())
+      Eq = DAG.getNode(ISD::FCANONICALIZE, DL, VT, Eq);
+    R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, ISD::SETOEQ), Eq,
+                      R);
+  }
+  if (!(CB && !CB->isNaN()))
+    R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, B, B, ISD::SETUO), B, R);
+  return R;
+}
+
 SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
                                            SelectionDAG &DAG) const {
   SDLoc DL(Op);
@@ -2205,6 +2263,9 @@ SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
   bool Max = Opc == ISD::FMAXIMUMNUM || Opc == ISD::FMAXIMUM;
   bool PropagateNaN = Opc == ISD::FMINIMUM || Opc == ISD::FMAXIMUM;
   EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
+  if (PropagateNaN && SelectMinimumMaximum && !Op->getFlags().hasNoNaNs())
+    return lowerFMinimumMaximum(DAG, DL, VT, A, B, Max,
+                                Op->getFlags().hasNoSignedZeros());
   SDValue R = DAG.getNode(Max ? ISD::FMAXNUM : ISD::FMINNUM, DL, VT, A, B,
                           Op->getFlags());
   // (equal operands with different bits are zeros of two signs: none where
@@ -2233,6 +2294,10 @@ SDValue AGXTargetLowering::lowerFMinMaxNum(SDValue Op,
   return R;
 }
 
+static cl::opt<bool> CopysignBfi("agx-copysign-bfi",
+                                 cl::desc("copysign as one bfi"),
+                                 cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFCOPYSIGN(SDValue Op,
                                           SelectionDAG &DAG) const {
   SDLoc DL(Op);
@@ -2245,6 +2310,18 @@ SDValue AGXTargetLowering::lowerFCOPYSIGN(SDValue Op,
                ? DAG.getNode(ISD::FP_EXTEND, DL, VT, Sign)
                : DAG.getNode(ISD::FP_ROUND, DL, VT, Sign,
                              DAG.getTargetConstant(0, DL, MVT::i32));
+  if (CopysignBfi && !isa<ConstantFPSDNode>(Mag)) {
+    // The magnitude's low bits inserted into the sign's value: one bfi,
+    // instead of two masks (one of them a constant in a register, the other
+    // a bfeil on the same unit as the bfi) and an or. A constant magnitude
+    // keeps the masks, which stay on the ALUs (copysign(0, x) is one and).
+    unsigned BW = IntVT.getSizeInBits();
+    return DAG.getBitcast(
+        VT, DAG.getNode(AGXISD::BFI_FIELD, DL, IntVT,
+                        DAG.getBitcast(IntVT, Sign), DAG.getBitcast(IntVT, Mag),
+                        DAG.getConstant(0, DL, IntVT),
+                        DAG.getTargetConstant(BW - 1, DL, MVT::i32)));
+  }
   APInt SignMask = APInt::getSignMask(IntVT.getSizeInBits());
   SDValue M = DAG.getNode(ISD::AND, DL, IntVT,
                           DAG.getBitcast(IntVT, Mag),
