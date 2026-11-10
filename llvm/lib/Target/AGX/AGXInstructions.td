@@ -165,6 +165,17 @@ def BITOP_I32_FROM16 : AGXALUPseudo<BITOP_g13, (outs GPR32:$dst),
 def : Pat<(i32 (zext i16:$a)), (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0))>;
 def : Pat<(i32 (anyext i16:$a)), (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0))>;
 
+// A widened 16-bit value masked by a 16-bit constant (a boolean phi's low
+// bit): the and of the 16 bits, zero-extended by the bitop, in one
+// instruction instead of the widening copy and the and.
+def agx_uimm16 : ImmLeaf<i32, [{ return isUInt<16>(Imm); }]>;
+def agx_imm_to_i16 : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(N->getZExtValue(), SDLoc(N), MVT::i16);
+}]>;
+foreach Ext = [zext, anyext] in
+def : Pat<(i32 (and (Ext i16:$a), agx_uimm16:$c)),
+          (BITOP_I32_FROM16 TT_AND, 0, $a, 0, (i16 (agx_imm_to_i16 $c)))>;
+
 def : Pat<(i64 (and i64:$a, i64:$b)),
           (REG_SEQUENCE GPR64,
             (BITOP_I32 TT_AND, 0, (EXTRACT_SUBREG $a, sub0), 0,
@@ -331,12 +342,15 @@ def : Pat<(i64 (zext i32:$a)),
           (REG_SEQUENCE GPR64, $a, sub0, (MOV_IMM32 0), sub1)>;
 def : Pat<(i64 (anyext i32:$a)),
           (REG_SEQUENCE GPR64, $a, sub0, (i32 (IMPLICIT_DEF)), sub1)>;
+// A 16-bit value widened: as a 32-bit one (the widening copy as the low
+// half, a zero or nothing as the high one), so that an unread high half costs
+// nothing, instead of the copy and a 64-bit addition of zero.
 def : Pat<(i64 (zext i16:$a)),
-          (IADD_I64_FROM32 0, (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0)), 0,
-                           (i32 0), 0)>;
+          (REG_SEQUENCE GPR64, (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0)),
+                        sub0, (MOV_IMM32 0), sub1)>;
 def : Pat<(i64 (anyext i16:$a)),
-          (IADD_I64_FROM32 0, (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0)), 0,
-                           (i32 0), 0)>;
+          (REG_SEQUENCE GPR64, (BITOP_I32_FROM16 TT_MOV, 0, $a, 0, (i16 0)),
+                        sub0, (i32 (IMPLICIT_DEF)), sub1)>;
 def : Pat<(i64 (sext i16:$a)),
           (IADD_I64_FROM32 MOD_SX, (IADD_I32_FROM16 MOD_SX, $a, 0, (i16 0), 0),
                            0, (i32 0), 0)>;

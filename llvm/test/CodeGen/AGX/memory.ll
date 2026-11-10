@@ -74,9 +74,8 @@ define agx_kernel void @bytes(ptr addrspace(1) %a, ptr addrspace(1) %out) {
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    device_load 0, i8, x, r1l, u0_u1, 0, signed
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    bitop 0101, r2, r1l, 0
+; CHECK-NEXT:    and r2, r1l, 255
 ; CHECK-NEXT:    device_store 0, i8, x, r1l, u2_u3, 7, signed
-; CHECK-NEXT:    and r2, r2, 255
 ; CHECK-NEXT:    xor r3, r2, 128
 ; CHECK-NEXT:    iadd r2, r3, r2
 ; CHECK-NEXT:    isub r2, r2, 128
