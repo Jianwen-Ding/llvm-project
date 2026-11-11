@@ -337,6 +337,19 @@ def : Pat<(i32 (add AGXIntSrc32:$a, (shl AGXIntSrc32:$b, agx_iadd_shift:$s))),
           (IADD_I32 0, $a, 0, $b, imm:$s)>;
 def : Pat<(i32 (sub AGXIntSrc32:$a, (shl AGXIntSrc32:$b, agx_iadd_shift:$s))),
           (ISUB_I32 0, $a, 0, $b, imm:$s)>;
+// The same on 16 bits (the 16-bit iadd takes the shift too; an i16 shift
+// amount).
+def agx_iadd_shift16 : ImmLeaf<i16, [{ return Imm >= 0 && Imm <= 4; }]>;
+def agx_shift16_to_i32 : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(N->getZExtValue(), SDLoc(N), MVT::i32);
+}]>;
+let AddedComplexity = 1 in
+def : Pat<(i16 (shl AGXIntSrc16:$b, agx_iadd_shift16:$s)),
+          (IADD_I16 0, (i16 0), 0, $b, (agx_shift16_to_i32 $s))>;
+def : Pat<(i16 (add AGXIntSrc16:$a, (shl AGXIntSrc16:$b, agx_iadd_shift16:$s))),
+          (IADD_I16 0, $a, 0, $b, (agx_shift16_to_i32 $s))>;
+def : Pat<(i16 (sub AGXIntSrc16:$a, (shl AGXIntSrc16:$b, agx_iadd_shift16:$s))),
+          (ISUB_I16 0, $a, 0, $b, (agx_shift16_to_i32 $s))>;
 
 def : Pat<(i32 (sext i16:$a)), (IADD_I32_FROM16 MOD_SX, $a, 0, (i16 0), 0)>;
 // A 32-bit value widened: the value itself as the low half and a zero (or,
