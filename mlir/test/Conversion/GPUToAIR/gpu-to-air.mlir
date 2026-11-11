@@ -702,3 +702,36 @@ gpu.module @inverse_hyperbolic {
     gpu.return
   }
 }
+
+// -----
+
+// math.erfc (upstream's approximation, its last step without a flushed
+// correction: exp(-a^2) times fma(r, t, r)), math.isinf (|x| == inf) and
+// math.ipowi (a loop of squarings; 1, +-1 or 0 for a negative exponent).
+gpu.module @erfc_isinf_ipowi {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>, %n: memref<8xi32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf32, 1>
+    // CHECK-NOT: math.
+    // CHECK: %[[S:.*]] = llvm.fmul %[[A:.*]], %[[A]]
+    // CHECK: llvm.intr.exp
+    // CHECK: %[[T:.*]] = llvm.intr.fma(%{{.*}}, %[[A]], %[[S]])
+    // CHECK: %[[C:.*]] = llvm.intr.fma(%{{.*}}, %[[T]], %{{.*}})
+    // CHECK: llvm.fmul %{{.*}}, %[[C]]
+    %e = math.erfc %v : f32
+    memref.store %e, %a[%c0] : memref<8xf32, 1>
+    %w = memref.load %h[%c0] : memref<8xf16, 1>
+    // CHECK: llvm.intr.fabs
+    // CHECK: llvm.fcmp "oeq" %{{.*}}, %{{.*}} : f16
+    %i = math.isinf %w : f16
+    %j = arith.extui %i : i1 to i32
+    %b = memref.load %n[%c0] : memref<8xi32, 1>
+    // CHECK: llvm.br
+    // CHECK: llvm.mul
+    // CHECK: llvm.lshr
+    %p = math.ipowi %b, %j : i32
+    memref.store %p, %n[%c0] : memref<8xi32, 1>
+    gpu.return
+  }
+}

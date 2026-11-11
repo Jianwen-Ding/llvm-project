@@ -738,6 +738,131 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
   return success();
 }
 
+/// math.erfc of f32: upstream's approximation (PolynomialApproximation.cpp,
+/// ErfcPolynomialApproximation: Shepherd and Laframboise's Chebyshev
+/// approximation of (1 + 2x) exp(x^2) erfc(x), 2.65 ulps) but for its last
+/// step: erfc = r exp(-a^2) with exp(-a^2) = e (1 + t), e = exp(-s), s = a a
+/// rounded, t = s - a^2 exactly, was r e + (r e) t, whose correction r e t
+/// is below 2^-126 from a ~ 8.7 and flushed (AGX's float arithmetic flushes
+/// denormals): up to 64 ulps lost. Here e (r + r t), each intermediate
+/// normal while the result is.
+static LogicalResult rewriteErfc(math::ErfcOp op, PatternRewriter &rewriter) {
+  if (!op.getType().isF32())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f32 = b.getF32Type();
+  Value x = op.getOperand();
+  auto c = [&](float v) {
+    return arith::ConstantOp::create(b, f32, b.getF32FloatAttr(v));
+  };
+  auto fma = [&](Value p, Value q, Value r) {
+    return math::FmaOp::create(b, p, q, r);
+  };
+  Value one = c(1.0f), two = c(2.0f);
+  Value a = math::AbsFOp::create(b, x);
+  Value r = arith::DivFOp::create(b, one, arith::AddFOp::create(b, a, two));
+  Value q = fma(c(-4.0f), r, one);
+  Value t = fma(arith::AddFOp::create(b, q, one), c(-2.0f), a);
+  Value e = fma(arith::NegFOp::create(b, a), q, t);
+  q = fma(r, e, q);
+  Value p = c(-0x1.a4a000p-12f);
+  for (float k : {-0x1.42a260p-10f, 0x1.585714p-10f, 0x1.1adcc4p-07f,
+                  -0x1.081b82p-07f, -0x1.bc0b6ap-05f, 0x1.4ffc46p-03f,
+                  -0x1.540840p-03f, -0x1.7bf616p-04f, 0x1.1ba03ap-02f})
+    p = fma(p, q, c(k));
+  Value d = fma(two, a, one);
+  r = arith::DivFOp::create(b, one, d);
+  q = fma(p, r, r);
+  Value negA = arith::NegFOp::create(b, a);
+  e = fma(fma(q, negA, c(0.5f)), two, arith::SubFOp::create(b, p, q));
+  r = fma(e, r, q);
+  Value s = arith::MulFOp::create(b, a, a);
+  e = math::ExpOp::create(b, arith::NegFOp::create(b, s));
+  t = fma(negA, a, s);
+  r = arith::MulFOp::create(b, e, fma(r, t, r));
+  auto cmp = [&](arith::CmpFPredicate pr, Value u, Value v) {
+    return arith::CmpFOp::create(b, pr, u, v);
+  };
+  // NaN (x + x) for a NaN or infinite x; 0 beyond 10.0546875; 2 - r below 0
+  // (from -inf: 2).
+  r = arith::SelectOp::create(b, cmp(arith::CmpFPredicate::UGE, a, c(INFINITY)),
+                              arith::AddFOp::create(b, x, x), r);
+  r = arith::SelectOp::create(b, cmp(arith::CmpFPredicate::OGT, a,
+                                     c(10.0546875f)),
+                              c(0.0f), r);
+  r = arith::SelectOp::create(b, cmp(arith::CmpFPredicate::OLT, x, c(0.0f)),
+                              arith::SubFOp::create(b, two, r), r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// math.isinf (no MathToLLVM pattern): |x| == +inf, ordered (false for NaN).
+static LogicalResult rewriteIsInf(math::IsInfOp op, PatternRewriter &rewriter) {
+  Type type = op.getOperand().getType();
+  auto et = cast<FloatType>(getElementTypeOrSelf(type));
+  Attribute inf = rewriter.getFloatAttr(
+      et, APFloat::getInf(et.getFloatSemantics()));
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    inf = SplatElementsAttr::get(shaped, inf);
+  Location loc = op.getLoc();
+  Value a = math::AbsFOp::create(rewriter, loc, op.getOperand());
+  Value c = arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(inf));
+  rewriter.replaceOpWithNewOp<arith::CmpFOp>(op, arith::CmpFPredicate::OEQ, a,
+                                             c);
+  return success();
+}
+
+/// math.ipowi of a scalar (no lowering to LLVM: MathToFuncs makes it a
+/// function, which a gpu.module cannot call into from outside), with
+/// MathToFuncs's semantics: for p >= 0, b^p by squaring (wrapping); for
+/// p < 0, 1 for b = 1, +-1 for b = -1 (p odd: -1), else 0.
+static LogicalResult rewriteIPowI(math::IPowIOp op, PatternRewriter &rewriter) {
+  auto type = dyn_cast<IntegerType>(op.getType());
+  if (!type)
+    return failure();
+  Location loc = op.getLoc();
+  Value b = op.getLhs(), p = op.getRhs();
+  auto c = [&](int64_t v) {
+    return arith::ConstantIntOp::create(rewriter, loc, type, v);
+  };
+  auto cmp = [&](arith::CmpIPredicate pr, Value x, Value y) {
+    return arith::CmpIOp::create(rewriter, loc, pr, x, y);
+  };
+  Value zero = c(0), one = c(1);
+  Value negative = cmp(arith::CmpIPredicate::slt, p, zero);
+  // the loop runs for p >= 0 only
+  Value start = arith::SelectOp::create(rewriter, loc, negative, zero, p);
+  auto loop = scf::WhileOp::create(
+      rewriter, loc, TypeRange{type, type, type}, ValueRange{one, b, start},
+      [&](OpBuilder &bb, Location l, ValueRange args) {
+        Value go = arith::CmpIOp::create(bb, l, arith::CmpIPredicate::ne,
+                                         args[2], zero);
+        scf::ConditionOp::create(bb, l, go, args);
+      },
+      [&](OpBuilder &bb, Location l, ValueRange args) {
+        Value odd = arith::CmpIOp::create(
+            bb, l, arith::CmpIPredicate::ne,
+            arith::AndIOp::create(bb, l, args[2], one), zero);
+        Value r = arith::SelectOp::create(
+            bb, l, odd, arith::MulIOp::create(bb, l, args[0], args[1]),
+            args[0]);
+        Value base = arith::MulIOp::create(bb, l, args[1], args[1]);
+        Value next = arith::ShRUIOp::create(bb, l, args[2], one);
+        scf::YieldOp::create(bb, l, ValueRange{r, base, next});
+      });
+  Value minusOne = c(-1);
+  Value oddP = cmp(arith::CmpIPredicate::ne,
+                   arith::AndIOp::create(rewriter, loc, p, one), zero);
+  Value negResult = arith::SelectOp::create(
+      rewriter, loc, cmp(arith::CmpIPredicate::eq, b, one), one,
+      arith::SelectOp::create(
+          rewriter, loc, cmp(arith::CmpIPredicate::eq, b, minusOne),
+          arith::SelectOp::create(rewriter, loc, oddP, minusOne, one), zero));
+  rewriter.replaceOpWithNewOp<arith::SelectOp>(op, negative, negResult,
+                                               loop.getResult(0));
+  return success();
+}
+
 /// Whether GPUSubgroupReduceOpLowering takes \p op to an AIR SIMD-group or
 /// quad-group reduction: of i32 or a float (maximumf / minimumf of f32), over
 /// the whole SIMD-group or clusters of 4 or 32 consecutive lanes.
@@ -1518,9 +1643,17 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteInverseHyperbolic<math::CbrtOp>);
       // erf: upstream's f32 approximation (f16 and bf16 widened to it).
       populatePolynomialApproximateErfPattern(patterns);
+      // erfc: upstream's f32 approximation likewise, its last step without
+      // a flushed correction (not 1 - erf, which cancels for large x).
+      patterns.add(rewriteErfc);
       populateMathF32ExpansionPatterns(
-          patterns, [](StringRef name) { return name == "math.erf"; },
+          patterns,
+          [](StringRef name) {
+            return name == "math.erf" || name == "math.erfc";
+          },
           /*benefit=*/2);
+      patterns.add(rewriteIsInf);
+      patterns.add(rewriteIPowI);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
