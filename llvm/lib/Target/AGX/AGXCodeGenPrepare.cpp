@@ -3545,7 +3545,8 @@ static bool expandPowI(Function &F) {
   return !Calls.empty();
 }
 
-/// frem of float and half (in float): fmod, exact. A step reduces a by a
+/// frem of float, half and bfloat (in float): fmod, exact (an fmod of
+/// half or bfloat values is one, so the truncation back is exact). A step reduces a by a
 /// divisor d with a / d < 2^24: q = trunc(a / d) is the integer part n or,
 /// rounded up, n + 1 (the quotient is correctly rounded and n representable),
 /// so the remainder is a - q d or a - (q - 1) d, whichever is in [0, d)
@@ -3559,7 +3560,8 @@ static bool expandFRem(Function &F, const AGXSubtarget &ST) {
   SmallVector<BinaryOperator *, 4> Rems;
   for (Instruction &I : instructions(F))
     if (I.getOpcode() == Instruction::FRem &&
-        (I.getType()->isFloatTy() || I.getType()->isHalfTy()))
+        (I.getType()->isFloatTy() || I.getType()->isHalfTy() ||
+         I.getType()->isBFloatTy()))
       Rems.push_back(cast<BinaryOperator>(&I));
   bool DenormalB =
       ST.hasIEEEFP32() &&

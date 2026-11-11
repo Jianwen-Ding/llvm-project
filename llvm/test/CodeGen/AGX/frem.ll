@@ -2,7 +2,8 @@
 ; rounded quotient below 2^24, truncated, and the remainder a - q d or
 ; a - (q - 1) d, whichever is in [0, d)) while the quotient could reach 2^24,
 ; then a last step by |b|; the sign of a, a for an infinite b, NaN for an
-; infinite or NaN a or a zero or NaN b. Half is computed in float.
+; infinite or NaN a or a zero or NaN b. Half and bfloat are computed in
+; float.
 ; RUN: llc -mtriple=agx -mcpu=agx-g14g -stop-after=agx-codegenprepare %s -o - | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14g %s -o /dev/null
 ; RUN: llc -mtriple=agx -mcpu=agx-g14g -mattr=+ieee-fp32 -stop-after=agx-codegenprepare %s -o - \
@@ -48,6 +49,19 @@ define agx_kernel void @f(ptr addrspace(1) %p, float %a, float %b) {
 define agx_kernel void @h(ptr addrspace(1) %p, half %a, half %b) {
   %r = frem half %a, %b
   store half %r, ptr addrspace(1) %p
+  ret void
+}
+
+; bfloat too (it was a - trunc(a / b) * b, wrong for quotients from 2^24:
+; fmod(2^30, 3) came out -32, L15-E200).
+; CHECK-LABEL: @bf(
+; CHECK: fpext bfloat %a to float
+; CHECK: frem.loop
+; CHECK: fptrunc float %{{.*}} to bfloat
+; CHECK-NOT: frem bfloat
+define agx_kernel void @bf(ptr addrspace(1) %p, bfloat %a, bfloat %b) {
+  %r = frem bfloat %a, %b
+  store bfloat %r, ptr addrspace(1) %p
   ret void
 }
 
