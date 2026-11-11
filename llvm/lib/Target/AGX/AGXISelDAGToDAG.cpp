@@ -17,6 +17,7 @@
 #include "AGXTargetMachine.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
@@ -674,6 +675,11 @@ bool AGXDAGToDAGISel::trySelectShift64(SDNode *N) {
 /// Device addresses are base + (index << (log2(element size) + shift)), with
 /// a 32-bit index that is zero or sign extended, or a signed 16-bit
 /// immediate index.
+static cl::opt<bool> KnownHighZeroIndices(
+    "agx-known-high-zero-indices", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit device address index whose high word is known zero "
+             "is the index register of its low word"));
+
 bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
                                        SDValue &Base, SDValue &Index,
                                        SDValue &Signed, SDValue &Shift) {
@@ -718,12 +724,20 @@ bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
       if (Scale < ElemLog2 || Scale > ElemLog2 + 2)
         continue;
       bool IsSExt = O.getOpcode() == ISD::SIGN_EXTEND;
-      if (!IsSExt && O.getOpcode() != ISD::ZERO_EXTEND)
-        continue;
-      if (O.getOperand(0).getValueType() != MVT::i32)
+      SDValue I32;
+      if ((IsSExt || O.getOpcode() == ISD::ZERO_EXTEND) &&
+          O.getOperand(0).getValueType() == MVT::i32)
+        I32 = O.getOperand(0);
+      // A 64-bit index whose high word is known zero (a zero-extending load
+      // of a byte, a masked value) is its low word unsigned.
+      else if (KnownHighZeroIndices && O.getValueType() == MVT::i64 &&
+               !isa<ConstantSDNode>(O) &&
+               CurDAG->computeKnownBits(O).countMinLeadingZeros() >= 32)
+        I32 = CurDAG->getTargetExtractSubreg(AGX::sub0, DL, MVT::i32, O);
+      else
         continue;
       Base = B;
-      Index = O.getOperand(0);
+      Index = I32;
       // The index signedness field is 1 for zero extension.
       Signed = getI32Imm(!IsSExt, DL);
       Shift = getI32Imm(Scale - ElemLog2, DL);

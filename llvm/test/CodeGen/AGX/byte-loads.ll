@@ -4,7 +4,8 @@
 ; A word loaded only to take its bytes apart (zero-extended: trunc, lshr by
 ; whole bytes, low masks) is a byte vector load, each byte zero-extended in a
 ; 16-bit half: no shifts or masks. Signed bytes keep the word (their shared
-; xor of it, E86).
+; xor of it, E86). Only the bytes up to the last one used are loaded (1, 2 or
+; 4 from the word's address): byte0, bytes01.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @bytes4(ptr addrspace(1) %p, ptr addrspace(1) %o) {
@@ -152,3 +153,71 @@ define agx_kernel void @uv(ptr addrspace(1) %p, ptr addrspace(1) %o) {
   ret void
 }
 !0 = !{}
+
+define agx_kernel void @byte0(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+; CHECK-LABEL: byte0:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    device_load 0, i8, x, r2, u0_u1, r1, unsigned, lsl 2
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, unsigned
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %z = zext i32 %i to i64
+  %g = getelementptr inbounds i32, ptr addrspace(1) %p, i64 %z
+  %v = load i32, ptr addrspace(1) %g, align 4
+  %b = and i32 %v, 255
+  %h = getelementptr inbounds i32, ptr addrspace(1) %o, i64 %z
+  store i32 %b, ptr addrspace(1) %h
+  ret void
+}
+
+define agx_kernel void @bytes01(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+; CHECK-LABEL: bytes01:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    device_load 0, i8, xy, r2l_r2h, u0_u1, r1, unsigned, lsl 2
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    convert u16_to_f, r3, r2l, rte
+; CHECK-NEXT:    convert u16_to_f, r2, r2h, rte
+; CHECK-NEXT:    fadd32 r2, r3, r2
+; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, unsigned
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %z = zext i32 %i to i64
+  %g = getelementptr inbounds i32, ptr addrspace(1) %p, i64 %z
+  %v = load i32, ptr addrspace(1) %g, align 4
+  %b0 = and i32 %v, 255
+  %s = lshr i32 %v, 8
+  %b1 = and i32 %s, 255
+  %f0 = uitofp i32 %b0 to float
+  %f1 = uitofp i32 %b1 to float
+  %f = fadd float %f0, %f1
+  %h = getelementptr inbounds float, ptr addrspace(1) %o, i64 %z
+  store float %f, ptr addrspace(1) %h
+  ret void
+}

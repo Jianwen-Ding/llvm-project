@@ -37,5 +37,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `two_index` | a row dot product reading one array at stride 2: two accesses that step differently |
 | `stride_loop` | a grid-stride loop to a 32-bit bound |
 | `conv1d` | a 3-tap filter of x[i], x[i + 1], x[i + 2] |
+| `hist` | a 256-bin histogram of low bytes by device atomics |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

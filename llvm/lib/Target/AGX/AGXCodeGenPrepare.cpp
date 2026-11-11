@@ -2550,6 +2550,7 @@ static cl::opt<bool> AGXByteLoads(
 /// one byte zero-extended, is a <4 x i8> load: the byte format's access puts
 /// each byte, zero-extended, in a 16-bit half, without the shifts and masks
 /// (RGBA8 pixels). A byte vector load is no more poisonous than the word.
+/// Only the bytes up to the last one used: 1 (an i8 load), 2 or 4.
 static bool loadBytesApart(Function &F) {
   if (!AGXByteLoads)
     return false;
@@ -2623,7 +2624,14 @@ static bool loadBytesApart(Function &F) {
     if (!OK || Bytes.empty())
       continue;
     IRBuilder<> B(L);
-    auto *VT = FixedVectorType::get(B.getInt8Ty(), WordBits / 8);
+    // Only the bytes up to the last one used (1, 2 or 4 from the word's
+    // address): the others would take registers for nothing.
+    unsigned N = 1;
+    for (auto [V, K] : Bytes)
+      while (N <= K)
+        N *= 2;
+    Type *VT = N == 1 ? B.getInt8Ty()
+                      : (Type *)FixedVectorType::get(B.getInt8Ty(), N);
     LoadInst *NL = B.CreateAlignedLoad(VT, L->getPointerOperand(),
                                        L->getAlign(), L->getName() + ".bytes");
     NL->setAAMetadata(L->getAAMetadata());
@@ -2631,7 +2639,8 @@ static bool loadBytesApart(Function &F) {
       // The byte's value is used outside the chain: its uses there take
       // the vector element instead.
       B.SetInsertPoint(NL->getNextNode());
-      Value *E = B.CreateZExt(B.CreateExtractElement(NL, K), V->getType());
+      Value *E = B.CreateZExt(N == 1 ? (Value *)NL : B.CreateExtractElement(NL, K),
+                              V->getType());
       V->replaceUsesWithIf(E, [&](Use &U) { return !Range.count(U.getUser()); });
     }
     for (auto It = Range.begin(); It != Range.end(); ++It)
