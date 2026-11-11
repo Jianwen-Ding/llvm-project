@@ -2435,10 +2435,25 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
     auto K = [&](float V) { return DAG.getConstantFP(V, DL, MVT::f32); };
     SDValue A32 = F(A), B32 = F(B);
     SDValue NegB = DAG.getNode(ISD::FNEG, DL, MVT::f32, B32);
-    SDValue Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, MVT::f32, B32);
-    SDValue Y = DAG.getNode(ISD::FMA, DL, MVT::f32,
-                            DAG.getNode(ISD::FMA, DL, MVT::f32, NegB, Y0, K(1.0f)),
-                            Y0, Y0);
+    SDValue Y0, Y;
+    auto *CB = dyn_cast<ConstantFPSDNode>(B);
+    if (CB && ConstDivisorFold && CB->getValueAPF().isNormal()) {
+      // A constant b: y is its rounded float reciprocal (what the Newton
+      // step gives), and serves as y0 too (exact for a's zeros, infinities
+      // and NaNs, with b's sign).
+      APFloat BV = CB->getValueAPF();
+      bool LosesInfo;
+      BV.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven,
+                 &LosesInfo);
+      APFloat YV(APFloat::IEEEsingle(), "1");
+      YV.divide(BV, APFloat::rmNearestTiesToEven);
+      Y0 = Y = DAG.getConstantFP(YV, DL, MVT::f32);
+    } else {
+      Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, MVT::f32, B32);
+      Y = DAG.getNode(ISD::FMA, DL, MVT::f32,
+                      DAG.getNode(ISD::FMA, DL, MVT::f32, NegB, Y0, K(1.0f)),
+                      Y0, Y0);
+    }
     SDValue Q1 = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y);
     SDValue Q = DAG.getNode(
         ISD::FMA, DL, MVT::f32,

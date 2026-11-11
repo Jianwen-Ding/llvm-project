@@ -249,3 +249,40 @@ define agx_kernel void @two_over(ptr addrspace(1) %p) {
   store float %r, ptr addrspace(1) %q
   ret void
 }
+
+; Half division by a constant: the divisor's rounded float reciprocal is a
+; constant, also for the dividend's zeros, infinities and NaNs.
+define agx_kernel void @half_by3(ptr addrspace(1) %p) {
+; CHECK-LABEL: half_by3:
+; CHECK:         // uniform registers: 10 x 16-bit (threadgroups_per_grid at u2)
+; CHECK-NEXT:    // general purpose registers: 6 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    mov_imm r3, 1051372203
+; CHECK-NEXT:    device_load 0, i16, x, r2l, u0_u1, r1, signed
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    fmul32 r4, r2l, r3
+; CHECK-NEXT:    fmadd32 r5, r4, -3.0, r2l
+; CHECK-NEXT:    fmadd32 r3, r5, r3, r4
+; CHECK-NEXT:    fcmpsel eq, r3, r3, r3, r3, r4
+; CHECK-NEXT:    fcmpsel eq, r2, r2l, 0.0, r4, r3
+; CHECK-NEXT:    fadd32 r2l, r2, -0.0
+; CHECK-NEXT:    device_store 0, i16, x, r2l, u0_u1, r1, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr half, ptr addrspace(1) %p, i32 %t
+  %x = load half, ptr addrspace(1) %q
+  %r = fdiv half %x, 0xH4200
+  store half %r, ptr addrspace(1) %q
+  ret void
+}
