@@ -247,6 +247,36 @@ gpu.module @clusters {
 
 // -----
 
+// maximumf / minimumf of f32 (NaN if any lane's is, -0.0 below +0.0, which
+// AIR's float maximum, a maxnum, does not give): the signed i32 maximum of
+// the keys b ^ ((b >>s 31) & 0x7fffffff), decoded, or a NaN where the
+// group's or of "is NaN" is set.
+gpu.module @ordered_float_reduce {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32) kernel {
+    // CHECK: %[[F:.*]] = llvm.freeze
+    // CHECK: %[[B:.*]] = llvm.bitcast %[[F]] : f32 to i32
+    // CHECK: %[[S:.*]] = llvm.ashr %[[B]]
+    // CHECK: %[[M:.*]] = llvm.and %[[S]]
+    // CHECK: %[[K:.*]] = llvm.xor %[[B]], %[[M]]
+    // CHECK: llvm.call @air.simd_max.s.i32(%[[K]])
+    // CHECK: llvm.fcmp "uno" %[[F]], %[[F]]
+    // CHECK: llvm.call @air.simd_or.s.i32
+    // CHECK: llvm.select
+    %mx = gpu.subgroup_reduce maximumf %v : (f32) -> f32
+    // CHECK: llvm.call @air.quad_min.s.i32
+    // CHECK: llvm.call @air.quad_or.s.i32
+    %mn = gpu.subgroup_reduce minimumf %v cluster(size = 4) : (f32) -> f32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    memref.store %mx, %out[%c0] : memref<8xf32, 1>
+    memref.store %mn, %out[%c1] : memref<8xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // gpu.global_id is AIR's 32-bit thread_position_in_grid where the dimension
 // has fewer than 2^32 threads (upper_bound, or known_block_size times
 // known_grid_size); without a bound, block_id * block_dim + thread_id in

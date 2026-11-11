@@ -16,11 +16,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGXTargetMachine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/SimplifyCFGOptions.h"
 #include "AGX.h"
 #include "AGXAliasAnalysis.h"
 #include "AGXMachineFunctionInfo.h"
 #include "AGXTargetTransformInfo.h"
 #include "TargetInfo/AGXTargetInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/Passes.h"
@@ -28,6 +31,8 @@
 #include "llvm/CodeGen/RegisterPressure.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Metadata.h"
@@ -357,6 +362,16 @@ static cl::opt<unsigned> AGXStraightLineSRMaxInstructions(
     cl::desc("Straight-line strength reduction and n-ary reassociation only "
              "for functions of at most this many instructions (0: all)"));
 
+static cl::opt<bool> AGXEarlySRRanges(
+    "agx-early-sr-ranges", cl::init(true), cl::Hidden,
+    cl::desc("Special register ranges during straight-line strength "
+             "reduction (taken off before loop strength reduction)"));
+
+static cl::opt<bool> AGXNonNegativeSignSplats(
+    "agx-nonnegative-sign-splats", cl::init(true), cl::Hidden,
+    cl::desc("x >> (bits - 1) of an x known not negative from the special "
+             "register ranges as 0"));
+
 namespace {
 /// Straight-line strength reduction, n-ary reassociation and the CSE after
 /// them, on functions of at most AGXStraightLineSRMaxInstructions
@@ -397,7 +412,38 @@ public:
       FPM.addPass(GVNPass());
     else
       FPM.addPass(EarlyCSEPass());
-    return !FPM.run(F, FAM).areAllPreserved();
+    // The thread indices' bounds let these passes see an index plus a
+    // constant (zext(tid + 256)) as the index and a constant offset, which
+    // memory accesses take as an immediate. They are taken off again: with
+    // them, loop strength reduction makes 64-bit offsets (L14-E1); the
+    // special register ranges pass gives them back after it.
+    SmallVector<WeakVH, 8> Ranged;
+    if (AGXEarlySRRanges)
+      AGX::addSpecialRegisterRanges(F, &Ranged);
+    bool Changed = !FPM.run(F, FAM).areAllPreserved();
+    // With the bounds, an index that starts at a thread position and steps
+    // up without signed overflow is known not negative: the sign splat of
+    // a signed division or remainder by a power of two (x >> 31, the
+    // correction) is 0, so they select as shifts and masks.
+    if (AGXEarlySRRanges && AGXNonNegativeSignSplats && !Ranged.empty()) {
+      using namespace PatternMatch;
+      SimplifyQuery SQ(F.getDataLayout());
+      for (Instruction &I : make_early_inc_range(instructions(F))) {
+        Value *X;
+        const APInt *C;
+        if (match(&I, m_AShr(m_Value(X), m_APInt(C))) &&
+            *C == I.getType()->getScalarSizeInBits() - 1 &&
+            isKnownNonNegative(X, SQ.getWithInstruction(&I))) {
+          I.replaceAllUsesWith(Constant::getNullValue(I.getType()));
+          I.eraseFromParent();
+          Changed = true;
+        }
+      }
+    }
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<CallBase>(V))
+        CI->removeRetAttr(Attribute::Range);
+    return Changed;
   }
 };
 char AGXStraightLineSRPass::ID = 0;
@@ -479,6 +525,11 @@ void AGXPassConfig::addIRPasses() {
   TargetPassConfig::addIRPasses();
 }
 
+static cl::opt<unsigned> AGXPreISelSimplifyCFG(
+    "agx-preisel-simplifycfg", cl::init(2), cl::Hidden,
+    cl::desc("SimplifyCFG before structurization with this bonus instruction "
+             "threshold (0: not run)"));
+
 bool AGXPassConfig::addPreISel() {
   // After loop strength reduction, which makes 64-bit counters of PTX's
   // 64-bit address arithmetic.
@@ -487,6 +538,16 @@ bool AGXPassConfig::addPreISel() {
   // After loop strength reduction, which would form 64-bit offsets from
   // the bounded indices (EXPERIMENTS.md L14-E1).
   addPass(createAGXSpecialRegisterRangesPass());
+  // The phis of an if's empty side (left by AGXCodeGenPrepare's merging of
+  // || and && conditions) become selects, as SimplifyCFG folds two-entry
+  // phis: an if is execution mask operations, which cost more than the
+  // speculated selects. Without SimplifyCFG's branch simplification, which
+  // would make switches of comparison chains.
+  if (getOptLevel() != CodeGenOptLevel::None && AGXPreISelSimplifyCFG)
+    addPass(createCFGSimplificationPass(
+        SimplifyCFGOptions()
+            .bonusInstThreshold(AGXPreISelSimplifyCFG)
+            .setSimplifyCondBranch(false)));
   // Bring the CFG into the structured form AGXAnnotateControlFlow expects.
   addPass(createLowerSwitchPass());
   addPass(createFixIrreduciblePass());

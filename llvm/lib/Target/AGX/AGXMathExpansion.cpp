@@ -24,18 +24,37 @@
 
 #include "AGX.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/PatternMatch.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsAGX.h"
 #include <cmath>
 
 using namespace llvm;
+using namespace llvm::PatternMatch;
+
+static cl::opt<bool> NegatedClamp(
+    "agx-exp-negated-clamp",
+    cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
+    cl::Hidden);
+
+static cl::opt<bool> IntegerLdexp(
+    "agx-exp-integer-scale",
+    cl::desc("the exponentials' 2^n scale as an exponent addition where f32 "
+             "flushes"),
+    cl::init(true), cl::Hidden);
 
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
   Type *Ty; // float or a vector of float
+  // No float operand is a denormal the expansion must keep: f32 arithmetic
+  // flushes (no ieee-fp32), or the operands are widened halves.
+  bool NoDenormals;
 
 public:
-  MathBuilder(IRBuilderBase &B, Type *Ty) : B(B), Ty(Ty) {}
+  MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false)
+      : B(B), Ty(Ty), NoDenormals(NoDenormals) {}
 
   Value *k(double V) { return ConstantFP::get(Ty, V); }
   Value *call(Intrinsic::ID ID, ArrayRef<Value *> Args) {
@@ -57,7 +76,7 @@ public:
   }
   Value *sqrt(Value *X) { return call(Intrinsic::sqrt, {X}); }
   Value *exp(Value *X) { return call(Intrinsic::exp, {X}); }
-  Value *expPrecise(Value *X) { return expHiLo(X, k(0.0)); }
+  Value *expPrecise(Value *X) { return expHiLo(X, nullptr); }
   Value *log(Value *X) { return call(Intrinsic::log, {X}); }
   Value *sel(Value *C, Value *T, Value *F) { return B.CreateSelect(C, T, F); }
   Value *gt(Value *A, double V) { return B.CreateFCmpOGT(A, k(V)); }
@@ -71,8 +90,11 @@ public:
   /// [0, tan(pi / 8)] around 0, pi / 4 or pi / 2.
   Value *atanNonNegative(Value *A) {
     Value *Big = gt(A, 2.414213562373095), *Mid = gt(A, 0.4142135623730950);
-    Value *X = sel(Big, div(k(-1.0), A),
-                   sel(Mid, div(sub(A, k(1.0)), add(A, k(1.0))), A));
+    // One division, of the operands the range picks (-1 / a or
+    // (a - 1) / (a + 1)): a select of two divisions computed both ways.
+    Value *Q = div(sel(Big, k(-1.0), sub(A, k(1.0))),
+                   sel(Big, A, add(A, k(1.0))));
+    Value *X = sel(B.CreateOr(Big, Mid), Q, A);
     Value *Y0 = sel(Big, k(M_PI_2), sel(Mid, k(M_PI_4), k(0.0)));
     Value *Z = mul(X, X);
     Value *P = poly(Z, {8.05374449538e-2, -1.38776856032e-1, 1.99777106478e-1,
@@ -93,8 +115,9 @@ public:
     // Above 0.5: asin(a) = pi / 2 - 2 asin(sqrt((1 - a) / 2)).
     Value *Big = gt(A, 0.5);
     Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)));
-    Value *R = sel(Big, sub(k(M_PI_2), mul(k(2.0), asinSmall(S))),
-                   asinSmall(A));
+    // One polynomial, of the argument the range picks.
+    Value *P = asinSmall(sel(Big, S, A));
+    Value *R = sel(Big, sub(k(M_PI_2), mul(k(2.0), P)), P);
     // |x| > 1: the square root is NaN.
     R = sel(gt(A, 1.0), S, R);
     return copysign(R, X);
@@ -105,10 +128,13 @@ public:
     // |x| > 0.5: acos(|x|) = 2 asin(sqrt((1 - |x|) / 2)), and
     // acos(-|x|) = pi - acos(|x|); else pi / 2 - asin(x).
     Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)));
-    Value *Twice = mul(k(2.0), asinSmall(S));
+    Value *Big = gt(A, 0.5);
+    // One polynomial, of the argument the range picks.
+    Value *P = asinSmall(sel(Big, S, A));
+    Value *Twice = mul(k(2.0), P);
     Value *Outer = sel(lt(X, 0.0), sub(k(M_PI), Twice), Twice);
-    Value *Inner = sub(k(M_PI_2), copysign(asinSmall(A), X));
-    Value *R = sel(gt(A, 0.5), Outer, Inner);
+    Value *Inner = sub(k(M_PI_2), copysign(P, X));
+    Value *R = sel(Big, Outer, Inner);
     return sel(gt(A, 1.0), S, R);
   }
 
@@ -134,8 +160,23 @@ public:
 
   /// e^a / 2 for a >= 0, without overflow below the largest float.
   Value *halfExp(Value *A) {
-    Value *Shifted = exp(sub(A, k(M_LN2)));
-    return sel(lt(A, 88.0), mul(k(0.5), exp(A)), Shifted);
+    // One exponential: e^a / 2, or e^(a - ln 2) from 88 on, a - ln 2 as
+    // (a - 0.693359375) + 2.12194440e-4 (the first exact for a >= 88: a
+    // rounded a - ln 2 put the result up to 24 ulp off near the overflow).
+    Value *Lt = lt(A, 88.0);
+    return mul(sel(Lt, k(0.5), k(1.0)),
+               expHiLo(sel(Lt, A, sub(A, k(0.693359375))),
+                       sel(Lt, k(0.0), k(2.12194440e-4))));
+  }
+
+  /// 0.25 / h for h = e^a / 2 >= 0.5 (or a NaN): 0.25 times the correctly
+  /// rounded reciprocal y0 + y0 (1 - h y0) (as in tanh) while the quotient is
+  /// above the flushed range, else 0 (h > 2^124, an infinite h too, whose
+  /// reciprocal step would be a NaN), without the general division.
+  Value *quarterOver(Value *H) {
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {H});
+    Value *Y = fma(fma(B.CreateFNeg(H), Y0, k(1.0)), Y0, Y0);
+    return sel(gt(H, 0x1p124), k(0.0), mul(k(0.25), Y));
   }
 
   Value *sinh(Value *X) {
@@ -146,13 +187,13 @@ public:
                            Z),
                        X, X);
     Value *H = halfExp(A);
-    Value *Big = copysign(sub(H, div(k(0.25), H)), X);
+    Value *Big = copysign(sub(H, quarterOver(H)), X);
     return sel(gt(A, 1.0), Big, Small);
   }
 
   Value *cosh(Value *X) {
     Value *H = halfExp(abs(X));
-    return add(H, div(k(0.25), H));
+    return add(H, quarterOver(H));
   }
 
   Value *tanh(Value *X) {
@@ -164,9 +205,20 @@ public:
                          -3.33332819422e-1}),
                 Z),
             X, X);
-    // 1 - 2 / (e^2a + 1), which is 1 in float from a = 9 on.
-    Value *S = exp(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)));
-    Value *Big = copysign(sub(k(1.0), div(k(2.0), add(S, k(1.0)))), X);
+    // 1 - 2 / (e^2a + 1), which is 1 in float from a = 9 on. 2a is in
+    // [0, 18] (or a NaN, which the exponential keeps): its exponential needs
+    // no clamp of the argument.
+    Value *S = expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
+                       /*Bounded=*/true);
+    // 2 / d for d = s + 1 in [2, e^18 + 1] (or a NaN): twice the correctly
+    // rounded reciprocal y0 + y0 (1 - d y0) (lowerFDIV32's, whose rcp and
+    // fmas scale with d's exponent here, no result near the flushed or the
+    // infinite range), without the general division's exponent scaling and
+    // special cases.
+    Value *D = add(S, k(1.0));
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
+    Value *Y = fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
+    Value *Big = copysign(sub(k(1.0), mul(k(2.0), Y)), X);
     return sel(lt(A, 0.625), Small, Big);
   }
 
@@ -182,10 +234,11 @@ public:
                          -1.6666288134e-1}),
                 Z),
             X, X);
-    // log(2a) once a * a + 1 is a * a in float (and before it overflows).
-    Value *Huge = add(log(A), k(M_LN2));
-    Value *Mid = log(add(A, sqrt(fma(A, A, k(1.0)))));
-    Value *Big = copysign(sel(gt(A, 1500.0), Huge, Mid), X);
+    // log(2a) = log(a) + ln 2 once a * a + 1 is a * a in float (and before
+    // it overflows): one log, of the argument the range picks.
+    Value *H = gt(A, 1500.0);
+    Value *L = log(sel(H, A, add(A, sqrt(fma(A, A, k(1.0))))));
+    Value *Big = copysign(add(L, sel(H, k(M_LN2), k(0.0))), X);
     return sel(lt(A, 0.5), Small, Big);
   }
 
@@ -196,9 +249,10 @@ public:
                       poly(Z, {1.7596881071e-3, -7.5272886713e-3,
                                2.6454905019e-2, -1.1784741703e-1,
                                1.4142135263e0}));
-    Value *Huge = add(log(X), k(M_LN2));
-    Value *Mid = log(add(X, sqrt(mul(Z, add(X, k(1.0))))));
-    return sel(lt(Z, 0.5), Near, sel(gt(X, 1500.0), Huge, Mid));
+    // As in asinh: one log.
+    Value *H = gt(X, 1500.0);
+    Value *L = log(sel(H, X, add(X, sqrt(mul(Z, add(X, k(1.0)))))));
+    return sel(lt(Z, 0.5), Near, add(L, sel(H, k(M_LN2), k(0.0))));
   }
 
   Value *atanh(Value *X) {
@@ -272,15 +326,31 @@ public:
     return {S, Err};
   }
 
-  /// 2^n for an integral n in [-126, 127].
-  Value *pow2(Value *N) {
-    Value *E = B.CreateAdd(B.CreateFPToSI(N, intTy()), ki(127));
-    return B.CreateBitCast(B.CreateShl(E, ki(23)), Ty);
+  /// 2^i for an i32 i in [-126, 127].
+  Value *pow2i(Value *I) {
+    return B.CreateBitCast(B.CreateShl(B.CreateAdd(I, ki(127)), ki(23)), Ty);
   }
-  /// v * 2^n for an integral n in [-252, 254], in two steps.
+  /// v * 2^n for an integral n in [-252, 254], in two steps. The split is
+  /// done on the integer: i >> 1 and i - (i >> 1) are both in [-126, 127].
   Value *ldexp(Value *V, Value *N) {
-    Value *N1 = call(Intrinsic::trunc, {mul(N, k(0.5))});
-    return mul(mul(V, pow2(N1)), pow2(sub(N, N1)));
+    // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
+    // reaches the result through the value it scales, without a select.
+    Value *I = B.CreateFreeze(B.CreateFPToSI(N, intTy()));
+    if (NoDenormals && IntegerLdexp) {
+      // v is the exponential's e^r in [0.7, 1.42] (or a NaN): v 2^n is its
+      // bits plus n << 23 while that is a normal float; at or past the
+      // infinite exponent +inf, below the normal range the +0 that the
+      // flushing multiplications gave, and a NaN v itself (its n arbitrary).
+      // Bit-identical to the two multiplications where results flush.
+      Value *S = B.CreateAdd(B.CreateBitCast(V, intTy()),
+                             B.CreateShl(I, ki(23)));
+      Value *R = B.CreateBitCast(S, Ty);
+      R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
+      R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
+      return sel(B.CreateFCmpUNO(V, V), V, R);
+    }
+    Value *I1 = B.CreateAShr(I, ki(1));
+    return mul(mul(V, pow2i(I1)), pow2i(B.CreateSub(I, I1)));
   }
 
   /// e^r for |r| <= ln(2) / 2 (Cephes expf).
@@ -290,31 +360,73 @@ public:
     return add(fma(P, mul(R, R), R), k(1.0));
   }
 
-  /// e^(hi + lo), lo a small correction: n = round(hi / ln 2) is split off
-  /// exactly (ln 2 in two parts) and the rest goes to expCore.
-  Value *expHiLo(Value *Hi, Value *Lo) {
-    Value *C = sel(gt(Hi, 89.0), k(89.0), sel(lt(Hi, -104.0), k(-104.0), Hi));
+  /// e^(hi + lo), lo a small correction (or none: an addition of +0.0 only
+  /// changes r = -0 to +0, for which expCore gives 1 either way): n =
+  /// round(hi / ln 2) is split off exactly (ln 2 in two parts) and the rest
+  /// goes to expCore.
+  /// \p Bounded: the caller clamped its argument so that hi is finite and
+  /// its n within ldexp's range (exp2, exp10), and the result over- and
+  /// underflows by itself: no clamp of hi here and no +inf / +0 selects.
+  Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false) {
+    Value *C;
+    Value *Y;
+    if (!Bounded && NegatedClamp && match(Hi, m_FNeg(m_Value(Y)))) {
+      // e^-y (sigmoid, silu): clamp y to the mirrored bounds and negate the
+      // result, the same value (a NaN y stays a NaN), so that the negation
+      // folds into the multiplication's constant and the fma's .neg instead
+      // of being an xor (a select's operand takes no modifier).
+      C = B.CreateFNeg(sel(lt(Y, -89.0), k(-89.0),
+                           sel(gt(Y, 104.0), k(104.0), Y)));
+    } else {
+      C = Bounded ? Hi
+                  : sel(gt(Hi, 89.0), k(89.0),
+                        sel(lt(Hi, -104.0), k(-104.0), Hi));
+    }
     Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
-    Value *E = ldexp(expCore(add(R, Lo)), N);
-    E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
-    return sel(isNaN(Hi), Hi, E);
+    Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N);
+    // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
+    // rounds to 0) by itself: for exp, checked for every float x, flushing
+    // and not; with a low part (exp2, exp10, pow) the selects stay.
+    if (Lo && !Bounded)
+      E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
+    // A NaN hi is a NaN r, which makes E a NaN (ldexp freezes its
+    // conversion of the NaN n, which would be poison).
+    return E;
+  }
+
+  /// x clamped to [Lo, Hi], a little beyond where b^x overflows and rounds
+  /// to 0: no infinity whose product error would be a NaN, and the same
+  /// result for every float x as clamping e^(hi + lo) (checked exhaustively
+  /// for 2^x and 10^x, flushing and not). A NaN stays one.
+  Value *clampArg(Value *X, double Lo, double Hi) {
+    Value *Y;
+    // -y: y clamped to the mirrored bounds, then negated (as in expHiLo),
+    // so that the negation folds into the multiplications that follow.
+    if (NegatedClamp && match(X, m_FNeg(m_Value(Y))))
+      return B.CreateFNeg(sel(lt(Y, -Hi), k(-Hi), sel(gt(Y, -Lo), k(-Lo), Y)));
+    return sel(gt(X, Hi), k(Hi), sel(lt(X, Lo), k(Lo), X));
   }
 
   Value *exp2Precise(Value *X) {
     // 2^x = e^(x ln 2), with x ln 2 as a rounded product and its error.
+    // (Up to 128, where 2^x overflows: n = 128 at most, which the exponent
+    // addition of ldexp needs.)
+    X = clampArg(X, -151.0, 128.0);
     Value *Hi = mul(X, k(M_LN2));
     Value *Lo = fma(X, k(M_LN2), B.CreateFNeg(Hi));
     Lo = fma(X, k(M_LN2 - (double)(float)M_LN2), Lo);
-    return expHiLo(Hi, Lo);
+    return expHiLo(Hi, Lo, /*Bounded=*/true);
   }
   Value *exp10Precise(Value *X) {
     constexpr double LN10 = 2.302585092994045684;
+    // (Up to 38.6, past 10^x's overflow at 38.53: n = 128 at most.)
+    X = clampArg(X, -46.0, 38.6);
     Value *Hi = mul(X, k(LN10));
     Value *Lo = fma(X, k(LN10), B.CreateFNeg(Hi));
     Lo = fma(X, k(LN10 - (double)(float)LN10), Lo);
-    return expHiLo(Hi, Lo);
+    return expHiLo(Hi, Lo, /*Bounded=*/true);
   }
 
   /// A positive finite x as 2^e * (1 + f), 1 + f in [sqrt(1/2), sqrt(2)),
@@ -323,12 +435,16 @@ public:
     Value *E, *F, *Y;
   };
   LogParts logParts(Value *X) {
-    Value *Tiny = lt(X, 1.17549435e-38);
-    Value *XS = sel(Tiny, mul(X, k(8388608.0)), X);
+    // A denormal x is scaled by 2^23 first, where it must be kept; where f32
+    // arithmetic flushes, it may be taken as the zero it compares equal to,
+    // which logSpecial's x == 0 (a flushing compare) turns into -inf.
+    Value *Tiny = NoDenormals ? nullptr : lt(X, 1.17549435e-38);
+    Value *XS = Tiny ? sel(Tiny, mul(X, k(8388608.0)), X) : X;
     Value *Bits = B.CreateBitCast(XS, intTy());
     Value *E = B.CreateSIToFP(
         B.CreateSub(B.CreateLShr(Bits, ki(23)), ki(127)), Ty);
-    E = sel(Tiny, sub(E, k(23.0)), E);
+    if (Tiny)
+      E = sel(Tiny, sub(E, k(23.0)), E);
     Value *M = B.CreateBitCast(
         B.CreateOr(B.CreateAnd(Bits, ki(0x7fffff)), ki(0x3f800000)), Ty);
     Value *Big = gt(M, 1.41421356);
@@ -473,12 +589,12 @@ public:
 /// vector of one.
 template <typename FnT>
 static Value *inFloat(IRBuilderBase &B, Type *Ty, ArrayRef<Value *> Args,
-                      FnT Fn) {
+                      FnT Fn, bool FlushF32 = false) {
   Type *F32 = Ty->getWithNewType(B.getFloatTy());
   SmallVector<Value *, 2> Ext;
   for (Value *A : Args)
     Ext.push_back(Ty == F32 ? A : B.CreateFPExt(A, F32));
-  MathBuilder M(B, F32);
+  MathBuilder M(B, F32, FlushF32 || Ty != F32);
   Value *R = Fn(M, Ext);
   return Ty == F32 ? R : B.CreateFPTrunc(R, Ty);
 }
@@ -498,6 +614,11 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
     return E->isFloatTy() || E->isHalfTy() || E->isBFloatTy();
   case Intrinsic::sin:
   case Intrinsic::cos:
+    // bfloat too: promoted to the hardware's reduction (afn's), its sin was
+    // up to 256 ulp off even below 16 (tiny results lost) and worse for large
+    // arguments (simulator, every bfloat); the float expansion rounded to
+    // bfloat is within an ulp below 10^6.
+    return (E->isFloatTy() || E->isBFloatTy()) && !Approx;
   case Intrinsic::exp:
   case Intrinsic::exp2:
   case Intrinsic::exp10:
@@ -514,7 +635,7 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 }
 
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
-                       ArrayRef<Value *> Args) {
+                       ArrayRef<Value *> Args, bool FlushF32) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
                    switch (ID) {
@@ -562,7 +683,8 @@ Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                    default:
                      llvm_unreachable("not an expanded math intrinsic");
                    }
-                 });
+                 },
+                 FlushF32);
 }
 
 Value *AGX::expandMath(IRBuilderBase &B, StringRef Fn, Value *X) {

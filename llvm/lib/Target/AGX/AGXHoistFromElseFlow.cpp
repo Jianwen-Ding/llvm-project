@@ -19,8 +19,10 @@
 //
 // This pass moves these instructions to the end of the block's immediate
 // dominator, the if block, which runs with the execution mask of both sides,
-// when they only read values available there and have no memory or other
-// side effects (which rules out every move that could change a result).
+// when they only read values available there (virtual registers defined in
+// a dominating block, or physical registers nothing in the function writes)
+// and have no memory or other side effects (which rules out every move that
+// could change a result).
 //
 //===----------------------------------------------------------------------===//
 
@@ -93,7 +95,12 @@ bool AGXHoistFromElseFlow::runOnMachineFunction(MachineFunction &MF) {
     if (!Node || !Node->getIDom())
       continue;
     MachineBasicBlock *If = Node->getIDom()->getBlock();
-    if (!endsInOpcode(*If, AGX::AGX_IF))
+    // AGX_IF, or an if whose condition AGXFoldOperands made the comparison
+    // itself (whose flow blocks AGXLowerControlFlow otherwise runs twice).
+    if (!endsInOpcode(*If, AGX::AGX_IF) &&
+        !endsInOpcode(*If, AGX::AGX_IF_ICMP) &&
+        !endsInOpcode(*If, AGX::AGX_IF_FCMP) &&
+        !endsInOpcode(*If, AGX::AGX_IF_ICMP16))
       continue;
 
     for (MachineInstr &MI : llvm::make_early_inc_range(
@@ -106,6 +113,10 @@ bool AGXHoistFromElseFlow::runOnMachineFunction(MachineFunction &MF) {
         if (!MO.isReg() || !MO.getReg())
           continue;
         if (!MO.getReg().isVirtual()) {
+          // A register nothing in the function writes (the uniform registers
+          // the kernel's arguments are preloaded in) reads the same anywhere.
+          if (MO.isUse() && MRI.isConstantPhysReg(MO.getReg().asMCReg()))
+            continue;
           Movable = false;
           break;
         }

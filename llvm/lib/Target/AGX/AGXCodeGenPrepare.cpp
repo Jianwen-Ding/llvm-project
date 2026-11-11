@@ -44,6 +44,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -1706,7 +1707,7 @@ static bool isLaneMovement(const Value *V) {
 /// Shuffles that undo each other: a value whose every thread (and element)
 /// is, through shuffles, selects and element moves that depend only on the
 /// thread index, the same thread's (and element's) bits of one earlier value
-/// is that value. ZLUDA's mma emulation moves the elements of D from the
+/// is that value. The PTX front end's mma emulation moves the elements of D from the
 /// matrix unit's layout to the PTX fragment layout and the next mma's C back:
 /// a chain of mmas keeps its accumulator in the unit's layout. Each candidate
 /// is checked in all 32 threads.
@@ -1818,6 +1819,79 @@ static bool readsNamedThreads(const Value *Idx, LaneEvaluator &LE) {
 /// shuffles with divergent deltas become shuffles of the computed thread;
 /// threads whose source is outside the SIMD-group (or quad) keep their own
 /// value, as Metal documents for simd_shuffle_up and simd_shuffle_down.
+static cl::opt<bool> AGXShuffleSelects(
+    "agx-shuffle-selects", cl::init(true), cl::Hidden,
+    cl::desc("A shuffle at select(c, i, thread index) as a select between "
+             "the shuffle at i and the value (a shuffle_xor for i = thread "
+             "index ^ k)"));
+
+/// A thread reads its own value at its own index: a SIMD-group shuffle at
+/// select(C, I, thread index) (through a mask that leaves both alone) is
+/// select(C, shuffle at I, the value), and a shuffle at the thread index
+/// xor a constant is a shuffle_xor, whose index is no longer divergent:
+/// partial reductions' butterflies (the lane's partner where it is in range,
+/// else the lane) were split into four shuffles each. Takes the shuffles it
+/// rewrites out of Worklist and adds the ones it makes that still need a
+/// split.
+static bool shuffleSelectedLanes(SmallVectorImpl<IntrinsicInst *> &Worklist,
+                                 const DataLayout &DL) {
+  using namespace PatternMatch;
+  bool Changed = false;
+  auto IsLane = [](Value *V) {
+    auto *II = dyn_cast<IntrinsicInst>(V);
+    return II && II->getIntrinsicID() == Intrinsic::agx_thread_index_in_simdgroup;
+  };
+  SmallVector<IntrinsicInst *, 8> Out;
+  for (IntrinsicInst *II : Worklist) {
+    Value *Idx = II->getArgOperand(1);
+    // a mask that keeps every bit the index can have (the thread index and
+    // its xor with a constant are below 32)
+    const APInt *K;
+    Value *L;
+    auto IsLaneXor = [&](Value *V) {
+      return match(V, m_c_Xor(m_Value(L), m_APInt(K))) && IsLane(L) &&
+             K->ult(32);
+    };
+    auto Below32 = [&](Value *V) { return IsLane(V) || IsLaneXor(V); };
+    const APInt *M;
+    Value *X, *C, *T, *E;
+    if (match(Idx, m_And(m_Value(X), m_APInt(M))) &&
+        ((computeKnownBits(X, DL).Zero | *M).isAllOnes() ||
+         (M->countr_one() >= 5 &&
+          match(X, m_Select(m_Value(), m_Value(T), m_Value(E))) &&
+          Below32(T) && Below32(E))))
+      Idx = X;
+    if (II->getIntrinsicID() != Intrinsic::agx_simd_shuffle ||
+        !match(Idx, m_Select(m_Value(C), m_Value(T), m_Value(E))) ||
+        IsLane(T) == IsLane(E)) {
+      Out.push_back(II);
+      continue;
+    }
+    bool LaneIfTrue = IsLane(T);
+    Value *I = LaneIfTrue ? E : T;
+    Value *V = II->getArgOperand(0);
+    IRBuilder<> B(II);
+    Value *R;
+    if (IsLaneXor(I)) {
+      R = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle_xor, {V->getType()},
+                            {V, B.getInt32(K->getZExtValue())});
+    } else {
+      auto *S = cast<IntrinsicInst>(B.CreateIntrinsic(
+          Intrinsic::agx_simd_shuffle, {V->getType()}, {V, I}));
+      R = S;
+      if (!isa<Constant>(I))
+        Out.push_back(S);
+    }
+    Value *Sel = LaneIfTrue ? B.CreateSelect(C, V, R) : B.CreateSelect(C, R, V);
+    Sel->takeName(II);
+    II->replaceAllUsesWith(Sel);
+    II->eraseFromParent();
+    Changed = true;
+  }
+  Worklist.assign(Out.begin(), Out.end());
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
                                                const TargetTransformInfo &TTI) {
   SmallVector<IntrinsicInst *, 8> Worklist;
@@ -1844,11 +1918,14 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
 
   if (AGXUnsplitShuffles)
     return false;
+  bool Changed = false;
+  if (AGXShuffleSelects)
+    Changed |= shuffleSelectedLanes(Worklist, F.getDataLayout());
   // Most compute kernels have no variable shuffle indices. Do not compute
   // whole-function divergence (and its dominator/cycle analyses) for them.
   // Build it after matrix lowering, which can itself introduce shuffles.
   if (Worklist.empty())
-    return false;
+    return Changed;
   DominatorTree DT(F);
   CycleInfo CI;
   CI.compute(F);
@@ -1929,7 +2006,7 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
     II->replaceAllUsesWith(Result);
     II->eraseFromParent();
   }
-  return !Worklist.empty();
+  return Changed || !Worklist.empty();
 }
 
 /// Whether I computes a floating point value from its operands (and so
@@ -2463,6 +2540,550 @@ static Bytes4 byteSources(Value *V, unsigned Depth,
 /// into the other's half (and a shift or a sign fill for the byte), the
 /// halves the 32-bit register's, where that takes fewer instructions than
 /// the tree.
+static cl::opt<bool> AGXByteLoads(
+    "agx-byte-loads", cl::init(true), cl::Hidden,
+    cl::desc("a word loaded only to take its bytes apart as a vector of "
+             "bytes (each zero-extended in a 16-bit half)"));
+
+/// A device i32 load whose users only take its bytes apart (trunc, lshr by
+/// whole bytes, and with low masks, zext), every value used otherwise being
+/// one byte zero-extended, is a <4 x i8> load: the byte format's access puts
+/// each byte, zero-extended, in a 16-bit half, without the shifts and masks
+/// (RGBA8 pixels). A byte vector load is no more poisonous than the word.
+static bool loadBytesApart(Function &F) {
+  if (!AGXByteLoads)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<LoadInst *, 8> Loads;
+  for (Instruction &I : instructions(F))
+    if (auto *L = dyn_cast<LoadInst>(&I);
+        L && L->isSimple() &&
+        L->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+        ((L->getType()->isIntegerTy(32) && L->getAlign() >= 4) ||
+         (L->getType()->isIntegerTy(16) && L->getAlign() >= 2)))
+      Loads.push_back(L);
+  bool Changed = false;
+  for (LoadInst *L : Loads) {
+    // The bits [Lo, Hi) of the word each value holds, zero-extended above.
+    DenseMap<Value *, std::pair<unsigned, unsigned>> Range;
+    SmallVector<Instruction *, 16> Work{L};
+    SmallVector<std::pair<Instruction *, unsigned>, 8> Bytes;
+    unsigned WordBits = L->getType()->getIntegerBitWidth();
+    Range[L] = {0, WordBits};
+    bool OK = true;
+    while (OK && !Work.empty()) {
+      Instruction *V = Work.pop_back_val();
+      auto [Lo, Hi] = Range[V];
+      bool UsedOutside = false;
+      for (User *U : V->users()) {
+        auto *UI = cast<Instruction>(U);
+        unsigned NLo = Lo, NHi = Hi;
+        const APInt *C;
+        if (isa<TruncInst>(UI))
+          NHi = std::min(Hi, Lo + UI->getType()->getScalarSizeInBits());
+        else if (isa<ZExtInst>(UI))
+          ;
+        else if (match(UI, m_LShr(m_Specific(V), m_APInt(C))) &&
+                 C->getZExtValue() % 8 == 0)
+          NLo = Lo + C->getZExtValue();
+        else if (match(UI, m_And(m_Specific(V), m_APInt(C))) && C->isMask())
+          NHi = std::min(Hi, Lo + unsigned(C->countr_one()));
+        else {
+          UsedOutside = true;
+          continue;
+        }
+        if (NLo >= NHi || !UI->getType()->isIntegerTy()) {
+          OK = false;
+          break;
+        }
+        auto It = Range.find(UI);
+        if (It == Range.end()) {
+          Range[UI] = {NLo, NHi};
+          Work.push_back(UI);
+        } else if (It->second != std::make_pair(NLo, NHi)) {
+          OK = false;
+        }
+      }
+      if (!OK)
+        break;
+      if (!UsedOutside)
+        continue;
+      // A value used outside the chain must be one byte (not the word), and
+      // not sign-extended: signed bytes share one xor of the word instead
+      // (E86), which zero-extended halves would lose.
+      if (V == L || Hi - Lo != 8 || Lo % 8 ||
+          any_of(V->users(), [](const User *U) {
+            return isa<SExtInst>(U) || isa<SIToFPInst>(U);
+          })) {
+        OK = false;
+        break;
+      }
+      Bytes.push_back({V, Lo / 8});
+    }
+    if (!OK || Bytes.empty())
+      continue;
+    IRBuilder<> B(L);
+    auto *VT = FixedVectorType::get(B.getInt8Ty(), WordBits / 8);
+    LoadInst *NL = B.CreateAlignedLoad(VT, L->getPointerOperand(),
+                                       L->getAlign(), L->getName() + ".bytes");
+    NL->setAAMetadata(L->getAAMetadata());
+    for (auto [V, K] : Bytes) {
+      // The byte's value is used outside the chain: its uses there take
+      // the vector element instead.
+      B.SetInsertPoint(NL->getNextNode());
+      Value *E = B.CreateZExt(B.CreateExtractElement(NL, K), V->getType());
+      V->replaceUsesWithIf(E, [&](Use &U) { return !Range.count(U.getUser()); });
+    }
+    for (auto It = Range.begin(); It != Range.end(); ++It)
+      if (auto *I = dyn_cast<Instruction>(It->first); I && I != L)
+        I->dropAllReferences();
+    for (auto It = Range.begin(); It != Range.end(); ++It)
+      if (auto *I = dyn_cast<Instruction>(It->first); I && I != L)
+        I->eraseFromParent();
+    L->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
+/// The values whose low bytes make up V, each at its bit offset, if V is
+/// only bytes put together: an or of pieces, zext, shl by whole bytes, a
+/// value masked by 255, and a value shifted into the top byte (whose other
+/// bits are shifted out).
+static bool bytePieces(Value *V, unsigned Shift,
+                       SmallVectorImpl<std::pair<Value *, unsigned>> &Pieces,
+                       unsigned Depth = 0) {
+  using namespace PatternMatch;
+  if (Depth > 8)
+    return false;
+  unsigned W = V->getType()->getScalarSizeInBits();
+  Value *A, *B;
+  const APInt *C;
+  if (match(V, m_Or(m_Value(A), m_APInt(C)))) {
+    // A constant's nonzero bytes are pieces of their own (an alpha of 255);
+    // its zero bytes are the other operand's.
+    for (unsigned K = 0; K < W / 8; ++K) {
+      uint64_t Byte = C->extractBitsAsZExtValue(8, 8 * K);
+      if (Byte)
+        Pieces.push_back(
+            {ConstantInt::get(Type::getInt8Ty(V->getContext()), Byte),
+             Shift + 8 * K});
+    }
+    return bytePieces(A, Shift, Pieces, Depth + 1);
+  }
+  if (match(V, m_Or(m_Value(A), m_Value(B))))
+    return bytePieces(A, Shift, Pieces, Depth + 1) &&
+           bytePieces(B, Shift, Pieces, Depth + 1);
+  if (match(V, m_ZExt(m_Value(A)))) {
+    if (A->getType()->getScalarSizeInBits() == 8) {
+      Pieces.push_back({A, Shift});
+      return true;
+    }
+    return bytePieces(A, Shift, Pieces, Depth + 1);
+  }
+  if (match(V, m_Shl(m_Value(A), m_APInt(C))) && C->getZExtValue() % 8 == 0 &&
+      C->getZExtValue() < W) {
+    unsigned Sh = C->getZExtValue();
+    if (Sh == W - 8) {
+      Pieces.push_back({A, Shift + Sh});
+      return true;
+    }
+    return bytePieces(A, Shift + Sh, Pieces, Depth + 1);
+  }
+  if (match(V, m_And(m_Value(A), m_SpecificInt(255)))) {
+    Pieces.push_back({A, Shift});
+    return true;
+  }
+  // A value known to fit in its low byte (a clamp to [0, 255]).
+  if (isa<Instruction>(V) && W > 8 &&
+      computeKnownBits(V, cast<Instruction>(V)->getDataLayout())
+              .countMinLeadingZeros() >= W - 8) {
+    Pieces.push_back({V, Shift});
+    return true;
+  }
+  return false;
+}
+
+static cl::opt<bool> AGXByteStores(
+    "agx-byte-stores", cl::init(true), cl::Hidden,
+    cl::desc("a device word store of four bytes put together as a store of "
+             "the bytes (the byte format, from 16-bit halves)"));
+
+/// A device i32 store of four bytes put together (bytePieces) is a <4 x i8>
+/// store of them: the byte format's access stores each 16-bit half's low
+/// byte, without the shifts, masks and ors that pack the word.
+static bool storeBytesTogether(Function &F) {
+  if (!AGXByteStores)
+    return false;
+  SmallVector<StoreInst *, 8> Stores;
+  for (Instruction &I : instructions(F))
+    if (auto *St = dyn_cast<StoreInst>(&I);
+        St && St->getValueOperand()->getType()->isIntegerTy(32) &&
+        St->isSimple() && St->getAlign() >= 4 &&
+        St->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+      Stores.push_back(St);
+  bool Changed = false;
+  for (StoreInst *St : Stores) {
+    SmallVector<std::pair<Value *, unsigned>, 4> Pieces;
+    if (!bytePieces(St->getValueOperand(), 0, Pieces) || Pieces.size() != 4)
+      continue;
+    Value *ByOff[4] = {};
+    bool OK = true;
+    for (auto [P, Off] : Pieces) {
+      if (Off % 8 || Off >= 32 || ByOff[Off / 8]) {
+        OK = false;
+        break;
+      }
+      ByOff[Off / 8] = P;
+    }
+    // Separate values only (conversions' results, say): bytes of the same
+    // word (a byte permute, PTX prmt) are built from its halves already
+    // (bit-field inserts), which the halves of a byte store would only move.
+    SmallPtrSet<Value *, 4> Roots;
+    for (Value *P : ByOff) {
+      Value *R = P;
+      while (isa<TruncInst>(R) || isa<ZExtInst>(R) ||
+             (isa<BinaryOperator>(R) &&
+              (cast<BinaryOperator>(R)->getOpcode() == Instruction::LShr ||
+               cast<BinaryOperator>(R)->getOpcode() == Instruction::AShr ||
+               cast<BinaryOperator>(R)->getOpcode() == Instruction::And) &&
+              isa<Constant>(cast<BinaryOperator>(R)->getOperand(1))))
+        R = cast<Instruction>(R)->getOperand(0);
+      OK &= Roots.insert(R).second;
+    }
+    if (!OK)
+      continue;
+    IRBuilder<> B(St);
+    Value *Vec = PoisonValue::get(FixedVectorType::get(B.getInt8Ty(), 4));
+    for (unsigned K = 0; K < 4; ++K)
+      Vec = B.CreateInsertElement(Vec, B.CreateTrunc(ByOff[K], B.getInt8Ty()), K);
+    StoreInst *NS = B.CreateAlignedStore(Vec, St->getPointerOperand(),
+                                         St->getAlign());
+    NS->setAAMetadata(St->getAAMetadata());
+    Value *Old = St->getValueOperand();
+    St->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+    Changed = true;
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXSinkMulExtensions(
+    "agx-sink-mul-extensions", cl::init(true), cl::Hidden,
+    cl::desc("a 64-bit multiply's operand that is a 32-bit value extended "
+             "(and shifted) in another block, extended again next to it"));
+
+/// A 64-bit multiply whose operand is a sext / zext of a 32-bit value, or
+/// such a value shifted left by a constant, computed in another block (a
+/// loop-invariant stride LICM hoisted): the extension (and shift) are made
+/// again next to the multiply, so that instruction selection, which sees
+/// one block, makes it a 32 x 32 -> 64-bit multiply (and the shift part of
+/// the address addition) instead of the four-multiply 64-bit product
+/// (index_add's row offsets).
+static bool sinkMulExtensions(Function &F) {
+  if (!AGXSinkMulExtensions)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : instructions(F)) {
+    if (I.getOpcode() != Instruction::Mul || !I.getType()->isIntegerTy(64))
+      continue;
+    // The extension (and a shift of it) of a 32-bit value, and its kind.
+    auto ExtOf = [](Value *V, const APInt *&C) -> Instruction * {
+      using namespace PatternMatch;
+      C = nullptr;
+      Value *X;
+      if (!match(V, m_Shl(m_Value(X), m_APInt(C))))
+        X = V;
+      auto *E = dyn_cast<CastInst>(X);
+      if (!E || !isa<SExtInst, ZExtInst>(E) ||
+          !E->getSrcTy()->isIntegerTy(32))
+        return nullptr;
+      return E;
+    };
+    // Only a multiply of two extensions of one kind is the 32 x 32 -> 64-bit
+    // multiply the cloned extension lets the DAG see.
+    const APInt *C0, *C1;
+    Instruction *E0 = ExtOf(I.getOperand(0), C0);
+    Instruction *E1 = ExtOf(I.getOperand(1), C1);
+    if (!E0 || !E1 || E0->getOpcode() != E1->getOpcode())
+      continue;
+    for (Use &U : I.operands()) {
+      auto *Op = dyn_cast<Instruction>(U.get());
+      if (!Op || Op->getParent() == I.getParent())
+        continue;
+      const APInt *C;
+      ExtOf(Op, C);
+      IRBuilder<> B(&I);
+      Instruction *Ext = C ? cast<Instruction>(Op->getOperand(0)) : Op;
+      Instruction *NewExt = Ext->clone();
+      B.Insert(NewExt);
+      Value *New = NewExt;
+      if (C) {
+        Instruction *NewShl = Op->clone();
+        NewShl->setOperand(0, NewExt);
+        B.Insert(NewShl);
+        New = NewShl;
+      }
+      U.set(New);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXSatConvertClamps(
+    "agx-sat-convert-clamps", cl::init(true), cl::Hidden,
+    cl::desc("a float clamped above at an 8- or 16-bit integer's maximum and "
+             "converted to it as the saturating conversion of the unclamped "
+             "value"));
+
+/// fptosi / fptoui (minnum(y, h)) to i8 / i16, h at least the type's
+/// maximum and y never NaN, is fpto[su]i.sat(y): above the maximum the
+/// conversion was poison (h above it) or the maximum (h equal), which the
+/// saturation gives, and below it the truncation commutes with the bound.
+/// The conversions saturate in hardware (B27): the bound goes (quant_i8's
+/// clamp to [-127, 127] keeps only its lower half).
+static bool satConvertClamps(Function &F) {
+  if (!AGXSatConvertClamps)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<CastInst *, 8> Work;
+  for (Instruction &I : instructions(F))
+    if (isa<FPToSIInst>(I) || isa<FPToUIInst>(I))
+      Work.push_back(cast<CastInst>(&I));
+  bool Changed = false;
+  for (CastInst *C : Work) {
+    Type *IT = C->getType();
+    unsigned W = IT->getScalarSizeInBits();
+    if (W != 8 && W != 16)
+      continue;
+    bool Signed = isa<FPToSIInst>(C);
+    Value *Y;
+    const APFloat *H;
+    if (!match(C->getOperand(0),
+               m_CombineOr(m_Intrinsic<Intrinsic::minnum>(m_Value(Y), m_APFloat(H)),
+                           m_Intrinsic<Intrinsic::minimumnum>(m_Value(Y),
+                                                              m_APFloat(H)))))
+      continue;
+    double Max = Signed ? double((1u << (W - 1)) - 1) : double((1u << W) - 1);
+    if (H->isNaN() || H->convertToDouble() < Max)
+      continue;
+    // y never NaN: a maxnum / maximumnum with a non-NaN constant, or what
+    // ValueTracking proves (sums of products of converted integers, say).
+    const APFloat *L;
+    if (!(match(Y, m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(L)),
+                               m_Intrinsic<Intrinsic::maximumnum>(m_Value(),
+                                                                  m_APFloat(L)))) &&
+          !L->isNaN()) &&
+        !isKnownNeverNaN(Y, SimplifyQuery(F.getDataLayout())))
+      continue;
+    IRBuilder<> B(C);
+    Value *R = B.CreateIntrinsic(
+        Signed ? Intrinsic::fptosi_sat : Intrinsic::fptoui_sat,
+        {IT, Y->getType()}, {Y});
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+    Changed = true;
+  }
+  // A saturating conversion's own bounds: fptoui.sat (maxnum(m, l)), l <= 0,
+  // is fptoui.sat (m) for every m (a NaN m gives l, converted to 0, as the
+  // conversion gives NaN); fptosi.sat (maxnum(m, l)), l at most the type's
+  // minimum, and fpto[su]i.sat (minnum(m, h)), h at least its maximum, are
+  // the conversion of m where m is never NaN (a maxnum / minnum with a
+  // non-NaN constant).
+  auto NeverNaN = [&](Value *V) {
+    const APFloat *K;
+    return (match(V, m_CombineOr(
+                        m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(K)),
+                                    m_Intrinsic<Intrinsic::minnum>(m_Value(), m_APFloat(K))),
+                        m_CombineOr(m_Intrinsic<Intrinsic::maximumnum>(m_Value(), m_APFloat(K)),
+                                    m_Intrinsic<Intrinsic::minimumnum>(m_Value(), m_APFloat(K))))) &&
+            !K->isNaN()) ||
+           isKnownNeverNaN(V, SimplifyQuery(F.getDataLayout()));
+  };
+  SmallVector<IntrinsicInst *, 8> Sats;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && (II->getIntrinsicID() == Intrinsic::fptosi_sat ||
+               II->getIntrinsicID() == Intrinsic::fptoui_sat))
+      Sats.push_back(II);
+  for (IntrinsicInst *II : Sats) {
+    bool Signed = II->getIntrinsicID() == Intrinsic::fptosi_sat;
+    unsigned W = II->getType()->getScalarSizeInBits();
+    if (W > 32)
+      continue;
+    double Max = Signed ? double((uint64_t(1) << (W - 1)) - 1)
+                        : double((uint64_t(1) << W) - 1);
+    double Min = Signed ? -double(uint64_t(1) << (W - 1)) : 0.0;
+    for (unsigned Round = 0; Round < 2; ++Round) {
+      Value *X = II->getArgOperand(0), *M;
+      const APFloat *K;
+      bool Drop = false;
+      if (match(X, m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(M), m_APFloat(K)),
+                               m_Intrinsic<Intrinsic::maximumnum>(m_Value(M), m_APFloat(K)))) &&
+          !K->isNaN() && K->convertToDouble() <= Min)
+        Drop = !Signed || NeverNaN(M);
+      else if (match(X, m_CombineOr(m_Intrinsic<Intrinsic::minnum>(m_Value(M), m_APFloat(K)),
+                                    m_Intrinsic<Intrinsic::minimumnum>(m_Value(M), m_APFloat(K)))) &&
+               !K->isNaN() && K->convertToDouble() >= Max)
+        Drop = NeverNaN(M);
+      if (!Drop)
+        break;
+      II->setArgOperand(0, M);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+static cl::opt<unsigned> AGXFoldConditionChains(
+    "agx-fold-condition-chains", cl::init(2), cl::Hidden,
+    cl::desc("merge a branch on a condition a few more instructions decide "
+             "(an || or && of comparisons in their own blocks) into its "
+             "predecessor's, with this many speculated instructions at most "
+             "(0: off)"));
+
+/// SimplifyCFG's foldBranchToCommonDest on every conditional branch: a
+/// block that computes the second half of an || or && and branches to one
+/// of its predecessor's successors joins the predecessor's branch (its
+/// instructions speculated there). Every branch is execution mask
+/// operations (an if, a pop, often a jump over the body), which cost more
+/// than a few comparisons; the phis of the empty side that remains become
+/// selects in the SimplifyCFG before structurization. (Only this fold:
+/// SimplifyCFG's branch simplification would also make switches of
+/// comparison chains, whose lowered trees the structurizer cannot always
+/// handle.)
+static bool foldConditionChains(Function &F, const TargetTransformInfo &TTI) {
+  if (!AGXFoldConditionChains)
+    return false;
+  bool Changed = false;
+  for (unsigned Round = 0; Round < 8; ++Round) {
+    SmallVector<WeakTrackingVH, 16> Branches;
+    for (BasicBlock &BB : F)
+      if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator()))
+        Branches.push_back(BI);
+    bool Local = false;
+    for (WeakTrackingVH &V : Branches)
+      if (auto *BI = dyn_cast_or_null<CondBrInst>(V))
+        Local |= foldBranchToCommonDest(BI, nullptr, nullptr, &TTI, nullptr,
+                                        AGXFoldConditionChains);
+    if (!Local)
+      break;
+    Changed = true;
+  }
+  if (Changed)
+    removeUnreachableBlocks(F);
+  return Changed;
+}
+
+static cl::opt<bool> AGXWordBFloatLoads(
+    "agx-word-bfloat-loads", cl::init(true), cl::Hidden,
+    cl::desc("a vector of bfloats loaded only to be extended to floats as "
+             "32-bit words, each pair's floats the word's halves, and "
+             "vectors of bfloats stored as 16-bit integers"));
+
+/// A <2k x bfloat> load whose only users extend it to floats: bfloat is not
+/// a register type, so the load was split into a 16-bit load per element,
+/// each shifted into a float. Loaded as <2k x i16> instead (one load, as k
+/// words), each element zero-extended and shifted left by 16: the DAG makes
+/// the high element of a word the word with its low half cleared (an and on
+/// the ALU), the low element the word shifted left by 16.
+static bool loadBFloatsAsWords(Function &F) {
+  if (!AGXWordBFloatLoads)
+    return false;
+  bool Changed = false;
+  SmallVector<LoadInst *, 8> Loads;
+  for (Instruction &I : instructions(F)) {
+    // A <2k x bfloat> store likewise, as <2k x i16> (the same bits element
+    // by element): one store of k words instead of one per element.
+    if (auto *St = dyn_cast<StoreInst>(&I)) {
+      auto *VT = dyn_cast<FixedVectorType>(St->getValueOperand()->getType());
+      if (VT && VT->getElementType()->isBFloatTy() &&
+          VT->getNumElements() % 2 == 0 && St->isSimple() &&
+          St->getAlign() >= 4) {
+        // Element by element (the scalarizer's elements, gathered), so
+        // that the DAG sees each element's 16 bits.
+        IRBuilder<> B(St);
+        unsigned N = VT->getNumElements();
+        Value *V = PoisonValue::get(FixedVectorType::get(B.getInt16Ty(), N));
+        for (unsigned E = 0; E < N; ++E)
+          V = B.CreateInsertElement(
+              V,
+              B.CreateBitCast(B.CreateExtractElement(St->getValueOperand(), E),
+                              B.getInt16Ty()),
+              E);
+        St->setOperand(0, V);
+        Changed = true;
+      }
+      continue;
+    }
+    auto *L = dyn_cast<LoadInst>(&I);
+    auto *VT = L ? dyn_cast<FixedVectorType>(L->getType()) : nullptr;
+    if (!VT || !VT->getElementType()->isBFloatTy() ||
+        VT->getNumElements() % 2 || !L->isSimple() || L->getAlign() < 4 ||
+        L->user_empty())
+      continue;
+    auto IsFloatExt = [](const User *U) {
+      auto *E = dyn_cast<FPExtInst>(U);
+      return E && E->getType()->getScalarType()->isFloatTy();
+    };
+    // The vector extended, or (after the scalarizer) its elements each.
+    if (all_of(L->users(), [&](const User *U) {
+          if (IsFloatExt(U))
+            return true;
+          auto *X = dyn_cast<ExtractElementInst>(U);
+          return X && isa<ConstantInt>(X->getIndexOperand()) &&
+                 !X->user_empty() && all_of(X->users(), IsFloatExt);
+        }))
+      Loads.push_back(L);
+  }
+  for (LoadInst *L : Loads) {
+    unsigned N = cast<FixedVectorType>(L->getType())->getNumElements();
+    IRBuilder<> B(L);
+    // As 16-bit integers, which keeps each element's poison its own (a word
+    // with a poison half would be poison whole); the DAG sees the vector as
+    // words, each element's float a half of one.
+    auto *HT = FixedVectorType::get(B.getInt16Ty(), N);
+    LoadInst *W = B.CreateAlignedLoad(HT, L->getPointerOperand(),
+                                      L->getAlign(), L->getName() + ".bits");
+    W->setAAMetadata(L->getAAMetadata());
+    for (unsigned K : {LLVMContext::MD_nontemporal,
+                       LLVMContext::MD_invariant_load})
+      if (MDNode *MD = L->getMetadata(K))
+        W->setMetadata(K, MD);
+    SmallVector<Value *, 8> Floats;
+    for (unsigned I = 0; I < N; ++I) {
+      Value *E = B.CreateZExt(B.CreateExtractElement(W, I), B.getInt32Ty());
+      Floats.push_back(B.CreateBitCast(B.CreateShl(E, 16), B.getFloatTy()));
+    }
+    Value *V = nullptr;
+    for (User *U : make_early_inc_range(L->users())) {
+      auto *E = cast<Instruction>(U);
+      if (auto *X = dyn_cast<ExtractElementInst>(E)) {
+        uint64_t Idx = cast<ConstantInt>(X->getIndexOperand())->getZExtValue();
+        Value *Fl = Idx < N ? Floats[Idx]
+                            : PoisonValue::get(B.getFloatTy());
+        for (User *XU : make_early_inc_range(X->users())) {
+          cast<Instruction>(XU)->replaceAllUsesWith(Fl);
+          cast<Instruction>(XU)->eraseFromParent();
+        }
+        X->eraseFromParent();
+        continue;
+      }
+      if (!V) {
+        V = PoisonValue::get(FixedVectorType::get(B.getFloatTy(), N));
+        for (unsigned I = 0; I < N; ++I)
+          V = B.CreateInsertElement(V, Floats[I], I);
+      }
+      E->replaceAllUsesWith(V);
+      E->eraseFromParent();
+    }
+    L->eraseFromParent();
+  }
+  return Changed || !Loads.empty();
+}
+
 static bool permuteBytes(Function &F) {
   if (!AGXBytePermutes)
     return false;
@@ -2629,6 +3250,98 @@ static bool permuteBytes(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXHoistAddressParts(
+    "agx-hoist-address-parts", cl::init(true), cl::Hidden,
+    cl::desc("A loop's integer address ((inv + i) << c) + base as "
+             "(base + (inv << c)) + (i << c), the sum before the loop"));
+
+/// An address that PTX computes in 64-bit integers, ((Inv + I) << C) + Base
+/// with Inv and Base the same every iteration (a row's offset and a buffer)
+/// and I the loop's index (a sign-extended 32-bit counter), is
+/// (Base + (Inv << C)) + (I << C) modulo 2^64: the first sum goes before
+/// the loop, and the access takes the base and the 32-bit index (two 64-bit
+/// additions less each iteration). Loop strength reduction does not see it:
+/// I's add has no nsw, so its extension is not a recurrence.
+static bool hoistInvariantAddressParts(Function &F) {
+  if (!AGXHoistAddressParts)
+    return false;
+  using namespace PatternMatch;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *Pre = L->getLoopPreheader();
+    if (!Pre)
+      continue;
+    auto Inv = [&](Value *V) { return L->isLoopInvariant(V); };
+    for (BasicBlock *BB : L->blocks()) {
+      if (LI.getLoopFor(BB) != L)
+        continue;
+      for (Instruction &I : make_early_inc_range(*BB)) {
+        Value *X, *Base, *A, *Bv;
+        const APInt *C = nullptr;
+        if (!I.getType()->isIntegerTy(64) ||
+            !match(&I, m_c_Add(m_Value(X), m_Value(Base))) || !Inv(Base) ||
+            Inv(X) || !X->hasOneUse() ||
+            !all_of(I.users(), [](User *U) { return isa<IntToPtrInst>(U); }))
+          continue;
+        Value *Y = X;
+        if (match(X, m_Shl(m_Value(Y), m_APInt(C))) &&
+            (C->uge(64) || !Y->hasOneUse()))
+          continue;
+        if (!match(Y, m_c_Add(m_Value(A), m_Value(Bv))) || !isa<Instruction>(Y))
+          continue;
+        if (!Inv(A))
+          std::swap(A, Bv);
+        if (!Inv(A) || Inv(Bv))
+          continue;
+        IRBuilder<> P(Pre->getTerminator());
+        Value *Hoisted = P.CreateAdd(Base, C ? P.CreateShl(A, *C) : A);
+        IRBuilder<> B(&I);
+        Value *New = B.CreateAdd(Hoisted, C ? B.CreateShl(Bv, *C) : Bv);
+        New->takeName(&I);
+        I.replaceAllUsesWith(New);
+        RecursivelyDeleteTriviallyDeadInstructions(&I);
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXNarrowMaskedIndices(
+    "agx-narrow-masked-indices", cl::init(true), cl::Hidden,
+    cl::desc("(zext(x) << c) & m with m below 2^32 as zext((x << c) & m)"));
+
+/// An index modulo a power of two that MLIR computes in 64 bits,
+/// (zext(x) << c) & m with m below 2^32 (a broadcast operand's (i * 4) %
+/// 4096), is zext((x << c) & m): the mask clears every bit the 32-bit
+/// shift loses. The access then takes the base and the 32-bit index (no
+/// 64-bit shift, and or add, nor the base's copy to registers).
+static bool narrowMaskedIndices(Function &F) {
+  if (!AGXNarrowMaskedIndices)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Value *X;
+    const APInt *C, *M;
+    if (!I.getType()->isIntegerTy(64) ||
+        !match(&I, m_And(m_Shl(m_ZExt(m_Value(X)), m_APInt(C)), m_APInt(M))) ||
+        !X->getType()->isIntegerTy(32) || C->uge(32) || !M->isIntN(32))
+      continue;
+    IRBuilder<> B(&I);
+    Value *N = B.CreateAnd(B.CreateShl(X, C->getZExtValue()),
+                           M->trunc(32).getZExtValue());
+    Value *Z = B.CreateZExt(N, I.getType());
+    Z->takeName(&I);
+    I.replaceAllUsesWith(Z);
+    RecursivelyDeleteTriviallyDeadInstructions(&I);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -2651,6 +3364,14 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= expandDivisions(F);
   Changed |= mergeMaskedOrs(F);
   Changed |= permuteBytes(F);
+  Changed |= loadBFloatsAsWords(F);
+  Changed |= foldConditionChains(F, TTI);
+  Changed |= satConvertClamps(F);
+  Changed |= loadBytesApart(F);
+  Changed |= storeBytesTogether(F);
+  Changed |= sinkMulExtensions(F);
+  Changed |= hoistInvariantAddressParts(F);
+  Changed |= narrowMaskedIndices(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);
@@ -2928,7 +3649,8 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
       IRBuilder<> B(II);
       B.setFastMathFlags(II->getFastMathFlags());
       SmallVector<Value *, 2> Args(II->args());
-      Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args);
+      Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args,
+                                 !ST.hasIEEEFP32());
       R->takeName(II);
       II->replaceAllUsesWith(R);
       II->eraseFromParent();

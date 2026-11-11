@@ -11,9 +11,8 @@ define agx_kernel void @args(ptr addrspace(1) %out, i16 %a, i32 %b, i64 %c, half
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bitop 0101, r1, u2l, 0
+; CHECK-NEXT:    iadd r1, u2l, u3
 ; CHECK-NEXT:    fadd32 r2, u6l, u7
-; CHECK-NEXT:    iadd r1, r1, u3
 ; CHECK-NEXT:    iadd r1, r1, u4
 ; CHECK-NEXT:    iadd r1, r1, r2
 ; CHECK-NEXT:    iadd r1, r1, u9

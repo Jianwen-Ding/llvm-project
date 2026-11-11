@@ -256,6 +256,7 @@ def main():
         sources += [("ptx", p) for p in a.ptx]
 
     results = {}
+    failed = []
     with tempfile.TemporaryDirectory() as tmp:
         for kind, src in sources:
             for chip in CHIPS:
@@ -264,6 +265,8 @@ def main():
                     asm, obj = (compile_ll(a.llc, src, chip, tmp) if kind == "ll" else compile_ptx(a.zoc, src, chip, tmp))
                 except subprocess.CalledProcessError as e:
                     print(json.dumps({"source": os.path.basename(src), "chip": chip, "error": (e.stderr or "")[-300:]}))
+                    print("FAILED: %s %s" % (os.path.basename(src), chip), file=sys.stderr)
+                    failed.append("%s:%s" % (os.path.basename(src), chip))
                     continue
                 for name in kernels_in(asm):
                     m = kernel_metrics(asm, name)
@@ -286,6 +289,11 @@ def main():
                     results[key] = m
                     print(json.dumps(dict(key=key, **m)))
 
+    # a compiler failure is a regression, and must not drop the kernel from
+    # the baseline
+    if failed:
+        print("%d compilations failed: %s" % (len(failed), ", ".join(failed)), file=sys.stderr)
+        return 1
     if (a.update or not os.path.exists(a.baseline)) and not ((a.agx_strict or a.agx_checked) and
                                                              a.baseline.endswith("/baseline.json")):
         json.dump(results, open(a.baseline, "w"), indent=1, sort_keys=True)
@@ -308,6 +316,10 @@ def main():
                 worse.append("%s %s %s -> %s" % (key, k, x, y))
             elif y < x * (1 - a.tolerance) and x - y >= 1:
                 better.append("%s %s %s -> %s" % (key, k, x, y))
+    # a kernel the baseline has and this run does not (a source or kernel
+    # that went missing)
+    for key in sorted(set(base) - set(results)):
+        worse.append("%s missing" % key)
     for l in better:
         print("better: " + l, file=sys.stderr)
     for l in worse:

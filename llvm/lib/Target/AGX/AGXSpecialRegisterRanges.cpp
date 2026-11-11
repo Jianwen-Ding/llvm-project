@@ -91,9 +91,8 @@ static std::optional<std::pair<uint64_t, uint64_t>> bounds(Intrinsic::ID ID) {
   }
 }
 
-bool AGXSpecialRegisterRangesPass::runOnFunction(Function &F) {
-  if (!AGXSpecialRegisterRanges || skipFunction(F))
-    return false;
+bool AGX::addSpecialRegisterRanges(Function &F,
+                                   SmallVectorImpl<WeakVH> *Added) {
   bool Changed = false;
   for (Instruction &I : instructions(F)) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
@@ -105,7 +104,15 @@ bool AGXSpecialRegisterRangesPass::runOnFunction(Function &F) {
     II->addRetAttr(Attribute::get(
         F.getContext(), Attribute::Range,
         ConstantRange(APInt(32, B->first), APInt(32, B->second))));
+    if (Added)
+      Added->push_back(II);
     Changed = true;
   }
   return Changed;
+}
+
+bool AGXSpecialRegisterRangesPass::runOnFunction(Function &F) {
+  if (!AGXSpecialRegisterRanges || skipFunction(F))
+    return false;
+  return AGX::addSpecialRegisterRanges(F);
 }

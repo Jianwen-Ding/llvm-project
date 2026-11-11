@@ -33,7 +33,16 @@ The kernels in `kernels/` cover the common shapes of CUDA code:
 | `softmax_row` | SIMD reductions + `exp` |
 | `matrixmul` | CUDA samples matrixMul through zoc: threadgroup tiles, barriers, unrolled FMAs |
 | `int8_dp4a_gemv` | quantized GEMV: int8 weights and activations four to a word (`__dp4a` as sext / mul / reduce), an i32 SIMD-group sum per row |
+| `quant_i8` | int8 quantization: a float4 scaled, rounded, clamped to [-127, 127] and packed to one word |
+| `adam` | Adam optimizer step: elementwise fmas, a correctly rounded sqrt and division, three stores |
+| `cross_entropy` | per-row log-sum-exp loss: a max loop, an exp-sum loop, a log and a gathered label |
+| `pcm_mix` | int16 audio mixing: saturating sample sums and a gain clamped to 16 bits, two samples per thread |
+| `rgba_gray` | image: RGBA8 pixels to 8-bit luma (byte loads, a rounded saturating conversion) |
+| `yuv2rgb` | image: YUV bytes to RGBA8 (integer BT.601, clamps, bytes and alpha packed into a word) |
 | `gemv_f16` | LLM decode GEMV in f16: half2 loads, float fmas, a SIMD-group per row |
+| `gemv_f16_rowptr` | gemv_f16 over a `const half *` row (W + row * K, K at run time): half2 loads at element offsets |
+| `gemv_bf16` | the same GEMV in bf16: bfloat2 loads extended to float, two fmas per step, a bf16 store |
+| `axpy_bf16` | bf16 axpy: four bf16s of x and y per thread, float fmas, RNE back to bf16, one 8-byte store |
 | `bitonic_simd32` | bitonic sort of 32 keys in registers: 15 shuffle-xor compare-exchange steps (warp sort, top-k) |
 | `block_scan_simd` | threadgroup inclusive scan from SIMD-group prefixes and a threadgroup array of SIMD-group totals |
 | `bilinear_resize` | image resize, bilinear (align_corners = false): 2-D grid, float to int, clamped neighbours, two lerps |

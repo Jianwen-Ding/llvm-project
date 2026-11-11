@@ -2,8 +2,8 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g13g -mattr=+agx-strict -verify-machineinstrs < %s | FileCheck %s
 
 ; convert saturates and converts NaN to 0, so saturating conversions to 32 or
-; 16 bits are one convert. A conversion that saturates to a narrower width
-; than its result clamps first.
+; 16 bits are one convert. One that saturates to 8 bits is the 16-bit
+; convert and an integer clamp (an unsigned one a single icmpsel).
 
 ; CHECK-LABEL: sat32:
 ; CHECK-NOT:     fcmpsel
@@ -35,10 +35,27 @@ define agx_kernel void @sat16(ptr addrspace(1) %out, float %a, half %h) {
 }
 
 ; CHECK-LABEL: sat8:
-; CHECK:         fcmpsel
+; CHECK-NOT:     fcmpsel
+; The convert's 8-bit mode saturates to the byte (mode 1, printed by its
+; integer-to-float name, with the float-to-integer direction rtz); the byte
+; store needs no sign extension.
+; CHECK:         convert s8_to_f, {{r[0-9]+l}}, {{u[0-9]+}}, rtz
+; CHECK-NOT:     icmpsel
 ; CHECK:         stop
 define agx_kernel void @sat8(ptr addrspace(1) %out, float %a) {
   %s = call i8 @llvm.fptosi.sat.i8.f32(float %a)
   store i8 %s, ptr addrspace(1) %out
   ret void
 }
+
+; CHECK-LABEL: usat8:
+; CHECK-NOT:     fcmpsel
+; CHECK:         convert u8_to_f, {{r[0-9]+l}}, {{u[0-9]+l}}, rtz
+; CHECK-NOT:     icmpsel
+; CHECK:         stop
+define agx_kernel void @usat8(ptr addrspace(1) %out, half %a) {
+  %s = call i8 @llvm.fptoui.sat.i8.f16(half %a)
+  store i8 %s, ptr addrspace(1) %out
+  ret void
+}
+declare i8 @llvm.fptoui.sat.i8.f16(half)

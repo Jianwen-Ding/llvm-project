@@ -32,6 +32,11 @@ static cl::opt<bool> FoldSharedBranchCompares(
     cl::desc("Fold a comparison that only branches use into each branch"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> FoldWidenedBranchConds(
+    "agx-fold-widened-branch-conds",
+    cl::desc("Branch on a zero-extended 16-bit condition's 16 bits"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 
 class AGXFoldOperands : public MachineFunctionPass {
@@ -178,6 +183,58 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
     B.add(Br.getOperand(1));
     Br.eraseFromParent();
   };
+  // An AGX_IF / AGX_LOOP on a 16-bit value zero-extended to 32 bits (a
+  // boolean phi, which type legalization keeps as i16) tests the 16 bits
+  // themselves, without the widening copy: every use of the copy is such a
+  // branch, so the 16-bit register stays live instead of the 32-bit one.
+  if (FoldWidenedBranchConds) {
+    SmallVector<MachineInstr *, 8> Widened;
+    for (MachineBasicBlock &MBB : MF) {
+      MachineBasicBlock::iterator T = MBB.getFirstTerminator();
+      if (T == MBB.end() || !IsCondBranch(*T) ||
+          !T->getOperand(0).getReg().isVirtual())
+        continue;
+      MachineInstr *Def = MRI.getVRegDef(T->getOperand(0).getReg());
+      // (dst, table, src0_mods, src0, src1_mods, src1): a move of src0.
+      if (!Def || Def->getOpcode() != AGX::BITOP_I32_FROM16 ||
+          Def->getOperand(1).getImm() != 0b1010 ||
+          Def->getOperand(2).getImm() || !Def->getOperand(3).isReg() ||
+          !Def->getOperand(3).getReg().isVirtual() ||
+          Def->getOperand(3).getSubReg() || !Def->getOperand(5).isImm() ||
+          Def->getOperand(5).getImm() || is_contained(Widened, Def))
+        continue;
+      if (all_of(MRI.use_nodbg_instructions(Def->getOperand(0).getReg()),
+                 [&](MachineInstr &U) {
+                   return IsCondBranch(U) &&
+                          &*U.getParent()->getFirstTerminator() == &U;
+                 }))
+        Widened.push_back(Def);
+    }
+    for (MachineInstr *Def : Widened) {
+      Register Src = Def->getOperand(3).getReg();
+      MRI.clearKillFlags(Src);
+      SmallVector<MachineInstr *, 4> Branches;
+      for (MachineInstr &U :
+           MRI.use_nodbg_instructions(Def->getOperand(0).getReg()))
+        Branches.push_back(&U);
+      for (MachineInstr *Br : Branches) {
+        bool Loop = Br->getOpcode() == AGX::AGX_LOOP;
+        // Nonzero takes the if / breaks the loop: "not ueq 0" (cc bit 3).
+        BuildMI(*Br->getParent(), Br, Br->getDebugLoc(),
+                TII->get(Loop ? AGX::AGX_LOOP_ICMP16 : AGX::AGX_IF_ICMP16))
+            .addImm(8)
+            .addImm(0)
+            .addReg(Src)
+            .addImm(0)
+            .addImm(0)
+            .add(Br->getOperand(1));
+        Br->eraseFromParent();
+      }
+      Def->eraseFromParent();
+      Changed = true;
+    }
+  }
+
   SmallVector<MachineInstr *, 8> Defs;
   for (MachineBasicBlock &MBB : MF) {
     MachineBasicBlock::iterator T = MBB.getFirstTerminator();

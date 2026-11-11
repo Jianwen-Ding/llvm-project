@@ -533,6 +533,57 @@ struct GPUBallotOpLowering : ConvertOpToLLVMPattern<gpu::BallotOp> {
   }
 };
 
+/// The key b ^ ((b >>s 31) & 0x7fffffff) of float bits b, whose signed order
+/// is the floats' with -0.0 below +0.0 (NaNs aside); it is its own inverse.
+static Value orderedFloatKey(ConversionPatternRewriter &rewriter, Location loc,
+                             Value bits) {
+  Type i32 = rewriter.getI32Type();
+  Value sign = LLVM::AShrOp::create(
+      rewriter, loc, bits, LLVM::ConstantOp::create(rewriter, loc, i32, 31));
+  Value mask = LLVM::AndOp::create(
+      rewriter, loc, sign,
+      LLVM::ConstantOp::create(rewriter, loc, i32, 0x7fffffff));
+  return LLVM::XOrOp::create(rewriter, loc, bits, mask);
+}
+
+/// gpu.subgroup_reduce maximumf / minimumf of f32: AIR's float SIMD-group
+/// maximum and minimum are maxnum and minnum, which drop NaNs and may order
+/// the zeros either way, so it is the signed i32 maximum (minimum) of the
+/// floats' keys, decoded, or a NaN where the group's or of "is NaN" is set
+/// (alive2: tests/alive-tv/gpu/subgroup-maximum-key, subgroup-minimum-key).
+static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
+                                gpu::SubgroupReduceOp op, Value value,
+                                StringRef group) {
+  Location loc = op.getLoc();
+  Type i32 = rewriter.getI32Type();
+  Type f32 = value.getType();
+  bool isMax = op.getOp() == gpu::AllReduceOperation::MAXIMUMF;
+  // Used twice: one value even if it is undefined.
+  value = LLVM::FreezeOp::create(rewriter, loc, value);
+  Value key = orderedFloatKey(
+      rewriter, loc, LLVM::BitcastOp::create(rewriter, loc, i32, value));
+  Value reduced =
+      callAIR(rewriter, op,
+              ("air." + group + (isMax ? "_max" : "_min") + ".s.i32").str(),
+              i32, {key}, AIREffects::Convergent);
+  Value result = LLVM::BitcastOp::create(
+      rewriter, loc, f32, orderedFloatKey(rewriter, loc, reduced));
+  Value isNaN = LLVM::ZExtOp::create(
+      rewriter, loc, i32,
+      LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno, value,
+                           value));
+  Value anyNaN = callAIR(rewriter, op, ("air." + group + "_or.s.i32").str(),
+                         i32, {isNaN}, AIREffects::Convergent);
+  Value nan = LLVM::ConstantOp::create(
+      rewriter, loc, f32,
+      rewriter.getFloatAttr(f32, APFloat::getQNaN(APFloat::IEEEsingle())));
+  return LLVM::SelectOp::create(
+      rewriter, loc,
+      LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::ne, anyNaN,
+                           LLVM::ConstantOp::create(rewriter, loc, i32, 0)),
+      nan, result);
+}
+
 /// gpu.subgroup_reduce over the whole SIMD-group.
 struct GPUSubgroupReduceOpLowering
     : ConvertOpToLLVMPattern<gpu::SubgroupReduceOp> {
@@ -556,6 +607,14 @@ struct GPUSubgroupReduceOpLowering
     bool isFloat = isa<FloatType>(type);
     if (!isFloat && !type.isInteger(32))
       return rewriter.notifyMatchFailure(op, "only i32 and floats");
+    if (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+        op.getOp() == gpu::AllReduceOperation::MINIMUMF) {
+      if (!type.isF32())
+        return rewriter.notifyMatchFailure(op, "maximumf / minimumf of f32");
+      rewriter.replaceOp(op, reduceOrderedFloat(rewriter, op,
+                                                adaptor.getValue(), group));
+      return success();
+    }
     StringRef fn;
     bool isUnsigned = false;
     switch (op.getOp()) {
