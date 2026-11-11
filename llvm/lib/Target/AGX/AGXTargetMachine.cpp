@@ -85,6 +85,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXDAGToDAGISelLegacyPass(PR);
   initializeAGXFoldOperandsPass(PR);
   initializeAGXLoadLanesPass(PR);
+  initializeAGXHoistReloadsPassPass(PR);
   initializeAGXUniformConstantsPassPass(PR);
   initializeAGXHoistFromElseFlowPass(PR);
   initializeAGXSinkRematPass(PR);
@@ -203,6 +204,7 @@ public:
   bool addPreISel() override;
   bool addInstSelector() override;
   void addMachineSSAOptimization() override;
+  void addPostRegAlloc() override;
   void addPreEmitPass() override;
 };
 
@@ -593,6 +595,12 @@ void AGXPassConfig::addMachineSSAOptimization() {
     addPass(createAGXSinkRematPass());
   // (last in SSA form: a load's lanes allocated until its first use)
   addPass(createAGXLoadLanesLivePass());
+}
+
+void AGXPassConfig::addPostRegAlloc() {
+  // (before frame lowering: a callee-saved register it gives a reload is saved)
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAGXHoistReloadsPass());
 }
 
 void AGXPassConfig::addPreEmitPass() {

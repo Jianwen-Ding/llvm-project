@@ -24,6 +24,11 @@
 
 using namespace llvm;
 
+static cl::opt<bool> FoldFrameOffsets(
+    "agx-fold-frame-offsets", cl::init(true), cl::Hidden,
+    cl::desc("A stack object's address plus a constant as one move "
+             "(FRAME_ADDR_OFF)"));
+
 #define DEBUG_TYPE "agx-isel"
 #define PASS_NAME "AGX DAG->DAG Pattern Instruction Selection"
 
@@ -672,6 +677,11 @@ bool AGXDAGToDAGISel::trySelectShift64(SDNode *N) {
   return true;
 }
 
+static cl::opt<bool> FoldConstantChains(
+    "agx-fold-constant-address-chains", cl::init(true), cl::Hidden,
+    cl::desc("A device address (b + c1) + c2 takes b with c1 + c2 as its "
+             "immediate even where b + c1 has other uses"));
+
 static cl::opt<bool> KnownHighZeroIndices(
     "agx-known-high-zero-indices", cl::init(true), cl::Hidden,
     cl::desc("A 64-bit device address index whose high word is known zero "
@@ -696,6 +706,20 @@ bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
       // Constant byte offset.
       if (auto *C = dyn_cast<ConstantSDNode>(O)) {
         int64_t Off = C->getSExtValue();
+        // (b + c1) + c2 with b + c1 used elsewhere too (the combiner folds
+        // only a single use): b and c1 + c2, without the 64-bit add for
+        // this access.
+        while (FoldConstantChains &&
+               (B.getOpcode() == ISD::ADD ||
+                (B.getOpcode() == ISD::OR && B->getFlags().hasDisjoint())) &&
+               isa<ConstantSDNode>(B.getOperand(1))) {
+          int64_t Sum = Off + B.getConstantOperandAPInt(1).getSExtValue();
+          if (Sum % (int64_t(1) << ElemLog2) != 0 ||
+              !isInt<16>(Sum >> ElemLog2))
+            break;
+          Off = Sum;
+          B = B.getOperand(0);
+        }
         if (Off % (int64_t(1) << ElemLog2) == 0 &&
             isInt<16>(Off >> ElemLog2)) {
           Base = B;

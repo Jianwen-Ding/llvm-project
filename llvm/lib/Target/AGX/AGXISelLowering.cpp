@@ -1923,6 +1923,53 @@ static SDValue performOffsetIndexCombine(SDNode *N,
   return SDValue();
 }
 
+static cl::opt<bool> NarrowTruncatedOps(
+    "agx-narrow-truncated-ops", cl::init(true), cl::Hidden,
+    cl::desc("The low half of a 64-bit add, sub, mul or shift left by a "
+             "constant, used only truncated, as a 32-bit operation"));
+
+/// trunc (op i64 a, b) -> op i32 (trunc a), (trunc b), for an arithmetic op
+/// whose low half depends only on the low halves of its operands, when every
+/// use of it is that truncation. A private or threadgroup address made from a generic
+/// pointer (AGXLowerGenericAddresses: (tag | offset) + index) is such a
+/// truncation: without this, the index was added in 64 bits (the shared
+/// unit, and a register pair for the tag) to keep the low half. The generic
+/// combine narrows only ops with a constant operand.
+static SDValue narrowTruncatedOp(SDNode *N,
+                                 TargetLowering::DAGCombinerInfo &DCI) {
+  SDValue Op = N->getOperand(0);
+  EVT VT = N->getValueType(0);
+  if (!NarrowTruncatedOps || VT != MVT::i32 || Op.getValueType() != MVT::i64)
+    return SDValue();
+  // (not and / or / xor: a 64-bit one is two 32-bit ALU operations, and the
+  // generic combine makes (op (trunc a), (trunc b)) a truncated 64-bit op
+  // again, which would loop)
+  switch (Op.getOpcode()) {
+  case ISD::ADD:
+  case ISD::SUB:
+  case ISD::MUL:
+    break;
+  case ISD::SHL: {
+    auto *S = dyn_cast<ConstantSDNode>(Op.getOperand(1));
+    if (!S || S->getZExtValue() >= 32)
+      return SDValue();
+    break;
+  }
+  default:
+    return SDValue();
+  }
+  for (SDNode *U : Op->users())
+    if (U->getOpcode() != ISD::TRUNCATE || U->getValueType(0) != VT)
+      return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  SDLoc DL(N);
+  SDValue L = DAG.getNode(ISD::TRUNCATE, DL, VT, Op.getOperand(0));
+  SDValue R = Op.getOpcode() == ISD::SHL
+                  ? DAG.getConstant(Op.getConstantOperandVal(1), DL, MVT::i32)
+                  : DAG.getNode(ISD::TRUNCATE, DL, VT, Op.getOperand(1));
+  return DAG.getNode(Op.getOpcode(), DL, VT, L, R);
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
@@ -2268,6 +2315,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       SDValue Lo = N->getOperand(0).getOperand(0);
       return DCI.DAG.getZExtOrTrunc(Lo, SDLoc(N), N->getValueType(0));
     }
+    if (SDValue V = narrowTruncatedOp(N, DCI))
+      return V;
     // The low half of a 64-bit sign extension in register from at most the
     // result's width: the extension of the low half (sext i16 -> i64 masked
     // to 32 bits, as zext (sext i16 -> i32) becomes, is then one extension

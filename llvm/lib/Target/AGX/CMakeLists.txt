@@ -32,6 +32,7 @@ add_llvm_target(AGXCodeGen
   AGXUniformConstants.cpp
   AGXLowerRecursion.cpp
   AGXFoldOperands.cpp
+  AGXHoistReloads.cpp
   AGXLoadLanesLive.cpp
   AGXHoistFromElseFlow.cpp
   AGXSinkRemat.cpp

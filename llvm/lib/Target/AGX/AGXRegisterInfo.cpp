@@ -216,6 +216,12 @@ bool AGXRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
     // module without kernels, at offset zero)
     Offset += AGXFrameLowering::getCalleeFrameOffset(MF);
   }
+  if (MI.getOpcode() == AGX::FRAME_ADDR_OFF) {
+    // an object's address plus a constant: the move of the sum
+    Offset += MI.getOperand(FIOperandNum + 1).getImm();
+    MI.removeOperand(FIOperandNum + 1);
+    MI.setDesc(MF.getSubtarget().getInstrInfo()->get(AGX::FRAME_ADDR));
+  }
   if (Offset < 0 || Offset > 0x7fff)
     report_fatal_error("AGX stack frame too large");
   FIOp.ChangeToImmediate(Offset);

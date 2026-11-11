@@ -1929,6 +1929,17 @@ def agx_to_tframeindex : SDNodeXForm<frameindex, [{
 
 def : Pat<(i32 frameindex:$fi), (FRAME_ADDR (agx_to_tframeindex $fi))>;
 
+// A stack object's address plus a constant (a field, an element): one move of
+// the sum, which frame lowering computes (AGXRegisterInfo::eliminateFrameIndex
+// turns it into FRAME_ADDR), instead of a move and an add.
+let isReMaterializable = 1 in
+def FRAME_ADDR_OFF : AGXALUPseudo<MOV_IMM32_g13, (outs GPR32:$dst),
+                                  (ins i32imm:$imm, i32imm:$off), [],
+                                  [WriteMovImm]>;
+def agx_frame_off : ImmLeaf<i32, [{ return FoldFrameOffsets && Imm > 0 && Imm < 4096; }]>;
+def : Pat<(i32 (add_like frameindex:$fi, agx_frame_off:$off)),
+          (FRAME_ADDR_OFF (agx_to_tframeindex $fi), imm:$off)>;
+
 let hasSideEffects = 1 in
 def STACK_ADJUST : AGXPseudo<(outs), (ins i32imm:$size)> {
   let G13Real = STACK_ADJUST_g13;
