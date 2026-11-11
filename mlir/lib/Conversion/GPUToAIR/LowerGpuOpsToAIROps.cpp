@@ -47,6 +47,7 @@
 #include "mlir/Dialect/LLVMIR/FunctionCallUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
@@ -631,6 +632,105 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
         rewriter, loc, arith::MulFOp::create(rewriter, loc, lu, x),
         arith::SubFOp::create(rewriter, loc, u, one));
     r = sel(small, sel(eq(u, one), x, q), lu);
+  }
+  if (!type.isF32())
+    r = arith::TruncFOp::create(rewriter, loc, type, r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// log1p of an f32 x, accurate (rewriteAccurateM1's form).
+static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) {
+  Type f32 = rewriter.getF32Type();
+  auto c = [&](float v) {
+    return arith::ConstantOp::create(rewriter, loc, f32,
+                                     rewriter.getF32FloatAttr(v));
+  };
+  Value one = c(1.0f);
+  Value u = arith::AddFOp::create(rewriter, loc, one, x);
+  Value lu = math::LogOp::create(rewriter, loc, u);
+  Value q = arith::DivFOp::create(
+      rewriter, loc, arith::MulFOp::create(rewriter, loc, lu, x),
+      arith::SubFOp::create(rewriter, loc, u, one));
+  Value small = arith::CmpFOp::create(
+      rewriter, loc, arith::CmpFPredicate::OLT,
+      math::AbsFOp::create(rewriter, loc, x), c(0.5f));
+  Value isOne =
+      arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ, u, one);
+  return arith::SelectOp::create(
+      rewriter, loc, small, arith::SelectOp::create(rewriter, loc, isOne, x, q),
+      lu);
+}
+
+/// asinh, acosh, atanh and cbrt, which MathToLLVM does not lower (and whose
+/// upstream expansions, log(x + sqrt(x^2 +- 1)) and log((1 + x) / (1 - x)) / 2,
+/// cancel for small x and overflow for large), in f32 (f16 and bf16 rounded
+/// once from it), with a = |x| and the sign of x copied back:
+///   asinh = log1p(a + a^2 / (1 + sqrt(1 + a^2))), from 2^12 log(a) + ln 2;
+///   acosh = log1p(t + sqrt(2 t + t^2)), t = x - 1, from 2^12 log(x) + ln 2
+///           (NaN below 1);
+///   atanh = log1p(2 a / (1 - a)) / 2 (inf at 1, NaN beyond);
+///   cbrt  = exp2(log2(a) / 3) and a Newton step y - (y^3 - a) / (3 y^2)
+///           (inf and NaN themselves, a signed zero below 2^-126: a
+///           denormal flushed).
+template <typename OpTy>
+static LogicalResult rewriteInverseHyperbolic(OpTy op,
+                                              PatternRewriter &rewriter) {
+  auto type = dyn_cast<FloatType>(op.getType());
+  if (!type || !(type.isF16() || type.isBF16() || type.isF32()))
+    return failure();
+  Location loc = op.getLoc();
+  Type f32 = rewriter.getF32Type();
+  Value x = op.getOperand();
+  if (!type.isF32())
+    x = arith::ExtFOp::create(rewriter, loc, f32, x);
+  auto c = [&](float v) {
+    return arith::ConstantOp::create(rewriter, loc, f32,
+                                     rewriter.getF32FloatAttr(v));
+  };
+  auto cmp = [&](arith::CmpFPredicate p, Value a, Value b) {
+    return arith::CmpFOp::create(rewriter, loc, p, a, b);
+  };
+  auto sel = [&](Value cnd, Value a, Value b) {
+    return arith::SelectOp::create(rewriter, loc, cnd, a, b);
+  };
+  auto add = [&](Value a, Value b) { return arith::AddFOp::create(rewriter, loc, a, b); };
+  auto sub = [&](Value a, Value b) { return arith::SubFOp::create(rewriter, loc, a, b); };
+  auto mul = [&](Value a, Value b) { return arith::MulFOp::create(rewriter, loc, a, b); };
+  auto div = [&](Value a, Value b) { return arith::DivFOp::create(rewriter, loc, a, b); };
+  Value a = math::AbsFOp::create(rewriter, loc, x);
+  Value one = c(1.0f), ln2 = c(0.693147180559945309f);
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::AsinhOp>) {
+    Value a2 = mul(a, a);
+    Value s = math::SqrtOp::create(rewriter, loc, add(one, a2));
+    Value nearV = accurateLog1pF32(rewriter, loc, add(a, div(a2, add(one, s))));
+    Value farV = add(math::LogOp::create(rewriter, loc, a), ln2);
+    r = sel(cmp(arith::CmpFPredicate::OLT, a, c(4096.0f)), nearV, farV);
+    r = math::CopySignOp::create(rewriter, loc, r, x);
+  } else if constexpr (std::is_same_v<OpTy, math::AcoshOp>) {
+    Value t = sub(x, one);
+    Value s = math::SqrtOp::create(rewriter, loc, add(add(t, t), mul(t, t)));
+    Value nearV = accurateLog1pF32(rewriter, loc, add(t, s));
+    Value farV = add(math::LogOp::create(rewriter, loc, x), ln2);
+    r = sel(cmp(arith::CmpFPredicate::OLT, x, c(4096.0f)), nearV, farV);
+    // below 1 a NaN (t + sqrt(2 t + t^2) is -1 for large negative x)
+    r = sel(cmp(arith::CmpFPredicate::OLT, x, one), c(NAN), r);
+  } else if constexpr (std::is_same_v<OpTy, math::AtanhOp>) {
+    Value q = div(add(a, a), sub(one, a));
+    r = mul(c(0.5f), accurateLog1pF32(rewriter, loc, q));
+    r = math::CopySignOp::create(rewriter, loc, r, x);
+  } else {
+    Value y = math::Exp2Op::create(
+        rewriter, loc,
+        mul(math::Log2Op::create(rewriter, loc, a), c(1.0f / 3.0f)));
+    Value y2 = mul(y, y);
+    y = sub(y, div(sub(mul(y2, y), a), mul(c(3.0f), y2)));
+    // inf and NaN themselves; zero (and a flushed denormal) a signed zero
+    r = sel(cmp(arith::CmpFPredicate::UEQ, a, c(INFINITY)), x,
+            math::CopySignOp::create(rewriter, loc, y, x));
+    r = sel(cmp(arith::CmpFPredicate::OLT, a, c(0x1p-126f)),
+            math::CopySignOp::create(rewriter, loc, c(0.0f), x), r);
   }
   if (!type.isF32())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
@@ -1412,6 +1512,15 @@ struct LowerGpuOpsToAIROpsPass final
       populateGpuShufflePatterns(patterns);
       patterns.add(rewriteAccurateM1<math::ExpM1Op>);
       patterns.add(rewriteAccurateM1<math::Log1pOp>);
+      patterns.add(rewriteInverseHyperbolic<math::AsinhOp>);
+      patterns.add(rewriteInverseHyperbolic<math::AcoshOp>);
+      patterns.add(rewriteInverseHyperbolic<math::AtanhOp>);
+      patterns.add(rewriteInverseHyperbolic<math::CbrtOp>);
+      // erf: upstream's f32 approximation (f16 and bf16 widened to it).
+      populatePolynomialApproximateErfPattern(patterns);
+      populateMathF32ExpansionPatterns(
+          patterns, [](StringRef name) { return name == "math.erf"; },
+          /*benefit=*/2);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
