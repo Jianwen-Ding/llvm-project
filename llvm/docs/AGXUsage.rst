@@ -957,7 +957,9 @@ precision apply to vectors too. A ``fneg`` or ``fabs`` of ``float`` that is
 not a source modifier of another operation is a bit operation, and the
 results of ``float`` minimum and maximum are flushed in functions that flush
 ``float`` denormals (the hardware returns a denormal operand unchanged).
-Conversions of ``float`` to ``bfloat`` round to nearest even.
+Conversions of ``float`` to ``bfloat`` round to nearest even. Integers of more than 24 bits
+convert to ``bfloat`` with one rounding: rounded to odd at 24 significant bits
+first (exact in ``float``), then to nearest ``bfloat``.
 
 Rounding modes
 --------------

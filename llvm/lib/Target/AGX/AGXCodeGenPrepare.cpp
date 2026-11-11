@@ -3635,9 +3635,63 @@ static bool expandFRem(Function &F, const AGXSubtarget &ST) {
   return !Rems.empty();
 }
 
+static cl::opt<bool> AGXIntToBFloatOnce(
+    "agx-int-to-bf16-once", cl::init(true), cl::Hidden,
+    cl::desc("Convert integers of more than 24 bits to bfloat with one "
+             "rounding (rounded to odd at 24 bits first)"));
+
+/// sitofp / uitofp of an integer of more than 24 bits to bfloat, rounded once:
+/// instruction selection converts to float (rounded) and rounds that to
+/// bfloat again, which is wrong where the first rounding lands on a bfloat
+/// halfway point (21430271 came out 0x4ba4, not 0x4ba3). |x| is first rounded
+/// to odd at 24 significant bits (the bits below cleared, the lowest kept one
+/// set where any of them was): that converts to float exactly, and rounding
+/// it to nearest bfloat is rounding x once (float keeps the 2 extra bits).
+static bool convertIntsToBFloatOnce(Function &F) {
+  if (!AGXIntToBFloatOnce)
+    return false;
+  SmallVector<CastInst *, 4> Casts;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<CastInst>(&I);
+        C && (isa<SIToFPInst>(C) || isa<UIToFPInst>(C)) &&
+        C->getType()->isBFloatTy() &&
+        C->getSrcTy()->getIntegerBitWidth() > 24)
+      Casts.push_back(C);
+  for (CastInst *C : Casts) {
+    IRBuilder<> B(C);
+    Value *X = C->getOperand(0);
+    auto *Ty = cast<IntegerType>(X->getType());
+    unsigned W = Ty->getBitWidth();
+    bool Signed = isa<SIToFPInst>(C);
+    auto K = [&](uint64_t V) { return ConstantInt::get(Ty, V); };
+    Value *A = Signed ? B.CreateBinaryIntrinsic(Intrinsic::abs, X, B.getFalse())
+                      : X;
+    // bits below the 24 significant ones: max(W - ctlz(a) - 24, 0)
+    Value *S = B.CreateSub(K(W - 24),
+                           B.CreateBinaryIntrinsic(
+                               Intrinsic::umin,
+                               B.CreateBinaryIntrinsic(Intrinsic::ctlz, A,
+                                                       B.getFalse()),
+                               K(W - 24)));
+    Value *Low = B.CreateSub(B.CreateShl(K(1), S), K(1));
+    Value *Sticky = B.CreateZExt(B.CreateICmpNE(B.CreateAnd(A, Low), K(0)), Ty);
+    Value *Odd = B.CreateOr(B.CreateAnd(A, B.CreateNot(Low)),
+                            B.CreateShl(Sticky, S));
+    Value *R = B.CreateFPTrunc(B.CreateUIToFP(Odd, B.getFloatTy()),
+                               C->getType());
+    if (Signed)
+      R = B.CreateSelect(B.CreateICmpSLT(X, K(0)), B.CreateFNeg(R), R);
+    R->takeName(C);
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+  }
+  return !Casts.empty();
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
   bool Changed = expandPowI(F);
   Changed |= expandFRem(F, ST);
+  Changed |= convertIntsToBFloatOnce(F);
   // An expansion may use functions that are expanded in turn (tan's sin).
   for (;;) {
     SmallVector<IntrinsicInst *, 8> Calls;
