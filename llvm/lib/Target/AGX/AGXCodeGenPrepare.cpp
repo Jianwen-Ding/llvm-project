@@ -2567,6 +2567,109 @@ static bool loadBytesApart(Function &F) {
   return Changed;
 }
 
+/// The values whose low bytes make up V, each at its bit offset, if V is
+/// only bytes put together: an or of pieces, zext, shl by whole bytes, a
+/// value masked by 255, and a value shifted into the top byte (whose other
+/// bits are shifted out).
+static bool bytePieces(Value *V, unsigned Shift,
+                       SmallVectorImpl<std::pair<Value *, unsigned>> &Pieces,
+                       unsigned Depth = 0) {
+  using namespace PatternMatch;
+  if (Depth > 8)
+    return false;
+  unsigned W = V->getType()->getScalarSizeInBits();
+  Value *A, *B;
+  const APInt *C;
+  if (match(V, m_Or(m_Value(A), m_Value(B))))
+    return bytePieces(A, Shift, Pieces, Depth + 1) &&
+           bytePieces(B, Shift, Pieces, Depth + 1);
+  if (match(V, m_ZExt(m_Value(A)))) {
+    if (A->getType()->getScalarSizeInBits() == 8) {
+      Pieces.push_back({A, Shift});
+      return true;
+    }
+    return bytePieces(A, Shift, Pieces, Depth + 1);
+  }
+  if (match(V, m_Shl(m_Value(A), m_APInt(C))) && C->getZExtValue() % 8 == 0 &&
+      C->getZExtValue() < W) {
+    unsigned Sh = C->getZExtValue();
+    if (Sh == W - 8) {
+      Pieces.push_back({A, Shift + Sh});
+      return true;
+    }
+    return bytePieces(A, Shift + Sh, Pieces, Depth + 1);
+  }
+  if (match(V, m_And(m_Value(A), m_SpecificInt(255)))) {
+    Pieces.push_back({A, Shift});
+    return true;
+  }
+  return false;
+}
+
+static cl::opt<bool> AGXByteStores(
+    "agx-byte-stores", cl::init(true), cl::Hidden,
+    cl::desc("a device word store of four bytes put together as a store of "
+             "the bytes (the byte format, from 16-bit halves)"));
+
+/// A device i32 store of four bytes put together (bytePieces) is a <4 x i8>
+/// store of them: the byte format's access stores each 16-bit half's low
+/// byte, without the shifts, masks and ors that pack the word.
+static bool storeBytesTogether(Function &F) {
+  if (!AGXByteStores)
+    return false;
+  SmallVector<StoreInst *, 8> Stores;
+  for (Instruction &I : instructions(F))
+    if (auto *St = dyn_cast<StoreInst>(&I);
+        St && St->getValueOperand()->getType()->isIntegerTy(32) &&
+        St->isSimple() && St->getAlign() >= 4 &&
+        St->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+      Stores.push_back(St);
+  bool Changed = false;
+  for (StoreInst *St : Stores) {
+    SmallVector<std::pair<Value *, unsigned>, 4> Pieces;
+    if (!bytePieces(St->getValueOperand(), 0, Pieces) || Pieces.size() != 4)
+      continue;
+    Value *ByOff[4] = {};
+    bool OK = true;
+    for (auto [P, Off] : Pieces) {
+      if (Off % 8 || Off >= 32 || ByOff[Off / 8]) {
+        OK = false;
+        break;
+      }
+      ByOff[Off / 8] = P;
+    }
+    // Separate values only (conversions' results, say): bytes of the same
+    // word (a byte permute, PTX prmt) are built from its halves already
+    // (bit-field inserts), which the halves of a byte store would only move.
+    SmallPtrSet<Value *, 4> Roots;
+    for (Value *P : ByOff) {
+      Value *R = P;
+      while (isa<TruncInst>(R) || isa<ZExtInst>(R) ||
+             (isa<BinaryOperator>(R) &&
+              (cast<BinaryOperator>(R)->getOpcode() == Instruction::LShr ||
+               cast<BinaryOperator>(R)->getOpcode() == Instruction::AShr ||
+               cast<BinaryOperator>(R)->getOpcode() == Instruction::And) &&
+              isa<Constant>(cast<BinaryOperator>(R)->getOperand(1))))
+        R = cast<Instruction>(R)->getOperand(0);
+      OK &= Roots.insert(R).second;
+    }
+    if (!OK)
+      continue;
+    IRBuilder<> B(St);
+    Value *Vec = PoisonValue::get(FixedVectorType::get(B.getInt8Ty(), 4));
+    for (unsigned K = 0; K < 4; ++K)
+      Vec = B.CreateInsertElement(Vec, B.CreateTrunc(ByOff[K], B.getInt8Ty()), K);
+    StoreInst *NS = B.CreateAlignedStore(Vec, St->getPointerOperand(),
+                                         St->getAlign());
+    NS->setAAMetadata(St->getAAMetadata());
+    Value *Old = St->getValueOperand();
+    St->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSatConvertClamps(
     "agx-sat-convert-clamps", cl::init(true), cl::Hidden,
     cl::desc("a float clamped above at an 8- or 16-bit integer's maximum and "
@@ -3008,6 +3111,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= foldConditionChains(F, TTI);
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);
+  Changed |= storeBytesTogether(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);
