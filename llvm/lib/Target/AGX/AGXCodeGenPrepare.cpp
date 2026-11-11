@@ -3309,6 +3309,39 @@ static bool hoistInvariantAddressParts(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNarrowMaskedIndices(
+    "agx-narrow-masked-indices", cl::init(true), cl::Hidden,
+    cl::desc("(zext(x) << c) & m with m below 2^32 as zext((x << c) & m)"));
+
+/// An index modulo a power of two that MLIR computes in 64 bits,
+/// (zext(x) << c) & m with m below 2^32 (a broadcast operand's (i * 4) %
+/// 4096), is zext((x << c) & m): the mask clears every bit the 32-bit
+/// shift loses. The access then takes the base and the 32-bit index (no
+/// 64-bit shift, and or add, nor the base's copy to registers).
+static bool narrowMaskedIndices(Function &F) {
+  if (!AGXNarrowMaskedIndices)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Value *X;
+    const APInt *C, *M;
+    if (!I.getType()->isIntegerTy(64) ||
+        !match(&I, m_And(m_Shl(m_ZExt(m_Value(X)), m_APInt(C)), m_APInt(M))) ||
+        !X->getType()->isIntegerTy(32) || C->uge(32) || !M->isIntN(32))
+      continue;
+    IRBuilder<> B(&I);
+    Value *N = B.CreateAnd(B.CreateShl(X, C->getZExtValue()),
+                           M->trunc(32).getZExtValue());
+    Value *Z = B.CreateZExt(N, I.getType());
+    Z->takeName(&I);
+    I.replaceAllUsesWith(Z);
+    RecursivelyDeleteTriviallyDeadInstructions(&I);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -3338,6 +3371,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= storeBytesTogether(F);
   Changed |= sinkMulExtensions(F);
   Changed |= hoistInvariantAddressParts(F);
+  Changed |= narrowMaskedIndices(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

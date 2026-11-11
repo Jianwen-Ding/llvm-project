@@ -678,6 +678,27 @@ def AGXMaskWidth : SDNodeXForm<imm, [{
 }]>;
 def : Pat<(i32 (and AGXIntSrc32:$a, agx_low_mask32:$m)),
           (BFEIL_I32 0, (i32 0), 0, $a, 0, (i32 0), (AGXMaskWidth $m))>;
+// (x << s) & ((2^k - 1) << s) with a mask beyond the 8-bit immediates (an
+// index modulo a power of two, scaled) is one bfi of x's low k bits at
+// offset s instead of a shift, a mov_imm for the mask and an and.
+def agx_shl_field : PatFrag<(ops node:$a, node:$s, node:$m),
+                            (and (shl node:$a, node:$s), node:$m), [{
+  SDValue Shl = N->getOperand(0);
+  auto *S = dyn_cast<ConstantSDNode>(Shl.getOperand(1));
+  auto *M = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  if (!S || !M || !Shl.hasOneUse())
+    return false;
+  uint64_t Sh = S->getZExtValue(), V = M->getZExtValue();
+  return Sh > 0 && Sh < 32 && V > 0xff && isUInt<32>(V) &&
+         (V & ((uint64_t(1) << Sh) - 1)) == 0 && isMask_64(V >> Sh);
+}]>;
+def AGXShiftedFieldWidth : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(llvm::popcount(N->getZExtValue()),
+                                   SDLoc(N), MVT::i32);
+}]>;
+def : Pat<(i32 (agx_shl_field AGXIntSrc32:$a, (i32 imm:$s), (i32 imm:$m))),
+          (BFI_I32 0, (i32 0), 0, $a, 0, (i32 imm:$s),
+                   (AGXShiftedFieldWidth $m))>;
 // A field of x, (x >> s) & (2^k - 1), is one bfeil (offset s, width k)
 // instead of a shift and an and (AGXISelLowering turns (x & m) >> s into
 // this form).
