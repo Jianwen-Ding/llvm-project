@@ -218,6 +218,127 @@ static SmallVector<MachineInstr *, 8> flowBody(MachineBasicBlock &MBB,
   return Body;
 }
 
+static cl::opt<bool> IndexIntoR0H(
+    "agx-shuffle-index-into-r0h", cl::init(true), cl::Hidden,
+    cl::desc("a shuffle index computed by an addition or bit operation just "
+             "before the shuffle is computed into r0h, without the move"));
+
+/// Whether register R (or a register overlapping it) is read after MI before
+/// being written again: in MI's block, then on entry to its successors.
+static bool isReadAfter(MachineInstr &MI, MCRegister R,
+                        const TargetRegisterInfo *TRI) {
+  MachineBasicBlock &MBB = *MI.getParent();
+  for (auto I = std::next(MI.getIterator()); I != MBB.end(); ++I) {
+    if (I->isDebugInstr())
+      continue;
+    // A read of R or of a register overlapping it.
+    if (I->readsRegister(R, TRI))
+      return true;
+    // A write of R or of a register containing it ends its value.
+    if (I->definesRegister(R, TRI))
+      return false;
+  }
+  for (MachineBasicBlock *S : MBB.successors())
+    for (MCRegAliasIterator A(R, TRI, true); A.isValid(); ++A)
+      if (S->isLiveIn(*A))
+        return true;
+  return false;
+}
+
+/// The 16-bit form of an addition, subtraction or bit operation D whose
+/// result is a shuffle's index: computed straight into r0h. The low 16 bits
+/// of these results depend only on the low 16 bits of their sources.
+static bool computeIndexIntoR0H(MachineInstr &MI, MachineOperand &Index,
+                                const AGXInstrInfo &TII) {
+  if (!IndexIntoR0H)
+    return false;
+  MachineBasicBlock &MBB = *MI.getParent();
+  const TargetRegisterInfo *TRI = MBB.getParent()->getSubtarget().getRegisterInfo();
+  MCRegister I = Index.getReg().asMCReg();
+  // The 32-bit register I is the low half of, if any.
+  MCRegister W;
+  for (MCRegister Sup : TRI->superregs(I))
+    if (AGX::GPR32RegClass.contains(Sup) &&
+        TRI->getSubReg(Sup, AGX::lo16) == I)
+      W = Sup;
+  // The instruction that last wrote I, with nothing between it and the
+  // shuffle that reads I (or its 32-bit register) or changes the mask.
+  MachineInstr *D = nullptr;
+  SmallVector<MachineInstr *, 8> Between;
+  for (MachineBasicBlock::reverse_iterator It(MI), E = MBB.rend(); ++It != E;) {
+    MachineInstr &P = *It;
+    if (P.isDebugInstr())
+      continue;
+    if (P.modifiesRegister(I, TRI)) {
+      D = &P;
+      break;
+    }
+    if (P.readsRegister(I, TRI) || (W && P.readsRegister(W, TRI)) ||
+        P.isTerminator() || P.isCall() || AGXInstrInfo::isExecMaskOp(P) ||
+        Between.size() > 16)
+      return false;
+    Between.push_back(&P);
+  }
+  if (!D)
+    return false;
+  unsigned Opc = D->getOpcode(), NewOpc;
+  switch (Opc) {
+  case AGX::BITOP_I32: NewOpc = AGX::BITOP_I16; break;
+  case AGX::BITOP_I16: NewOpc = AGX::BITOP_I16; break;
+  case AGX::IADD_I32: NewOpc = AGX::IADD_I16; break;
+  case AGX::IADD_I16: NewOpc = AGX::IADD_I16; break;
+  case AGX::ISUB_I32: NewOpc = AGX::ISUB_I16; break;
+  case AGX::ISUB_I16: NewOpc = AGX::ISUB_I16; break;
+  default:
+    return false;
+  }
+  MCRegister Dst = D->getOperand(0).getReg().asMCReg();
+  bool Wide = Opc == AGX::BITOP_I32 || Opc == AGX::IADD_I32 ||
+              Opc == AGX::ISUB_I32;
+  if (Wide ? (!W || Dst != W) : Dst != I)
+    return false;
+  // The shuffled value must not be the destination, which the shuffle then
+  // no longer finds written, and the destination must be dead after it.
+  MachineOperand &Src = MI.getOperand(2);
+  if (Src.isReg() && TRI->regsOverlap(Src.getReg(), Dst))
+    return false;
+  // Dead after the shuffle: the shuffle writes it, or nothing reads it.
+  if (!MI.definesRegister(Dst, TRI) && isReadAfter(MI, Dst, TRI))
+    return false;
+  // Computed again right before the shuffle (after any other shuffle's use of
+  // r0h between them): its sources must be unchanged there.
+  for (const MachineOperand &MO : D->explicit_uses())
+    if (MO.isReg())
+      for (MachineInstr *P : Between)
+        if (P->modifiesRegister(MO.getReg(), TRI))
+          return false;
+  // 16-bit sources: the low halves of 32-bit registers, or immediates.
+  SmallVector<MachineOperand, 6> Ops;
+  for (unsigned K = 1, N = D->getNumExplicitOperands(); K < N; ++K) {
+    MachineOperand MO = D->getOperand(K);
+    if (MO.isReg()) {
+      MCRegister R = MO.getReg().asMCReg();
+      if (Wide) {
+        MCRegister Lo = TRI->getSubReg(R, AGX::lo16);
+        if (!Lo)
+          return false;
+        R = Lo;
+      }
+      Ops.push_back(MachineOperand::CreateReg(R, false));
+    } else if (MO.isImm()) {
+      Ops.push_back(MO);
+    } else {
+      return false;
+    }
+  }
+  MachineInstrBuilder B =
+      BuildMI(MBB, MI.getIterator(), D->getDebugLoc(), TII.get(NewOpc), AGX::R0H);
+  for (MachineOperand &MO : Ops)
+    B.add(MO);
+  D->eraseFromParent();
+  return true;
+}
+
 /// Pass the register index of a shuffle in r0h. Returns true if MI was
 /// changed.
 static bool lowerShuffleIndex(MachineInstr &MI, const AGXInstrInfo &TII) {
@@ -227,6 +348,14 @@ static bool lowerShuffleIndex(MachineInstr &MI, const AGXInstrInfo &TII) {
     return false;
   MachineBasicBlock &MBB = *MI.getParent();
   const DebugLoc &DL = MI.getDebugLoc();
+  if (computeIndexIntoR0H(MI, Index, TII)) {
+    Index.setReg(AGX::R0H);
+    Index.setIsKill();
+    BuildMI(MBB, std::next(MI.getIterator()), DL, TII.get(AGX::MOV_IMM16),
+            AGX::R0H)
+        .addImm(0);
+    return true;
+  }
   TII.copyPhysReg(MBB, MI, DL, AGX::R0H, Index.getReg(), Index.isKill());
   Index.setReg(AGX::R0H);
   Index.setIsKill();
