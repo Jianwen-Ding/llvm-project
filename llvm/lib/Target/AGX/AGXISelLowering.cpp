@@ -1725,8 +1725,8 @@ static cl::opt<bool> SignSelect(
 
 static cl::opt<bool> WideByteLoads(
     "agx-wide-byte-loads", cl::init(true), cl::Hidden,
-    cl::desc("A byte loaded zero-extended to 16 bits and extended further is "
-             "loaded into a 32-bit register"));
+    cl::desc("A byte or 16-bit value loaded into 16 bits and zero-extended "
+             "further is loaded into a 32-bit register"));
 
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
@@ -2002,20 +2002,24 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   }
   case ISD::ZERO_EXTEND: {
     SDValue A = N->getOperand(0);
-    // A byte loaded zero-extended to 16 bits (an i64 zero-extending load of
-    // a byte is expanded so), extended further: the byte loaded into the
+    // A byte or 16-bit value loaded into 16 bits (an i64 zero-extending load
+    // of either is expanded so) and zero-extended further: loaded into the
     // 32-bit register, zero-extended, instead of a 16-bit half and a move.
     if (auto *L = dyn_cast<LoadSDNode>(A);
         WideByteLoads && L && A.getValueType() == MVT::i16 &&
         (N->getValueType(0) == MVT::i32 || N->getValueType(0) == MVT::i64) &&
-        L->getExtensionType() == ISD::ZEXTLOAD && L->getMemoryVT() == MVT::i8 &&
+        ((L->getExtensionType() == ISD::ZEXTLOAD &&
+          L->getMemoryVT() == MVT::i8) ||
+         (L->getExtensionType() == ISD::NON_EXTLOAD &&
+          L->getMemoryVT() == MVT::i16)) &&
         !L->isIndexed() && L->isSimple() && A.hasOneUse()) {
-      // (Device, threadgroup and stack loads of a byte into 32 bits all
-      // have patterns.)
+      // (Device, threadgroup and stack loads of a byte or 16 bits into 32
+      // bits all have patterns.)
       SelectionDAG &DAG = DCI.DAG;
       SDLoc DL(N);
-      SDValue W = DAG.getExtLoad(ISD::ZEXTLOAD, DL, MVT::i32, L->getChain(),
-                                 L->getBasePtr(), MVT::i8, L->getMemOperand());
+      SDValue W =
+          DAG.getExtLoad(ISD::ZEXTLOAD, DL, MVT::i32, L->getChain(),
+                         L->getBasePtr(), L->getMemoryVT(), L->getMemOperand());
       DAG.ReplaceAllUsesOfValueWith(SDValue(L, 1), W.getValue(1));
       return N->getValueType(0) == MVT::i32
                  ? W
