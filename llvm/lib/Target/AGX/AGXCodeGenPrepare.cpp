@@ -1818,6 +1818,79 @@ static bool readsNamedThreads(const Value *Idx, LaneEvaluator &LE) {
 /// shuffles with divergent deltas become shuffles of the computed thread;
 /// threads whose source is outside the SIMD-group (or quad) keep their own
 /// value, as Metal documents for simd_shuffle_up and simd_shuffle_down.
+static cl::opt<bool> AGXShuffleSelects(
+    "agx-shuffle-selects", cl::init(true), cl::Hidden,
+    cl::desc("A shuffle at select(c, i, thread index) as a select between "
+             "the shuffle at i and the value (a shuffle_xor for i = thread "
+             "index ^ k)"));
+
+/// A thread reads its own value at its own index: a SIMD-group shuffle at
+/// select(C, I, thread index) (through a mask that leaves both alone) is
+/// select(C, shuffle at I, the value), and a shuffle at the thread index
+/// xor a constant is a shuffle_xor, whose index is no longer divergent:
+/// partial reductions' butterflies (the lane's partner where it is in range,
+/// else the lane) were split into four shuffles each. Takes the shuffles it
+/// rewrites out of Worklist and adds the ones it makes that still need a
+/// split.
+static bool shuffleSelectedLanes(SmallVectorImpl<IntrinsicInst *> &Worklist,
+                                 const DataLayout &DL) {
+  using namespace PatternMatch;
+  bool Changed = false;
+  auto IsLane = [](Value *V) {
+    auto *II = dyn_cast<IntrinsicInst>(V);
+    return II && II->getIntrinsicID() == Intrinsic::agx_thread_index_in_simdgroup;
+  };
+  SmallVector<IntrinsicInst *, 8> Out;
+  for (IntrinsicInst *II : Worklist) {
+    Value *Idx = II->getArgOperand(1);
+    // a mask that keeps every bit the index can have (the thread index and
+    // its xor with a constant are below 32)
+    const APInt *K;
+    Value *L;
+    auto IsLaneXor = [&](Value *V) {
+      return match(V, m_c_Xor(m_Value(L), m_APInt(K))) && IsLane(L) &&
+             K->ult(32);
+    };
+    auto Below32 = [&](Value *V) { return IsLane(V) || IsLaneXor(V); };
+    const APInt *M;
+    Value *X, *C, *T, *E;
+    if (match(Idx, m_And(m_Value(X), m_APInt(M))) &&
+        ((computeKnownBits(X, DL).Zero | *M).isAllOnes() ||
+         (M->countr_one() >= 5 &&
+          match(X, m_Select(m_Value(), m_Value(T), m_Value(E))) &&
+          Below32(T) && Below32(E))))
+      Idx = X;
+    if (II->getIntrinsicID() != Intrinsic::agx_simd_shuffle ||
+        !match(Idx, m_Select(m_Value(C), m_Value(T), m_Value(E))) ||
+        IsLane(T) == IsLane(E)) {
+      Out.push_back(II);
+      continue;
+    }
+    bool LaneIfTrue = IsLane(T);
+    Value *I = LaneIfTrue ? E : T;
+    Value *V = II->getArgOperand(0);
+    IRBuilder<> B(II);
+    Value *R;
+    if (IsLaneXor(I)) {
+      R = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle_xor, {V->getType()},
+                            {V, B.getInt32(K->getZExtValue())});
+    } else {
+      auto *S = cast<IntrinsicInst>(B.CreateIntrinsic(
+          Intrinsic::agx_simd_shuffle, {V->getType()}, {V, I}));
+      R = S;
+      if (!isa<Constant>(I))
+        Out.push_back(S);
+    }
+    Value *Sel = LaneIfTrue ? B.CreateSelect(C, V, R) : B.CreateSelect(C, R, V);
+    Sel->takeName(II);
+    II->replaceAllUsesWith(Sel);
+    II->eraseFromParent();
+    Changed = true;
+  }
+  Worklist.assign(Out.begin(), Out.end());
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
                                                const TargetTransformInfo &TTI) {
   SmallVector<IntrinsicInst *, 8> Worklist;
@@ -1844,11 +1917,14 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
 
   if (AGXUnsplitShuffles)
     return false;
+  bool Changed = false;
+  if (AGXShuffleSelects)
+    Changed |= shuffleSelectedLanes(Worklist, F.getDataLayout());
   // Most compute kernels have no variable shuffle indices. Do not compute
   // whole-function divergence (and its dominator/cycle analyses) for them.
   // Build it after matrix lowering, which can itself introduce shuffles.
   if (Worklist.empty())
-    return false;
+    return Changed;
   DominatorTree DT(F);
   CycleInfo CI;
   CI.compute(F);
@@ -1929,7 +2005,7 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
     II->replaceAllUsesWith(Result);
     II->eraseFromParent();
   }
-  return !Worklist.empty();
+  return Changed || !Worklist.empty();
 }
 
 /// Whether I computes a floating point value from its operands (and so
@@ -2817,12 +2893,13 @@ static bool satConvertClamps(Function &F) {
   // non-NaN constant).
   auto NeverNaN = [&](Value *V) {
     const APFloat *K;
-    return match(V, m_CombineOr(
+    return (match(V, m_CombineOr(
                         m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(K)),
                                     m_Intrinsic<Intrinsic::minnum>(m_Value(), m_APFloat(K))),
                         m_CombineOr(m_Intrinsic<Intrinsic::maximumnum>(m_Value(), m_APFloat(K)),
                                     m_Intrinsic<Intrinsic::minimumnum>(m_Value(), m_APFloat(K))))) &&
-           !K->isNaN() || isKnownNeverNaN(V, SimplifyQuery(F.getDataLayout()));
+            !K->isNaN()) ||
+           isKnownNeverNaN(V, SimplifyQuery(F.getDataLayout()));
   };
   SmallVector<IntrinsicInst *, 8> Sats;
   for (Instruction &I : instructions(F))
