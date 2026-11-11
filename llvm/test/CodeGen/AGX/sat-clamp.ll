@@ -6,6 +6,8 @@
 ; convert saturates; the conversion above the maximum was poison): int8
 ; quantization keeps its lower bound, a fcmpsel, and the 8-bit convert, which
 ; also takes round's truncation; the byte store reads the byte, unextended.
+; An unsigned conversion's lower bound at 0 or below goes too (a NaN gives 0
+; either way): x * 255 clamped to [0, 255] is the product and the convert.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 
@@ -59,7 +61,6 @@ define agx_kernel void @unorm8(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 ; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    fmul32 r2, r2, r3
-; CHECK-NEXT:    fcmpsel gtn, r2, r2, 0.0, r2, 0
 ; CHECK-NEXT:    convert u8_to_f, r2l, r2, rtz
 ; CHECK-NEXT:    device_store 0, i8, x, r2l, u2_u3, r1, signed
 ; CHECK-NEXT:    stop

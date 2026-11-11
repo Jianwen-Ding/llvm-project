@@ -2515,6 +2515,53 @@ static bool satConvertClamps(Function &F) {
     C->eraseFromParent();
     Changed = true;
   }
+  // A saturating conversion's own bounds: fptoui.sat (maxnum(m, l)), l <= 0,
+  // is fptoui.sat (m) for every m (a NaN m gives l, converted to 0, as the
+  // conversion gives NaN); fptosi.sat (maxnum(m, l)), l at most the type's
+  // minimum, and fpto[su]i.sat (minnum(m, h)), h at least its maximum, are
+  // the conversion of m where m is never NaN (a maxnum / minnum with a
+  // non-NaN constant).
+  auto NeverNaN = [&](Value *V) {
+    const APFloat *K;
+    return match(V, m_CombineOr(
+                        m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(K)),
+                                    m_Intrinsic<Intrinsic::minnum>(m_Value(), m_APFloat(K))),
+                        m_CombineOr(m_Intrinsic<Intrinsic::maximumnum>(m_Value(), m_APFloat(K)),
+                                    m_Intrinsic<Intrinsic::minimumnum>(m_Value(), m_APFloat(K))))) &&
+           !K->isNaN();
+  };
+  SmallVector<IntrinsicInst *, 8> Sats;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && (II->getIntrinsicID() == Intrinsic::fptosi_sat ||
+               II->getIntrinsicID() == Intrinsic::fptoui_sat))
+      Sats.push_back(II);
+  for (IntrinsicInst *II : Sats) {
+    bool Signed = II->getIntrinsicID() == Intrinsic::fptosi_sat;
+    unsigned W = II->getType()->getScalarSizeInBits();
+    if (W > 32)
+      continue;
+    double Max = Signed ? double((uint64_t(1) << (W - 1)) - 1)
+                        : double((uint64_t(1) << W) - 1);
+    double Min = Signed ? -double(uint64_t(1) << (W - 1)) : 0.0;
+    for (unsigned Round = 0; Round < 2; ++Round) {
+      Value *X = II->getArgOperand(0), *M;
+      const APFloat *K;
+      bool Drop = false;
+      if (match(X, m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(M), m_APFloat(K)),
+                               m_Intrinsic<Intrinsic::maximumnum>(m_Value(M), m_APFloat(K)))) &&
+          !K->isNaN() && K->convertToDouble() <= Min)
+        Drop = !Signed || NeverNaN(M);
+      else if (match(X, m_CombineOr(m_Intrinsic<Intrinsic::minnum>(m_Value(M), m_APFloat(K)),
+                                    m_Intrinsic<Intrinsic::minimumnum>(m_Value(M), m_APFloat(K)))) &&
+               !K->isNaN() && K->convertToDouble() >= Max)
+        Drop = NeverNaN(M);
+      if (!Drop)
+        break;
+      II->setArgOperand(0, M);
+      Changed = true;
+    }
+  }
   return Changed;
 }
 
