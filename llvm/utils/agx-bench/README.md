@@ -37,6 +37,8 @@ The kernels in `kernels/` cover the common shapes of CUDA code:
 | `adam` | Adam optimizer step: elementwise fmas, a correctly rounded sqrt and division, three stores |
 | `cross_entropy` | per-row log-sum-exp loss: a max loop, an exp-sum loop, a log and a gathered label |
 | `pcm_mix` | int16 audio mixing: saturating sample sums and a gain clamped to 16 bits, two samples per thread |
+| `rgba_gray` | image: RGBA8 pixels to 8-bit luma (byte loads, a rounded saturating conversion) |
+| `yuv2rgb` | image: YUV bytes to RGBA8 (integer BT.601, clamps, bytes and alpha packed into a word) |
 | `gemv_f16` | LLM decode GEMV in f16: half2 loads, float fmas, a SIMD-group per row |
 | `gemv_f16_rowptr` | gemv_f16 over a `const half *` row (W + row * K, K at run time): half2 loads at element offsets |
 | `gemv_bf16` | the same GEMV in bf16: bfloat2 loads extended to float, two fmas per step, a bf16 store |

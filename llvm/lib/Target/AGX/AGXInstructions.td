@@ -580,6 +580,13 @@ def : Pat<(i32 (add (mul (AGXExt16Src i16:$a, i32:$am), AGXIntSrc32:$b),
           (IMADD_I32_A16 $am, $a, 0, $b, 0, $c, 0)>;
 }
 
+// An extended 16-bit value plus a small negative constant (a byte - 128):
+// the subtraction of its magnitude from the 16-bit register, ahead of the
+// 32-bit form of agx_neg_imm8 (which would extend the value first).
+let AddedComplexity = 11 in
+def : Pat<(i32 (add (AGXExt16Src i16:$a, i32:$am), agx_neg_imm8:$c)),
+          (ISUB_I32_A16 $am, $a, 0, (i32 (AGXNegImm $c)), 0)>;
+
 // 32 x 32 -> 64-bit multiply-add.
 def IMADD_I64_FROM32 : AGXALUPseudo<IMADD_g13, (outs GPR64:$dst),
                                     (ins SrcMods:$src0_mods, Src32Op:$src0,

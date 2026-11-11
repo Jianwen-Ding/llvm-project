@@ -2580,6 +2580,18 @@ static bool bytePieces(Value *V, unsigned Shift,
   unsigned W = V->getType()->getScalarSizeInBits();
   Value *A, *B;
   const APInt *C;
+  if (match(V, m_Or(m_Value(A), m_APInt(C)))) {
+    // A constant's nonzero bytes are pieces of their own (an alpha of 255);
+    // its zero bytes are the other operand's.
+    for (unsigned K = 0; K < W / 8; ++K) {
+      uint64_t Byte = C->extractBitsAsZExtValue(8, 8 * K);
+      if (Byte)
+        Pieces.push_back(
+            {ConstantInt::get(Type::getInt8Ty(V->getContext()), Byte),
+             Shift + 8 * K});
+    }
+    return bytePieces(A, Shift, Pieces, Depth + 1);
+  }
   if (match(V, m_Or(m_Value(A), m_Value(B))))
     return bytePieces(A, Shift, Pieces, Depth + 1) &&
            bytePieces(B, Shift, Pieces, Depth + 1);
@@ -2601,6 +2613,13 @@ static bool bytePieces(Value *V, unsigned Shift,
   }
   if (match(V, m_And(m_Value(A), m_SpecificInt(255)))) {
     Pieces.push_back({A, Shift});
+    return true;
+  }
+  // A value known to fit in its low byte (a clamp to [0, 255]).
+  if (isa<Instruction>(V) && W > 8 &&
+      computeKnownBits(V, cast<Instruction>(V)->getDataLayout())
+              .countMinLeadingZeros() >= W - 8) {
+    Pieces.push_back({V, Shift});
     return true;
   }
   return false;
@@ -2707,12 +2726,14 @@ static bool satConvertClamps(Function &F) {
     double Max = Signed ? double((1u << (W - 1)) - 1) : double((1u << W) - 1);
     if (H->isNaN() || H->convertToDouble() < Max)
       continue;
-    // y never NaN: a maxnum / minnum / maximumnum with a non-NaN constant.
+    // y never NaN: a maxnum / maximumnum with a non-NaN constant, or what
+    // ValueTracking proves (sums of products of converted integers, say).
     const APFloat *L;
-    if (!match(Y, m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(L)),
-                              m_Intrinsic<Intrinsic::maximumnum>(m_Value(),
-                                                                 m_APFloat(L)))) ||
-        L->isNaN())
+    if (!(match(Y, m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(L)),
+                               m_Intrinsic<Intrinsic::maximumnum>(m_Value(),
+                                                                  m_APFloat(L)))) &&
+          !L->isNaN()) &&
+        !isKnownNeverNaN(Y, SimplifyQuery(F.getDataLayout())))
       continue;
     IRBuilder<> B(C);
     Value *R = B.CreateIntrinsic(
@@ -2735,7 +2756,7 @@ static bool satConvertClamps(Function &F) {
                                     m_Intrinsic<Intrinsic::minnum>(m_Value(), m_APFloat(K))),
                         m_CombineOr(m_Intrinsic<Intrinsic::maximumnum>(m_Value(), m_APFloat(K)),
                                     m_Intrinsic<Intrinsic::minimumnum>(m_Value(), m_APFloat(K))))) &&
-           !K->isNaN();
+           !K->isNaN() || isKnownNeverNaN(V, SimplifyQuery(F.getDataLayout()));
   };
   SmallVector<IntrinsicInst *, 8> Sats;
   for (Instruction &I : instructions(F))

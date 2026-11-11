@@ -1031,6 +1031,30 @@
   "uniform_halves": 14,
   "waits": 1
  },
+ "rgba_gray.ll:gray:agx-g13g": {
+  "bytes": 88,
+  "cycles": 123.3,
+  "gprs": 6,
+  "groups": 96,
+  "instructions": 15,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 6.7,
+  "uniform_halves": 14,
+  "waits": 1
+ },
+ "rgba_gray.ll:gray:agx-g14c": {
+  "bytes": 88,
+  "cycles": 123.3,
+  "gprs": 6,
+  "groups": 96,
+  "instructions": 15,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 6.7,
+  "uniform_halves": 14,
+  "waits": 1
+ },
  "saxpy.ll:saxpy:agx-g13g": {
   "bytes": 62,
   "cycles": 116.5,
@@ -1150,5 +1174,29 @@
   "tput": 18.8,
   "uniform_halves": 16,
   "waits": 1
+ },
+ "yuv2rgb.ll:yuv2rgb:agx-g13g": {
+  "bytes": 226,
+  "cycles": 201.4,
+  "gprs": 7,
+  "groups": 96,
+  "instructions": 33,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 13.0,
+  "uniform_halves": 18,
+  "waits": 2
+ },
+ "yuv2rgb.ll:yuv2rgb:agx-g14c": {
+  "bytes": 226,
+  "cycles": 201.4,
+  "gprs": 7,
+  "groups": 96,
+  "instructions": 33,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 13.0,
+  "uniform_halves": 18,
+  "waits": 2
  }
 }
