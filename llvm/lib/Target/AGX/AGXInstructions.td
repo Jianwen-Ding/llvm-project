@@ -525,6 +525,18 @@ def : Pat<(i32 (add (mul AGXIntSrc32:$a, AGXIntSrc32:$b),
                    (shl AGXIntSrc32:$c, agx_iadd_shift:$s))),
           (IMADD_I32 0, $a, 0, $b, 0, $c, imm:$s)>;
 
+// imsub: D = A * B - C, the multiply-add with its addend negated (bit 27;
+// the simulator's coverage recordings imsub_r14_r6_r7_r8 and its .sx and
+// immediate forms): a product minus a value is one instruction instead of
+// imadd and isub.
+def IMSUB_I32 : AGXALUPseudo<IMSUB_g13, (outs GPR32:$dst),
+                             (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                  SrcMods:$src1_mods, Src32Op:$src1,
+                                  SrcMods:$src2_mods, Src32Op:$src2,
+                                  i32imm:$shift), [], [WriteIMul]>;
+def : Pat<(i32 (sub (mul AGXIntSrc32:$a, AGXIntSrc32:$b), AGXIntSrc32:$c)),
+          (IMSUB_I32 0, $a, 0, $b, 0, $c, 0)>;
+
 // 32-bit adds, subtracts and multiply-adds of 16-bit values sign or zero
 // extended read the 16-bit registers (with .sx for the sign) instead of
 // extending them first: a 32-bit operation takes 16-bit sources.
