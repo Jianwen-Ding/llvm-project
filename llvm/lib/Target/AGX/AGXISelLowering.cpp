@@ -2352,6 +2352,11 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   return R;
 }
 
+static cl::opt<bool> PreciseHalfDiv(
+    "agx-precise-half-div",
+    cl::desc("correctly rounded half division (without arcp / afn)"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
@@ -2361,6 +2366,44 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
   bool Approx = Flags.hasAllowReciprocal() || Flags.hasApproximateFuncs();
   if (VT == MVT::f32 && !Approx)
     return lowerFDIV32(Op, DAG);
+  if (VT == MVT::f16 && !Approx && PreciseHalfDiv) {
+    // Correctly rounded: the half rcp times a is up to an ulp off (a fifth of
+    // random operand pairs on the simulator). In float, the correctly rounded
+    // reciprocal y = y0 + y0 (1 - b y0) and one correction of q1 = a y,
+    // q = q1 + (a - b q1) y, give the correctly rounded float quotient
+    // (lowerFDIV32's steps: halves are normal floats and their quotients
+    // far from the float's flushed and infinite ranges, so no scaling), and
+    // float has the 2 * 11 + 2 bits for which rounding that to half is the
+    // correctly rounded half quotient. Zeros, infinities and NaNs (a NaN q,
+    // or a zero a whose correction can lose the sign) take a y0, which is
+    // exact for them.
+    auto F = [&](SDValue V) {
+      return DAG.getNode(ISD::FP_EXTEND, DL, MVT::f32, V);
+    };
+    auto K = [&](float V) { return DAG.getConstantFP(V, DL, MVT::f32); };
+    SDValue A32 = F(A), B32 = F(B);
+    SDValue NegB = DAG.getNode(ISD::FNEG, DL, MVT::f32, B32);
+    SDValue Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, MVT::f32, B32);
+    SDValue Y = DAG.getNode(ISD::FMA, DL, MVT::f32,
+                            DAG.getNode(ISD::FMA, DL, MVT::f32, NegB, Y0, K(1.0f)),
+                            Y0, Y0);
+    SDValue Q1 = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y);
+    SDValue Q = DAG.getNode(
+        ISD::FMA, DL, MVT::f32,
+        DAG.getNode(ISD::FMA, DL, MVT::f32, NegB, Q1, A32), Y, Q1);
+    SDValue Simple = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y0);
+    EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(),
+                                  MVT::f32);
+    SDValue R = DAG.getSelect(DL, MVT::f32,
+                              DAG.getSetCC(DL, CCVT, Q, Q, ISD::SETUO), Simple, Q);
+    R = DAG.getSelect(
+        DL, MVT::f32,
+        DAG.getSetCC(DL, CCVT, A, DAG.getConstantFP(0.0, DL, MVT::f16),
+                     ISD::SETOEQ),
+        Simple, R);
+    return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, R,
+                       DAG.getTargetConstant(0, DL, MVT::i32));
+  }
   SDValue R = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, VT, B);
   auto *CA = dyn_cast<ConstantFPSDNode>(A);
   if (CA && CA->isExactlyValue(1.0))

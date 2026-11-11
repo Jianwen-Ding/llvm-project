@@ -454,14 +454,23 @@ define agx_kernel void @compare(ptr addrspace(1) %out, float %a, float %b) {
 define agx_kernel void @half(ptr addrspace(1) %out, half %a, half %b) {
 ; CHECK-LABEL: half:
 ; CHECK:         // uniform registers: 12 x 16-bit (threadgroups_per_grid at u3)
-; CHECK-NEXT:    // general purpose registers: 2 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 6 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    rcp r1l, u2h
-; CHECK-NEXT:    fmul16 r1h, u2l, u2h
-; CHECK-NEXT:    fmadd16 r1h, r1h, u2l, 1.0
-; CHECK-NEXT:    fmul16 r1l, r1h, r1l
+; CHECK-NEXT:    fadd32 r1, u2h, -0.0
+; CHECK-NEXT:    fmul16 r3l, u2l, u2h
+; CHECK-NEXT:    rcp r2, r1
+; CHECK-NEXT:    fmadd16 r3l, r3l, u2l, 1.0
+; CHECK-NEXT:    fmadd32 r4, r1.neg, r2, 1.0
+; CHECK-NEXT:    fmadd32 r4, r4, r2, r2
+; CHECK-NEXT:    fmul32 r2, r3l, r2
+; CHECK-NEXT:    fmul32 r5, r3l, r4
+; CHECK-NEXT:    fmadd32 r1, r1.neg, r5, r3l
+; CHECK-NEXT:    fmadd32 r1, r1, r4, r5
+; CHECK-NEXT:    fcmpsel eq, r1, r1, r1, r1, r2
+; CHECK-NEXT:    fcmpsel eq, r1, r3l, 0.0, r2, r1
+; CHECK-NEXT:    fadd32 r1l, r1, -0.0
 ; CHECK-NEXT:    fadd16 r1l, r1l, u2l
 ; CHECK-NEXT:    device_store 0, i16, x, r1l, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
