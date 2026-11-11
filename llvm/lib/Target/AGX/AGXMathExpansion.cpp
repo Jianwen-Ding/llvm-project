@@ -401,6 +401,11 @@ public:
   /// result for every float x as clamping e^(hi + lo) (checked exhaustively
   /// for 2^x and 10^x, flushing and not). A NaN stays one.
   Value *clampArg(Value *X, double Lo, double Hi) {
+    Value *Y;
+    // -y: y clamped to the mirrored bounds, then negated (as in expHiLo),
+    // so that the negation folds into the multiplications that follow.
+    if (NegatedClamp && match(X, m_FNeg(m_Value(Y))))
+      return B.CreateFNeg(sel(lt(Y, -Hi), k(-Hi), sel(gt(Y, -Lo), k(-Lo), Y)));
     return sel(gt(X, Hi), k(Hi), sel(lt(X, Lo), k(Lo), X));
   }
 

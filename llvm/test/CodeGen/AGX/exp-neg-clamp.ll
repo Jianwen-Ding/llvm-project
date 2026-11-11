@@ -18,3 +18,15 @@ define agx_kernel void @nexp(ptr addrspace(1) %p, float %x) {
   ret void
 }
 declare float @llvm.exp.f32(float)
+
+; 2^-x likewise (its clamp of x itself).
+; CHECK-LABEL: nexp2:
+; CHECK-NOT: xor
+; CHECK: stop
+define agx_kernel void @nexp2(ptr addrspace(1) %p, float %x) {
+  %n = fneg float %x
+  %e = call float @llvm.exp2.f32(float %n)
+  store float %e, ptr addrspace(1) %p
+  ret void
+}
+declare float @llvm.exp2.f32(float)
