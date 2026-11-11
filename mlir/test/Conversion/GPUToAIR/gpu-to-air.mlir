@@ -613,8 +613,37 @@ gpu.module @clustered_reduce {
     // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M1]])
     // CHECK: llvm.intr.umax
     // CHECK-NOT: simd_shuffle
+    // CHECK: llvm.store
     %r = gpu.subgroup_reduce maxui %v cluster(size = 2) : (i32) -> i32
     memref.store %r, %a[%c0] : memref<64xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Reductions AIR has no op for: of i64 (64-bit xor shuffles at 1 .. 16, the
+// shuffle lowering splitting each), and over clusters of 8 of f16 (AIR's
+// quad-group reduction, then a shuffle at 4).
+gpu.module @shuffle_reduce {
+  // CHECK-LABEL: llvm.func @i64max(
+  gpu.func @i64max(%a: memref<64xi64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xi64, 1>
+    // CHECK-COUNT-10: llvm.call @air.simd_shuffle_xor.u.i32
+    %r = gpu.subgroup_reduce maxui %v : (i64) -> i64
+    memref.store %r, %a[%c0] : memref<64xi64, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @f16cluster8(
+  gpu.func @f16cluster8(%a: memref<64xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf16, 1>
+    // CHECK: llvm.call @air.quad_sum.f16
+    // CHECK: llvm.call @air.simd_shuffle_xor
+    // CHECK: llvm.fadd %{{.*}} : f16
+    %r = gpu.subgroup_reduce add %v cluster(size = 8) : (f16) -> f16
+    memref.store %r, %a[%c0] : memref<64xf16, 1>
     gpu.return
   }
 }

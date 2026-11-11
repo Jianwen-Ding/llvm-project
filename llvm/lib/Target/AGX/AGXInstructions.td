@@ -2274,6 +2274,18 @@ foreach Op = AGXSIMDOps in {
   foreach VT = [i32, f32] in
   def : Pat<(VT (Intr VT:$v, (i32 !cast<TImmLeaf>("AGXSIMDOpImm"#Op.Op)))),
             (!cast<Instruction>(Kind.Name#"_"#Op.Name#"_32") 0, $v)>;
+  // The 16-bit forms (half-register source and destination: fp16 for the
+  // float operations; recorded on the M2 Max, e.g. simd_fadd r14l, r6l).
+  let isConvergent = 1 in
+  def Kind.Name#_#Op.Name#_16
+      : AGXALUPseudo<Real, (outs GPR16:$dst),
+                     (ins SrcMods:$src0_mods, Src16Op:$src0), [],
+                     [!if(!eq(Kind.Opc, 1), WriteSIMDReduce,
+                          !if(!eq(Kind.Opc, 3), WriteSIMDReduce,
+                              WriteQuadReduce))]>;
+  foreach VT = [i16, f16] in
+  def : Pat<(VT (Intr VT:$v, (i32 !cast<TImmLeaf>("AGXSIMDOpImm"#Op.Op)))),
+            (!cast<Instruction>(Kind.Name#"_"#Op.Name#"_16") 0, $v)>;
 }
 
 let isConvergent = 1 in {

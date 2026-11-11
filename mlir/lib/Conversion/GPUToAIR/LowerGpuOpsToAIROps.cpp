@@ -584,6 +584,22 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
       nan, result);
 }
 
+/// Whether GPUSubgroupReduceOpLowering takes \p op to an AIR SIMD-group or
+/// quad-group reduction: of i32 or a float (maximumf / minimumf of f32), over
+/// the whole SIMD-group or clusters of 4 or 32 consecutive lanes.
+static bool airSubgroupReduce(gpu::SubgroupReduceOp op) {
+  if (std::optional<uint32_t> cluster = op.getClusterSize())
+    if (op.getClusterStride() != 1 || (*cluster != 4 && *cluster != 32))
+      return false;
+  Type type = op.getValue().getType();
+  if (!isa<FloatType>(type) && !type.isInteger(32))
+    return false;
+  if (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+      op.getOp() == gpu::AllReduceOperation::MINIMUMF)
+    return type.isF32();
+  return true;
+}
+
 /// gpu.subgroup_reduce over the whole SIMD-group.
 struct GPUSubgroupReduceOpLowering
     : ConvertOpToLLVMPattern<gpu::SubgroupReduceOp> {
@@ -1342,25 +1358,28 @@ struct LowerGpuOpsToAIROpsPass final
       populateGpuShufflePatterns(patterns);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
-    // A reduction over clusters of 2, 8 or 16 lanes (AIR has quad-group and
-    // SIMD-group ones, for clusters of 4 and 32, which the conversion takes):
+    // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
+    // has quad-group and SIMD-group ones; of i8, i16, i64; maximumf of f16):
     // xor shuffles at 1, 2, 4, ... within each cluster (the order AIR's
     // reductions add in), which the shuffle lowering takes to AIR.
     {
       SmallVector<Operation *> clustered;
       m.walk([&](gpu::SubgroupReduceOp op) {
-        std::optional<uint32_t> size = op.getClusterSize();
-        if (size && *size != 4 && *size != 32)
+        if (!airSubgroupReduce(op))
           clustered.push_back(op);
       });
       RewritePatternSet patterns(ctx);
-      // Clusters of 8 or 16: AIR's quad-group reduction for lanes 1 and 2,
-      // then shuffles at 4 (and 8): the same order, fewer instructions.
+      // Clusters of 8 or 16 of a type AIR's quad-group reduction takes: it
+      // for lanes 1 and 2, then shuffles at 4 (and 8): the same order, fewer
+      // instructions.
       patterns.add(+[](gpu::SubgroupReduceOp op, PatternRewriter &rewriter) {
         std::optional<uint32_t> size = op.getClusterSize();
+        Type type = op.getType();
         if (!size || (*size != 8 && *size != 16) || op.getClusterStride() != 1 ||
-            !op.getType().isIntOrFloat() ||
-            op.getType().getIntOrFloatBitWidth() != 32)
+            !(type.isInteger(32) || isa<FloatType>(type)) ||
+            ((op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+              op.getOp() == gpu::AllReduceOperation::MINIMUMF) &&
+             !type.isF32()))
           return failure();
         Location loc = op.getLoc();
         Value v = gpu::SubgroupReduceOp::create(rewriter, loc, op.getValue(),
@@ -1381,13 +1400,21 @@ struct LowerGpuOpsToAIROpsPass final
         (void)applyOpPatternsGreedily(clustered, std::move(patterns));
       clustered.clear();
       m.walk([&](gpu::SubgroupReduceOp op) {
-        std::optional<uint32_t> size = op.getClusterSize();
-        if (size && *size != 4 && *size != 32)
+        if (!airSubgroupReduce(op))
           clustered.push_back(op);
       });
       RewritePatternSet generic(ctx);
       populateGpuLowerClusteredSubgroupReduceToShufflePatterns(
           generic, /*subgroupSize=*/32);
+      populateGpuLowerSubgroupReduceToShufflePatterns(generic,
+                                                      /*subgroupSize=*/32);
+      // 64-bit values shuffled whole (the shuffle lowering splits them).
+      populateGpuLowerSubgroupReduceToShufflePatterns(
+          generic, /*subgroupSize=*/32, /*shuffleBitwidth=*/64,
+          /*benefit=*/0);
+      populateGpuLowerClusteredSubgroupReduceToShufflePatterns(
+          generic, /*subgroupSize=*/32, /*shuffleBitwidth=*/64,
+          /*benefit=*/0);
       if (!clustered.empty())
         (void)applyOpPatternsGreedily(clustered, std::move(generic));
       RewritePatternSet shuffles(ctx);
