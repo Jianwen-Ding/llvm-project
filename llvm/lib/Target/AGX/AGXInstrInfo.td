@@ -156,7 +156,11 @@ def AGXFPSrc16 : ComplexPattern<f16, 2, "SelectFPSrc", [], [], -2>;
 // A 32-bit integer source that is an extended 16-bit value.
 def AGXExt16Src : ComplexPattern<i32, 2, "SelectExt16Src",
                                  [sext, zext, sext_inreg, and, sra, srl], [], -2>;
-def AGXExt16Src64 : ComplexPattern<i64, 2, "SelectExt16Src64", [sext, zext], [], -2>;
+def agx_build_pair : SDNode<"ISD::BUILD_PAIR",
+                            SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i32>,
+                                                 SDTCisSameAs<1, 2>]>>;
+def AGXExt16Src64 : ComplexPattern<i64, 2, "SelectExt16Src64",
+                                   [sext, zext, agx_build_pair], [], -2>;
 def AGXFPSrc32 : ComplexPattern<f32, 2, "SelectFPSrc", [], [], -2>;
 
 // Device memory addresses: (base, index, signedness, shift) for an element

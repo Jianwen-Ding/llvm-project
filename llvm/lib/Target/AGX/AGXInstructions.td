@@ -358,7 +358,7 @@ def ISUB_I64_I16 : AGXALUPseudo<ISUB_g13, (outs GPR64:$dst),
                                 (ins SrcMods:$src0_mods, Src64Op:$src0,
                                      SrcMods:$src1_mods, Src16Op:$src1,
                                      i32imm:$shift), [], [WriteALU64]>;
-let AddedComplexity = 3 in {
+let AddedComplexity = 10 in {
 def : Pat<(i64 (add i64:$a, (AGXExt16Src64 i16:$b, i32:$bm))),
           (IADD_I64_I16 0, $a, $bm, $b, 0)>;
 def : Pat<(i64 (sub i64:$a, (AGXExt16Src64 i16:$b, i32:$bm))),
@@ -377,6 +377,18 @@ def : Pat<(i64 (add i64:$a, (shl (zext i32:$x), agx_iadd_shift:$s))),
 def : Pat<(i64 (add i64:$a, (shl (sext i32:$x), agx_iadd_shift:$s))),
           (IADD_I64_I32 0, $a, MOD_SX, $x, imm:$s)>;
 def : Pat<(i64 (add i64:$a, (zext i32:$x))), (IADD_I64_I32 0, $a, 0, $x, 0)>;
+// A pair with a zero high word (the 64-bit logic done on the halves) is a
+// zero-extended 32-bit value.
+def : Pat<(i64 (add i64:$a, (agx_build_pair i32:$x, (i32 0)))),
+          (IADD_I64_I32 0, $a, 0, $x, 0)>;
+def ISUB_I64_I32 : AGXALUPseudo<ISUB_g13, (outs GPR64:$dst),
+                                (ins SrcMods:$src0_mods, Src64Op:$src0,
+                                     SrcMods:$src1_mods, Src32Op:$src1,
+                                     i32imm:$shift), [], [WriteALU64]>;
+def : Pat<(i64 (sub i64:$a, (zext i32:$x))), (ISUB_I64_I32 0, $a, 0, $x, 0)>;
+def : Pat<(i64 (sub i64:$a, (sext i32:$x))), (ISUB_I64_I32 0, $a, MOD_SX, $x, 0)>;
+def : Pat<(i64 (sub i64:$a, (agx_build_pair i32:$x, (i32 0)))),
+          (ISUB_I64_I32 0, $a, 0, $x, 0)>;
 // A constant that fits 32 bits (beyond the 8-bit immediates) is added as a zero-extended 32-bit register: one
 // mov_imm and one GPR instead of a materialized 64-bit pair.
 def agx_u32_not_imm8 : ImmLeaf<i64, [{ return Imm > 0xff && isUInt<32>(Imm); }]>;

@@ -492,7 +492,10 @@ bool AGXDAGToDAGISel::SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods) {
 /// (sext / zext of an i16), or a 32-bit such value extended the same way.
 bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
   unsigned Opc = N.getOpcode();
-  if (Opc != ISD::SIGN_EXTEND && Opc != ISD::ZERO_EXTEND)
+  // A pair with a zero high word: the low word zero-extended.
+  if (Opc == ISD::BUILD_PAIR && isNullConstant(N.getOperand(1)))
+    Opc = ISD::ZERO_EXTEND;
+  else if (Opc != ISD::SIGN_EXTEND && Opc != ISD::ZERO_EXTEND)
     return false;
   SDValue X = N.getOperand(0);
   if (X.getValueType() == MVT::i16) {

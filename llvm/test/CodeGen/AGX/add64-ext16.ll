@@ -3,7 +3,9 @@
 
 ; A 64-bit add or subtract of a 16-bit value sign or zero extended reads the
 ; 16-bit register (.sx for the sign) instead of building the 64-bit value
-; (a mov_imm of the high word and a move of the low).
+; (a mov_imm of the high word and a move of the low). A pair with a zero high
+; word (64-bit logic done on the halves) is a zero extension likewise, and a
+; 32-bit one is the 32-bit source of a 64-bit add or subtract.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @add_z16(ptr addrspace(1) %p) {
@@ -311,6 +313,156 @@ define agx_kernel void @sl(ptr addrspace(1) %p, i64 %a, i16 %w) {
 ; CHECK-NEXT:    trap
   %z = sext i16 %w to i64
   %r = add i64 %a, %z
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @bp_add(ptr addrspace(1) %p, i64 %a, i64 %b) {
+; CHECK-LABEL: bp_add:
+; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, u4
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %m = and i64 %b, 4294967295
+  %r = add i64 %a, %m
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @bp_sub(ptr addrspace(1) %p, i64 %a, i64 %b) {
+; CHECK-LABEL: bp_sub:
+; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    isub r2_r3, r2_r3, u4
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %m = and i64 %b, 4294967295
+  %r = sub i64 %a, %m
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @bp_add16(ptr addrspace(1) %p, i64 %a, i64 %b) {
+; CHECK-LABEL: bp_add16:
+; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, u4l
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %m = and i64 %b, 65535
+  %r = add i64 %a, %m
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @sub_z32(ptr addrspace(1) %p, i64 %a, i32 %b) {
+; CHECK-LABEL: sub_z32:
+; CHECK:         // uniform registers: 16 x 16-bit (threadgroups_per_grid at u5)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    isub r2_r3, r2_r3, u4
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %z = zext i32 %b to i64
+  %r = sub i64 %a, %z
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @sub_s32(ptr addrspace(1) %p, i64 %a, i32 %b) {
+; CHECK-LABEL: sub_s32:
+; CHECK:         // uniform registers: 16 x 16-bit (threadgroups_per_grid at u5)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    isub r2_r3, r2_r3, u4.sx
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %z = sext i32 %b to i64
+  %r = sub i64 %a, %z
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @bp_shr(ptr addrspace(1) %p, i64 %a, i64 %b) {
+; CHECK-LABEL: bp_shr:
+; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, u5h
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %m = lshr i64 %b, 48
+  %r = add i64 %a, %m
   store i64 %r, ptr addrspace(1) %p
   ret void
 }
