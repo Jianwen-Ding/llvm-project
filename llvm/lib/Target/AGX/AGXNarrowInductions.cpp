@@ -646,6 +646,11 @@ static cl::opt<bool> AGXPointersFromCounters(
 /// [0, 2^31), p = p0 + (s / t) (j - j0): the accesses take the base
 /// p0 - (s / t) j0 and zext(j) << (2 + k) as their index, and p and its add
 /// go (one 64-bit add and a register pair less).
+static cl::opt<bool> AGXSignedCounterIndices(
+    "agx-signed-counter-indices", cl::init(true), cl::Hidden,
+    cl::desc("pointerFromCounter also for a counter from below zero, as a "
+             "signed index"));
+
 static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
@@ -684,16 +689,26 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     uint64_t M = Sp->getZExtValue() / T->getZExtValue();
     if (M != 4 && M != 8 && M != 16)
       continue;
-    if (!SE.getUnsignedRange(SE.getSCEV(&J)).getUnsignedMax().ult(1u << 31))
-      continue;
-    // p0 - M j0, then base + zext(j) * M before the first access
+    // j zero-extended where it is in [0, 2^31); else, a counter LSR starts
+    // below zero (from -t), j sign-extended where its recurrence does not
+    // wrap signed (j_k = j0 + t k exactly: the hardware's signed index).
+    bool Signed = false;
+    if (!SE.getUnsignedRange(SE.getSCEV(&J)).getUnsignedMax().ult(1u << 31)) {
+      auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(&J));
+      if (!AGXSignedCounterIndices || !AR || AR->getLoop() != &L ||
+          !AR->hasNoSignedWrap())
+        continue;
+      Signed = true;
+    }
+    // p0 - M j0, then base + ext(j) * M before the first access
     IRBuilder<> PB(Pre->getTerminator());
     Value *Base = PB.CreatePtrAdd(
         P.getIncomingValueForBlock(Pre),
         ConstantInt::get(Type::getInt64Ty(P.getContext()),
-                         -int64_t(M * J0->getZExtValue())));
+                         -int64_t(M) * J0->getSExtValue()));
     IRBuilder<> B(L.getHeader(), L.getHeader()->getFirstInsertionPt());
-    Value *Z = B.CreateZExt(&J, B.getInt64Ty());
+    Value *Z = Signed ? B.CreateSExt(&J, B.getInt64Ty())
+                      : B.CreateZExt(&J, B.getInt64Ty());
     Value *Addr = B.CreateGEP(B.getIntNTy(8 * M), Base, Z, P.getName());
     P.replaceUsesWithIf(Addr, [&](Use &U) { return U.getUser() != Inc; });
     Inc->replaceAllUsesWith(PoisonValue::get(Inc->getType()));

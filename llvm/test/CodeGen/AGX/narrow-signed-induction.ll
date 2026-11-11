@@ -4,6 +4,8 @@
 ; LSR counts this loop from -4 ({-4, +, 4} to 508): not in [0, 2^31), but its
 ; signed range fits 32 bits, so it is a 32-bit counter with sign-extended uses,
 ; and its compare with 508 a 32-bit compare (no 64-bit add and three selects).
+; The pointers it steps are then its signed index from their starts plus 16
+; (pointerFromCounter, -agx-signed-counter-indices): no 64-bit adds in the loop.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 
@@ -16,25 +18,25 @@ define agx_kernel void @rowcopy(ptr addrspace(1) %a, ptr addrspace(1) %b) {
 ; CHECK-NEXT:  // %bb.0: // %entry
 ; CHECK-NEXT:    mov_imm r0l, 0
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u2, 0
-; CHECK-NEXT:    bitop 0101, r3, u3, 0
-; CHECK-NEXT:    bfeil r5, 0, r1, 21
-; CHECK-NEXT:    bfi r4, 0, r1, 11
+; CHECK-NEXT:    bitop 0101, r4, u2, 0
+; CHECK-NEXT:    bitop 0101, r5, u3, 0
+; CHECK-NEXT:    bfeil r3, 0, r1, 21
+; CHECK-NEXT:    bfi r2, 0, r1, 11
 ; CHECK-NEXT:    bitop 0101, r6, u0, 0
 ; CHECK-NEXT:    bitop 0101, r7, u1, 0
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r4_r5
-; CHECK-NEXT:    iadd r4_r5, r6_r7, r4_r5
+; CHECK-NEXT:    iadd r4_r5, r4_r5, r2_r3
+; CHECK-NEXT:    iadd r6_r7, r6_r7, r2_r3
 ; CHECK-NEXT:    mov_imm r1, -4
-; CHECK-NEXT:    mov_imm r6, 507
 ; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
+; CHECK-NEXT:    iadd r4_r5, r4_r5, 16
+; CHECK-NEXT:    iadd r2_r3, r6_r7, 16
+; CHECK-NEXT:    mov_imm r6, 507
 ; CHECK-NEXT:  .LBB0_1: // %loop
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
-; CHECK-NEXT:    device_load 0, i32, xyzw, r7_r8_r9_r10, r4_r5, 0, signed
-; CHECK-NEXT:    iadd r4_r5, r4_r5, 16
-; CHECK-NEXT:    iadd r1, r1, 4
+; CHECK-NEXT:    device_load 0, i32, xyzw, r7_r8_r9_r10, r2_r3, r1, signed
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    device_store 0, i32, xyzw, r7_r8_r9_r10, r2_r3, 0, signed
-; CHECK-NEXT:    iadd r2_r3, r2_r3, 16
+; CHECK-NEXT:    device_store 0, i32, xyzw, r7_r8_r9_r10, r4_r5, r1, signed
+; CHECK-NEXT:    iadd r1, r1, 4
 ; CHECK-NEXT:    while_icmp r0l, ulte, r1, r6, 1
 ; CHECK-NEXT:    jmp_exec_any .LBB0_1
 ; CHECK-NEXT:  // %bb.2: // %exit
