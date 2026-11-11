@@ -291,7 +291,10 @@ gpu.module @global_id {
     memref.store %g, %out[%c0] : memref<8xindex, 1>
     gpu.return
   }
+  // The known grid is an AGX hint too (the backend bounds positions by it
+  // where an address needs the bound, L15-E190).
   // CHECK-LABEL: llvm.func @known(
+  // CHECK-SAME: ["agx-threadgroups-per-grid", "4096,1,1"], ["agx-threads-per-grid", "1048576,1,1"]
   gpu.func @known(%out: memref<8xindex, 1>) kernel
       attributes {known_block_size = array<i32: 256, 1, 1>,
                   known_grid_size = array<i32: 4096, 1, 1>} {
@@ -338,6 +341,24 @@ gpu.module @narrow_indices {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%r, %c0] : memref<1024x16xf32, 1>
     memref.store %v, %a[%c0, %c0] : memref<1024x16xf32, 1>
+    gpu.return
+  }
+  // A sum of ids and constants that are not negative (no partial sum or
+  // product wraps in index) is at most the index, below 2^32: its i32
+  // additions do not wrap unsigned. One of an argument (perhaps negative)
+  // may.
+  // CHECK-LABEL: llvm.func @nuw(
+  gpu.func @nuw(%a: memref<65538xf32, 1>, %k: index) kernel {
+    // CHECK: %[[X:.*]] = llvm.add %{{.*}}, %{{.*}} overflow<nuw> : i32
+    // CHECK: llvm.zext %[[X]] : i32 to i64
+    // CHECK: %[[Y:.*]] = llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.zext %[[Y]] : i32 to i64
+    %c2 = arith.constant 2 : index
+    %i = gpu.thread_id x
+    %x = arith.addi %i, %c2 : index
+    %v = memref.load %a[%x] : memref<65538xf32, 1>
+    %y = arith.addi %i, %k : index
+    memref.store %v, %a[%y] : memref<65538xf32, 1>
     gpu.return
   }
   // CHECK-LABEL: llvm.func @wide(
@@ -431,6 +452,26 @@ gpu.module @narrow_loops {
       %j = arith.addi %i, %i : index
       memref.store %f, %a[%j] : memref<1024xf32, 1>
     }
+    gpu.return
+  }
+  // An AIR matrix load or store indexes its memref as memref.load does
+  // (base[i + r, j + c] in bounds): k < 64 bounds the loop.
+  // CHECK-LABEL: llvm.func @matrix(
+  // CHECK: ^bb1(%[[O:.*]]: i32, %{{.*}}: vector<64xf32>):
+  // CHECK: llvm.icmp "ult" %[[O]], %{{.*}} : i32
+  // OFF-LABEL: llvm.func @matrix(
+  // OFF: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+  gpu.func @matrix(%a: memref<8x64xf32, 1>, %c: memref<8x8xf32, 1>, %kdim: index) kernel {
+    %c0 = arith.constant 0 : index
+    %c8 = arith.constant 8 : index
+    %zero = arith.constant 0.0 : f32
+    %init = air.simdgroup_matrix_fill %zero : vector<64xf32>
+    %acc = scf.for %k = %c0 to %kdim step %c8 iter_args(%t = %init) -> vector<64xf32> {
+      %m = air.simdgroup_matrix_load %a[%c0, %k] : memref<8x64xf32, 1> -> vector<64xf32>
+      %d = air.simdgroup_matrix_multiply_accumulate %m, %m, %t : vector<64xf32>
+      scf.yield %d : vector<64xf32>
+    }
+    air.simdgroup_matrix_store %acc, %c[%c0, %c0] : vector<64xf32> -> memref<8x8xf32, 1>
     gpu.return
   }
 }
@@ -540,6 +581,157 @@ gpu.module @simdgroup_all_reduce {
     %v = memref.load %a[%c0] : memref<1024xf32, 1>
     %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
     memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A reduction over clusters of 8 or 16 lanes is AIR's quad-group reduction
+// (lanes 1 and 2) and xor shuffles at 4 (and 8); over clusters of 2, one xor
+// shuffle at 1: the order AIR's whole-group reductions add in.
+gpu.module @clustered_reduce {
+  // CHECK-LABEL: llvm.func @cluster8(
+  gpu.func @cluster8(%a: memref<64xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf32, 1>
+    // CHECK: llvm.call @air.quad_sum.f32
+    // CHECK: %[[M4:.*]] = llvm.mlir.constant(4 : i16) : i16
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M4]])
+    // CHECK: llvm.fadd
+    // CHECK-NOT: simd_shuffle
+    // CHECK: llvm.store
+    %r = gpu.subgroup_reduce add %v cluster(size = 8) : (f32) -> f32
+    memref.store %r, %a[%c0] : memref<64xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @cluster2(
+  gpu.func @cluster2(%a: memref<64xi32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xi32, 1>
+    // CHECK: %[[M1:.*]] = llvm.mlir.constant(1 : i16) : i16
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M1]])
+    // CHECK: llvm.intr.umax
+    // CHECK-NOT: simd_shuffle
+    // CHECK: llvm.store
+    %r = gpu.subgroup_reduce maxui %v cluster(size = 2) : (i32) -> i32
+    memref.store %r, %a[%c0] : memref<64xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Reductions AIR has no op for: of i64 (64-bit xor shuffles at 1 .. 16, the
+// shuffle lowering splitting each), and over clusters of 8 of f16 (AIR's
+// quad-group reduction, then a shuffle at 4).
+gpu.module @shuffle_reduce {
+  // CHECK-LABEL: llvm.func @i64max(
+  gpu.func @i64max(%a: memref<64xi64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xi64, 1>
+    // CHECK-COUNT-10: llvm.call @air.simd_shuffle_xor.u.i32
+    %r = gpu.subgroup_reduce maxui %v : (i64) -> i64
+    memref.store %r, %a[%c0] : memref<64xi64, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @f16cluster8(
+  gpu.func @f16cluster8(%a: memref<64xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf16, 1>
+    // CHECK: llvm.call @air.quad_sum.f16
+    // CHECK: llvm.call @air.simd_shuffle_xor
+    // CHECK: llvm.fadd %{{.*}} : f16
+    %r = gpu.subgroup_reduce add %v cluster(size = 8) : (f16) -> f16
+    memref.store %r, %a[%c0] : memref<64xf16, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// expm1 and log1p accurate for small arguments (MathToLLVM's exp(x) - 1 and
+// log(1 + x) cancel to 0 there): for |x| < 1/2, (u - 1) x / log(u) with
+// u = exp(x), and log(u) x / (u - 1) with u = 1 + x (x where u is 1); from
+// 1/2, u - 1 and log(u). Half in float.
+gpu.module @accurate_m1 {
+  // CHECK-LABEL: llvm.func @expm1(
+  gpu.func @expm1(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf32, 1>
+    // CHECK: %[[U:.*]] = llvm.intr.exp(%[[X:.*]]) : (f32) -> f32
+    // CHECK: %[[UM1:.*]] = llvm.fsub %[[U]], %{{.*}} : f32
+    // CHECK: %[[P:.*]] = llvm.fmul %[[UM1]], %[[X]] : f32
+    // CHECK: %[[L:.*]] = llvm.intr.log(%[[U]]) : (f32) -> f32
+    // CHECK: llvm.fdiv %[[P]], %[[L]] : f32
+    %r = math.expm1 %v : f32
+    memref.store %r, %a[%c0] : memref<8xf32, 1>
+    // CHECK: llvm.fpext %{{.*}} : f16 to f32
+    // CHECK: llvm.intr.log(%{{.*}}) : (f32) -> f32
+    // CHECK: llvm.fptrunc %{{.*}} : f32 to f16
+    %w = memref.load %h[%c0] : memref<8xf16, 1>
+    %q = math.log1p %w : f16
+    memref.store %q, %h[%c0] : memref<8xf16, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// asinh, acosh, atanh, cbrt and erf, which MathToLLVM does not lower: the
+// first three through an accurate log1p (no log(x + sqrt(x^2 +- 1))), cbrt
+// as exp2(log2|x| / 3) and a Newton step, erf by the f32 polynomial; half in
+// float.
+gpu.module @inverse_hyperbolic {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf32, 1>
+    // CHECK-NOT: math.
+    // CHECK: llvm.intr.log
+    // CHECK: llvm.intr.log2
+    // CHECK: llvm.intr.exp2
+    %s = math.asinh %v : f32
+    %t = math.cbrt %s : f32
+    %u = math.erf %t : f32
+    %w = memref.load %h[%c0] : memref<8xf16, 1>
+    %x = math.atanh %w : f16
+    %y = math.acosh %x : f16
+    memref.store %u, %a[%c0] : memref<8xf32, 1>
+    memref.store %y, %h[%c0] : memref<8xf16, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// math.erfc (upstream's approximation, its last step without a flushed
+// correction: exp(-a^2) times fma(r, t, r)), math.isinf (|x| == inf) and
+// math.ipowi (a loop of squarings; 1, +-1 or 0 for a negative exponent).
+gpu.module @erfc_isinf_ipowi {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>, %n: memref<8xi32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf32, 1>
+    // CHECK-NOT: math.
+    // CHECK: %[[S:.*]] = llvm.fmul %[[A:.*]], %[[A]]
+    // CHECK: llvm.intr.exp
+    // CHECK: %[[T:.*]] = llvm.intr.fma(%{{.*}}, %[[A]], %[[S]])
+    // CHECK: %[[C:.*]] = llvm.intr.fma(%{{.*}}, %[[T]], %{{.*}})
+    // CHECK: llvm.fmul %{{.*}}, %[[C]]
+    %e = math.erfc %v : f32
+    memref.store %e, %a[%c0] : memref<8xf32, 1>
+    %w = memref.load %h[%c0] : memref<8xf16, 1>
+    // CHECK: llvm.intr.fabs
+    // CHECK: llvm.fcmp "oeq" %{{.*}}, %{{.*}} : f16
+    %i = math.isinf %w : f16
+    %j = arith.extui %i : i1 to i32
+    %b = memref.load %n[%c0] : memref<8xi32, 1>
+    // CHECK: llvm.br
+    // CHECK: llvm.mul
+    // CHECK: llvm.lshr
+    %p = math.ipowi %b, %j : i32
+    memref.store %p, %n[%c0] : memref<8xi32, 1>
     gpu.return
   }
 }

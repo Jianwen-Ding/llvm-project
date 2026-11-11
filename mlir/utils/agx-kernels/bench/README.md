@@ -32,5 +32,18 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `histogram_atomic` | 256-bin byte histogram: `memref.atomic_rmw` into workgroup bins, then into device memory |
 | `bsearch_while` | per-thread binary search as an `scf.while`: a divergent, data-dependent loop |
 | `rowsum` | row sums, one thread per row: an `scf.for` over a static row |
+| `rowsum_f16` | the same over f16, accumulated in f32 |
+| `rowcopy_vec4` | a row copy by `vector<4xf32>`: an `scf.for` of step 4 over a static row |
+| `two_index` | a row dot product reading one array at stride 2: two accesses that step differently |
+| `stride_loop` | a grid-stride loop to a 32-bit bound |
+| `conv1d` | a 3-tap filter of x[i], x[i + 1], x[i + 2] |
+| `hist` | a 256-bin histogram of low bytes by device atomics |
+| `dot_vec4` | row dot products by `vector<4xf32>` fma and a `vector.reduction` of the lanes |
+| `shfl_sum` | SIMD-group sums by an xor shuffle tree, one store per group |
+| `hash` | a 32-bit hash mix: multiplies, rotates of products, an xor shift |
+| `h2` | `vector<2xf16>` accesses split into halves (2-byte alignment) and f16 arithmetic |
+| `conv3x3` | a 3 x 3 convolution, its loops fully unrolled (known grid, no loops left) |
+| `cluster_reduce` | `gpu.subgroup_reduce` over clusters of 8 and 4 lanes |
+| `reduce_f16_i64` | `gpu.subgroup_reduce` of f16 (whole SIMD-group and clusters of 8) and of i64 |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

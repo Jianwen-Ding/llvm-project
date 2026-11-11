@@ -737,8 +737,8 @@ atomic operations are monotonic accesses between the fences of their scope
 25 ns before a store and 250 ns after a load; the sequentially consistent
 sequence costs 0.4 to 0.65 us.
 
-Not supported: ``frem`` and vector arithmetic on ``double`` (see `Double
-precision`_; diagnosed as unsupported), textures and graphics shaders, calls
+Not supported: vector arithmetic and the transcendental functions on
+``double`` (see `Double precision`_; diagnosed as unsupported), textures and graphics shaders, calls
 to functions that are not defined in the module, recursion through variadic
 functions or ``musttail`` calls, and dynamic ``alloca`` in recursive functions.
 
@@ -843,11 +843,18 @@ which is correctly rounded for every significand (x below 2^-80 is scaled by
 Performance Simulator, ``testsuite/transcendental``). A division takes 19
 instructions (1 / x 9) and a square root 13, constants included.
 
-``frem`` on ``float`` and ``half`` is an exact ``fmod``
+``frem`` on ``float``, ``half`` and ``bfloat`` is an exact ``fmod``
 (``AGXCodeGenPrepare.cpp``): a loop reduces |a| by |b| 2^j while the quotient
 could reach 2^24, then a last step by |b| truncates the correctly rounded
 quotient and keeps whichever of a - q |b| and a - (q - 1) |b| lies in
 [0, |b|).
+
+``llvm.fma`` on ``bfloat`` is rounded once in every mode (a ``float`` fma
+rounded again to ``bfloat`` would round twice): in ``float`` where that is
+exact (the product of normal ``bfloat`` values, TwoSum's error, the sum
+rounded to odd, then to nearest ``bfloat``), the exact software fma behind an
+unlikely branch otherwise (which keeps denormal operands and results).
+``llvm.fmuladd`` on ``bfloat`` is the ``bfloat`` multiplication and addition.
 
 Two features, off by default, implement IEEE 754 and PTX behavior in software
 (``AGXStrictFP.cpp``):
@@ -932,8 +939,13 @@ without changing a result. NaN results are ``0x7fffffffffffffff`` with
 to integers saturate, and NaN converts to 0.
 
 Values that are only moved (loads, stores, ``phi``, ``select``, arguments)
-stay ``double`` and become ``i64`` in type legalization. ``frem`` and vector
-arithmetic on ``double`` are diagnosed as unsupported. The code is large: in
+stay ``double`` and become ``i64`` in type legalization. ``frem`` is the
+exact ``fmod``, one bit of the quotient an iteration (8 instructions
+for each binade between the operands); ``powi`` is compiler-rt's
+``__powidf2`` (a multiplication for each bit of the exponent and a squaring
+for each but the last, each rounded; the reciprocal for a negative
+exponent). Vector arithmetic and the
+transcendental functions on ``double`` are diagnosed as unsupported. The code is large: in
 instructions per operation, about 215 for an addition or a multiplication,
 430 for a fused multiply-add, 290 for a division or a square root, 100 for a
 conversion and 30 for a comparison.
@@ -945,7 +957,9 @@ precision apply to vectors too. A ``fneg`` or ``fabs`` of ``float`` that is
 not a source modifier of another operation is a bit operation, and the
 results of ``float`` minimum and maximum are flushed in functions that flush
 ``float`` denormals (the hardware returns a denormal operand unchanged).
-Conversions of ``float`` to ``bfloat`` round to nearest even.
+Conversions of ``float`` to ``bfloat`` round to nearest even. Integers of more than 24 bits
+convert to ``bfloat`` with one rounding: rounded to odd at 24 significant bits
+first (exact in ``float``), then to nearest ``bfloat``.
 
 Rounding modes
 --------------

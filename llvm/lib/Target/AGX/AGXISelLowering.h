@@ -123,6 +123,7 @@ public:
                                             : FPImmAction::ConstantPool;
   }
   bool isTruncateFree(EVT SrcVT, EVT DstVT) const override;
+  bool shouldFoldConstantShiftPairToMask(const SDNode *N) const override;
   bool decomposeMulByConstant(LLVMContext &Context, EVT VT,
                               SDValue C) const override;
   bool isCheapToSpeculateCttz(Type *Ty) const override { return true; }

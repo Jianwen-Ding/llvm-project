@@ -2550,6 +2550,7 @@ static cl::opt<bool> AGXByteLoads(
 /// one byte zero-extended, is a <4 x i8> load: the byte format's access puts
 /// each byte, zero-extended, in a 16-bit half, without the shifts and masks
 /// (RGBA8 pixels). A byte vector load is no more poisonous than the word.
+/// Only the bytes up to the last one used: 1 (an i8 load), 2 or 4.
 static bool loadBytesApart(Function &F) {
   if (!AGXByteLoads)
     return false;
@@ -2623,7 +2624,14 @@ static bool loadBytesApart(Function &F) {
     if (!OK || Bytes.empty())
       continue;
     IRBuilder<> B(L);
-    auto *VT = FixedVectorType::get(B.getInt8Ty(), WordBits / 8);
+    // Only the bytes up to the last one used (1, 2 or 4 from the word's
+    // address): the others would take registers for nothing.
+    unsigned N = 1;
+    for (auto [V, K] : Bytes)
+      while (N <= K)
+        N *= 2;
+    Type *VT = N == 1 ? B.getInt8Ty()
+                      : (Type *)FixedVectorType::get(B.getInt8Ty(), N);
     LoadInst *NL = B.CreateAlignedLoad(VT, L->getPointerOperand(),
                                        L->getAlign(), L->getName() + ".bytes");
     NL->setAAMetadata(L->getAAMetadata());
@@ -2631,7 +2639,8 @@ static bool loadBytesApart(Function &F) {
       // The byte's value is used outside the chain: its uses there take
       // the vector element instead.
       B.SetInsertPoint(NL->getNextNode());
-      Value *E = B.CreateZExt(B.CreateExtractElement(NL, K), V->getType());
+      Value *E = B.CreateZExt(N == 1 ? (Value *)NL : B.CreateExtractElement(NL, K),
+                              V->getType());
       V->replaceUsesWithIf(E, [&](Use &U) { return !Range.count(U.getUser()); });
     }
     for (auto It = Range.begin(); It != Range.end(); ++It)
@@ -3504,17 +3513,18 @@ bool AGXCodeGenPrepare::combineUniformAtomics(Function &F,
   return Changed;
 }
 
-/// powi(x, n) with a variable n: pow(|x|, n) (AGX has no powi library
-/// function, and SelectionDAG's fallback, pow(x, n), is NaN for a negative x),
-/// with the sign of x for an odd n. A constant n is left to SelectionDAG's
-/// multiplications.
+/// powi(x, n) with a variable n (float, half or bfloat, in float):
+/// pow(|x|, n) (AGX has no powi library function, and SelectionDAG's
+/// fallback, pow(x, n), is NaN for a negative x), with the sign of x for an
+/// odd n. A constant n is left to SelectionDAG's multiplications.
 static bool expandPowI(Function &F) {
   SmallVector<IntrinsicInst *, 4> Calls;
   for (Instruction &I : instructions(F))
     if (auto *II = dyn_cast<IntrinsicInst>(&I);
         II && II->getIntrinsicID() == Intrinsic::powi &&
         !isa<Constant>(II->getArgOperand(1)) &&
-        (II->getType()->isFloatTy() || II->getType()->isHalfTy()))
+        (II->getType()->isFloatTy() || II->getType()->isHalfTy() ||
+         II->getType()->isBFloatTy()))
       Calls.push_back(II);
   for (IntrinsicInst *II : Calls) {
     IRBuilder<> B(II);
@@ -3536,7 +3546,8 @@ static bool expandPowI(Function &F) {
   return !Calls.empty();
 }
 
-/// frem of float and half (in float): fmod, exact. A step reduces a by a
+/// frem of float, half and bfloat (in float): fmod, exact (an fmod of
+/// half or bfloat values is one, so the truncation back is exact). A step reduces a by a
 /// divisor d with a / d < 2^24: q = trunc(a / d) is the integer part n or,
 /// rounded up, n + 1 (the quotient is correctly rounded and n representable),
 /// so the remainder is a - q d or a - (q - 1) d, whichever is in [0, d)
@@ -3550,7 +3561,8 @@ static bool expandFRem(Function &F, const AGXSubtarget &ST) {
   SmallVector<BinaryOperator *, 4> Rems;
   for (Instruction &I : instructions(F))
     if (I.getOpcode() == Instruction::FRem &&
-        (I.getType()->isFloatTy() || I.getType()->isHalfTy()))
+        (I.getType()->isFloatTy() || I.getType()->isHalfTy() ||
+         I.getType()->isBFloatTy()))
       Rems.push_back(cast<BinaryOperator>(&I));
   bool DenormalB =
       ST.hasIEEEFP32() &&
@@ -3624,9 +3636,96 @@ static bool expandFRem(Function &F, const AGXSubtarget &ST) {
   return !Rems.empty();
 }
 
+static cl::opt<bool> AGXIntToBFloatOnce(
+    "agx-int-to-bf16-once", cl::init(true), cl::Hidden,
+    cl::desc("Convert integers of more than 24 bits to bfloat with one "
+             "rounding (rounded to odd at 24 bits first)"));
+
+/// sitofp / uitofp of an integer of more than 24 bits to bfloat, rounded once:
+/// instruction selection converts to float (rounded) and rounds that to
+/// bfloat again, which is wrong where the first rounding lands on a bfloat
+/// halfway point (21430271 came out 0x4ba4, not 0x4ba3). |x| is first rounded
+/// to odd at 24 significant bits (the bits below cleared, the lowest kept one
+/// set where any of them was): that converts to float exactly, and rounding
+/// it to nearest bfloat is rounding x once (float keeps the 2 extra bits).
+static bool convertIntsToBFloatOnce(Function &F) {
+  if (!AGXIntToBFloatOnce)
+    return false;
+  SmallVector<CastInst *, 4> Casts;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<CastInst>(&I);
+        C && (isa<SIToFPInst>(C) || isa<UIToFPInst>(C)) &&
+        C->getType()->isBFloatTy() &&
+        C->getSrcTy()->getIntegerBitWidth() > 24)
+      Casts.push_back(C);
+  for (CastInst *C : Casts) {
+    IRBuilder<> B(C);
+    Value *X = C->getOperand(0);
+    auto *Ty = cast<IntegerType>(X->getType());
+    unsigned W = Ty->getBitWidth();
+    bool Signed = isa<SIToFPInst>(C);
+    auto K = [&](uint64_t V) { return ConstantInt::get(Ty, V); };
+    Value *A = Signed ? B.CreateBinaryIntrinsic(Intrinsic::abs, X, B.getFalse())
+                      : X;
+    // bits below the 24 significant ones: max(W - ctlz(a) - 24, 0)
+    Value *S = B.CreateSub(K(W - 24),
+                           B.CreateBinaryIntrinsic(
+                               Intrinsic::umin,
+                               B.CreateBinaryIntrinsic(Intrinsic::ctlz, A,
+                                                       B.getFalse()),
+                               K(W - 24)));
+    Value *Low = B.CreateSub(B.CreateShl(K(1), S), K(1));
+    Value *Sticky = B.CreateZExt(B.CreateICmpNE(B.CreateAnd(A, Low), K(0)), Ty);
+    Value *Odd = B.CreateOr(B.CreateAnd(A, B.CreateNot(Low)),
+                            B.CreateShl(Sticky, S));
+    Value *R = B.CreateFPTrunc(B.CreateUIToFP(Odd, B.getFloatTy()),
+                               C->getType());
+    if (Signed)
+      R = B.CreateSelect(B.CreateICmpSLT(X, K(0)), B.CreateFNeg(R), R);
+    R->takeName(C);
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+  }
+  return !Casts.empty();
+}
+
+/// lround / llround / lrint / llrint (no libcalls on AGX; half could not be
+/// selected): the integral value (round: halfway away from zero; rint: to
+/// nearest even, the only rounding direction here) converted, frozen (an
+/// out-of-range or NaN operand gives an unspecified value, not poison).
+static bool expandRoundToInt(Function &F) {
+  SmallVector<IntrinsicInst *, 4> Calls;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::lround:
+      case Intrinsic::llround:
+      case Intrinsic::lrint:
+      case Intrinsic::llrint:
+        Calls.push_back(II);
+        break;
+      default:
+        break;
+      }
+  for (IntrinsicInst *II : Calls) {
+    IRBuilder<> B(II);
+    Intrinsic::ID ID = II->getIntrinsicID();
+    bool Away = ID == Intrinsic::lround || ID == Intrinsic::llround;
+    Value *X = II->getArgOperand(0);
+    Value *R = B.CreateUnaryIntrinsic(Away ? Intrinsic::round : Intrinsic::rint, X);
+    R = B.CreateFreeze(B.CreateFPToSI(R, II->getType()));
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
+  return !Calls.empty();
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
-  bool Changed = expandPowI(F);
+  bool Changed = expandRoundToInt(F);
+  Changed |= expandPowI(F);
   Changed |= expandFRem(F, ST);
+  Changed |= convertIntsToBFloatOnce(F);
   // An expansion may use functions that are expanded in turn (tan's sin).
   for (;;) {
     SmallVector<IntrinsicInst *, 8> Calls;

@@ -14,6 +14,7 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
   MLIRLLVMCommonConversion
   MLIRLLVMDialect
   MLIRMathDialect
+  MLIRMathTransforms
   MLIRMemRefToLLVM
   MLIRPass
   MLIRSCFDialect

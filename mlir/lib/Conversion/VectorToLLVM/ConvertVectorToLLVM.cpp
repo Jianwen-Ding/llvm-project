@@ -473,6 +473,7 @@ public:
 
 /// Reduction neutral classes for overloading.
 class ReductionNeutralZero {};
+class ReductionNeutralFPNegZero {};
 class ReductionNeutralIntOne {};
 class ReductionNeutralFPOne {};
 class ReductionNeutralAllOnes {};
@@ -493,6 +494,20 @@ static Value createReductionNeutralValue(ReductionNeutralZero neutral,
                                          Location loc, Type llvmType) {
   return LLVM::ConstantOp::create(rewriter, loc, llvmType,
                                   rewriter.getZeroAttr(llvmType));
+}
+
+/// Create the reduction neutral negative zero value: the identity of a
+/// floating-point addition (+0.0 is not: -0.0 + +0.0 is +0.0), which the LLVM
+/// optimizer removes.
+static Value createReductionNeutralValue(ReductionNeutralFPNegZero neutral,
+                                         ConversionPatternRewriter &rewriter,
+                                         Location loc, Type llvmType) {
+  auto floatType = cast<FloatType>(llvmType);
+  return LLVM::ConstantOp::create(
+      rewriter, loc, llvmType,
+      rewriter.getFloatAttr(
+          llvmType, llvm::APFloat::getZero(floatType.getFloatSemantics(),
+                                           /*Negative=*/true)));
 }
 
 /// Create the reduction neutral integer one value.
@@ -945,7 +960,7 @@ public:
     Value result;
     if (kind == vector::CombiningKind::ADD) {
       result = lowerReductionWithStartValue<LLVM::vector_reduce_fadd,
-                                            ReductionNeutralZero>(
+                                            ReductionNeutralFPNegZero>(
           rewriter, loc, llvmType, operand, acc, fmf);
     } else if (kind == vector::CombiningKind::MUL) {
       result = lowerReductionWithStartValue<LLVM::vector_reduce_fmul,

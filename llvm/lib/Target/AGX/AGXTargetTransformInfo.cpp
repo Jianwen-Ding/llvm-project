@@ -126,6 +126,11 @@ static cl::opt<unsigned> AGXThreadgroupUnroll(
              "unrolled by, so that its loads can be merged (0: as far as "
              "contiguous loads become 16-byte ones, 1: no unrolling)"));
 
+static cl::opt<unsigned> AGXDeviceUnroll(
+    "agx-device-unroll", cl::init(4), cl::Hidden,
+    cl::desc("Iterations a single-block loop that loads device memory, of a "
+             "constant trip count this divides, is unrolled by (1: none)"));
+
 static bool isThreadVaryingIntrinsic(Intrinsic::ID ID) {
   switch (ID) {
   case Intrinsic::agx_thread_position_in_grid_x:
@@ -305,6 +310,26 @@ void AGXTTIImpl::getUnrollingPreferences(
       return LI && LI->getPointerAddressSpace() == AGX::THREADGROUP_ADDRESS;
     });
   });
+  if (!ThreadgroupLoads && L->getNumBlocks() == 1) {
+    // A loop that loads device memory, with a constant trip count the factor
+    // divides (no remainder loop: static shapes): unrolled, its loads of
+    // several iterations are in flight at once instead of one wait each
+    // (L15-E187; runtime trip counts lose, R12 / R20).
+    unsigned F = AGXDeviceUnroll;
+    unsigned Trips = SE.getSmallConstantTripCount(L);
+    bool DeviceLoads = any_of(L->blocks(), [](const BasicBlock *BB) {
+      return any_of(*BB, [](const Instruction &I) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+      });
+    });
+    if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
+      UP.Partial = true;
+      UP.MaxCount = F;
+      UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+    }
+    return;
+  }
   if (!ThreadgroupLoads || L->getNumBlocks() != 1)
     return;
   if (AGXThreadgroupUnroll == 1)

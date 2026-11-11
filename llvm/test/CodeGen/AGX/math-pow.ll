@@ -31,6 +31,17 @@ define agx_kernel void @powi_half(ptr addrspace(1) %p, half %x, i32 %n) {
   ret void
 }
 
+; bfloat likewise (it took SelectionDAG's pow(x, n): powi(-2, 2) was NaN).
+; CHECK-LABEL: @powi_bf16(
+; CHECK: fpext bfloat %x to float
+; CHECK: call float @llvm.copysign.f32
+; CHECK: fptrunc float %{{.*}} to bfloat
+define agx_kernel void @powi_bf16(ptr addrspace(1) %p, bfloat %x, i32 %n) {
+  %r = call bfloat @llvm.powi.bf16.i32(bfloat %x, i32 %n)
+  store bfloat %r, ptr addrspace(1) %p
+  ret void
+}
+
 ; CHECK-LABEL: @powi_const(
 ; CHECK: call float @llvm.powi.f32.i32(float %x, i32 3)
 define agx_kernel void @powi_const(ptr addrspace(1) %p, float %x) {

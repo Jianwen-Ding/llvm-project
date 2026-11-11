@@ -51,6 +51,16 @@ static cl::opt<bool> AGXSoftF64FastPaths(
 // operations (strict mode's exact texture sampler: ~2000 in one kernel) would
 // take 40% more memory to compile (544 -> 764 MB); it keeps the general code
 // alone.
+static cl::opt<bool> AGXSoftF64IntegralNaNSelect(
+    "agx-soft-f64-integral-nan-select", cl::init(true), cl::Hidden,
+    cl::desc("Double floor / ceil / trunc / round / roundeven / rint as the "
+             "masks with a select of the quieted NaN, not a slow path"));
+
+static cl::opt<bool> AGXSoftF64SaturateSelect(
+    "agx-soft-f64-saturate-select", cl::init(true), cl::Hidden,
+    cl::desc("Double to integer conversions as the fast path with a select "
+             "of the saturated value, not a slow path"));
+
 static cl::opt<unsigned> AGXSoftF64FastPathsMax(
     "agx-soft-f64-fast-paths-max", cl::init(256), cl::Hidden,
     cl::desc("Most double precision operations per function that get a "
@@ -486,6 +496,19 @@ public:
 
   /// A float (bits in an i64) as a double, where it is normal or zero, and
   /// whether it is: the exponent rebiased and the fraction 29 places up.
+  /// toIntFast's value where Valid, else the saturated one: 0 for a NaN,
+  /// otherwise the bound on X's side (X does not fit, so its sign decides;
+  /// an unsigned conversion's negative values are Valid already).
+  Value *saturateToInt(Value *X, Type *Ty, bool Signed, Value *FastV,
+                       Value *Valid) {
+    unsigned W = Ty->getIntegerBitWidth();
+    APInt Max = Signed ? APInt::getSignedMaxValue(W) : APInt::getMaxValue(W);
+    APInt Min = Signed ? APInt::getSignedMinValue(W) : APInt::getZero(W);
+    Value *Sat = select(B.CreateICmpSLT(X, c64(0)), ConstantInt::get(Ty, Min),
+                        ConstantInt::get(Ty, Max));
+    Sat = select(isNaN(X, F64), ConstantInt::get(Ty, 0), Sat);
+    return select(Valid, FastV, Sat);
+  }
   std::pair<Value *, Value *> extFast(Value *X) {
     // in 32 bits: the float's fields go to the double's high word (the top 20
     // fraction bits) and low word (the other 3, at its top)
@@ -1119,6 +1142,7 @@ bool AGX::isDoubleArithmetic(const Instruction &I) {
   case Instruction::FSub:
   case Instruction::FMul:
   case Instruction::FDiv:
+  case Instruction::FRem:
   case Instruction::FNeg:
   case Instruction::FPTrunc:
   case Instruction::SIToFP:
@@ -1203,6 +1227,99 @@ static Value *withSlowPath(Instruction &I, IRBuilder<> &B, Value *Fast,
   return Phi;
 }
 
+/// frem of the doubles of bits X and Y, exact, on integers (before I, which
+/// ends up in the join block): with a = mx 2^ex and b = my 2^ey (mx, my of 53
+/// bits, denormals normalized), mx 2^(ex - ey) mod my one bit at a time (r =
+/// 2 r - my where that is not negative), then normalized at b's exponent (a
+/// denormal result shifted back: exact, the remainder a multiple of the
+/// smaller of a's and b's last bits). The result has the sign of a: zero
+/// where b divides a, a itself where |a| < |b| (also an infinite b or a zero
+/// a), and NaN for an infinite or NaN a, a NaN or zero b (the first NaN
+/// operand quieted, or the canonical NaN).
+static Value *fmodBits(Instruction &I, IRBuilder<> &B, Value *X, Value *Y,
+                       bool CanonicalNaN) {
+  LLVMContext &Ctx = I.getContext();
+  Type *I32 = B.getInt32Ty(), *I64 = B.getInt64Ty();
+  auto K = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  const uint64_t Sign = 0x8000000000000000ull, Abs = ~Sign,
+                 Inf = 0x7ff0000000000000ull, Frac = (1ull << 52) - 1,
+                 One = 1ull << 52, Quiet = 1ull << 51;
+  Value *SX = B.CreateAnd(X, K(Sign));
+  Value *AX = B.CreateAnd(X, K(Abs)), *AY = B.CreateAnd(Y, K(Abs));
+  Value *XNaN = B.CreateICmpUGT(AX, K(Inf)), *YNaN = B.CreateICmpUGT(AY, K(Inf));
+  Value *NaN = B.CreateOr(B.CreateOr(B.CreateICmpUGE(AX, K(Inf)), YNaN),
+                          B.CreateICmpEQ(AY, K(0)));
+  Value *NaNR = K(CanonicalNaN ? 0x7fffffffffffffffull : 0x7ff8000000000000ull);
+  if (!CanonicalNaN)
+    NaNR = B.CreateSelect(XNaN, B.CreateOr(X, K(Quiet)),
+                          B.CreateSelect(YNaN, B.CreateOr(Y, K(Quiet)), NaNR));
+  Value *Small = B.CreateICmpULT(AX, AY);
+  Value *Special = B.CreateOr(B.CreateOr(NaN, Small), B.CreateICmpEQ(AX, AY));
+  Value *SpecialR =
+      B.CreateSelect(NaN, NaNR, B.CreateSelect(Small, X, SX));
+  // The significand of 53 bits and its exponent (a denormal's 1 - s, s the
+  // shift normalizing it); only used for finite nonzero operands.
+  auto Split = [&](Value *V) -> std::pair<Value *, Value *> {
+    Value *E = B.CreateTrunc(B.CreateLShr(V, 52), I32);
+    Value *Denormal = B.CreateICmpEQ(E, B.getInt32(0));
+    Value *S = B.CreateSub(
+        B.CreateTrunc(B.CreateBinaryIntrinsic(Intrinsic::ctlz, V, B.getTrue()),
+                      I32),
+        B.getInt32(11));
+    Value *M = B.CreateSelect(Denormal, B.CreateShl(V, B.CreateZExt(S, I64)),
+                              B.CreateOr(B.CreateAnd(V, K(Frac)), K(One)));
+    return {M, B.CreateSelect(Denormal, B.CreateSub(B.getInt32(1), S), E)};
+  };
+  auto [MX, EX] = Split(AX);
+  auto [MY, EY] = Split(AY);
+  Value *N0 = B.CreateSub(EX, EY);
+  Instruction *ThenTerm =
+      SplitBlockAndInsertIfThen(B.CreateNot(Special), I.getIterator(), false);
+  BasicBlock *Head = ThenTerm->getParent()->getSinglePredecessor();
+  BasicBlock *Pre = ThenTerm->getParent();
+  BasicBlock *Join = I.getParent();
+  Function *Fn = Join->getParent();
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "fmod.loop", Fn, Join);
+  BasicBlock *Tail = BasicBlock::Create(Ctx, "fmod.tail", Fn, Join);
+  ThenTerm->eraseFromParent();
+  IRBuilder<>(Pre).CreateBr(Loop);
+
+  IRBuilder<> LB(Loop);
+  PHINode *N = LB.CreatePHI(I32, 2);
+  PHINode *M = LB.CreatePHI(I64, 2);
+  N->addIncoming(N0, Pre);
+  M->addIncoming(MX, Pre);
+  Value *D = LB.CreateSub(M, MY);
+  Value *R = LB.CreateSelect(LB.CreateICmpSGE(D, K(0)), D, M);
+  N->addIncoming(LB.CreateSub(N, LB.getInt32(1)), Loop);
+  M->addIncoming(LB.CreateShl(R, K(1)), Loop);
+  LB.CreateCondBr(LB.CreateICmpEQ(N, LB.getInt32(0)), Tail, Loop);
+
+  // r below 2^53 at b's exponent: normalized (r = 0 is a signed zero).
+  IRBuilder<> TB(Tail);
+  Value *Z = TB.CreateTrunc(
+      TB.CreateBinaryIntrinsic(Intrinsic::ctlz, R, TB.getFalse()), I32);
+  Value *S = TB.CreateSub(Z, TB.getInt32(11));
+  Value *E = TB.CreateSub(EY, S);
+  Value *RN = TB.CreateShl(R, TB.CreateZExt(S, I64));
+  Value *Normal = TB.CreateOr(TB.CreateAnd(RN, K(Frac)),
+                              TB.CreateShl(TB.CreateZExt(E, I64), K(52)));
+  Value *Denormal = TB.CreateLShr(
+      RN, TB.CreateZExt(TB.CreateSub(TB.getInt32(1), E), I64));
+  Value *Bits = TB.CreateSelect(TB.CreateICmpSGT(E, TB.getInt32(0)), Normal,
+                                Denormal);
+  Bits = TB.CreateSelect(TB.CreateICmpEQ(R, K(0)), K(0), Bits);
+  Value *LoopR = TB.CreateOr(Bits, SX);
+  TB.CreateBr(Join);
+
+  B.SetInsertPoint(Join->begin());
+  PHINode *Result = B.CreatePHI(I64, 2);
+  Result->addIncoming(SpecialR, Head);
+  Result->addIncoming(LoopR, Tail);
+  B.SetInsertPoint(&I);
+  return Result;
+}
+
 Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
                                   bool CanonicalNaN, bool FastPathsHere) {
   if (!isDoubleArithmetic(I))
@@ -1259,6 +1376,9 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     }, Rounding, CanonicalNaN));
     break;
   }
+  case Instruction::FRem:
+    R = Dbl(fmodBits(I, B, Bits(0), Bits(1), CanonicalNaN));
+    break;
   case Instruction::FNeg:
     R = Dbl(B.CreateXor(Bits(0), SD.c64(F64.signBit())));
     break;
@@ -1317,9 +1437,12 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     Value *X = Bits(0);
     if (Fast && I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64) {
       auto [FastV, Valid] = SD.toIntFast(X, I.getType(), Signed);
-      R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
-        return Slow.toInt(X, I.getType(), Signed);
-      }, Rounding, CanonicalNaN);
+      if (AGXSoftF64SaturateSelect)
+        R = SD.saturateToInt(X, I.getType(), Signed, FastV, Valid);
+      else
+        R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
+          return Slow.toInt(X, I.getType(), Signed);
+        }, Rounding, CanonicalNaN);
       break;
     }
     R = SD.toInt(X, I.getType(), Signed);
@@ -1400,9 +1523,14 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
       bool Directional = Mode == SoftDouble::Nearest;
       if (AGXSoftF64FastPaths && FastPathsHere && (!Directional || Fast)) {
         auto [FastBits, Valid] = SD.integralFast(X, Mode);
-        R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
-          return Slow.integral(X, Mode);
-        }, Rounding, CanonicalNaN));
+        // integralFast is right but for a NaN (Valid), whose result is the
+        // NaN quieted: a select, not the general integral() behind a branch.
+        if (AGXSoftF64IntegralNaNSelect)
+          R = Dbl(SD.select(Valid, FastBits, SD.nanResult({X}, F64, F64)));
+        else
+          R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+            return Slow.integral(X, Mode);
+          }, Rounding, CanonicalNaN));
         break;
       }
       R = Dbl(SD.integral(X, Mode));
@@ -1423,9 +1551,12 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
       Value *X = Bits(0);
       if (Fast && I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64) {
         auto [FastV, Valid] = SD.toIntFast(X, I.getType(), Signed);
-        R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
-          return Slow.toInt(X, I.getType(), Signed);
-        }, Rounding, CanonicalNaN);
+        if (AGXSoftF64SaturateSelect)
+          R = SD.saturateToInt(X, I.getType(), Signed, FastV, Valid);
+        else
+          R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
+            return Slow.toInt(X, I.getType(), Signed);
+          }, Rounding, CanonicalNaN);
         break;
       }
       R = SD.toInt(X, I.getType(), Signed);
@@ -1466,12 +1597,122 @@ INITIALIZE_PASS_END(AGXSoftF64, DEBUG_TYPE, "AGX Soft F64", false, false)
 
 FunctionPass *llvm::createAGXSoftF64Pass() { return new AGXSoftF64(); }
 
+/// powi(x, n) of a double as compiler-rt's __powidf2: r = 1; for each bit
+/// of |n| from the lowest, r *= x where it is set and x *= x while bits
+/// remain (n / 2 rounded toward zero); 1 / r for a negative n.
+static void expandPowI(IntrinsicInst &II) {
+  LLVMContext &Ctx = II.getContext();
+  Value *X = II.getArgOperand(0), *N = II.getArgOperand(1);
+  Type *NT = N->getType(), *Dbl = II.getType();
+  BasicBlock *Entry = II.getParent();
+  BasicBlock *Done = Entry->splitBasicBlock(&II, "powi.done");
+  Function *Fn = Entry->getParent();
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "powi.loop", Fn, Done);
+  BasicBlock *Next = BasicBlock::Create(Ctx, "powi.next", Fn, Done);
+  Entry->getTerminator()->eraseFromParent();
+  IRBuilder<> B(Entry);
+  B.CreateBr(Loop);
+  B.SetInsertPoint(Loop);
+  PHINode *R = B.CreatePHI(Dbl, 2), *XP = B.CreatePHI(Dbl, 2),
+          *NP = B.CreatePHI(NT, 2);
+  R->addIncoming(ConstantFP::get(Dbl, 1.0), Entry);
+  XP->addIncoming(X, Entry);
+  NP->addIncoming(N, Entry);
+  // r *= x where the bit is set (a branch: the multiplication is long)
+  BasicBlock *MulBB = BasicBlock::Create(Ctx, "powi.mul", Fn, Done);
+  BasicBlock *Step = BasicBlock::Create(Ctx, "powi.step", Fn, Done);
+  B.CreateCondBr(B.CreateTrunc(NP, B.getInt1Ty()), MulBB, Step);
+  B.SetInsertPoint(MulBB);
+  Value *Prod = B.CreateFMul(R, XP);
+  B.CreateBr(Step);
+  B.SetInsertPoint(Step);
+  PHINode *RN = B.CreatePHI(Dbl, 2);
+  RN->addIncoming(Prod, MulBB);
+  RN->addIncoming(R, Loop);
+  Value *Half = B.CreateSDiv(NP, ConstantInt::get(NT, 2));
+  B.CreateCondBr(B.CreateICmpEQ(Half, ConstantInt::get(NT, 0)), Done, Next);
+  B.SetInsertPoint(Next);
+  Value *XN = B.CreateFMul(XP, XP);
+  B.CreateBr(Loop);
+  R->addIncoming(RN, Next);
+  XP->addIncoming(XN, Next);
+  NP->addIncoming(Half, Next);
+  B.SetInsertPoint(&II);
+  Value *Res = B.CreateSelect(B.CreateICmpSLT(N, ConstantInt::get(NT, 0)),
+                              B.CreateFDiv(ConstantFP::get(Dbl, 1.0), RN), RN);
+  Res->takeName(&II);
+  II.replaceAllUsesWith(Res);
+  II.eraseFromParent();
+}
+
 bool AGXSoftF64::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
   const TargetMachine &TM =
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
+  // powi of a double (SelectionDAG cannot soften it): compiler-rt's
+  // __powidf2 in double operations, which the lowering below takes.
+  SmallVector<IntrinsicInst *, 2> PowIs;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && II->getIntrinsicID() == Intrinsic::powi && isDouble(II))
+      PowIs.push_back(II);
+  for (IntrinsicInst *II : PowIs)
+    expandPowI(*II);
+  // lround / llround / lrint / llrint of a double (no libcalls): the
+  // integral value converted, frozen (an out-of-range operand gives an
+  // unspecified value), as AGXCodeGenPrepare does for the other types.
+  SmallVector<IntrinsicInst *, 2> RoundToInts;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::lround:
+      case Intrinsic::llround:
+      case Intrinsic::lrint:
+      case Intrinsic::llrint:
+        if (isDouble(II->getArgOperand(0)))
+          RoundToInts.push_back(II);
+        break;
+      default:
+        break;
+      }
+  for (IntrinsicInst *II : RoundToInts) {
+    IRBuilder<> B(II);
+    Intrinsic::ID ID = II->getIntrinsicID();
+    bool Away = ID == Intrinsic::lround || ID == Intrinsic::llround;
+    Value *R = B.CreateUnaryIntrinsic(Away ? Intrinsic::round : Intrinsic::rint,
+                                      II->getArgOperand(0));
+    R = B.CreateFreeze(B.CreateFPToSI(R, II->getType()));
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
+  // modf of a double (SelectionDAG cannot soften it): the integral part
+  // trunc(x), the fraction x - trunc(x) (exact) with x's sign, zero for an
+  // infinite x; double operations, which the lowering below takes.
+  SmallVector<IntrinsicInst *, 2> Modfs;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && II->getIntrinsicID() == Intrinsic::modf &&
+        isDouble(II->getArgOperand(0)))
+      Modfs.push_back(II);
+  for (IntrinsicInst *II : Modfs) {
+    IRBuilder<> B(II);
+    Value *X = II->getArgOperand(0);
+    Value *Int = B.CreateUnaryIntrinsic(Intrinsic::trunc, X);
+    Value *Inf = B.CreateFCmpOEQ(B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+                                 ConstantFP::getInfinity(X->getType()));
+    Value *Frac = B.CreateCopySign(
+        B.CreateSelect(Inf, ConstantFP::get(X->getType(), 0.0),
+                       B.CreateFSub(X, Int)),
+        X);
+    Value *R = B.CreateInsertValue(
+        B.CreateInsertValue(PoisonValue::get(II->getType()), Frac, 0), Int, 1);
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
   SmallVector<Instruction *, 16> Worklist;
   for (Instruction &I : instructions(F))
     if (AGX::isDoubleArithmetic(I))
