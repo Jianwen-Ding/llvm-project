@@ -568,6 +568,11 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
     return E->isFloatTy() || E->isHalfTy() || E->isBFloatTy();
   case Intrinsic::sin:
   case Intrinsic::cos:
+    // bfloat too: promoted to the hardware's reduction (afn's), its sin was
+    // up to 256 ulp off even below 16 (tiny results lost) and worse for large
+    // arguments (simulator, every bfloat); the float expansion rounded to
+    // bfloat is within an ulp below 10^6.
+    return (E->isFloatTy() || E->isBFloatTy()) && !Approx;
   case Intrinsic::exp:
   case Intrinsic::exp2:
   case Intrinsic::exp10:

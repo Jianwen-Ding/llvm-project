@@ -28,3 +28,16 @@ define agx_kernel void @s_afn(ptr addrspace(1) %p, half %x) {
   ret void
 }
 declare half @llvm.sin.f16(half)
+
+; bfloat sin without afn is the float expansion (Cody-Waite reduction and
+; polynomials), rounded to bfloat: the hardware's reduction lost small
+; results (up to 256 ulp off below 16).
+; CHECK-LABEL: sbf:
+; CHECK: rint
+; CHECK: fmadd32
+define agx_kernel void @sbf(ptr addrspace(1) %p, bfloat %x) {
+  %r = call bfloat @llvm.sin.bf16(bfloat %x)
+  store bfloat %r, ptr addrspace(1) %p
+  ret void
+}
+declare bfloat @llvm.sin.bf16(bfloat)
