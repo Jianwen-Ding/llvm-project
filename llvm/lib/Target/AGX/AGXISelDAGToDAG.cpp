@@ -17,9 +17,9 @@
 #include "AGXTargetMachine.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
-#include "llvm/Support/KnownBits.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
@@ -672,14 +672,14 @@ bool AGXDAGToDAGISel::trySelectShift64(SDNode *N) {
   return true;
 }
 
-/// Device addresses are base + (index << (log2(element size) + shift)), with
-/// a 32-bit index that is zero or sign extended, or a signed 16-bit
-/// immediate index.
 static cl::opt<bool> KnownHighZeroIndices(
     "agx-known-high-zero-indices", cl::init(true), cl::Hidden,
     cl::desc("A 64-bit device address index whose high word is known zero "
              "is the index register of its low word"));
 
+/// Device addresses are base + (index << (log2(element size) + shift)), with
+/// a 32-bit index that is zero or sign extended, or a signed 16-bit
+/// immediate index.
 bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
                                        SDValue &Base, SDValue &Index,
                                        SDValue &Signed, SDValue &Shift) {
