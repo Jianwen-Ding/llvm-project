@@ -294,6 +294,42 @@ def : Pat<(i32 (saddsat i32:$a, i32:$b)),
 def : Pat<(i32 (ssubsat i32:$a, i32:$b)),
           (ISUB_SAT_I32 MOD_SX, $a, MOD_SX, $b, 0)>;
 
+// The saturation is to the destination's size: 16-bit saturating adds and
+// subtracts, and a 32-bit value clamped to 16 bits and truncated (iadd.sat
+// of it and 0, sign-extended for the signed range).
+def IADD_SAT_I16 : AGXALUPseudo<IADD_SAT_g13, (outs GPR16:$dst),
+                                (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                     SrcMods:$src1_mods, Src16Op:$src1,
+                                     i32imm:$shift)>;
+def ISUB_SAT_I16 : AGXALUPseudo<ISUB_SAT_g13, (outs GPR16:$dst),
+                                (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                     SrcMods:$src1_mods, Src16Op:$src1,
+                                     i32imm:$shift)>;
+def IADD_SAT_I16_FROM32 : AGXALUPseudo<IADD_SAT_g13, (outs GPR16:$dst),
+                                       (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                            SrcMods:$src1_mods, Src32Op:$src1,
+                                            i32imm:$shift)>;
+
+def : Pat<(i16 (uaddsat AGXIntSrc16:$a, AGXIntSrc16:$b)),
+          (IADD_SAT_I16 0, $a, 0, $b, 0)>;
+def : Pat<(i16 (usubsat AGXIntSrc16:$a, AGXIntSrc16:$b)),
+          (ISUB_SAT_I16 0, $a, 0, $b, 0)>;
+def : Pat<(i16 (saddsat i16:$a, i16:$b)),
+          (IADD_SAT_I16 MOD_SX, $a, MOD_SX, $b, 0)>;
+def : Pat<(i16 (ssubsat i16:$a, i16:$b)),
+          (ISUB_SAT_I16 MOD_SX, $a, MOD_SX, $b, 0)>;
+
+def agx_sclamp16 : PatFrags<(ops node:$x),
+                            [(smin (smax node:$x, (i32 -32768)), (i32 32767)),
+                             (smax (smin node:$x, (i32 32767)), (i32 -32768))]>;
+def agx_uclamp16 : PatFrags<(ops node:$x), [(umin node:$x, (i32 65535))]>;
+let AddedComplexity = 5 in {
+def : Pat<(i16 (trunc (agx_sclamp16 i32:$x))),
+          (IADD_SAT_I16_FROM32 MOD_SX, $x, MOD_SX, (i32 0), 0)>;
+def : Pat<(i16 (trunc (agx_uclamp16 i32:$x))),
+          (IADD_SAT_I16_FROM32 0, $x, 0, (i32 0), 0)>;
+}
+
 // Sign and zero extension through iadd with a zero addend.
 def IADD_I32_FROM16 : AGXALUPseudo<IADD_g13, (outs GPR32:$dst),
                                    (ins SrcMods:$src0_mods, Src16Op:$src0,
@@ -548,6 +584,37 @@ def : Pat<(i32 (AGXpack16 i32:$lo, (i32 (anyext i16:$hi)))),
 def : Pat<(i32 (AGXpack16 i32:$lo, i32:$hi)),
           (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, lo16)), lo16,
                                (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
+// A pair of 32-bit values clamped to 16 bits and packed (a vector truncate
+// of clamps): iadd.sat into each half.
+class AGXSat16<PatFrags c, int m> {
+  PatFrags Clamp = c;
+  int Mod = m;
+}
+defvar AGXSat16Kinds = [AGXSat16<agx_sclamp16, MOD_SX>,
+                        AGXSat16<agx_uclamp16, 0>];
+let AddedComplexity = 5 in
+foreach L = AGXSat16Kinds in {
+  def : Pat<(i32 (AGXpack16 (i32 (L.Clamp i32:$lo)), (i32 (anyext i16:$hi)))),
+            (REG_SEQUENCE GPR32,
+                (IADD_SAT_I16_FROM32 L.Mod, $lo, L.Mod, (i32 0), 0), lo16,
+                $hi, hi16)>;
+  def : Pat<(i32 (AGXpack16 (i32 (anyext i16:$lo)), (i32 (L.Clamp i32:$hi)))),
+            (REG_SEQUENCE GPR32, $lo, lo16,
+                (IADD_SAT_I16_FROM32 L.Mod, $hi, L.Mod, (i32 0), 0), hi16)>;
+  def : Pat<(i32 (AGXpack16 (i32 (L.Clamp i32:$lo)), i32:$hi)),
+            (REG_SEQUENCE GPR32,
+                (IADD_SAT_I16_FROM32 L.Mod, $lo, L.Mod, (i32 0), 0), lo16,
+                (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
+  def : Pat<(i32 (AGXpack16 i32:$lo, (i32 (L.Clamp i32:$hi)))),
+            (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, lo16)), lo16,
+                (IADD_SAT_I16_FROM32 L.Mod, $hi, L.Mod, (i32 0), 0), hi16)>;
+  foreach H = AGXSat16Kinds in
+  let AddedComplexity = 6 in
+  def : Pat<(i32 (AGXpack16 (i32 (L.Clamp i32:$lo)), (i32 (H.Clamp i32:$hi)))),
+            (REG_SEQUENCE GPR32,
+                (IADD_SAT_I16_FROM32 L.Mod, $lo, L.Mod, (i32 0), 0), lo16,
+                (IADD_SAT_I16_FROM32 H.Mod, $hi, H.Mod, (i32 0), 0), hi16)>;
+}
 def : Pat<(i32 (AGXbfi_field AGXIntSrc32:$base, AGXIntSrc32:$ins, (i32 imm:$off),
                              (i32 timm:$w))),
           (BFI_I32 0, $base, 0, $ins, 0, (i32 imm:$off), timm:$w)>;
@@ -1400,6 +1467,21 @@ def : Pat<(device_truncstorei16 (i32 (Sh i32:$val, (i32 16))),
                                                  i32:$shift)),
           (DEVICE_STORE_16 0, FMT_I16, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
                            $base, $idx, $sgn, $shift)>;
+// A 16-bit store of a 32-bit value clamped to 16 bits: iadd.sat to 16 bits.
+let AddedComplexity = 1 in {
+def : Pat<(device_truncstorei16 (i32 (agx_sclamp16 i32:$val)),
+                                (AGXDeviceAddr16 i64:$base, i32:$idx, i32:$sgn,
+                                                 i32:$shift)),
+          (DEVICE_STORE_16 0, FMT_I16, 1,
+                           (IADD_SAT_I16_FROM32 MOD_SX, $val, MOD_SX, (i32 0), 0),
+                           $base, $idx, $sgn, $shift)>;
+def : Pat<(device_truncstorei16 (i32 (agx_uclamp16 i32:$val)),
+                                (AGXDeviceAddr16 i64:$base, i32:$idx, i32:$sgn,
+                                                 i32:$shift)),
+          (DEVICE_STORE_16 0, FMT_I16, 1,
+                           (IADD_SAT_I16_FROM32 0, $val, 0, (i32 0), 0),
+                           $base, $idx, $sgn, $shift)>;
+}
 // A byte store of x >> 16 likewise stores the high half's low byte.
 let AddedComplexity = 1 in
 foreach Sh = [srl, sra] in
@@ -1520,6 +1602,18 @@ def : Pat<(local_truncstorei16 (i32 (Sh i32:$val, (i32 16))),
                                (AGXLocalAddr16 i16:$base, i16:$idx)),
           (LOCAL_STORE_16 FMT_I16, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
                           $base, $idx)>;
+let AddedComplexity = 1 in {
+def : Pat<(local_truncstorei16 (i32 (agx_sclamp16 i32:$val)),
+                               (AGXLocalAddr16 i16:$base, i16:$idx)),
+          (LOCAL_STORE_16 FMT_I16, 1,
+                          (IADD_SAT_I16_FROM32 MOD_SX, $val, MOD_SX, (i32 0), 0),
+                          $base, $idx)>;
+def : Pat<(local_truncstorei16 (i32 (agx_uclamp16 i32:$val)),
+                               (AGXLocalAddr16 i16:$base, i16:$idx)),
+          (LOCAL_STORE_16 FMT_I16, 1,
+                          (IADD_SAT_I16_FROM32 0, $val, 0, (i32 0), 0),
+                          $base, $idx)>;
+}
 let AddedComplexity = 1 in
 foreach Sh = [srl, sra] in
 def : Pat<(local_truncstorei8 (i32 (Sh i32:$val, (i32 16))),

@@ -182,7 +182,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::BUILD_PAIR, MVT::i64, Legal);
   setOperationAction({ISD::UADDSAT, ISD::USUBSAT, ISD::SADDSAT,
                       ISD::SSUBSAT},
-                     MVT::i32, Legal);
+                     {MVT::i16, MVT::i32}, Legal);
 
   //===--------------------------------------------------------------------===//
   // Floating point operations

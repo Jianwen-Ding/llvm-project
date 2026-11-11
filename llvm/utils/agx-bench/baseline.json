@@ -887,6 +887,30 @@
   "uniform_halves": 22,
   "waits": 2
  },
+ "pcm_mix.ll:pcm_mix:agx-g13g": {
+  "bytes": 122,
+  "cycles": 181.3,
+  "gprs": 6,
+  "groups": 96,
+  "instructions": 18,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 7.4,
+  "uniform_halves": 24,
+  "waits": 2
+ },
+ "pcm_mix.ll:pcm_mix:agx-g14c": {
+  "bytes": 122,
+  "cycles": 181.3,
+  "gprs": 6,
+  "groups": 96,
+  "instructions": 18,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 7.4,
+  "uniform_halves": 24,
+  "waits": 2
+ },
  "quant_i8.ll:quant:agx-g13g": {
   "bytes": 268,
   "cycles": 155.6,

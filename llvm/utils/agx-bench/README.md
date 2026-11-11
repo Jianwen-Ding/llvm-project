@@ -36,6 +36,7 @@ The kernels in `kernels/` cover the common shapes of CUDA code:
 | `quant_i8` | int8 quantization: a float4 scaled, rounded, clamped to [-127, 127] and packed to one word |
 | `adam` | Adam optimizer step: elementwise fmas, a correctly rounded sqrt and division, three stores |
 | `cross_entropy` | per-row log-sum-exp loss: a max loop, an exp-sum loop, a log and a gathered label |
+| `pcm_mix` | int16 audio mixing: saturating sample sums and a gain clamped to 16 bits, two samples per thread |
 | `gemv_f16` | LLM decode GEMV in f16: half2 loads, float fmas, a SIMD-group per row |
 | `bitonic_simd32` | bitonic sort of 32 keys in registers: 15 shuffle-xor compare-exchange steps (warp sort, top-k) |
 | `block_scan_simd` | threadgroup inclusive scan from SIMD-group prefixes and a threadgroup array of SIMD-group totals |
