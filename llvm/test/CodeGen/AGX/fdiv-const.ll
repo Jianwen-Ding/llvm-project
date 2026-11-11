@@ -169,25 +169,28 @@ define agx_kernel void @by255(ptr addrspace(1) %p) {
 define agx_kernel void @by_huge(ptr addrspace(1) %p) {
 ; CHECK-LABEL: by_huge:
 ; CHECK:         // uniform registers: 10 x 16-bit (threadgroups_per_grid at u2)
-; CHECK-NEXT:    // general purpose registers: 7 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 10 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    mov_imm r4, 1050821216
-; CHECK-NEXT:    mov_imm r6, -1068895542
+; CHECK-NEXT:    mov_imm r7, 1049702377
+; CHECK-NEXT:    mov_imm r3, 2139095040
 ; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
+; CHECK-NEXT:    mov_imm r9, -1067339290
+; CHECK-NEXT:    mov_imm r4, 8388608
+; CHECK-NEXT:    mov_imm r6, 25165824
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    bfi r3, r2, 127, 23, mask 0xFF
-; CHECK-NEXT:    fmul32 r5, r3, r4
-; CHECK-NEXT:    fmadd32 r3, r5, r6, r3
-; CHECK-NEXT:    fmadd32 r3, r3, r4, r5
-; CHECK-NEXT:    mov_imm r4, 243269632
-; CHECK-NEXT:    fmul32 r3, r3, r4
-; CHECK-NEXT:    mov_imm r4, 2139095040
-; CHECK-NEXT:    and r4, r2, r4
-; CHECK-NEXT:    fmul32 r3, r3, r4
+; CHECK-NEXT:    bfi r5, r2, 127, 23, mask 0xFF
+; CHECK-NEXT:    and r3, r2, r3
+; CHECK-NEXT:    fmul32 r8, r5, r7
+; CHECK-NEXT:    fmadd32 r5, r8, r9, r5
+; CHECK-NEXT:    fcmpsel lt, r9, r2.abs, r6, r4, r3
+; CHECK-NEXT:    fmadd32 r5, r5, r7, r8
+; CHECK-NEXT:    fcmpsel lt, r3, r2.abs, r6, r3, r4
+; CHECK-NEXT:    fmul32 r5, r5, r9
 ; CHECK-NEXT:    mov_imm r4, 2143289344
+; CHECK-NEXT:    fmul32 r3, r5, r3
 ; CHECK-NEXT:    fcmpsel eq, r2, r2, r2, r3, r4
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
 ; CHECK-NEXT:    stop
@@ -202,7 +205,7 @@ define agx_kernel void @by_huge(ptr addrspace(1) %p) {
   %t = call i32 @llvm.agx.thread.position.in.grid.x()
   %q = getelementptr float, ptr addrspace(1) %p, i32 %t
   %x = load float, ptr addrspace(1) %q
-  %r = fdiv float %x, 0x46293E5940000000
+  %r = fdiv float %x, 0x47EC363CC0000000
   store float %r, ptr addrspace(1) %q
   ret void
 }
