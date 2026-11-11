@@ -51,6 +51,11 @@ static cl::opt<bool> AGXSoftF64FastPaths(
 // operations (strict mode's exact texture sampler: ~2000 in one kernel) would
 // take 40% more memory to compile (544 -> 764 MB); it keeps the general code
 // alone.
+static cl::opt<bool> AGXSoftF64IntegralNaNSelect(
+    "agx-soft-f64-integral-nan-select", cl::init(true), cl::Hidden,
+    cl::desc("Double floor / ceil / trunc / round / roundeven / rint as the "
+             "masks with a select of the quieted NaN, not a slow path"));
+
 static cl::opt<unsigned> AGXSoftF64FastPathsMax(
     "agx-soft-f64-fast-paths-max", cl::init(256), cl::Hidden,
     cl::desc("Most double precision operations per function that get a "
@@ -1497,9 +1502,14 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
       bool Directional = Mode == SoftDouble::Nearest;
       if (AGXSoftF64FastPaths && FastPathsHere && (!Directional || Fast)) {
         auto [FastBits, Valid] = SD.integralFast(X, Mode);
-        R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
-          return Slow.integral(X, Mode);
-        }, Rounding, CanonicalNaN));
+        // integralFast is right but for a NaN (Valid), whose result is the
+        // NaN quieted: a select, not the general integral() behind a branch.
+        if (AGXSoftF64IntegralNaNSelect)
+          R = Dbl(SD.select(Valid, FastBits, SD.nanResult({X}, F64, F64)));
+        else
+          R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+            return Slow.integral(X, Mode);
+          }, Rounding, CanonicalNaN));
         break;
       }
       R = Dbl(SD.integral(X, Mode));

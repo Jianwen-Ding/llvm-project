@@ -2022,17 +2022,35 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
     else if (B2 == "trunc")
       R = Trunc(A[0]);
     else if (B2 == "round") {
-      // Half way cases away from zero: |x| rounded down, and up when the
-      // (exact) fraction is at least 1/2.
-      Value *Abs = B.CreateAnd(A[0], B.getInt64(AbsMask));
-      Value *Down = Floor(Abs);
-      Value *Frac = Lib("__air_f64_sub", I64, {Abs, Down});
-      Value *Below = Bool(Lib("__air_f64_lt", I32,
-                              {Frac, B.getInt64(0x3fe0000000000000ull)}));
-      Value *Up = Lib("__air_f64_add", I64,
-                      {Down, B.getInt64(0x3ff0000000000000ull)});
-      R = B.CreateOr(B.CreateSelect(Below, Down, Up),
-                     B.CreateAnd(A[0], B.getInt64(SignBit)));
+      // Half way cases away from zero, on the bits: at or above 2^52 (or
+      // infinite) x itself (a NaN quieted); below 1 a zero or one of x's
+      // sign (one from 1/2); otherwise the k = 1075 - e fraction bits
+      // cleared and one unit of the lowest integral bit added to the
+      // magnitude where they are at least half of it (a carry into the
+      // exponent is right).
+      Value *X = A[0];
+      Value *E = B.CreateAnd(B.CreateLShr(X, 52), B.getInt64(0x7ff));
+      Value *Mag = B.CreateAnd(X, B.getInt64(AbsMask));
+      Value *Sign = B.CreateAnd(X, B.getInt64(SignBit));
+      Value *EC = B.CreateBinaryIntrinsic(
+          Intrinsic::umin,
+          B.CreateBinaryIntrinsic(Intrinsic::umax, E, B.getInt64(1023)),
+          B.getInt64(1074));
+      Value *Unit = B.CreateShl(B.getInt64(1), B.CreateSub(B.getInt64(1075), EC));
+      Value *Low = B.CreateSub(Unit, B.getInt64(1));
+      Value *Frac = B.CreateAnd(X, Low);
+      Value *T = B.CreateAnd(X, B.CreateNot(Low));
+      Value *Up = B.CreateICmpUGE(Frac, B.CreateLShr(Unit, 1));
+      Value *Mid = B.CreateAdd(T, B.CreateSelect(Up, Unit, B.getInt64(0)));
+      Value *Small = B.CreateSelect(
+          B.CreateICmpUGE(Mag, B.getInt64(0x3fe0000000000000ull)),
+          B.CreateOr(Sign, B.getInt64(0x3ff0000000000000ull)), Sign);
+      Value *Big = B.CreateSelect(
+          B.CreateICmpUGT(Mag, B.getInt64(0x7ff0000000000000ull)),
+          B.CreateOr(X, B.getInt64(0x0008000000000000ull)), X);
+      R = B.CreateSelect(B.CreateICmpUGE(E, B.getInt64(1075)), Big,
+                         B.CreateSelect(B.CreateICmpULT(E, B.getInt64(1023)),
+                                        Small, Mid));
     } else if (B2 == "roundeven")
       R = Lib("__air_f64_roundeven", I64, {A[0]});
     else if (B2 == "rint" || B2 == "nearbyint") {
