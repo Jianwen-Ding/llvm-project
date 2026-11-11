@@ -1254,6 +1254,11 @@ def : Pat<(f32 (uint_to_fp (and i16:$a, 255))),
           (CONVERT_32_16 CVT_U8_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (uint_to_fp (and i32:$a, 255))),
           (CONVERT_32_32 CVT_U8_TO_F, 0, $a, ROUND_RTE)>;
+// And to half (u8 pixels to half): the byte mode with a 16-bit destination.
+def : Pat<(f16 (uint_to_fp (and i16:$a, 255))),
+          (CONVERT_16_16 CVT_U8_TO_F, 0, $a, ROUND_RTE)>;
+def : Pat<(f16 (uint_to_fp (and i32:$a, 255))),
+          (CONVERT_16_32 CVT_U8_TO_F, 0, $a, ROUND_RTE)>;
 // Sign-extended bytes (int8 weights): s8_to_f reads the low eight bits as
 // signed (measured on G14C, AGX-Performance-Simulator testsuite
 // convert_s8_to_f_*), in place of a shift pair. Both the sext_inreg and
