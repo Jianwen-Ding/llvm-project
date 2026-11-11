@@ -63,7 +63,11 @@ INITIALIZE_PASS(AGXInsertWaits, DEBUG_TYPE, "AGX Insert Waits", false, false)
 
 FunctionPass *llvm::createAGXInsertWaitsPass() { return new AGXInsertWaits(); }
 
-static constexpr unsigned MaxPending = 8;
+#include "llvm/Support/CommandLine.h"
+// (Experiments: more requests outstanding than the eight Mesa keeps)
+static cl::opt<unsigned> MaxPending(
+    "agx-max-pending", cl::init(8), cl::Hidden,
+    cl::desc("Asynchronous requests kept outstanding before a wait"));
 
 static bool isBarrier(const MachineInstr &MI) {
   return MI.getOpcode() == AGX::THREADGROUP_BARRIER ||
