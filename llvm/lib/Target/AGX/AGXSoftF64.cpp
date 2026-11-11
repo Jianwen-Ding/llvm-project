@@ -56,6 +56,11 @@ static cl::opt<bool> AGXSoftF64IntegralNaNSelect(
     cl::desc("Double floor / ceil / trunc / round / roundeven / rint as the "
              "masks with a select of the quieted NaN, not a slow path"));
 
+static cl::opt<bool> AGXSoftF64SaturateSelect(
+    "agx-soft-f64-saturate-select", cl::init(true), cl::Hidden,
+    cl::desc("Double to integer conversions as the fast path with a select "
+             "of the saturated value, not a slow path"));
+
 static cl::opt<unsigned> AGXSoftF64FastPathsMax(
     "agx-soft-f64-fast-paths-max", cl::init(256), cl::Hidden,
     cl::desc("Most double precision operations per function that get a "
@@ -491,6 +496,19 @@ public:
 
   /// A float (bits in an i64) as a double, where it is normal or zero, and
   /// whether it is: the exponent rebiased and the fraction 29 places up.
+  /// toIntFast's value where Valid, else the saturated one: 0 for a NaN,
+  /// otherwise the bound on X's side (X does not fit, so its sign decides;
+  /// an unsigned conversion's negative values are Valid already).
+  Value *saturateToInt(Value *X, Type *Ty, bool Signed, Value *FastV,
+                       Value *Valid) {
+    unsigned W = Ty->getIntegerBitWidth();
+    APInt Max = Signed ? APInt::getSignedMaxValue(W) : APInt::getMaxValue(W);
+    APInt Min = Signed ? APInt::getSignedMinValue(W) : APInt::getZero(W);
+    Value *Sat = select(B.CreateICmpSLT(X, c64(0)), ConstantInt::get(Ty, Min),
+                        ConstantInt::get(Ty, Max));
+    Sat = select(isNaN(X, F64), ConstantInt::get(Ty, 0), Sat);
+    return select(Valid, FastV, Sat);
+  }
   std::pair<Value *, Value *> extFast(Value *X) {
     // in 32 bits: the float's fields go to the double's high word (the top 20
     // fraction bits) and low word (the other 3, at its top)
@@ -1419,9 +1437,12 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     Value *X = Bits(0);
     if (Fast && I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64) {
       auto [FastV, Valid] = SD.toIntFast(X, I.getType(), Signed);
-      R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
-        return Slow.toInt(X, I.getType(), Signed);
-      }, Rounding, CanonicalNaN);
+      if (AGXSoftF64SaturateSelect)
+        R = SD.saturateToInt(X, I.getType(), Signed, FastV, Valid);
+      else
+        R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
+          return Slow.toInt(X, I.getType(), Signed);
+        }, Rounding, CanonicalNaN);
       break;
     }
     R = SD.toInt(X, I.getType(), Signed);
@@ -1530,9 +1551,12 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
       Value *X = Bits(0);
       if (Fast && I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 64) {
         auto [FastV, Valid] = SD.toIntFast(X, I.getType(), Signed);
-        R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
-          return Slow.toInt(X, I.getType(), Signed);
-        }, Rounding, CanonicalNaN);
+        if (AGXSoftF64SaturateSelect)
+          R = SD.saturateToInt(X, I.getType(), Signed, FastV, Valid);
+        else
+          R = withSlowPath(I, B, FastV, Valid, [&](SoftDouble &Slow) {
+            return Slow.toInt(X, I.getType(), Signed);
+          }, Rounding, CanonicalNaN);
         break;
       }
       R = SD.toInt(X, I.getType(), Signed);

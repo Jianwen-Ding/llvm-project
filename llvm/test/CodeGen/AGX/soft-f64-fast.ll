@@ -107,3 +107,26 @@ define agx_kernel void @floor(ptr addrspace(1) %out, double %d) {
   store double %r, ptr addrspace(1) %out
   ret void
 }
+
+; Conversions to integers: the shifts of the significand, and where the value
+; does not fit a select of the saturated value (0 for a NaN, else the bound
+; on its side), no branch to the general code.
+; CHECK-LABEL: @to_i32(
+; CHECK-NOT: br i1
+; CHECK: select i1 {{.*}}, i32 -2147483648, i32 2147483647
+; CHECK: ret void
+define agx_kernel void @to_i32(ptr addrspace(1) %out, double %d) {
+  %r = fptosi double %d to i32
+  store i32 %r, ptr addrspace(1) %out
+  ret void
+}
+
+; CHECK-LABEL: @to_u64_sat(
+; CHECK-NOT: br i1
+; CHECK: select i1 {{.*}}, i64 0, i64 -1
+; CHECK: ret void
+define agx_kernel void @to_u64_sat(ptr addrspace(1) %out, double %d) {
+  %r = call i64 @llvm.fptoui.sat.i64.f64(double %d)
+  store i64 %r, ptr addrspace(1) %out
+  ret void
+}
