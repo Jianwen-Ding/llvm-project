@@ -3,7 +3,7 @@
 
 ; Shuffles that undo each other, through selects and element moves that
 ; depend only on the thread index, are the value they started from: each
-; thread reads back its own bits. (ZLUDA's mma emulation moves D from the
+; thread reads back its own bits. (The PTX front end's mma emulation moves D from the
 ; matrix unit's layout to the PTX fragments, and the next mma's C back.)
 
 declare i32 @llvm.agx.thread.index.in.simdgroup()

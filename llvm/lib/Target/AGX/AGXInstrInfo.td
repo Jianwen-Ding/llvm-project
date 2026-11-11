@@ -118,6 +118,11 @@ def SDT_AGXBfiField : SDTypeProfile<1, 4, [SDTCisInt<0>, SDTCisSameAs<1, 0>,
 def AGXbfi_field : SDNode<"AGXISD::BFI_FIELD", SDT_AGXBfiField>;
 // The low halves of Lo and Hi as the low and high halves of a 32-bit value.
 def AGXpack16 : SDNode<"AGXISD::PACK16", SDTIntBinOp>;
+// Float to an 8-bit integer, saturated to its range (NaN 0), in a 16-bit
+// register zero-extended from 8 bits (the convert's 8-bit modes, B27).
+def SDTAGXCvtF8 : SDTypeProfile<1, 1, [SDTCisVT<0, i16>, SDTCisFP<1>]>;
+def AGXcvt_f_to_u8 : SDNode<"AGXISD::CVT_F_TO_U8", SDTAGXCvtF8>;
+def AGXcvt_f_to_s8 : SDNode<"AGXISD::CVT_F_TO_S8", SDTAGXCvtF8>;
 // Clamp to [0, 1], a NaN to +0 (the .sat output modifier).
 def AGXfsat : SDNode<"AGXISD::FSAT", SDTFPUnaryOp>;
 // The 64-bit product of two 32-bit values, unsigned or signed (one imadd).
@@ -153,6 +158,14 @@ def AGXIntSrc64 : ComplexPattern<i64, 1, "SelectIntSrc", [], [], -2>;
 // Floating point source with abs/neg modifiers: (value, mods). The value may
 // be an 8-bit floating point immediate.
 def AGXFPSrc16 : ComplexPattern<f16, 2, "SelectFPSrc", [], [], -2>;
+// A 32-bit integer source that is an extended 16-bit value.
+def AGXExt16Src : ComplexPattern<i32, 2, "SelectExt16Src",
+                                 [sext, zext, sext_inreg, and, sra, srl], [], -2>;
+def agx_build_pair : SDNode<"ISD::BUILD_PAIR",
+                            SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i32>,
+                                                 SDTCisSameAs<1, 2>]>>;
+def AGXExt16Src64 : ComplexPattern<i64, 2, "SelectExt16Src64",
+                                   [sext, zext, agx_build_pair], [], -2>;
 def AGXFPSrc32 : ComplexPattern<f32, 2, "SelectFPSrc", [], [], -2>;
 
 // Device memory addresses: (base, index, signedness, shift) for an element
@@ -160,6 +173,10 @@ def AGXFPSrc32 : ComplexPattern<f32, 2, "SelectFPSrc", [], [], -2>;
 def AGXDeviceAddr8 : ComplexPattern<i64, 4, "SelectDeviceAddr8", [], [], -10>;
 def AGXDeviceAddr16 : ComplexPattern<i64, 4, "SelectDeviceAddr16", [], [], -10>;
 def AGXDeviceAddr32 : ComplexPattern<i64, 4, "SelectDeviceAddr32", [], [], -10>;
+// A device atomic's address: base + 4 * zext(i32) (the hardware's recorded
+// form, coverage atomic_*: an unsigned index register), else the address.
+def AGXAtomicAddr : ComplexPattern<i64, 3, "SelectAtomicAddr", [], [], -10>;
+def AGXDeviceAddr32Via16 : ComplexPattern<i64, 4, "SelectDeviceAddr32Via16", [], [], -9>;
 
 // Threadgroup memory addresses: (base, index) for an element size of 1, 2 or
 // 4 bytes.

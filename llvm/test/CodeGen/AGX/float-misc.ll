@@ -75,15 +75,27 @@ define agx_kernel void @vector_rz(ptr addrspace(1) %o, <2 x float> %a, <2 x floa
   ret void
 }
 
-; round(x), half away from zero: trunc(x), one away from zero more when
-; |x - trunc(x)| >= 0.5, and the sign of x.
+; round(x), half away from zero: trunc(x + copysign(0x3effffff, x)), the
+; float just below 0.5 (0.5 itself would round 0.49999997 up).
 ; CHECK-LABEL: round_f32:
-; CHECK: trunc [[T:r[0-9]+]], [[X:u[0-9]+]]
-; CHECK: fadd32 [[D:r[0-9]+]], [[X]], [[T]].neg
-; CHECK: fcmpsel gte, {{r[0-9]+}}, [[D]].abs, 0.5,
+; CHECK: mov_imm [[B:r[0-9]+]], 1056964607
+; CHECK-NEXT: bfi [[B]], [[X:u[0-9]+]], [[B]], 0, mask 0x7FFFFFFF
+; CHECK-NEXT: fadd32 [[S:r[0-9]+]], [[X]], [[B]]
+; CHECK-NEXT: trunc {{r[0-9]+}}, [[S]]
 define agx_kernel void @round_f32(ptr addrspace(1) %p, float %x) {
   %r = call float @llvm.round.f32(float %x)
   store float %r, ptr addrspace(1) %p
+  ret void
+}
+
+; CHECK-LABEL: round_f16:
+; CHECK: mov_imm [[B:r[0-9]+l]], 14335
+; CHECK-NEXT: bfi [[B]], [[X:u[0-9]+l]], [[B]], 0, mask 0x7FFF
+; CHECK-NEXT: fadd16 [[S:r[0-9]+l]], [[X]], [[B]]
+; CHECK-NEXT: trunc {{r[0-9]+l}}, [[S]]
+define agx_kernel void @round_f16(ptr addrspace(1) %p, half %x) {
+  %r = call half @llvm.round.f16(half %x)
+  store half %r, ptr addrspace(1) %p
   ret void
 }
 
@@ -159,3 +171,25 @@ declare float @llvm.maximumnum.f32(float, float)
 declare float @llvm.experimental.constrained.fadd.f32(float, float, metadata, metadata)
 declare float @llvm.experimental.constrained.trunc.f32(float, metadata)
 attributes #99 = { strictfp }
+
+; -|x| is an or of the sign bit.
+; CHECK-LABEL: fnabs_f32:
+; CHECK: mov_imm [[M:r[0-9]+]], -2147483648
+; CHECK-NEXT: or [[M]], {{u[0-9]+}}, [[M]]
+; CHECK-NEXT: device_store
+; CHECK-LABEL: fnabs_f16:
+; CHECK: mov_imm [[H:r[0-9]+l]], 32768
+; CHECK-NEXT: or [[H]], {{u[0-9]+l}}, [[H]]
+; CHECK-NEXT: device_store
+define agx_kernel void @fnabs_f32(ptr addrspace(1) %p, float %x) {
+  %a = call float @llvm.fabs.f32(float %x)
+  %n = fneg float %a
+  store float %n, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @fnabs_f16(ptr addrspace(1) %p, half %x) {
+  %a = call half @llvm.fabs.f16(half %x)
+  %n = fneg half %a
+  store half %n, ptr addrspace(1) %p
+  ret void
+}

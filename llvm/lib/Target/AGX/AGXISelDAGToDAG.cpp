@@ -18,6 +18,7 @@
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
@@ -53,6 +54,8 @@ private:
   // Complex patterns.
   bool SelectIntSrc(SDValue N, SDValue &Src);
   bool SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods);
+  bool SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods);
+  bool SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods);
   bool SelectDeviceAddr(SDValue Addr, unsigned ElemLog2, SDValue &Base,
                         SDValue &Index, SDValue &Signed, SDValue &Shift);
   bool SelectDeviceAddr8(SDValue Addr, SDValue &Base, SDValue &Index,
@@ -67,6 +70,10 @@ private:
                           SDValue &Signed, SDValue &Shift) {
     return SelectDeviceAddr(Addr, 2, Base, Index, Signed, Shift);
   }
+  bool SelectAtomicAddr(SDValue Addr, SDValue &Base, SDValue &Index,
+                        SDValue &Signed);
+  bool SelectDeviceAddr32Via16(SDValue Addr, SDValue &Base, SDValue &Index,
+                               SDValue &Signed, SDValue &Shift);
   bool SelectLocalAddr(SDValue Addr, SDValue &Base, SDValue &Index,
                        unsigned Unit);
   bool SelectLocalAddr8(SDValue Addr, SDValue &Base, SDValue &Index) {
@@ -235,6 +242,11 @@ bool AGXDAGToDAGISel::trySelectFieldInsert(SDNode *N) {
   return false;
 }
 
+static cl::opt<bool> Via16Addresses(
+    "agx-via16-addresses", cl::init(true), cl::Hidden,
+    cl::desc("4- and 8-byte device accesses at a 16-bit-unit index in the "
+             "16-bit format, the index folded"));
+
 // The i32 format and the masks of 2, 3 and 4 consecutive values.
 static constexpr unsigned FmtI32 = 2;
 static unsigned vectorMask(unsigned NumElts) { return (1u << NumElts) - 1; }
@@ -266,10 +278,17 @@ void AGXDAGToDAGISel::selectVectorLoad(SDNode *N, unsigned NumElts) {
                                   {Fmt, Mask, Base, Index, Chain});
   } else {
     SDValue Base, Index, Signed, Shift;
-    SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
     unsigned Opc = NumElts == 2   ? AGX::DEVICE_LOAD_64
                    : NumElts == 3 ? AGX::DEVICE_LOAD_96
                                   : AGX::DEVICE_LOAD_128;
+    if (NumElts == 2 && Via16Addresses &&
+        SelectDeviceAddr32Via16(Addr, Base, Index, Signed, Shift)) {
+      Opc = AGX::DEVICE_LOAD_64_H16;
+      Fmt = CurDAG->getTargetConstant(1, DL, MVT::i32);
+      Mask = CurDAG->getTargetConstant(vectorMask(4), DL, MVT::i32);
+    } else {
+      SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
+    }
     SDValue G = CurDAG->getTargetConstant(0, DL, MVT::i32);
     Load = CurDAG->getMachineNode(
         Opc, DL, MVT::Untyped, MVT::Other,
@@ -384,10 +403,17 @@ void AGXDAGToDAGISel::selectVectorStore(SDNode *N, unsigned NumElts) {
                                    {Fmt, Mask, Val, Base, Index, Chain});
   } else {
     SDValue Base, Index, Signed, Shift;
-    SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
     unsigned Opc = NumElts == 2   ? AGX::DEVICE_STORE_64
                    : NumElts == 3 ? AGX::DEVICE_STORE_96
                                   : AGX::DEVICE_STORE_128;
+    if (NumElts == 2 && Via16Addresses &&
+        SelectDeviceAddr32Via16(Addr, Base, Index, Signed, Shift)) {
+      Opc = AGX::DEVICE_STORE_64_H16;
+      Fmt = CurDAG->getTargetConstant(1, DL, MVT::i32);
+      Mask = CurDAG->getTargetConstant(vectorMask(4), DL, MVT::i32);
+    } else {
+      SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
+    }
     SDValue G = CurDAG->getTargetConstant(0, DL, MVT::i32);
     Store = CurDAG->getMachineNode(
         Opc, DL, MVT::Other,
@@ -438,6 +464,76 @@ bool AGXDAGToDAGISel::SelectIntSrc(SDValue N, SDValue &Src) {
   }
   Src = N;
   return true;
+}
+
+/// A 32-bit integer source that is a 16-bit value sign or zero extended: the
+/// 16-bit register (a half of a 32-bit one for x >> 16 and the low 16 bits of
+/// x) read with or without .sx, instead of the extension.
+bool AGXDAGToDAGISel::SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods) {
+  SDLoc DL(N);
+  auto Half = [&](SDValue X, unsigned SubReg) {
+    return CurDAG->getTargetExtractSubreg(SubReg, DL, MVT::i16, X);
+  };
+  unsigned M = 0;
+  switch (N.getOpcode()) {
+  case ISD::SIGN_EXTEND:
+    M = AGX::SRC_MOD_SX;
+    [[fallthrough]];
+  case ISD::ZERO_EXTEND:
+    if (N.getOperand(0).getValueType() != MVT::i16)
+      return false;
+    Src = N.getOperand(0);
+    break;
+  case ISD::SIGN_EXTEND_INREG:
+    if (cast<VTSDNode>(N.getOperand(1))->getVT() != MVT::i16)
+      return false;
+    M = AGX::SRC_MOD_SX;
+    Src = Half(N.getOperand(0), AGX::lo16);
+    break;
+  case ISD::AND:
+    if (!isa<ConstantSDNode>(N.getOperand(1)) ||
+        N.getConstantOperandVal(1) != 0xffff)
+      return false;
+    Src = Half(N.getOperand(0), AGX::lo16);
+    break;
+  case ISD::SRA:
+    M = AGX::SRC_MOD_SX;
+    [[fallthrough]];
+  case ISD::SRL:
+    if (!isa<ConstantSDNode>(N.getOperand(1)) ||
+        N.getConstantOperandVal(1) != 16)
+      return false;
+    Src = Half(N.getOperand(0), AGX::hi16);
+    break;
+  default:
+    return false;
+  }
+  Mods = getI32Imm(M, DL);
+  return true;
+}
+
+/// A 64-bit source that is a 16-bit value sign or zero extended: directly
+/// (sext / zext of an i16), or a 32-bit such value extended the same way.
+bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
+  unsigned Opc = N.getOpcode();
+  // A pair with a zero high word: the low word zero-extended.
+  if (Opc == ISD::BUILD_PAIR && isNullConstant(N.getOperand(1)))
+    Opc = ISD::ZERO_EXTEND;
+  else if (Opc != ISD::SIGN_EXTEND && Opc != ISD::ZERO_EXTEND)
+    return false;
+  SDValue X = N.getOperand(0);
+  if (X.getValueType() == MVT::i16) {
+    Src = X;
+    Mods = getI32Imm(Opc == ISD::SIGN_EXTEND ? AGX::SRC_MOD_SX : 0, SDLoc(N));
+    return true;
+  }
+  if (X.getValueType() != MVT::i32 || !SelectExt16Src(X, Src, Mods))
+    return false;
+  // The inner extension must be the outer one's kind (zext of a sign
+  // extension is not a sign extension to 64 bits), except that a zero
+  // extension sign-extended is still a zero extension.
+  bool InnerSX = cast<ConstantSDNode>(Mods)->getZExtValue() & AGX::SRC_MOD_SX;
+  return Opc == ISD::SIGN_EXTEND || !InnerSX;
 }
 
 /// Floating point sources fold neg and abs into modifiers, and constants
@@ -638,6 +734,49 @@ bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
   Base = Addr;
   Index = CurDAG->getTargetConstant(0, DL, MVT::i32);
   return true;
+}
+
+static cl::opt<bool> AtomicIndices(
+    "agx-atomic-indices", cl::init(true), cl::Hidden,
+    cl::desc("Device atomics at base + 4 * zext(i32) take the index register"));
+
+/// Device atomics take the base and index registers as loads do (the
+/// simulator's coverage recordings on the M2 Max: atomic add, 0, r14, u8_u9,
+/// r5, unsigned, r6), the index counting 4 bytes. Only the recorded form, a
+/// zero-extended 32-bit register index unshifted; otherwise the full address
+/// in the base register (a 64-bit add and, for a uniform base, its copy to
+/// registers).
+bool AGXDAGToDAGISel::SelectAtomicAddr(SDValue Addr, SDValue &Base,
+                                       SDValue &Index, SDValue &Signed) {
+  SDLoc DL(Addr);
+  SDValue B, I, S, Sh;
+  if (AtomicIndices && SelectDeviceAddr(Addr, 2, B, I, S, Sh) && B != Addr &&
+      !isa<ConstantSDNode>(I) && cast<ConstantSDNode>(Sh)->isZero() &&
+      cast<ConstantSDNode>(S)->getZExtValue() == 1) {
+    Base = B;
+    Index = I;
+    Signed = S;
+    return true;
+  }
+  Base = Addr;
+  Index = CurDAG->getTargetConstant(0, DL, MVT::i32);
+  Signed = getI32Imm(0, DL);
+  return true;
+}
+
+/// A 4- or 8-byte access whose index is in 16-bit units (base + 2 * i, a
+/// half or bfloat vector at an element index) does not fold into the 32-bit
+/// format's index, which would compute the 64-bit address; the 16-bit format
+/// (xy / xyzw into the same register halves) takes it. Only where the 32-bit
+/// form would not fold.
+bool AGXDAGToDAGISel::SelectDeviceAddr32Via16(SDValue Addr, SDValue &Base,
+                                              SDValue &Index, SDValue &Signed,
+                                              SDValue &Shift) {
+  SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
+  if (Base != Addr)
+    return false;
+  SelectDeviceAddr16(Addr, Base, Index, Signed, Shift);
+  return Base != Addr;
 }
 
 /// Threadgroup addresses are 16-bit byte offsets in the base register. The

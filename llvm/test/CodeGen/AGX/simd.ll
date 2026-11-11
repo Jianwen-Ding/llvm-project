@@ -69,12 +69,11 @@ define agx_kernel void @ballots(ptr addrspace(1) %out, i32 %x) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    icmpsel ugt, r1, u2, 5, 1, 0
+; CHECK-NEXT:    icmp_quad_ballot r1, ugt, u2, 5
 ; CHECK-NEXT:    get_sr r3, sr58 (active_thread_index_in_simdgroup)
-; CHECK-NEXT:    icmp_quad_ballot r2, nueq, r1, 0
-; CHECK-NEXT:    icmp_ballot r1, nueq, r1, 0
-; CHECK-NEXT:    and r2, r2, 15
-; CHECK-NEXT:    iadd r1, r1, r2
+; CHECK-NEXT:    icmp_ballot r2, ugt, u2, 5
+; CHECK-NEXT:    and r1, r1, 15
+; CHECK-NEXT:    iadd r1, r2, r1
 ; CHECK-NEXT:    iadd r1, r1, r3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

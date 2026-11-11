@@ -1,5 +1,5 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-max-unskipped-instrs=0 -verify-machineinstrs < %s | FileCheck %s --check-prefix=ALWAYS
+; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -agx-max-unskipped-instrs=0 -verify-machineinstrs < %s | FileCheck %s --check-prefix=ALWAYS
 
 ; A short ALU-only body runs with an empty execution mask instead of being
 ; jumped over (B31); a body with a memory access, or any body with the

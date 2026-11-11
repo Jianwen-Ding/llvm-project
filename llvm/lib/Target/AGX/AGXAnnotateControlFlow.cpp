@@ -27,7 +27,11 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -47,6 +51,16 @@ using namespace llvm;
 static cl::opt<bool> AGXWidenBooleanPhis(
     "agx-widen-boolean-phis", cl::init(true), cl::Hidden,
     cl::desc("Booleans live across blocks as i32 phis (32-bit registers)"));
+
+static cl::opt<bool> AGXPostIncrementCompares(
+    "agx-post-increment-compares", cl::init(true), cl::Hidden,
+    cl::desc("A loop's compare of its index i with a constant as a compare "
+             "of i + c, where i + c cannot overflow"));
+
+static cl::opt<bool> AGXSinkLoopCarriedDefs(
+    "agx-sink-loop-carried-defs", cl::init(true), cl::Hidden,
+    cl::desc("A loop-carried variable's new value computed after the old "
+             "value's last use in its block"));
 
 #define DEBUG_TYPE "agx-annotate-control-flow"
 
@@ -75,6 +89,8 @@ class AGXAnnotateControlFlowImpl {
   bool closeControlFlow(BasicBlock *BB);
   bool layoutBlocks();
   bool widenBooleanPhis();
+  bool sinkLoopCarriedDefs();
+  bool postIncrementCompares();
 
   CallInst *createCall(IRBuilder<> &IRB, Intrinsic::ID ID,
                        ArrayRef<Value *> Args = {}) {
@@ -219,9 +235,10 @@ bool AGXAnnotateControlFlowImpl::closeControlFlow(BasicBlock *BB) {
 }
 
 bool AGXAnnotateControlFlowImpl::run() {
+  bool Changed = AGXPostIncrementCompares && postIncrementCompares();
+  Changed |= AGXSinkLoopCarriedDefs && sinkLoopCarriedDefs();
   prepareLoops();
 
-  bool Changed = false;
   for (df_iterator<BasicBlock *> I = df_begin(&F.getEntryBlock()),
                                  E = df_end(&F.getEntryBlock());
        I != E; ++I) {
@@ -261,6 +278,108 @@ bool AGXAnnotateControlFlowImpl::run() {
   Changed |= layoutBlocks();
   if (AGXWidenBooleanPhis)
     Changed |= widenBooleanPhis();
+  return Changed;
+}
+
+/// A loop's index i stepping i' = i + c, compared with a constant k
+/// (InstCombine's form of i' < k + c: i < k), keeps i live to the compare at
+/// the end of the iteration next to i', and its register takes a copy of i'
+/// each iteration. Where the signed range of i (scalar evolution, with the
+/// special register bounds) shows that i + c and k + c do not overflow, the
+/// compare is of i' with k + c, the same for every i, and i' is never
+/// poison.
+bool AGXAnnotateControlFlowImpl::postIncrementCompares() {
+  using namespace PatternMatch;
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  std::optional<ScalarEvolution> SE;
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder())
+    for (PHINode &HP : L->getHeader()->phis()) {
+      if (!HP.getType()->isIntegerTy())
+        continue;
+      for (unsigned I = 0, E = HP.getNumIncomingValues(); I != E; ++I) {
+        if (!L->contains(HP.getIncomingBlock(I)))
+          continue;
+        auto *Def = dyn_cast<BinaryOperator>(HP.getIncomingValue(I));
+        const APInt *C;
+        if (!Def || !match(Def, m_Add(m_Specific(&HP), m_APInt(C))))
+          continue;
+        for (User *U : make_early_inc_range(HP.users())) {
+          auto *Cmp = dyn_cast<ICmpInst>(U);
+          const APInt *K;
+          if (!Cmp || Cmp->getParent() != Def->getParent() ||
+              Cmp->getOperand(0) != &HP ||
+              !match(Cmp->getOperand(1), m_APInt(K)) ||
+              !(Cmp->isSigned() || Cmp->isEquality()))
+            continue;
+          if (!SE)
+            SE.emplace(F, TLI, AC, DT, LI);
+          ConstantRange R = SE->getSignedRange(SE->getSCEV(&HP));
+          bool Ov;
+          APInt K2 = K->sadd_ov(*C, Ov);
+          if (Ov || R.signedAddMayOverflow(ConstantRange(*C)) !=
+                        ConstantRange::OverflowResult::NeverOverflows)
+            continue;
+          if (Cmp->comesBefore(Def))
+            Def->moveBefore(Cmp->getIterator());
+          Cmp->setOperand(0, Def);
+          Cmp->setOperand(1, ConstantInt::get(Cmp->getContext(), K2));
+          Changed = true;
+        }
+      }
+    }
+  if (SE && Changed)
+    SE->forgetAllLoops();
+  return Changed;
+}
+
+/// The new value of a loop-carried variable computed before the old one's
+/// last use in its block keeps both live, and the old one's register takes a
+/// copy of it each iteration (mandelbrot's z: z.re' = ... computed before
+/// 2 z.re): the new value goes after that use where nothing between needs
+/// it. (Instruction selection keeps the order of the block here.) The new
+/// value is the header phi's, or that of the structurizer's flow phi which
+/// gives it.
+bool AGXAnnotateControlFlowImpl::sinkLoopCarriedDefs() {
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder())
+    for (PHINode &HP : L->getHeader()->phis())
+      for (unsigned I = 0, E = HP.getNumIncomingValues(); I != E; ++I) {
+        if (!L->contains(HP.getIncomingBlock(I)))
+          continue;
+        SmallVector<std::pair<Value *, BasicBlock *>, 4> News;
+        auto *P = dyn_cast<PHINode>(HP.getIncomingValue(I));
+        if (P && P != &HP && L->contains(P->getParent())) {
+          for (unsigned J = 0, N = P->getNumIncomingValues(); J != N; ++J)
+            News.push_back({P->getIncomingValue(J), P->getIncomingBlock(J)});
+        } else {
+          News.push_back({HP.getIncomingValue(I), HP.getIncomingBlock(I)});
+        }
+        for (auto [V, From] : News) {
+          auto *Def = dyn_cast<Instruction>(V);
+          if (!Def || isa<PHINode>(Def) || Def->getParent() != From ||
+              !L->contains(From) || Def->mayReadOrWriteMemory() ||
+              Def->mayHaveSideEffects() || Def->isTerminator())
+            continue;
+          // the last use of the old value after Def in its block
+          Instruction *Last = nullptr;
+          for (Instruction *It = Def->getNextNode(); It; It = It->getNextNode())
+            if (is_contained(It->operands(), &HP))
+              Last = It;
+          if (!Last || isa<PHINode>(Last) || Last->isTerminator())
+            continue;
+          bool UsedBefore = false;
+          for (Instruction *It = Def->getNextNode(); It != Last->getNextNode();
+               It = It->getNextNode())
+            UsedBefore |= is_contained(It->operands(), Def);
+          if (UsedBefore)
+            continue;
+          Def->moveAfter(Last);
+          Changed = true;
+        }
+      }
   return Changed;
 }
 

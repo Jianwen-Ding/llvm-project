@@ -88,16 +88,15 @@ define agx_kernel void @shifts(ptr addrspace(1) %out, i64 %a, i64 %s) {
 define agx_kernel void @compare(ptr addrspace(1) %out, i64 %a, i64 %b) {
 ; CHECK-LABEL: compare:
 ; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
-; CHECK-NEXT:    // general purpose registers: 5 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    icmpsel slt, r1, u3, u5, 1, 0
 ; CHECK-NEXT:    icmpsel ult, r2, u2, u4, 1, 0
 ; CHECK-NEXT:    icmpsel ueq, r3, u3, u5, 1, 0
-; CHECK-NEXT:    icmpsel ueq, r4, u2, u4, 1, 0
 ; CHECK-NEXT:    icmpsel ueq, r1, u3, u5, r2, r1
-; CHECK-NEXT:    and r2, r4, r3
+; CHECK-NEXT:    icmpsel ueq, r2, u2, u4, r3, 0
 ; CHECK-NEXT:    iadd r1, r1, r2
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
@@ -121,29 +120,25 @@ define agx_kernel void @compare(ptr addrspace(1) %out, i64 %a, i64 %b) {
 define agx_kernel void @bitcount(ptr addrspace(1) %out, i64 %a) {
 ; CHECK-LABEL: bitcount:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 7 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 8 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    ffs r1, u3
-; CHECK-NEXT:    mov_imm r3, 0
-; CHECK-NEXT:    ffs r2, u2
-; CHECK-NEXT:    isub r1, 31, r1
-; CHECK-NEXT:    bitrev r4, u3
-; CHECK-NEXT:    isub r2, 63, r2
-; CHECK-NEXT:    popcount r5, u3
-; CHECK-NEXT:    icmpsel ueq, r2, u3, 0, r2, r1
-; CHECK-NEXT:    bitrev r1, u2
-; CHECK-NEXT:    ffs r4, r4
-; CHECK-NEXT:    popcount r6, u2
+; CHECK-NEXT:    icmpsel ueq, r1, u3, 0, u2, u3
+; CHECK-NEXT:    mov_imm r5, 0
 ; CHECK-NEXT:    ffs r1, r1
-; CHECK-NEXT:    isub r4, 63, r4
-; CHECK-NEXT:    iadd r5, r6, r5
-; CHECK-NEXT:    isub r1, 31, r1
-; CHECK-NEXT:    icmpsel ueq, r1, u2, 0, r4, r1
-; CHECK-NEXT:    iadd r4_r5, r5, 0
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r4_r5
+; CHECK-NEXT:    icmpsel ueq, r2, u2, 0, u3, u2
+; CHECK-NEXT:    icmpsel ueq, r3, u3, 0, 63, 31
+; CHECK-NEXT:    bitrev r2, r2
+; CHECK-NEXT:    isub r4, r3, r1
+; CHECK-NEXT:    popcount r3, u2
+; CHECK-NEXT:    ffs r1, r2
+; CHECK-NEXT:    icmpsel ueq, r2, u2, 0, 63, 31
+; CHECK-NEXT:    isub r1, r2, r1
+; CHECK-NEXT:    popcount r2, u3
+; CHECK-NEXT:    iadd r6_r7, r4_r5, r1
+; CHECK-NEXT:    iadd r4, r3, r2
+; CHECK-NEXT:    iadd r2_r3, r6_r7, r4_r5
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

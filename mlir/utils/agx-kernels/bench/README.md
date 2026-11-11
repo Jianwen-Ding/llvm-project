@@ -31,5 +31,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `stencil5_2d` | 5-point Jacobi step on a 2-D memref with a halo |
 | `histogram_atomic` | 256-bin byte histogram: `memref.atomic_rmw` into workgroup bins, then into device memory |
 | `bsearch_while` | per-thread binary search as an `scf.while`: a divergent, data-dependent loop |
+| `rowsum` | row sums, one thread per row: an `scf.for` over a static row |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.
