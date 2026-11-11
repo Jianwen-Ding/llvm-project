@@ -1379,6 +1379,14 @@ def : Pat<(device_truncstorei16 (i32 (Sh i32:$val, (i32 16))),
                                                  i32:$shift)),
           (DEVICE_STORE_16 0, FMT_I16, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
                            $base, $idx, $sgn, $shift)>;
+// A byte store of x >> 16 likewise stores the high half's low byte.
+let AddedComplexity = 1 in
+foreach Sh = [srl, sra] in
+def : Pat<(device_truncstorei8 (i32 (Sh i32:$val, (i32 16))),
+                               (AGXDeviceAddr8 i64:$base, i32:$idx, i32:$sgn,
+                                               i32:$shift)),
+          (DEVICE_STORE_16 0, FMT_I8, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
+                           $base, $idx, $sgn, $shift)>;
 
 // System-scope atomic loads and stores of device memory (ld.acquire.sys,
 // st.release.sys) are coherent loads and stores, not atomics: device atomics
@@ -1490,6 +1498,12 @@ foreach Sh = [srl, sra] in
 def : Pat<(local_truncstorei16 (i32 (Sh i32:$val, (i32 16))),
                                (AGXLocalAddr16 i16:$base, i16:$idx)),
           (LOCAL_STORE_16 FMT_I16, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
+                          $base, $idx)>;
+let AddedComplexity = 1 in
+foreach Sh = [srl, sra] in
+def : Pat<(local_truncstorei8 (i32 (Sh i32:$val, (i32 16))),
+                              (AGXLocalAddr8 i16:$base, i16:$idx)),
+          (LOCAL_STORE_16 FMT_I8, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
                           $base, $idx)>;
 
 //===----------------------------------------------------------------------===//

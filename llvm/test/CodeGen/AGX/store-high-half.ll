@@ -36,3 +36,15 @@ define agx_kernel void @tg(i32 %a, i32 %b, i16 %i) {
   store i16 %t, ptr addrspace(3) %p
   ret void
 }
+
+; A byte store of x >> 16: the high half's low byte.
+; CHECK-LABEL: b8:
+; CHECK: iadd [[R:r[0-9]+]],
+; CHECK-NEXT: device_store 0, i8, x, [[R]]h,
+define agx_kernel void @b8(ptr addrspace(1) %p, i32 %a, i32 %b) {
+  %s = add i32 %a, %b
+  %h = lshr i32 %s, 16
+  %t = trunc i32 %h to i8
+  store i8 %t, ptr addrspace(1) %p
+  ret void
+}
