@@ -24,11 +24,18 @@
 
 #include "AGX.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include <cmath>
 
 using namespace llvm;
+
+static cl::opt<bool> IntegerLdexp(
+    "agx-exp-integer-scale",
+    cl::desc("the exponentials' 2^n scale as an exponent addition where f32 "
+             "flushes"),
+    cl::init(true), cl::Hidden);
 
 namespace {
 class MathBuilder {
@@ -322,6 +329,19 @@ public:
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
     Value *I = B.CreateFreeze(B.CreateFPToSI(N, intTy()));
+    if (NoDenormals && IntegerLdexp) {
+      // v is the exponential's e^r in [0.7, 1.42] (or a NaN): v 2^n is its
+      // bits plus n << 23 while that is a normal float; at or past the
+      // infinite exponent +inf, below the normal range the +0 that the
+      // flushing multiplications gave, and a NaN v itself (its n arbitrary).
+      // Bit-identical to the two multiplications where results flush.
+      Value *S = B.CreateAdd(B.CreateBitCast(V, intTy()),
+                             B.CreateShl(I, ki(23)));
+      Value *R = B.CreateBitCast(S, Ty);
+      R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
+      R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
+      return sel(B.CreateFCmpUNO(V, V), V, R);
+    }
     Value *I1 = B.CreateAShr(I, ki(1));
     return mul(mul(V, pow2i(I1)), pow2i(B.CreateSub(I, I1)));
   }
@@ -368,7 +388,9 @@ public:
 
   Value *exp2Precise(Value *X) {
     // 2^x = e^(x ln 2), with x ln 2 as a rounded product and its error.
-    X = clampArg(X, -151.0, 130.0);
+    // (Up to 128, where 2^x overflows: n = 128 at most, which the exponent
+    // addition of ldexp needs.)
+    X = clampArg(X, -151.0, 128.0);
     Value *Hi = mul(X, k(M_LN2));
     Value *Lo = fma(X, k(M_LN2), B.CreateFNeg(Hi));
     Lo = fma(X, k(M_LN2 - (double)(float)M_LN2), Lo);
@@ -376,7 +398,8 @@ public:
   }
   Value *exp10Precise(Value *X) {
     constexpr double LN10 = 2.302585092994045684;
-    X = clampArg(X, -46.0, 40.0);
+    // (Up to 38.6, past 10^x's overflow at 38.53: n = 128 at most.)
+    X = clampArg(X, -46.0, 38.6);
     Value *Hi = mul(X, k(LN10));
     Value *Lo = fma(X, k(LN10), B.CreateFNeg(Hi));
     Lo = fma(X, k(LN10 - (double)(float)LN10), Lo);

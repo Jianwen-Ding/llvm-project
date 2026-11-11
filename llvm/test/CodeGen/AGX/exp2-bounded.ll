@@ -1,12 +1,15 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
 
-; 2^x and 10^x clamp x itself (to [-151, 130] and [-46, 40]), so that no
-; infinity makes the low part of x ln b a NaN: two selects, instead of a
-; clamp of x ln b and +inf / +0 selects after (the same result for every
-; float, checked exhaustively, flushing and not).
+; 2^x and 10^x clamp x itself (to [-151, 128] and [-46, 38.6], past the
+; overflow, so that the scale 2^n has n <= 128), so that no infinity makes
+; the low part of x ln b a NaN: two selects, instead of a clamp of x ln b and
+; +inf / +0 selects after (the same result for every float, checked
+; exhaustively, flushing and not). The scale, an exponent addition, ends in
+; a NaN select (fcmpsel eq).
 
 ; CHECK-LABEL: e2:
-; CHECK-COUNT-2: fcmpsel
+; CHECK-COUNT-2: fcmpsel {{lt|gt}}
+; CHECK: fcmpsel eq
 ; CHECK-NOT: fcmpsel
 ; CHECK: stop
 define agx_kernel void @e2(ptr addrspace(1) %p) {
@@ -19,7 +22,8 @@ define agx_kernel void @e2(ptr addrspace(1) %p) {
 }
 
 ; CHECK-LABEL: e10:
-; CHECK-COUNT-2: fcmpsel
+; CHECK-COUNT-2: fcmpsel {{lt|gt}}
+; CHECK: fcmpsel eq
 ; CHECK-NOT: fcmpsel
 ; CHECK: stop
 define agx_kernel void @e10(ptr addrspace(1) %p) {

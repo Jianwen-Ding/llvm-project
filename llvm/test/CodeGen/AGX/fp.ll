@@ -90,267 +90,264 @@ define agx_kernel void @div(ptr addrspace(1) %out, float %a, float %b) {
 define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b) {
 ; CHECK-LABEL: transcendental:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 28 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 31 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    mov_imm r2, 1059256707
-; CHECK-NEXT:    fmul32 r1, u2, r2
+; CHECK-NEXT:    mov_imm r1, 1059256707
+; CHECK-NEXT:    fmul32 r2, u2, r1
 ; CHECK-NEXT:    mov_imm r3, 1070141403
-; CHECK-NEXT:    rint r1, r1
+; CHECK-NEXT:    rint r2, r2
 ; CHECK-NEXT:    mov_imm r5, -1287930578
 ; CHECK-NEXT:    mov_imm r6, -1493750547
-; CHECK-NEXT:    fmadd32 r4, r1.neg, r3, u2
+; CHECK-NEXT:    fmadd32 r4, r2.neg, r3, u2
 ; CHECK-NEXT:    mov_imm r9, 1007190942
-; CHECK-NEXT:    fmadd32 r4, r1.neg, r5, r4
+; CHECK-NEXT:    fmadd32 r4, r2.neg, r5, r4
 ; CHECK-NEXT:    mov_imm r10, -1186160135
 ; CHECK-NEXT:    mov_imm r16, 1042479491
 ; CHECK-NEXT:    mov_imm r12, -1104500061
 ; CHECK-NEXT:    fmul32 r17, u2, r16
 ; CHECK-NEXT:    mov_imm r13, -1162476006
 ; CHECK-NEXT:    floor r19, r17
-; CHECK-NEXT:    fmadd32 r4, r1.neg, r6, r4
+; CHECK-NEXT:    fmadd32 r4, r2.neg, r6, r4
 ; CHECK-NEXT:    mov_imm r14, 936179150
 ; CHECK-NEXT:    fmul32 r8, r4, r4
 ; CHECK-NEXT:    mov_imm r7, 1249902592
 ; CHECK-NEXT:    mov_imm r18, 1026206373
 ; CHECK-NEXT:    fadd32 r17, r17, r19.neg
-; CHECK-NEXT:    mov_imm r20, 1039082778
-; CHECK-NEXT:    mov_imm r21, -1107403441
-; CHECK-NEXT:    mov_imm r22, 1041361343
-; CHECK-NEXT:    mov_imm r23, -1104499120
-; CHECK-NEXT:    mov_imm r24, 1045221036
-; CHECK-NEXT:    mov_imm r25, -1098907652
-; CHECK-NEXT:    mov_imm r26, 1051372202
+; CHECK-NEXT:    mov_imm r20, -1108618824
+; CHECK-NEXT:    mov_imm r21, 1032855995
+; CHECK-NEXT:    mov_imm r23, 1039082778
+; CHECK-NEXT:    mov_imm r24, -1107403441
+; CHECK-NEXT:    mov_imm r25, 1041361343
+; CHECK-NEXT:    mov_imm r26, -1104499120
+; CHECK-NEXT:    mov_imm r27, 1045221036
+; CHECK-NEXT:    mov_imm r28, -1098907652
+; CHECK-NEXT:    mov_imm r29, 1051372202
 ; CHECK-NEXT:    fmadd32 r11, r8, r10, r9
 ; CHECK-NEXT:    fmadd32 r15, r8, r14, r13
 ; CHECK-NEXT:    fmadd32 r11, r11, r8, r12
-; CHECK-NEXT:    fcmpsel lt, r1, u2.abs, r7, r1, 0
+; CHECK-NEXT:    fcmpsel lt, r2, u2.abs, r7, r2, 0
 ; CHECK-NEXT:    fmul32 r11, r11, r8
-; CHECK-NEXT:    convert f_to_s32, r1, r1, rtz
+; CHECK-NEXT:    convert f_to_s32, r2, r2, rtz
 ; CHECK-NEXT:    fmadd32 r4, r11, r4, r4
 ; CHECK-NEXT:    fmul32 r11, r8, r8
 ; CHECK-NEXT:    fmadd32 r15, r15, r8, r18
 ; CHECK-NEXT:    fmadd32 r8, r8, -0.5, 1.0
 ; CHECK-NEXT:    fmadd32 r8, r11, r15, r8
 ; CHECK-NEXT:    fmul32 r11, r17, 4.0
-; CHECK-NEXT:    bfeil r17, 0, r1, 1, mask 0x1
+; CHECK-NEXT:    and r15, r2, 1
 ; CHECK-NEXT:    sin_pt_1 r11, r11
-; CHECK-NEXT:    and r15, r1, 1
-; CHECK-NEXT:    mov_imm r1, -2147483648
+; CHECK-NEXT:    bfeil r2, 0, r2, 1, mask 0x1
 ; CHECK-NEXT:    icmpsel ueq, r4, r15, 0, r4, r8
 ; CHECK-NEXT:    sin_pt_2 r8, r11
-; CHECK-NEXT:    xor r15, r4, r1
-; CHECK-NEXT:    icmpsel ueq, r4, r17, 0, r4, r15
-; CHECK-NEXT:    mov_imm r17, -1108618824
-; CHECK-NEXT:    fmul32 r8, r8, r11
-; CHECK-NEXT:    fcmpsel lt, r4, u2.abs, r7, r4, r8
-; CHECK-NEXT:    fmul32 r2, r4, r2
-; CHECK-NEXT:    rint r2, r2
-; CHECK-NEXT:    fmadd32 r3, r2.neg, r3, r4
-; CHECK-NEXT:    fmadd32 r3, r2.neg, r5, r3
-; CHECK-NEXT:    fmadd32 r3, r2.neg, r6, r3
-; CHECK-NEXT:    fcmpsel lt, r2, r4.abs, r7, r2, 0
-; CHECK-NEXT:    fmul32 r5, r3, r3
-; CHECK-NEXT:    convert f_to_s32, r2, r2, rtz
-; CHECK-NEXT:    fmul32 r8, r5, r5
-; CHECK-NEXT:    fmadd32 r6, r5, r10, r9
-; CHECK-NEXT:    fmul32 r10, r4, r16
-; CHECK-NEXT:    iadd r2, r2, 1
-; CHECK-NEXT:    fadd32 r10, r10, 0.25
-; CHECK-NEXT:    fmadd32 r6, r6, r5, r12
-; CHECK-NEXT:    floor r11, r10
-; CHECK-NEXT:    fmul32 r6, r6, r5
-; CHECK-NEXT:    mov_imm r12, 1042983594
-; CHECK-NEXT:    fmadd32 r3, r6, r3, r3
-; CHECK-NEXT:    fadd32 r6, r10, r11.neg
-; CHECK-NEXT:    mov_imm r10, 1007192328
-; CHECK-NEXT:    fmul32 r6, r6, 4.0
-; CHECK-NEXT:    mov_imm r11, 1026206145
-; CHECK-NEXT:    sin_pt_1 r6, r6
-; CHECK-NEXT:    fmadd32 r9, r5, r14, r13
-; CHECK-NEXT:    mov_imm r14, 1065353216
-; CHECK-NEXT:    fmadd32 r9, r9, r5, r18
-; CHECK-NEXT:    mov_imm r18, 1032855995
-; CHECK-NEXT:    fmadd32 r5, r5, -0.5, 1.0
-; CHECK-NEXT:    fmadd32 r5, r8, r9, r5
-; CHECK-NEXT:    and r8, r2, 1
-; CHECK-NEXT:    bfeil r2, 0, r2, 1, mask 0x1
-; CHECK-NEXT:    icmpsel ueq, r3, r8, 0, r3, r5
-; CHECK-NEXT:    sin_pt_2 r5, r6
-; CHECK-NEXT:    xor r8, r3, r1
-; CHECK-NEXT:    icmpsel ueq, r2, r2, 0, r3, r8
-; CHECK-NEXT:    mov_imm r8, 961571175
-; CHECK-NEXT:    fmul32 r3, r5, r6
-; CHECK-NEXT:    mov_imm r5, 1069066811
-; CHECK-NEXT:    fcmpsel lt, r2, r4.abs, r7, r2, r3
-; CHECK-NEXT:    mov_imm r3, -1021902848
-; CHECK-NEXT:    mov_imm r4, 1124204544
-; CHECK-NEXT:    mov_imm r7, -1325210872
-; CHECK-NEXT:    fcmpsel lt, r3, r2, r3, r3, r2
-; CHECK-NEXT:    fcmpsel gt, r2, r2, r4, r4, r3
-; CHECK-NEXT:    mov_imm r3, 1060205080
-; CHECK-NEXT:    fmul32 r4, r2, r3
-; CHECK-NEXT:    fmul32 r6, r4, r5
-; CHECK-NEXT:    fmadd32 r3, r2, r3, r4.neg
-; CHECK-NEXT:    rint r6, r6
-; CHECK-NEXT:    fmadd32 r2, r2, r7, r3
-; CHECK-NEXT:    mov_imm r3, 1060208640
-; CHECK-NEXT:    mov_imm r7, -1184989053
-; CHECK-NEXT:    fmadd32 r4, r6.neg, r3, r4
-; CHECK-NEXT:    fmadd32 r4, r6.neg, r7, r4
-; CHECK-NEXT:    convert f_to_s32, r6, r6, rtz
-; CHECK-NEXT:    fadd32 r2, r4, r2
-; CHECK-NEXT:    mov_imm r4, 985088974
-; CHECK-NEXT:    fmul32 r13, r2, r2
-; CHECK-NEXT:    fmadd32 r9, r2, r8, r4
-; CHECK-NEXT:    fmadd32 r9, r9, r2, r10
-; CHECK-NEXT:    fmadd32 r9, r9, r2, r11
-; CHECK-NEXT:    fmadd32 r9, r9, r2, r12
-; CHECK-NEXT:    fmadd32 r9, r9, r2, 0.5
-; CHECK-NEXT:    fmadd32 r2, r9, r13, r2
-; CHECK-NEXT:    asr r9, r6, 1
-; CHECK-NEXT:    fadd32 r2, r2, 1.0
-; CHECK-NEXT:    bfi r13, 0, r9, 23
-; CHECK-NEXT:    isub r6, r6, r9
-; CHECK-NEXT:    bfi r6, 0, r6, 23
-; CHECK-NEXT:    iadd r9, r13, r14
-; CHECK-NEXT:    mov_imm r13, 1068827891
-; CHECK-NEXT:    fmul32 r2, r2, r9
-; CHECK-NEXT:    iadd r6, r6, r14
-; CHECK-NEXT:    fmul32 r2, r2, r6
-; CHECK-NEXT:    bfi r6, r2, 127, 23, mask 0x1FF
-; CHECK-NEXT:    bfeil r15, 0, r2, 23
-; CHECK-NEXT:    fmul32 r9, r6, 0.5
-; CHECK-NEXT:    isub r15l, r15l, 127
-; CHECK-NEXT:    fcmpsel gt, r9, r6, r13, r9, r6
-; CHECK-NEXT:    convert s16_to_f, r15, r15l, rte
-; CHECK-NEXT:    fadd32 r9, r9, -1.0
-; CHECK-NEXT:    fmadd32 r19, r9, r18, r17
-; CHECK-NEXT:    fmul32 r16, r9, r9
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r20
-; CHECK-NEXT:    fmul32 r27, r9, r16
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r21
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r22
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r23
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r24
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r25
-; CHECK-NEXT:    fmadd32 r19, r19, r9, r26
-; CHECK-NEXT:    fmul32 r19, r27, r19
-; CHECK-NEXT:    fmadd32 r16, r16, -0.5, r19
-; CHECK-NEXT:    mov_imm r19, 1001012009
-; CHECK-NEXT:    fmul32 r27, r16, r19
-; CHECK-NEXT:    fmadd32 r19, r9, r19, r27
-; CHECK-NEXT:    fadd32 r27, r15, 1.0
-; CHECK-NEXT:    fmadd32 r16, r16, 1.4375, r19
-; CHECK-NEXT:    fcmpsel gt, r6, r6, r13, r27, r15
-; CHECK-NEXT:    fmadd32 r9, r9, 1.4375, r16
-; CHECK-NEXT:    mov_imm r15, -8388608
-; CHECK-NEXT:    mov_imm r16, 2143289344
-; CHECK-NEXT:    fmadd32 r9, r6, 0.0, r9
-; CHECK-NEXT:    fadd32 r6, r6, r9
-; CHECK-NEXT:    mov_imm r9, 2139095040
-; CHECK-NEXT:    fcmpsel eq, r6, r2, r9, r2, r6
-; CHECK-NEXT:    fcmpsel eq, r6, r2, 0.0, r15, r6
-; CHECK-NEXT:    fcmpsel gte, r2, r2, 0.0, r6, r16
-; CHECK-NEXT:    mov_imm r6, 2147483647
-; CHECK-NEXT:    and r6, r2, r6
-; CHECK-NEXT:    bfi r19, r6, 127, 23, mask 0x1FF
-; CHECK-NEXT:    fmul32 r27, r19, 0.5
-; CHECK-NEXT:    fcmpsel gt, r27, r19, r13, r27, r19
-; CHECK-NEXT:    fadd32 r27, r27, -1.0
-; CHECK-NEXT:    fmadd32 r17, r27, r18, r17
-; CHECK-NEXT:    bfeil r18, 0, r6, 23
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r20
-; CHECK-NEXT:    fmul32 r20, r27, r27
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r21
-; CHECK-NEXT:    isub r18l, r18l, 127
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r22
-; CHECK-NEXT:    convert s16_to_f, r18, r18l, rte
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r23
-; CHECK-NEXT:    fmul32 r21, r27, r20
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r24
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r25
-; CHECK-NEXT:    fmadd32 r17, r17, r27, r26
-; CHECK-NEXT:    fmul32 r17, r21, r17
-; CHECK-NEXT:    fadd32 r21, r18, 1.0
-; CHECK-NEXT:    fmadd32 r17, r20, -0.5, r17
-; CHECK-NEXT:    fcmpsel gt, r13, r19, r13, r21, r18
-; CHECK-NEXT:    fadd32 r18, r27, r17
-; CHECK-NEXT:    fmul32 r19, r13, r3
-; CHECK-NEXT:    fadd32 r20, r18, r27.neg
-; CHECK-NEXT:    fadd32 r21, r19, r18
-; CHECK-NEXT:    fadd32 r22, r18, r20.neg
-; CHECK-NEXT:    fadd32 r23, r21, r19.neg
-; CHECK-NEXT:    fadd32 r22, r27, r22.neg
-; CHECK-NEXT:    fadd32 r24, r21, r23.neg
-; CHECK-NEXT:    fadd32 r18, r18, r23.neg
-; CHECK-NEXT:    fadd32 r19, r19, r24.neg
-; CHECK-NEXT:    fadd32 r17, r17, r20.neg
-; CHECK-NEXT:    fadd32 r18, r19, r18
-; CHECK-NEXT:    fmul32 r19, u3, r21
-; CHECK-NEXT:    mov_imm r20, -1026555904
-; CHECK-NEXT:    fadd32 r17, r22, r17
-; CHECK-NEXT:    mov_imm r23, 1118961664
-; CHECK-NEXT:    fadd32 r17, r17, r18
-; CHECK-NEXT:    fmul32 r13, r13, r7
-; CHECK-NEXT:    fcmpsel lt, r22, r19, r20, r20, r19
-; CHECK-NEXT:    fadd32 r13, r17, r13
-; CHECK-NEXT:    fcmpsel gt, r22, r19, r23, r23, r22
-; CHECK-NEXT:    fmadd32 r17, u3, r21, r19.neg
-; CHECK-NEXT:    fmul32 r5, r22, r5
-; CHECK-NEXT:    fmadd32 r13, u3, r13, r17
+; CHECK-NEXT:    mov_imm r15, -2147483648
+; CHECK-NEXT:    xor r17, r4, r15
+; CHECK-NEXT:    icmpsel ueq, r2, r2, 0, r4, r17
+; CHECK-NEXT:    fmul32 r4, r8, r11
+; CHECK-NEXT:    mov_imm r11, 1042983594
+; CHECK-NEXT:    mov_imm r17, 1068827891
+; CHECK-NEXT:    fcmpsel lt, r2, u2.abs, r7, r2, r4
+; CHECK-NEXT:    fmul32 r1, r2, r1
+; CHECK-NEXT:    rint r1, r1
+; CHECK-NEXT:    fmadd32 r3, r1.neg, r3, r2
+; CHECK-NEXT:    fmadd32 r3, r1.neg, r5, r3
+; CHECK-NEXT:    fmadd32 r3, r1.neg, r6, r3
+; CHECK-NEXT:    fcmpsel lt, r1, r2.abs, r7, r1, 0
+; CHECK-NEXT:    fmul32 r4, r3, r3
+; CHECK-NEXT:    convert f_to_s32, r1, r1, rtz
+; CHECK-NEXT:    fmul32 r6, r4, r4
+; CHECK-NEXT:    fmadd32 r5, r4, r10, r9
+; CHECK-NEXT:    fmul32 r9, r2, r16
+; CHECK-NEXT:    iadd r1, r1, 1
+; CHECK-NEXT:    fadd32 r9, r9, 0.25
+; CHECK-NEXT:    mov_imm r16, 8388608
+; CHECK-NEXT:    floor r10, r9
+; CHECK-NEXT:    fmadd32 r5, r5, r4, r12
+; CHECK-NEXT:    fmadd32 r8, r4, r14, r13
+; CHECK-NEXT:    fmul32 r5, r5, r4
+; CHECK-NEXT:    mov_imm r14, 0
+; CHECK-NEXT:    fmadd32 r3, r5, r3, r3
+; CHECK-NEXT:    fadd32 r5, r9, r10.neg
+; CHECK-NEXT:    mov_imm r9, 1007192328
+; CHECK-NEXT:    fmul32 r5, r5, 4.0
+; CHECK-NEXT:    mov_imm r10, 1026206145
+; CHECK-NEXT:    sin_pt_1 r5, r5
+; CHECK-NEXT:    fmadd32 r8, r8, r4, r18
+; CHECK-NEXT:    fmadd32 r4, r4, -0.5, 1.0
+; CHECK-NEXT:    fmadd32 r4, r6, r8, r4
+; CHECK-NEXT:    and r6, r1, 1
+; CHECK-NEXT:    bfeil r1, 0, r1, 1, mask 0x1
+; CHECK-NEXT:    icmpsel ueq, r3, r6, 0, r3, r4
+; CHECK-NEXT:    sin_pt_2 r4, r5
+; CHECK-NEXT:    xor r6, r3, r15
+; CHECK-NEXT:    icmpsel ueq, r1, r1, 0, r3, r6
+; CHECK-NEXT:    mov_imm r6, -1325210872
+; CHECK-NEXT:    fmul32 r3, r4, r5
+; CHECK-NEXT:    mov_imm r4, 1069066811
+; CHECK-NEXT:    fcmpsel lt, r1, r2.abs, r7, r1, r3
+; CHECK-NEXT:    mov_imm r2, -1021902848
+; CHECK-NEXT:    mov_imm r3, 1124073472
+; CHECK-NEXT:    mov_imm r7, 961571175
+; CHECK-NEXT:    fcmpsel lt, r2, r1, r2, r2, r1
+; CHECK-NEXT:    fcmpsel gt, r1, r1, r3, r3, r2
+; CHECK-NEXT:    mov_imm r2, 1060205080
+; CHECK-NEXT:    fmul32 r3, r1, r2
+; CHECK-NEXT:    fmul32 r5, r3, r4
+; CHECK-NEXT:    fmadd32 r2, r1, r2, r3.neg
 ; CHECK-NEXT:    rint r5, r5
-; CHECK-NEXT:    fmadd32 r3, r5.neg, r3, r22
-; CHECK-NEXT:    fmadd32 r3, r5.neg, r7, r3
+; CHECK-NEXT:    fmadd32 r1, r1, r6, r2
+; CHECK-NEXT:    mov_imm r2, 1060208640
+; CHECK-NEXT:    mov_imm r6, -1184989053
+; CHECK-NEXT:    fmadd32 r3, r5.neg, r2, r3
+; CHECK-NEXT:    fmadd32 r3, r5.neg, r6, r3
 ; CHECK-NEXT:    convert f_to_s32, r5, r5, rtz
-; CHECK-NEXT:    fadd32 r3, r3, r13
-; CHECK-NEXT:    fmul32 r7, r3, r3
-; CHECK-NEXT:    fmadd32 r4, r3, r8, r4
-; CHECK-NEXT:    asr r8, r5, 1
-; CHECK-NEXT:    fmadd32 r4, r4, r3, r10
-; CHECK-NEXT:    isub r5, r5, r8
-; CHECK-NEXT:    fmadd32 r4, r4, r3, r11
+; CHECK-NEXT:    fadd32 r1, r3, r1
+; CHECK-NEXT:    mov_imm r3, 985088974
 ; CHECK-NEXT:    bfi r5, 0, r5, 23
-; CHECK-NEXT:    fmadd32 r4, r4, r3, r12
-; CHECK-NEXT:    iadd r5, r5, r14
-; CHECK-NEXT:    fmadd32 r4, r4, r3, 0.5
-; CHECK-NEXT:    fmadd32 r3, r4, r7, r3
-; CHECK-NEXT:    bfi r4, 0, r8, 23
-; CHECK-NEXT:    trunc r7, u3
-; CHECK-NEXT:    fadd32 r3, r3, 1.0
-; CHECK-NEXT:    iadd r4, r4, r14
-; CHECK-NEXT:    fmul32 r3, r3, r4
-; CHECK-NEXT:    fcmpsel eq, r4, r2.abs, r9, r6, r21
-; CHECK-NEXT:    fmul32 r3, r3, r5
-; CHECK-NEXT:    fcmpsel eq, r4, r2.abs, 0.0, r15, r4
-; CHECK-NEXT:    fmul32 r6, u3, 0.5
-; CHECK-NEXT:    fcmpsel gte, r4, r2.abs, 0.0, r4, r16
-; CHECK-NEXT:    fcmpsel lt, r3, r19, r20, 0, r3
-; CHECK-NEXT:    fmul32 r4, u3, r4
-; CHECK-NEXT:    fcmpsel gt, r3, r19, r23, r9, r3
-; CHECK-NEXT:    fcmpsel gt, r5, r4, 0.0, r9, 0
-; CHECK-NEXT:    fcmpsel eq, r3, r4.abs, r9, r5, r3
-; CHECK-NEXT:    trunc r4, r6
-; CHECK-NEXT:    xor r5, r3, r1
-; CHECK-NEXT:    and r1, r2, r1
-; CHECK-NEXT:    fcmpsel lt, r8, r4, r6, r5, r3
-; CHECK-NEXT:    or r1, r1, r14
-; CHECK-NEXT:    fcmpsel gt, r4, r4, r6, r5, r8
-; CHECK-NEXT:    fcmpsel eq, r4, r7, u3, r4, r3
-; CHECK-NEXT:    fcmpsel lt, r1, r1, 0.0, r4, r3
-; CHECK-NEXT:    fcmpsel eq, r3, r7, u3, r1, r16
-; CHECK-NEXT:    fcmpsel lt, r3, u3.abs, r9, r3, r1
-; CHECK-NEXT:    fcmpsel gt, r3, r2, r15, r3, r1
-; CHECK-NEXT:    fcmpsel lt, r1, r2, 0.0, r3, r1
-; CHECK-NEXT:    fcmpsel lt, r3, u3.abs, r9, r1, r14
-; CHECK-NEXT:    fcmpsel eq, r1, r2.abs, 1.0, r3, r1
+; CHECK-NEXT:    fmul32 r12, r1, r1
+; CHECK-NEXT:    fmadd32 r8, r1, r7, r3
+; CHECK-NEXT:    fmadd32 r8, r8, r1, r9
+; CHECK-NEXT:    fmadd32 r8, r8, r1, r10
+; CHECK-NEXT:    fmadd32 r8, r8, r1, r11
+; CHECK-NEXT:    fmadd32 r8, r8, r1, 0.5
+; CHECK-NEXT:    fmadd32 r1, r8, r12, r1
+; CHECK-NEXT:    mov_imm r8, 2139095040
+; CHECK-NEXT:    fadd32 r1, r1, 1.0
+; CHECK-NEXT:    mov_imm r12, 2139095039
+; CHECK-NEXT:    iadd r5, r1, r5
+; CHECK-NEXT:    icmpsel sgt, r13, r5, r12, r8, r5
+; CHECK-NEXT:    icmpsel slt, r5, r5, r16, r14, r13
+; CHECK-NEXT:    fcmpsel eq, r1, r1, r1, r5, r1
+; CHECK-NEXT:    bfi r5, r1, 127, 23, mask 0x1FF
+; CHECK-NEXT:    bfeil r18, 0, r1, 23
+; CHECK-NEXT:    fmul32 r13, r5, 0.5
+; CHECK-NEXT:    isub r18l, r18l, 127
+; CHECK-NEXT:    fcmpsel gt, r13, r5, r17, r13, r5
+; CHECK-NEXT:    convert s16_to_f, r18, r18l, rte
+; CHECK-NEXT:    fadd32 r13, r13, -1.0
+; CHECK-NEXT:    fmul32 r19, r13, r13
+; CHECK-NEXT:    fmadd32 r22, r13, r21, r20
+; CHECK-NEXT:    fmul32 r30, r13, r19
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r23
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r24
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r25
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r26
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r27
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r28
+; CHECK-NEXT:    fmadd32 r22, r22, r13, r29
+; CHECK-NEXT:    fmul32 r22, r30, r22
+; CHECK-NEXT:    fmadd32 r19, r19, -0.5, r22
+; CHECK-NEXT:    mov_imm r22, 1001012009
+; CHECK-NEXT:    fmul32 r30, r19, r22
+; CHECK-NEXT:    fmadd32 r22, r13, r22, r30
+; CHECK-NEXT:    fadd32 r30, r18, 1.0
+; CHECK-NEXT:    fmadd32 r19, r19, 1.4375, r22
+; CHECK-NEXT:    fcmpsel gt, r5, r5, r17, r30, r18
+; CHECK-NEXT:    mov_imm r18, 2143289344
+; CHECK-NEXT:    fmadd32 r13, r13, 1.4375, r19
+; CHECK-NEXT:    fmadd32 r13, r5, 0.0, r13
+; CHECK-NEXT:    fadd32 r5, r5, r13
+; CHECK-NEXT:    mov_imm r13, -8388608
+; CHECK-NEXT:    fcmpsel eq, r5, r1, r8, r1, r5
+; CHECK-NEXT:    fcmpsel eq, r5, r1, 0.0, r13, r5
+; CHECK-NEXT:    fcmpsel gte, r1, r1, 0.0, r5, r18
+; CHECK-NEXT:    mov_imm r5, 2147483647
+; CHECK-NEXT:    and r5, r1, r5
+; CHECK-NEXT:    bfi r19, r5, 127, 23, mask 0x1FF
+; CHECK-NEXT:    fmul32 r22, r19, 0.5
+; CHECK-NEXT:    fcmpsel gt, r22, r19, r17, r22, r19
+; CHECK-NEXT:    fadd32 r22, r22, -1.0
+; CHECK-NEXT:    fmadd32 r20, r22, r21, r20
+; CHECK-NEXT:    bfeil r21, 0, r5, 23
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r23
+; CHECK-NEXT:    fmul32 r23, r22, r22
+; CHECK-NEXT:    isub r21l, r21l, 127
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r24
+; CHECK-NEXT:    convert s16_to_f, r21, r21l, rte
+; CHECK-NEXT:    fmul32 r24, r22, r23
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r25
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r26
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r27
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r28
+; CHECK-NEXT:    fmadd32 r20, r20, r22, r29
+; CHECK-NEXT:    fmul32 r20, r24, r20
+; CHECK-NEXT:    fadd32 r24, r21, 1.0
+; CHECK-NEXT:    fmadd32 r20, r23, -0.5, r20
+; CHECK-NEXT:    fcmpsel gt, r17, r19, r17, r24, r21
+; CHECK-NEXT:    fadd32 r19, r22, r20
+; CHECK-NEXT:    fmul32 r21, r17, r2
+; CHECK-NEXT:    fadd32 r23, r19, r22.neg
+; CHECK-NEXT:    fadd32 r24, r21, r19
+; CHECK-NEXT:    fadd32 r25, r19, r23.neg
+; CHECK-NEXT:    fadd32 r26, r24, r21.neg
+; CHECK-NEXT:    fadd32 r22, r22, r25.neg
+; CHECK-NEXT:    fadd32 r25, r24, r26.neg
+; CHECK-NEXT:    fadd32 r19, r19, r26.neg
+; CHECK-NEXT:    fadd32 r21, r21, r25.neg
+; CHECK-NEXT:    fadd32 r20, r20, r23.neg
+; CHECK-NEXT:    fadd32 r19, r21, r19
+; CHECK-NEXT:    fmul32 r21, u3, r24
+; CHECK-NEXT:    fadd32 r20, r22, r20
+; CHECK-NEXT:    mov_imm r22, -1026555904
+; CHECK-NEXT:    mov_imm r25, 1118961664
+; CHECK-NEXT:    fadd32 r19, r20, r19
+; CHECK-NEXT:    fmul32 r17, r17, r6
+; CHECK-NEXT:    fcmpsel lt, r23, r21, r22, r22, r21
+; CHECK-NEXT:    fadd32 r17, r19, r17
+; CHECK-NEXT:    fcmpsel gt, r23, r21, r25, r25, r23
+; CHECK-NEXT:    fmadd32 r19, u3, r24, r21.neg
+; CHECK-NEXT:    fmul32 r4, r23, r4
+; CHECK-NEXT:    fmadd32 r17, u3, r17, r19
+; CHECK-NEXT:    rint r4, r4
+; CHECK-NEXT:    fcmpsel eq, r5, r1.abs, r8, r5, r24
+; CHECK-NEXT:    fmadd32 r2, r4.neg, r2, r23
+; CHECK-NEXT:    fmadd32 r2, r4.neg, r6, r2
+; CHECK-NEXT:    convert f_to_s32, r4, r4, rtz
+; CHECK-NEXT:    fadd32 r2, r2, r17
+; CHECK-NEXT:    fmul32 r6, r2, r2
+; CHECK-NEXT:    fmadd32 r3, r2, r7, r3
+; CHECK-NEXT:    and r7, r1, r15
+; CHECK-NEXT:    fmadd32 r3, r3, r2, r9
+; CHECK-NEXT:    fmadd32 r3, r3, r2, r10
+; CHECK-NEXT:    mov_imm r10, 1065353216
+; CHECK-NEXT:    fmadd32 r3, r3, r2, r11
+; CHECK-NEXT:    fmadd32 r3, r3, r2, 0.5
+; CHECK-NEXT:    fmadd32 r2, r3, r6, r2
+; CHECK-NEXT:    bfi r3, 0, r4, 23
+; CHECK-NEXT:    fadd32 r2, r2, 1.0
+; CHECK-NEXT:    iadd r3, r2, r3
+; CHECK-NEXT:    icmpsel sgt, r4, r3, r12, r8, r3
+; CHECK-NEXT:    icmpsel slt, r3, r3, r16, r14, r4
+; CHECK-NEXT:    fcmpsel eq, r4, r1.abs, 0.0, r13, r5
+; CHECK-NEXT:    fcmpsel eq, r2, r2, r2, r3, r2
+; CHECK-NEXT:    fcmpsel gte, r3, r1.abs, 0.0, r4, r18
+; CHECK-NEXT:    fcmpsel lt, r2, r21, r22, 0, r2
+; CHECK-NEXT:    fmul32 r3, u3, r3
+; CHECK-NEXT:    fcmpsel gt, r2, r21, r25, r8, r2
+; CHECK-NEXT:    fcmpsel gt, r4, r3, 0.0, r8, 0
+; CHECK-NEXT:    fcmpsel eq, r2, r3.abs, r8, r4, r2
+; CHECK-NEXT:    trunc r4, u3
+; CHECK-NEXT:    fmul32 r3, u3, 0.5
+; CHECK-NEXT:    xor r6, r2, r15
+; CHECK-NEXT:    trunc r5, r3
+; CHECK-NEXT:    fcmpsel lt, r9, r5, r3, r6, r2
+; CHECK-NEXT:    fcmpsel gt, r3, r5, r3, r6, r9
+; CHECK-NEXT:    or r5, r7, r10
+; CHECK-NEXT:    fcmpsel eq, r3, r4, u3, r3, r2
+; CHECK-NEXT:    fcmpsel lt, r2, r5, 0.0, r3, r2
+; CHECK-NEXT:    fcmpsel eq, r3, r4, u3, r2, r18
+; CHECK-NEXT:    fcmpsel lt, r3, u3.abs, r8, r3, r2
+; CHECK-NEXT:    fcmpsel gt, r3, r1, r13, r3, r2
+; CHECK-NEXT:    fcmpsel lt, r2, r1, 0.0, r3, r2
+; CHECK-NEXT:    fcmpsel lt, r3, u3.abs, r8, r2, r10
+; CHECK-NEXT:    fcmpsel eq, r2, r1.abs, 1.0, r3, r2
 ; CHECK-NEXT:    mov_imm r3, 394264576
-; CHECK-NEXT:    fcmpsel eq, r1, u3, u3, r1, r16
-; CHECK-NEXT:    fcmpsel eq, r1, r2, r2, r1, r16
-; CHECK-NEXT:    fcmpsel eq, r1, r2, 1.0, r14, r1
+; CHECK-NEXT:    fcmpsel eq, r2, u3, u3, r2, r18
+; CHECK-NEXT:    fcmpsel eq, r2, r1, r1, r2, r18
+; CHECK-NEXT:    fcmpsel eq, r1, r1, 1.0, r10, r2
 ; CHECK-NEXT:    mov_imm r2, 1602224128
-; CHECK-NEXT:    fcmpsel eq, r1, u3, 0.0, r14, r1
+; CHECK-NEXT:    fcmpsel eq, r1, u3, 0.0, r10, r1
 ; CHECK-NEXT:    fmul32 r2, r1, r2
 ; CHECK-NEXT:    fcmpsel lt, r2, r1, r3, r2, r1
 ; CHECK-NEXT:    rsqrt_special r4, r2
