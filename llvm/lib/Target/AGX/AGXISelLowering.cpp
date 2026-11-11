@@ -209,7 +209,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                       ISD::FEXP10, ISD::FLOG, ISD::FLOG10, ISD::FPOW},
                      MVT::f32, Custom);
   setOperationAction(ISD::FDIV, MVT::f16, Custom);
-  setOperationAction(ISD::FSQRT, MVT::f32, Custom);
+  setOperationAction(ISD::FSQRT, {MVT::f32, MVT::f16}, Custom);
   setOperationAction({ISD::FREM, ISD::FSIN, ISD::FCOS, ISD::FEXP, ISD::FEXP10,
                       ISD::FLOG, ISD::FLOG10, ISD::FPOW},
                      MVT::f16, Promote);
@@ -2419,6 +2419,27 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
 /// scaled by 2^64 first. +-0 gives +-0, and the NaN of +inf's remainder
 /// (s0 = inf), negative values and NaNs are s0.
 SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
+  if (Op.getValueType() == MVT::f16 && !Op->getFlags().hasApproximateFuncs() &&
+      PreciseHalfDiv) {
+    // Correctly rounded: x rsqrt_special(x) in half is an ulp off for 8,520
+    // of the 65,536 halves (simulator). The float square root below, rounded
+    // to half, is the correctly rounded half one (float has the 2 * 11 + 2
+    // bits for which the double rounding is exact).
+    // A half is never below the 2^-80 that the float path scales first.
+    SDLoc DL(Op);
+    const MVT VT = MVT::f32;
+    SDValue X = DAG.getNode(ISD::FP_EXTEND, DL, VT, Op.getOperand(0));
+    EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
+    SDValue Y = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rsqrt_special, VT, X);
+    SDValue S0 = DAG.getNode(ISD::FMUL, DL, VT, X, Y);
+    SDValue H = DAG.getNode(ISD::FMUL, DL, VT, Y, DAG.getConstantFP(0.5, DL, VT));
+    SDValue Rem = DAG.getNode(ISD::FMA, DL, VT,
+                              DAG.getNode(ISD::FNEG, DL, VT, S0), S0, X);
+    SDValue S = DAG.getNode(ISD::FMA, DL, VT, Rem, H, S0);
+    S = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, S, S, ISD::SETUO), S0, S);
+    return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, S,
+                       DAG.getTargetConstant(0, DL, MVT::i32));
+  }
   if (Op.getValueType() != MVT::f32 || Op->getFlags().hasApproximateFuncs())
     return Op;
   SDLoc DL(Op);

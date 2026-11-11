@@ -25,3 +25,17 @@ define agx_kernel void @hdiv_arcp(ptr addrspace(1) %p, half %a, half %b) {
   store half %r, ptr addrspace(1) %p
   ret void
 }
+
+; half sqrt without afn likewise: the float steps (x y, the remainder's
+; correction, y = rsqrt_special(x)) rounded to half; x rsqrt_special(x) in
+; half was an ulp off for 8,520 of the 65,536 halves.
+; CHECK-LABEL: hsqrt:
+; CHECK: rsqrt_special [[Y:r[0-9]+]], [[X:r[0-9]+]]
+; CHECK: fmadd32
+; CHECK: fadd32 {{r[0-9]+l}}, {{r[0-9]+}}, -0.0
+define agx_kernel void @hsqrt(ptr addrspace(1) %p, half %a) {
+  %r = call half @llvm.sqrt.f16(half %a)
+  store half %r, ptr addrspace(1) %p
+  ret void
+}
+declare half @llvm.sqrt.f16(half)
