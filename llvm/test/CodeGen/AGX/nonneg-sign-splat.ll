@@ -3,7 +3,9 @@
 
 ; l starts at a thread position and steps up by 256 without signed overflow:
 ; with the special register bounds it is never negative, so the corrections
-; of l / 16 and l % 16 (l >> 31) are 0: a shift and a mask.
+; of l / 16 and l % 16 (l >> 31) are 0: a shift and a mask (L15-E158). The
+; exit test l < 768 is of l + 256 < 1024, which cannot overflow, so l and
+; l + 256 share a register (L15-E159).
 
 declare i32 @llvm.agx.thread.position.in.threadgroup.x()
 
@@ -15,28 +17,27 @@ define agx_kernel void @tile(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0: // %entry
 ; CHECK-NEXT:    mov_imm r0l, 0
-; CHECK-NEXT:    get_sr r8, sr48 (thread_position_in_threadgroup.x)
+; CHECK-NEXT:    get_sr r1, sr48 (thread_position_in_threadgroup.x)
 ; CHECK-NEXT:    bitop 0101, r2, u2, 0
 ; CHECK-NEXT:    bitop 0101, r3, u3, 0
 ; CHECK-NEXT:    bitop 0101, r4, u0, 0
 ; CHECK-NEXT:    bitop 0101, r5, u1, 0
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r8, lsl 2
-; CHECK-NEXT:    iadd r4_r5, r4_r5, r8, lsl 2
-; CHECK-NEXT:    mov_imm r1, 1024
-; CHECK-NEXT:    mov_imm r6, 767
-; CHECK-NEXT:    mov_imm r7, 256
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r1, lsl 2
+; CHECK-NEXT:    iadd r4_r5, r4_r5, r1, lsl 2
+; CHECK-NEXT:    mov_imm r6, 256
+; CHECK-NEXT:    mov_imm r7, 1024
+; CHECK-NEXT:    mov_imm r8, 1023
 ; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
 ; CHECK-NEXT:  .LBB0_1: // %loop
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
-; CHECK-NEXT:    bitop 0101, r9, r8, 0
-; CHECK-NEXT:    asr r8, r8, 4
-; CHECK-NEXT:    and r10, r9, 15
-; CHECK-NEXT:    device_store 0, i32, x, r8, r4_r5, 0, signed
+; CHECK-NEXT:    asr r9, r1, 4
+; CHECK-NEXT:    and r10, r1, 15
+; CHECK-NEXT:    iadd r1, r1, r6
+; CHECK-NEXT:    device_store 0, i32, x, r9, r4_r5, 0, signed
 ; CHECK-NEXT:    device_store 0, i32, x, r10, r2_r3, 0, signed
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1
-; CHECK-NEXT:    iadd r4_r5, r4_r5, r1
-; CHECK-NEXT:    iadd r8, r9, r7
-; CHECK-NEXT:    while_icmp r0l, slte, r9, r6, 1
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r7
+; CHECK-NEXT:    iadd r4_r5, r4_r5, r7
+; CHECK-NEXT:    while_icmp r0l, slte, r1, r8, 1
 ; CHECK-NEXT:    jmp_exec_any .LBB0_1
 ; CHECK-NEXT:  // %bb.2: // %done
 ; CHECK-NEXT:    pop_exec r0l, 1

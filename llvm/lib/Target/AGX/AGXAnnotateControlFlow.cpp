@@ -27,7 +27,11 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -47,6 +51,11 @@ using namespace llvm;
 static cl::opt<bool> AGXWidenBooleanPhis(
     "agx-widen-boolean-phis", cl::init(true), cl::Hidden,
     cl::desc("Booleans live across blocks as i32 phis (32-bit registers)"));
+
+static cl::opt<bool> AGXPostIncrementCompares(
+    "agx-post-increment-compares", cl::init(true), cl::Hidden,
+    cl::desc("A loop's compare of its index i with a constant as a compare "
+             "of i + c, where i + c cannot overflow"));
 
 static cl::opt<bool> AGXSinkLoopCarriedDefs(
     "agx-sink-loop-carried-defs", cl::init(true), cl::Hidden,
@@ -81,6 +90,7 @@ class AGXAnnotateControlFlowImpl {
   bool layoutBlocks();
   bool widenBooleanPhis();
   bool sinkLoopCarriedDefs();
+  bool postIncrementCompares();
 
   CallInst *createCall(IRBuilder<> &IRB, Intrinsic::ID ID,
                        ArrayRef<Value *> Args = {}) {
@@ -225,7 +235,8 @@ bool AGXAnnotateControlFlowImpl::closeControlFlow(BasicBlock *BB) {
 }
 
 bool AGXAnnotateControlFlowImpl::run() {
-  bool Changed = AGXSinkLoopCarriedDefs && sinkLoopCarriedDefs();
+  bool Changed = AGXPostIncrementCompares && postIncrementCompares();
+  Changed |= AGXSinkLoopCarriedDefs && sinkLoopCarriedDefs();
   prepareLoops();
 
   for (df_iterator<BasicBlock *> I = df_begin(&F.getEntryBlock()),
@@ -267,6 +278,60 @@ bool AGXAnnotateControlFlowImpl::run() {
   Changed |= layoutBlocks();
   if (AGXWidenBooleanPhis)
     Changed |= widenBooleanPhis();
+  return Changed;
+}
+
+/// A loop's index i stepping i' = i + c, compared with a constant k
+/// (InstCombine's form of i' < k + c: i < k), keeps i live to the compare at
+/// the end of the iteration next to i', and its register takes a copy of i'
+/// each iteration. Where the signed range of i (scalar evolution, with the
+/// special register bounds) shows that i + c and k + c do not overflow, the
+/// compare is of i' with k + c, the same for every i, and i' is never
+/// poison.
+bool AGXAnnotateControlFlowImpl::postIncrementCompares() {
+  using namespace PatternMatch;
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  std::optional<ScalarEvolution> SE;
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder())
+    for (PHINode &HP : L->getHeader()->phis()) {
+      if (!HP.getType()->isIntegerTy())
+        continue;
+      for (unsigned I = 0, E = HP.getNumIncomingValues(); I != E; ++I) {
+        if (!L->contains(HP.getIncomingBlock(I)))
+          continue;
+        auto *Def = dyn_cast<BinaryOperator>(HP.getIncomingValue(I));
+        const APInt *C;
+        if (!Def || !match(Def, m_Add(m_Specific(&HP), m_APInt(C))))
+          continue;
+        for (User *U : make_early_inc_range(HP.users())) {
+          auto *Cmp = dyn_cast<ICmpInst>(U);
+          const APInt *K;
+          if (!Cmp || Cmp->getParent() != Def->getParent() ||
+              Cmp->getOperand(0) != &HP ||
+              !match(Cmp->getOperand(1), m_APInt(K)) ||
+              !(Cmp->isSigned() || Cmp->isEquality()))
+            continue;
+          if (!SE)
+            SE.emplace(F, TLI, AC, DT, LI);
+          ConstantRange R = SE->getSignedRange(SE->getSCEV(&HP));
+          bool Ov;
+          APInt K2 = K->sadd_ov(*C, Ov);
+          if (Ov || R.signedAddMayOverflow(ConstantRange(*C)) !=
+                        ConstantRange::OverflowResult::NeverOverflows)
+            continue;
+          if (Cmp->comesBefore(Def))
+            Def->moveBefore(Cmp->getIterator());
+          Cmp->setOperand(0, Def);
+          Cmp->setOperand(1, ConstantInt::get(Cmp->getContext(), K2));
+          Changed = true;
+        }
+      }
+    }
+  if (SE && Changed)
+    SE->forgetAllLoops();
   return Changed;
 }
 
