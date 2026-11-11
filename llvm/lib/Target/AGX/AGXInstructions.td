@@ -2020,13 +2020,15 @@ multiclass AGXAtomicPats<SDPatternOperator node, int op> {
   def _device_noret : AtomicNoRetFrag<node, i32>;
 
   let AddedComplexity = 10 in
-  def : Pat<(i32 (!cast<PatFrag>(NAME#"_device_noret") i64:$ptr, i32:$val)),
-            (DEVICE_ATOMIC_NORET op, 0, $ptr, (i32 0), 0, $val, 0)>;
+  def : Pat<(i32 (!cast<PatFrag>(NAME#"_device_noret")
+                     (AGXAtomicAddr i64:$base, i32:$idx, i32:$sgn), i32:$val)),
+            (DEVICE_ATOMIC_NORET op, 0, $base, $idx, $sgn, $val, 0)>;
 
-  // Atomics take the full address in the base register; the element index
-  // is always zero.
-  def : Pat<(i32 (!cast<PatFrag>(NAME#"_device") i64:$ptr, i32:$val)),
-            (DEVICE_ATOMIC op, 0, $ptr, (i32 0), 0, $val, 0)>;
+  // The base and an unsigned index register, or the full address in the
+  // base register (AGXAtomicAddr).
+  def : Pat<(i32 (!cast<PatFrag>(NAME#"_device")
+                     (AGXAtomicAddr i64:$base, i32:$idx, i32:$sgn), i32:$val)),
+            (DEVICE_ATOMIC op, 0, $base, $idx, $sgn, $val, 0)>;
   def : Pat<(i32 (!cast<PatFrag>(NAME#"_local") i32:$ptr, i32:$val)),
             (LOCAL_ATOMIC op, (EXTRACT_SUBREG $ptr, lo16), (i16 0), $val)>;
 }
@@ -2097,8 +2099,9 @@ def : Pat<(i64 (agx_atomic_umax64_noret i64:$ptr, i64:$val)),
 def agx_cmpxchg_device : AtomicCmpSwapFrag<DeviceAS>;
 def agx_cmpxchg_local : AtomicCmpSwapFrag<LocalAS>;
 
-def : Pat<(i32 (agx_cmpxchg_device i64:$ptr, i32:$cmp, i32:$new)),
-          (DEVICE_ATOMIC_CMPXCHG AOP_CMPXCHG, 0, $ptr, (i32 0), 0,
+def : Pat<(i32 (agx_cmpxchg_device (AGXAtomicAddr i64:$base, i32:$idx, i32:$sgn),
+                                   i32:$cmp, i32:$new)),
+          (DEVICE_ATOMIC_CMPXCHG AOP_CMPXCHG, 0, $base, $idx, $sgn,
              (REG_SEQUENCE GPR64, $new, sub0, $cmp, sub1), 0)>;
 def : Pat<(i32 (agx_cmpxchg_local i32:$ptr, i32:$cmp, i32:$new)),
           (LOCAL_ATOMIC_CMPXCHG AOP_CMPXCHG, (EXTRACT_SUBREG $ptr, lo16),

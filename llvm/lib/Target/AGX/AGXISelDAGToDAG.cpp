@@ -18,6 +18,7 @@
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
 #include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
@@ -69,6 +70,8 @@ private:
                           SDValue &Signed, SDValue &Shift) {
     return SelectDeviceAddr(Addr, 2, Base, Index, Signed, Shift);
   }
+  bool SelectAtomicAddr(SDValue Addr, SDValue &Base, SDValue &Index,
+                        SDValue &Signed);
   bool SelectDeviceAddr32Via16(SDValue Addr, SDValue &Base, SDValue &Index,
                                SDValue &Signed, SDValue &Shift);
   bool SelectLocalAddr(SDValue Addr, SDValue &Base, SDValue &Index,
@@ -730,6 +733,34 @@ bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
 
   Base = Addr;
   Index = CurDAG->getTargetConstant(0, DL, MVT::i32);
+  return true;
+}
+
+static cl::opt<bool> AtomicIndices(
+    "agx-atomic-indices", cl::init(true), cl::Hidden,
+    cl::desc("Device atomics at base + 4 * zext(i32) take the index register"));
+
+/// Device atomics take the base and index registers as loads do (the
+/// simulator's coverage recordings on the M2 Max: atomic add, 0, r14, u8_u9,
+/// r5, unsigned, r6), the index counting 4 bytes. Only the recorded form, a
+/// zero-extended 32-bit register index unshifted; otherwise the full address
+/// in the base register (a 64-bit add and, for a uniform base, its copy to
+/// registers).
+bool AGXDAGToDAGISel::SelectAtomicAddr(SDValue Addr, SDValue &Base,
+                                       SDValue &Index, SDValue &Signed) {
+  SDLoc DL(Addr);
+  SDValue B, I, S, Sh;
+  if (AtomicIndices && SelectDeviceAddr(Addr, 2, B, I, S, Sh) && B != Addr &&
+      !isa<ConstantSDNode>(I) && cast<ConstantSDNode>(Sh)->isZero() &&
+      cast<ConstantSDNode>(S)->getZExtValue() == 1) {
+    Base = B;
+    Index = I;
+    Signed = S;
+    return true;
+  }
+  Base = Addr;
+  Index = CurDAG->getTargetConstant(0, DL, MVT::i32);
+  Signed = getI32Imm(0, DL);
   return true;
 }
 

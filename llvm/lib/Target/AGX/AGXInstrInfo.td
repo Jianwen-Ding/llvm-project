@@ -173,6 +173,9 @@ def AGXFPSrc32 : ComplexPattern<f32, 2, "SelectFPSrc", [], [], -2>;
 def AGXDeviceAddr8 : ComplexPattern<i64, 4, "SelectDeviceAddr8", [], [], -10>;
 def AGXDeviceAddr16 : ComplexPattern<i64, 4, "SelectDeviceAddr16", [], [], -10>;
 def AGXDeviceAddr32 : ComplexPattern<i64, 4, "SelectDeviceAddr32", [], [], -10>;
+// A device atomic's address: base + 4 * zext(i32) (the hardware's recorded
+// form, coverage atomic_*: an unsigned index register), else the address.
+def AGXAtomicAddr : ComplexPattern<i64, 3, "SelectAtomicAddr", [], [], -10>;
 def AGXDeviceAddr32Via16 : ComplexPattern<i64, 4, "SelectDeviceAddr32Via16", [], [], -9>;
 
 // Threadgroup memory addresses: (base, index) for an element size of 1, 2 or
