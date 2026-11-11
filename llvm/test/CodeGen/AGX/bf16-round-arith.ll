@@ -39,3 +39,19 @@ define agx_kernel void @maxbf(ptr addrspace(1) %p, <2 x bfloat> %a, <2 x bfloat>
   ret void
 }
 declare <2 x bfloat> @llvm.maximumnum.v2bf16(<2 x bfloat>, <2 x bfloat>)
+
+; An integer rounding of a bfloat is a bfloat (from 2^7 the value itself,
+; below it an integer of at most 128): its top half, no rounding, no NaN
+; test (L15-E201).
+; CHECK-LABEL: floorbf:
+; CHECK: floor
+; CHECK-NOT: fcmpsel
+; CHECK-NOT: mov_imm
+; CHECK: stop
+define agx_kernel void @floorbf(ptr addrspace(1) %p) {
+  %x = load bfloat, ptr addrspace(1) %p, align 2
+  %r = call bfloat @llvm.floor.bf16(bfloat %x)
+  store bfloat %r, ptr addrspace(1) %p, align 2
+  ret void
+}
+declare bfloat @llvm.floor.bf16(bfloat)

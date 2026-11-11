@@ -3192,6 +3192,15 @@ static bool isBF16Exact(SelectionDAG &DAG, SDValue V, unsigned Depth = 0) {
            isBF16Exact(DAG, V.getOperand(1), Depth + 1);
   case ISD::FNEG:
   case ISD::FABS:
+  // An integer rounding of a bfloat is one: from 2^7 it is the value itself,
+  // below it an integer of at most 128 (a NaN's low half stays zero).
+  case ISD::FFLOOR:
+  case ISD::FCEIL:
+  case ISD::FTRUNC:
+  case ISD::FROUND:
+  case ISD::FROUNDEVEN:
+  case ISD::FRINT:
+  case ISD::FNEARBYINT:
     return isBF16Exact(DAG, V.getOperand(0), Depth + 1);
   case ISD::FMINNUM:
   case ISD::FMAXNUM:
