@@ -2480,9 +2480,10 @@ static bool loadBytesApart(Function &F) {
   SmallVector<LoadInst *, 8> Loads;
   for (Instruction &I : instructions(F))
     if (auto *L = dyn_cast<LoadInst>(&I);
-        L && L->getType()->isIntegerTy(32) && L->isSimple() &&
-        L->getAlign() >= 4 &&
-        L->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+        L && L->isSimple() &&
+        L->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+        ((L->getType()->isIntegerTy(32) && L->getAlign() >= 4) ||
+         (L->getType()->isIntegerTy(16) && L->getAlign() >= 2)))
       Loads.push_back(L);
   bool Changed = false;
   for (LoadInst *L : Loads) {
@@ -2490,7 +2491,8 @@ static bool loadBytesApart(Function &F) {
     DenseMap<Value *, std::pair<unsigned, unsigned>> Range;
     SmallVector<Instruction *, 16> Work{L};
     SmallVector<std::pair<Instruction *, unsigned>, 8> Bytes;
-    Range[L] = {0, 32};
+    unsigned WordBits = L->getType()->getIntegerBitWidth();
+    Range[L] = {0, WordBits};
     bool OK = true;
     while (OK && !Work.empty()) {
       Instruction *V = Work.pop_back_val();
@@ -2544,7 +2546,7 @@ static bool loadBytesApart(Function &F) {
     if (!OK || Bytes.empty())
       continue;
     IRBuilder<> B(L);
-    auto *VT = FixedVectorType::get(B.getInt8Ty(), 4);
+    auto *VT = FixedVectorType::get(B.getInt8Ty(), WordBits / 8);
     LoadInst *NL = B.CreateAlignedLoad(VT, L->getPointerOperand(),
                                        L->getAlign(), L->getName() + ".bytes");
     NL->setAAMetadata(L->getAAMetadata());

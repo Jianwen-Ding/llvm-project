@@ -117,4 +117,38 @@ define agx_kernel void @signed_kept(ptr addrspace(1) %p, ptr addrspace(1) %o) {
   store i32 %r, ptr addrspace(1) %qo
   ret void
 }
+; A 16-bit word of two bytes (UV pairs): a <2 x i8> load.
+define agx_kernel void @uv(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+; CHECK-LABEL: uv:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    device_load 0, i8, xy, r2l_r2h, u0_u1, r1, signed, lsl 1
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    isub r2, r2l, r2h
+; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr i16, ptr addrspace(1) %p, i32 %t
+  %w = load i16, ptr addrspace(1) %q, align 2, !noundef !0
+  %u = and i16 %w, 255
+  %v = lshr i16 %w, 8
+  %uz = zext i16 %u to i32
+  %vz = zext i16 %v to i32
+  %d = sub i32 %uz, %vz
+  %qo = getelementptr i32, ptr addrspace(1) %o, i32 %t
+  store i32 %d, ptr addrspace(1) %qo
+  ret void
+}
 !0 = !{}
