@@ -30,6 +30,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -85,6 +86,11 @@ INITIALIZE_PASS_END(AGXNarrowInductions, DEBUG_TYPE, "AGX Narrow Inductions",
 FunctionPass *llvm::createAGXNarrowInductionsPass() {
   return new AGXNarrowInductions();
 }
+
+static cl::opt<bool> AGXNarrowBoundCompares(
+    "agx-narrow-bound-compares", cl::init(true), cl::Hidden,
+    cl::desc("A narrowed induction's compare with a 64-bit bound known to "
+             "fit 32 bits in 32 bits"));
 
 static cl::opt<bool> AGXSignedNarrowing(
     "agx-signed-narrowing", cl::init(true), cl::Hidden,
@@ -148,6 +154,29 @@ static bool narrow(PHINode &Phi, Loop &L, ScalarEvolution &SE) {
   Phi.replaceAllUsesWith(WidePhi);
   Inc->eraseFromParent();
   Phi.eraseFromParent();
+  // A compare of the zero-extended value with a 64-bit value V whose high
+  // word is known zero (a trip bound umin(n - i, 65536) computed before the
+  // loop, which instruction selection sees only as a register) is of the
+  // 32-bit values: both are in [0, 2^32), where the signed and unsigned
+  // orders agree.
+  if (Unsigned && AGXNarrowBoundCompares) {
+    const DataLayout &DL = Preheader->getModule()->getDataLayout();
+    for (auto [Wide, Narrow] : {std::pair<Value *, Value *>(WidePhi, NarrowPhi),
+                                {WideInc, NarrowInc}})
+      for (User *U : make_early_inc_range(Wide->users())) {
+        auto *C = dyn_cast<ICmpInst>(U);
+        if (!C || C->getOperand(0) != Wide || isa<Constant>(C->getOperand(1)) ||
+            !L.isLoopInvariant(C->getOperand(1)) ||
+            computeKnownBits(C->getOperand(1), DL).countMinLeadingZeros() < 32)
+          continue;
+        IRBuilder<> CB(Preheader->getTerminator());
+        Value *V = CB.CreateTrunc(C->getOperand(1), I32,
+                                  C->getOperand(1)->getName() + ".lo");
+        C->setPredicate(C->getUnsignedPredicate());
+        C->setOperand(0, Narrow);
+        C->setOperand(1, V);
+      }
+  }
   // A compare of a sign-extended value with a constant C is of the 32-bit
   // value with C where C is in [0, 2^31) (a negative value is above C
   // unsigned either way) or the predicate is signed and C in 32 bits.
