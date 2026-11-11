@@ -1370,6 +1370,15 @@ defm : DeviceStorePat<device_store, bf16, DEVICE_STORE_16, AGXDeviceAddr16, FMT_
 defm : DeviceStorePat<device_truncstorei8, i16, DEVICE_STORE_16, AGXDeviceAddr8, FMT_I8, 1>;
 defm : DeviceStorePat<device_truncstorei8, i32, DEVICE_STORE_32, AGXDeviceAddr8, FMT_I8, 1>;
 defm : DeviceStorePat<device_truncstorei16, i32, DEVICE_STORE_32, AGXDeviceAddr16, FMT_I16, 1>;
+// A 16-bit store of x >> 16 is a store of x's high half register (a float
+// rounded to bfloat, the high half of a packed pair), without the shift.
+let AddedComplexity = 1 in
+foreach Sh = [srl, sra] in
+def : Pat<(device_truncstorei16 (i32 (Sh i32:$val, (i32 16))),
+                                (AGXDeviceAddr16 i64:$base, i32:$idx, i32:$sgn,
+                                                 i32:$shift)),
+          (DEVICE_STORE_16 0, FMT_I16, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
+                           $base, $idx, $sgn, $shift)>;
 
 // System-scope atomic loads and stores of device memory (ld.acquire.sys,
 // st.release.sys) are coherent loads and stores, not atomics: device atomics
@@ -1475,6 +1484,13 @@ defm : LocalStorePat<local_store, f16, LOCAL_STORE_16, AGXLocalAddr16, FMT_I16, 
 defm : LocalStorePat<local_truncstorei8, i16, LOCAL_STORE_16, AGXLocalAddr8, FMT_I8, 1>;
 defm : LocalStorePat<local_truncstorei8, i32, LOCAL_STORE_32, AGXLocalAddr8, FMT_I8, 1>;
 defm : LocalStorePat<local_truncstorei16, i32, LOCAL_STORE_32, AGXLocalAddr16, FMT_I16, 1>;
+// As for device memory: the high half register for a 16-bit store of x >> 16.
+let AddedComplexity = 1 in
+foreach Sh = [srl, sra] in
+def : Pat<(local_truncstorei16 (i32 (Sh i32:$val, (i32 16))),
+                               (AGXLocalAddr16 i16:$base, i16:$idx)),
+          (LOCAL_STORE_16 FMT_I16, 1, (i16 (EXTRACT_SUBREG $val, hi16)),
+                          $base, $idx)>;
 
 //===----------------------------------------------------------------------===//
 // Stack memory
