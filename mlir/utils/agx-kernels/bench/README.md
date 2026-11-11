@@ -43,5 +43,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `hash` | a 32-bit hash mix: multiplies, rotates of products, an xor shift |
 | `h2` | `vector<2xf16>` accesses split into halves (2-byte alignment) and f16 arithmetic |
 | `conv3x3` | a 3 x 3 convolution, its loops fully unrolled (known grid, no loops left) |
+| `cluster_reduce` | `gpu.subgroup_reduce` over clusters of 8 and 4 lanes |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

@@ -1342,6 +1342,26 @@ struct LowerGpuOpsToAIROpsPass final
       populateGpuShufflePatterns(patterns);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
+    // A reduction over clusters of 2, 8 or 16 lanes (AIR has quad-group and
+    // SIMD-group ones, for clusters of 4 and 32, which the conversion takes):
+    // xor shuffles at 1, 2, 4, ... within each cluster (the order AIR's
+    // reductions add in), which the shuffle lowering takes to AIR.
+    {
+      SmallVector<Operation *> clustered;
+      m.walk([&](gpu::SubgroupReduceOp op) {
+        std::optional<uint32_t> size = op.getClusterSize();
+        if (size && *size != 4 && *size != 32)
+          clustered.push_back(op);
+      });
+      RewritePatternSet patterns(ctx);
+      populateGpuLowerClusteredSubgroupReduceToShufflePatterns(
+          patterns, /*subgroupSize=*/32);
+      if (!clustered.empty())
+        (void)applyOpPatternsGreedily(clustered, std::move(patterns));
+      RewritePatternSet shuffles(ctx);
+      populateGpuShufflePatterns(shuffles);
+      (void)applyPatternsGreedily(m, std::move(shuffles));
+    }
 
     LLVMTypeConverter converter(ctx, options);
     populateGpuMemorySpaceAttributeConversions(
