@@ -65,3 +65,64 @@ exit:
   store float %acc1, ptr addrspace(1) %o, align 4
   ret void
 }
+
+; 16-bit elements: the i16 format's index (base + zext(j) * 2).
+define agx_kernel void @rowsum_f16(ptr addrspace(1) %in, ptr addrspace(1) %out) {
+; CHECK-LABEL: rowsum_f16:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 8 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0: // %entry
+; CHECK-NEXT:    mov_imm r0l, 0
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    bitop 0101, r4, u0, 0
+; CHECK-NEXT:    bitop 0101, r5, u1, 0
+; CHECK-NEXT:    bfi r2, 0, r1, 9
+; CHECK-NEXT:    mov_imm r3, 0
+; CHECK-NEXT:    mov_imm r6, 512
+; CHECK-NEXT:    iadd r4_r5, r4_r5, r2, lsl 1
+; CHECK-NEXT:    mov_imm r2, 0
+; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
+; CHECK-NEXT:  .LBB1_1: // %loop
+; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
+; CHECK-NEXT:    device_load 0, i16, x, r7l, r4_r5, r3, unsigned
+; CHECK-NEXT:    iadd r3, r3, 1
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    fadd32 r2, r2, r7l
+; CHECK-NEXT:    while_icmp r0l, nueq, r3, r6, 1
+; CHECK-NEXT:    jmp_exec_any .LBB1_1
+; CHECK-NEXT:  // %bb.2: // %exit
+; CHECK-NEXT:    pop_exec r0l, 1
+; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, unsigned
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %r = shl i32 %t, 9
+  %re = zext i32 %r to i64
+  %row = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %in, i64 %re
+  br label %loop
+loop:
+  %j = phi i64 [ 0, %entry ], [ %j1, %loop ]
+  %acc = phi float [ 0.0, %entry ], [ %acc1, %loop ]
+  %p = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %row, i64 %j
+  %v = load half, ptr addrspace(1) %p, align 2
+  %e = fpext half %v to float
+  %acc1 = fadd float %acc, %e
+  %j1 = add nuw nsw i64 %j, 1
+  %done = icmp eq i64 %j1, 512
+  br i1 %done, label %exit, label %loop
+exit:
+  %te = zext i32 %t to i64
+  %o = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %out, i64 %te
+  store float %acc1, ptr addrspace(1) %o, align 4
+  ret void
+}

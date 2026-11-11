@@ -449,11 +449,12 @@ static cl::opt<bool> AGXElementIndices(
 /// Loop strength reduction counts a row walk in bytes ({0, +, 4}: LSR sees
 /// no scaled index addressing, L14-E2), and narrowing makes that offset
 /// 32-bit, zero-extended for each address: base + zext(o) is a 64-bit add
-/// before every access. Where every access is of 32-bit elements and the
-/// offset's start, step and the constants it is compared with are multiples
-/// of 4, it is 4 j for an element index j (o < 2^32, so 4 j does not wrap):
-/// j steps by s / 4, the accesses take base + zext(j) << 2 as their index,
-/// and the compares are of j with k / 4.
+/// before every access. Where every access is of elements of one size u (2
+/// or 4 bytes: 16- or 32-bit, scalars or vectors) and the offset's start,
+/// step and the constants it is compared with are multiples of u, it is u j
+/// for an element index j (o < 2^32, so u j does not wrap): j steps by
+/// s / u, the accesses take base + zext(j) * u as their index, and the
+/// compares are of j with k / u.
 static bool elementIndex(PHINode &P, Loop &L) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
@@ -463,15 +464,19 @@ static bool elementIndex(PHINode &P, Loop &L) {
   const APInt *C0, *St;
   auto *Inc = dyn_cast<BinaryOperator>(P.getIncomingValueForBlock(Latch));
   if (!match(P.getIncomingValueForBlock(Pre), m_APInt(C0)) || !Inc ||
-      !match(Inc, m_Add(m_Specific(&P), m_APInt(St))) || C0->urem(4) ||
-      St->urem(4) || St->isZero())
+      !match(Inc, m_Add(m_Specific(&P), m_APInt(St))) || St->isZero())
     return false;
+  // the accesses' element size in bytes, the same for all
+  unsigned Unit = 0;
   SmallVector<GetElementPtrInst *, 4> Geps;
   SmallVector<std::pair<ICmpInst *, bool>, 2> Cmps; // (compare, of Inc)
   SmallVector<ZExtInst *, 2> Exts;
-  auto Divisible = [](Value *V) {
+  SmallVector<ConstantInt *, 2> Ks;
+  auto Divisible = [&](Value *V) {
     auto *C = dyn_cast<ConstantInt>(V);
-    return C && C->getValue().urem(4) == 0;
+    if (C)
+      Ks.push_back(C);
+    return C != nullptr;
   };
   auto CheckUse = [&](User *U, bool OfInc, bool Extended) {
     if (auto *Z = dyn_cast<ZExtInst>(U)) {
@@ -498,8 +503,11 @@ static bool elementIndex(PHINode &P, Loop &L) {
       else if (auto *St = dyn_cast<StoreInst>(A))
         T = St->getPointerOperand() == G ? St->getValueOperand()->getType()
                                          : nullptr;
-      if (!T || T->getScalarSizeInBits() != 32)
+      unsigned E = T ? T->getScalarSizeInBits() / 8 : 0;
+      if (!T || (E != 2 && E != 4) || T->getScalarSizeInBits() % 8 ||
+          (Unit && Unit != E))
         return false;
+      Unit = E;
     }
     Geps.push_back(G);
     return true;
@@ -517,20 +525,21 @@ static bool elementIndex(PHINode &P, Loop &L) {
       if (!CheckUse(U, OfInc, true))
         return false;
   }
-  if (Geps.empty())
+  if (Geps.empty() || !Unit || C0->urem(Unit) || St->urem(Unit) ||
+      any_of(Ks, [&](ConstantInt *K) { return K->getValue().urem(Unit); }))
     return false;
   // the element index and its step
   IRBuilder<> B(&P);
   PHINode *J = B.CreatePHI(P.getType(), 2, P.getName() + ".elt");
   IRBuilder<> BI(Inc);
-  Value *JN = BI.CreateAdd(J, ConstantInt::get(P.getType(), St->udiv(4)),
+  Value *JN = BI.CreateAdd(J, ConstantInt::get(P.getType(), St->udiv(Unit)),
                            J->getName() + ".next", /*HasNUW=*/true);
-  J->addIncoming(ConstantInt::get(P.getType(), C0->udiv(4)), Pre);
+  J->addIncoming(ConstantInt::get(P.getType(), C0->udiv(Unit)), Pre);
   J->addIncoming(JN, Latch);
   for (GetElementPtrInst *G : Geps) {
     IRBuilder<> BG(G);
     Value *Z = BG.CreateZExt(J, G->getOperand(1)->getType());
-    Value *N = BG.CreateGEP(BG.getInt32Ty(), G->getPointerOperand(), Z,
+    Value *N = BG.CreateGEP(BG.getIntNTy(8 * Unit), G->getPointerOperand(), Z,
                             G->getName());
     G->replaceAllUsesWith(N);
     G->eraseFromParent();
@@ -542,7 +551,7 @@ static bool elementIndex(PHINode &P, Loop &L) {
       V = BC.CreateZExt(V, C->getOperand(0)->getType());
     auto *K = cast<ConstantInt>(C->getOperand(1));
     C->setOperand(0, V);
-    C->setOperand(1, ConstantInt::get(K->getType(), K->getValue().udiv(4)));
+    C->setOperand(1, ConstantInt::get(K->getType(), K->getValue().udiv(Unit)));
   }
   for (ZExtInst *Z : Exts)
     if (Z->use_empty())
