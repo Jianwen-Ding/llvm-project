@@ -1617,6 +1617,11 @@ static cl::opt<bool> SharedByteBias(
     cl::desc("signed bytes of one word through one xor of the word"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> Byte1Asr(
+    "agx-byte1-asr",
+    cl::desc("the signed byte 1 of a word as an asr of its low half"),
+    cl::init(true), cl::Hidden);
+
 /// Whether X is a word with two or more signed bytes taken from it (the
 /// shl / sra pairs and sign_extend_inregs of the type legalized sext of its
 /// <4 x i8>), or one already taken through x ^ 0x80808080.
@@ -1651,6 +1656,13 @@ static bool hasSharedSignedBytes(SDValue X) {
 static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
                              unsigned P) {
   auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i32); };
+  // Byte 1: one asr of the low half by 8 (asr sign-extends its 16-bit
+  // source), the shift a bfeil would take anyway, without the subtraction.
+  if (P == 8 && Byte1Asr)
+    return DAG.getNode(ISD::SRA, DL, MVT::i32,
+                       DAG.getNode(ISD::SIGN_EXTEND_INREG, DL, MVT::i32, X,
+                                   DAG.getValueType(MVT::i16)),
+                       C(8));
   bool Shared = SharedByteBias && hasSharedSignedBytes(X);
   // Opaque, so that demanded bits do not narrow each byte's xor to its own
   // bit (which would make one xor per byte again).

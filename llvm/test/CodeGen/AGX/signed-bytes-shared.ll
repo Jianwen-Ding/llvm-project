@@ -23,23 +23,21 @@ define agx_kernel void @dp4a_word(ptr addrspace(1) noalias readonly %a, ptr addr
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    xor r4, r3, r4
 ; CHECK-NEXT:    and r6, r5, 255
-; CHECK-NEXT:    bfeil r7, 0, r5, 8, mask 0xFF
 ; CHECK-NEXT:    and r5, r5h, 255
 ; CHECK-NEXT:    and r8, r4, 255
-; CHECK-NEXT:    bfeil r9, 0, r4, 8, mask 0xFF
 ; CHECK-NEXT:    and r4, r4h, 255
+; CHECK-NEXT:    asr r7, r2l, 8
 ; CHECK-NEXT:    asr r2, r2, 24
-; CHECK-NEXT:    asr r3, r3, 24
+; CHECK-NEXT:    asr r9, r3, 24
 ; CHECK-NEXT:    isub r5, r5, 128
 ; CHECK-NEXT:    isub r4, r4, 128
-; CHECK-NEXT:    imadd r2, r2, r3, 0
-; CHECK-NEXT:    imadd r3, r5, r4, 0
+; CHECK-NEXT:    asr r3, r3l, 8
+; CHECK-NEXT:    imadd r2, r2, r9, 0
+; CHECK-NEXT:    imadd r4, r5, r4, 0
 ; CHECK-NEXT:    isub r6, r6, 128
-; CHECK-NEXT:    isub r7, r7, 128
-; CHECK-NEXT:    isub r9, r9, 128
-; CHECK-NEXT:    isub r4, r8, 128
-; CHECK-NEXT:    imadd r2, r7, r9, r2
-; CHECK-NEXT:    imadd r3, r6, r4, r3
+; CHECK-NEXT:    isub r5, r8, 128
+; CHECK-NEXT:    imadd r2, r7, r3, r2
+; CHECK-NEXT:    imadd r3, r6, r5, r4
 ; CHECK-NEXT:    iadd r2, r3, r2
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u4_u5, r1, signed
 ; CHECK-NEXT:    stop
@@ -75,9 +73,7 @@ define agx_kernel void @one_byte(ptr addrspace(1) %p, i32 %w) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bfeil r1, 0, u2, 8, mask 0xFF
-; CHECK-NEXT:    xor r1, r1, 128
-; CHECK-NEXT:    isub r1, r1, 128
+; CHECK-NEXT:    asr r1, u2l, 8
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

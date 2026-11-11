@@ -591,6 +591,20 @@ def ASR_I32 : AGXALUPseudo<ASR_g13, (outs GPR32:$dst),
                                 SrcMods:$src1_mods, Src32Op:$src1), [],
                            [WriteIMul]>;
 
+// asr sign-extends its source from the source's size: a 16-bit value
+// sign-extended and shifted right is one asr of the 16-bit register (the
+// signed byte 1 of a word: asr of its low half by 8).
+def ASR_I32_A16 : AGXALUPseudo<ASR_g13, (outs GPR32:$dst),
+                               (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                    SrcMods:$src1_mods, Src32Op:$src1), [],
+                               [WriteIMul]>;
+let AddedComplexity = 3 in {
+def : Pat<(i32 (sra (sext_inreg i32:$a, i16), AGXIntSrc32:$s)),
+          (ASR_I32_A16 0, (i16 (EXTRACT_SUBREG $a, lo16)), 0, $s)>;
+def : Pat<(i32 (sra (sext i16:$a), AGXIntSrc32:$s)),
+          (ASR_I32_A16 0, $a, 0, $s)>;
+}
+
 // shl x, s = bfi 0, x, s (full mask); srl x, s = bfeil 0, x, s.
 def : Pat<(i32 (shl AGXIntSrc32:$a, AGXIntSrc32:$s)),
           (BFI_I32 0, (i32 0), 0, $a, 0, $s, 0)>;
