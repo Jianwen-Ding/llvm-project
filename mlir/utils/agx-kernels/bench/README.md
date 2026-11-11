@@ -39,5 +39,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `conv1d` | a 3-tap filter of x[i], x[i + 1], x[i + 2] |
 | `hist` | a 256-bin histogram of low bytes by device atomics |
 | `dot_vec4` | row dot products by `vector<4xf32>` fma and a `vector.reduction` of the lanes |
+| `shfl_sum` | SIMD-group sums by an xor shuffle tree, one store per group |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

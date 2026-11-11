@@ -1728,6 +1728,36 @@ static cl::opt<bool> WideByteLoads(
     cl::desc("A byte or 16-bit value loaded into 16 bits and zero-extended "
              "further is loaded into a 32-bit register"));
 
+static cl::opt<bool> KeepShiftPairs(
+    "agx-keep-shift-pairs", cl::init(true), cl::Hidden,
+    cl::desc("Keep a 64-bit (x >> a) << b rather than a shift and a mask the "
+             "8-bit immediate does not hold"));
+
+/// A 64-bit (x >> a) << b is a shift and an and with ((-1 >> a) << b)
+/// otherwise. Where the mask is beyond the 8-bit immediate, the and is a
+/// mov_imm and a (32-bit) and, and the offset no longer a shifted index: the
+/// shift left of an address offset is free, the device address's index shift
+/// ((i / 32) * 4 bytes: one bfeil, the index register). (32-bit masks stay:
+/// one mov_imm serves every and, and x - ((x >> a) << a) is x & (2^a - 1).)
+bool AGXTargetLowering::shouldFoldConstantShiftPairToMask(
+    const SDNode *N) const {
+  if (!KeepShiftPairs || N->getOpcode() != ISD::SHL ||
+      N->getValueType(0) != MVT::i64)
+    return true;
+  SDValue X = N->getOperand(0);
+  auto *B = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  auto *A = X.getNumOperands() > 1
+                ? dyn_cast<ConstantSDNode>(X.getOperand(1))
+                : nullptr;
+  if (X.getOpcode() != ISD::SRL || !A || !B)
+    return true;
+  unsigned W = N->getValueType(0).getScalarSizeInBits();
+  if (A->getZExtValue() >= W || B->getZExtValue() >= W)
+    return true;
+  APInt M = APInt::getAllOnes(W).lshr(A->getZExtValue()).shl(B->getZExtValue());
+  return M.isIntN(8);
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
