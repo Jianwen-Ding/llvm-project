@@ -2463,6 +2463,61 @@ static Bytes4 byteSources(Value *V, unsigned Depth,
 /// into the other's half (and a shift or a sign fill for the byte), the
 /// halves the 32-bit register's, where that takes fewer instructions than
 /// the tree.
+static cl::opt<bool> AGXSatConvertClamps(
+    "agx-sat-convert-clamps", cl::init(true), cl::Hidden,
+    cl::desc("a float clamped above at an 8- or 16-bit integer's maximum and "
+             "converted to it as the saturating conversion of the unclamped "
+             "value"));
+
+/// fptosi / fptoui (minnum(y, h)) to i8 / i16, h at least the type's
+/// maximum and y never NaN, is fpto[su]i.sat(y): above the maximum the
+/// conversion was poison (h above it) or the maximum (h equal), which the
+/// saturation gives, and below it the truncation commutes with the bound.
+/// The conversions saturate in hardware (B27): the bound goes (quant_i8's
+/// clamp to [-127, 127] keeps only its lower half).
+static bool satConvertClamps(Function &F) {
+  if (!AGXSatConvertClamps)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<CastInst *, 8> Work;
+  for (Instruction &I : instructions(F))
+    if (isa<FPToSIInst>(I) || isa<FPToUIInst>(I))
+      Work.push_back(cast<CastInst>(&I));
+  bool Changed = false;
+  for (CastInst *C : Work) {
+    Type *IT = C->getType();
+    unsigned W = IT->getScalarSizeInBits();
+    if (W != 8 && W != 16)
+      continue;
+    bool Signed = isa<FPToSIInst>(C);
+    Value *Y;
+    const APFloat *H;
+    if (!match(C->getOperand(0),
+               m_CombineOr(m_Intrinsic<Intrinsic::minnum>(m_Value(Y), m_APFloat(H)),
+                           m_Intrinsic<Intrinsic::minimumnum>(m_Value(Y),
+                                                              m_APFloat(H)))))
+      continue;
+    double Max = Signed ? double((1u << (W - 1)) - 1) : double((1u << W) - 1);
+    if (H->isNaN() || H->convertToDouble() < Max)
+      continue;
+    // y never NaN: a maxnum / minnum / maximumnum with a non-NaN constant.
+    const APFloat *L;
+    if (!match(Y, m_CombineOr(m_Intrinsic<Intrinsic::maxnum>(m_Value(), m_APFloat(L)),
+                              m_Intrinsic<Intrinsic::maximumnum>(m_Value(),
+                                                                 m_APFloat(L)))) ||
+        L->isNaN())
+      continue;
+    IRBuilder<> B(C);
+    Value *R = B.CreateIntrinsic(
+        Signed ? Intrinsic::fptosi_sat : Intrinsic::fptoui_sat,
+        {IT, Y->getType()}, {Y});
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<unsigned> AGXFoldConditionChains(
     "agx-fold-condition-chains", cl::init(2), cl::Hidden,
     cl::desc("merge a branch on a condition a few more instructions decide "
@@ -2800,6 +2855,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= permuteBytes(F);
   Changed |= loadBFloatsAsWords(F);
   Changed |= foldConditionChains(F, TTI);
+  Changed |= satConvertClamps(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

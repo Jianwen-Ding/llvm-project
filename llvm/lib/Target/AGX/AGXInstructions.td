@@ -1479,6 +1479,14 @@ def : Pat<(i16 (AGXcvt_f_to_u8 f32:$a)), (CONVERT_16_32 CVT_F_TO_U8, 0, $a, ROUN
 def : Pat<(i16 (AGXcvt_f_to_s8 f32:$a)), (CONVERT_16_32 CVT_F_TO_S8, 0, $a, ROUND_RTZ)>;
 def : Pat<(i16 (AGXcvt_f_to_u8 f16:$a)), (CONVERT_16_16 CVT_F_TO_U8, 0, $a, ROUND_RTZ)>;
 def : Pat<(i16 (AGXcvt_f_to_s8 f16:$a)), (CONVERT_16_16 CVT_F_TO_S8, 0, $a, ROUND_RTZ)>;
+// The convert truncates: a ftrunc before it (round's lowering) is free.
+defvar TZ8 = PatFrag<(ops node:$a), (ftrunc node:$a), [{ return N->hasOneUse(); }]>;
+let AddedComplexity = 1 in {
+def : Pat<(i16 (AGXcvt_f_to_u8 (f32 (TZ8 f32:$a)))), (CONVERT_16_32 CVT_F_TO_U8, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_s8 (f32 (TZ8 f32:$a)))), (CONVERT_16_32 CVT_F_TO_S8, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_u8 (f16 (TZ8 f16:$a)))), (CONVERT_16_16 CVT_F_TO_U8, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_s8 (f16 (TZ8 f16:$a)))), (CONVERT_16_16 CVT_F_TO_S8, 0, $a, ROUND_RTZ)>;
+}
 foreach R = [frint, froundeven, fnearbyint] in {
 defvar RN8 = PatFrag<(ops node:$a), (R node:$a), [{ return N->hasOneUse(); }]>;
 def : Pat<(i16 (AGXcvt_f_to_u8 (f32 (RN8 f32:$a)))), (CONVERT_16_32 CVT_F_TO_U8_RN, 0, $a, ROUND_RTZ)>;

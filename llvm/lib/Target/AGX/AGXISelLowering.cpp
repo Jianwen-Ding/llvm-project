@@ -939,8 +939,12 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
       // The convert's 8-bit modes saturate to the byte's range (NaN 0) and
       // zero-extend it (B27): unsigned is that, signed its sign extension
       // (which a byte store, reading only the byte, drops).
+      // The convert truncates: a ftrunc before it (round's lowering) goes.
+      SDValue Src = Op.getOperand(0);
+      if (Src.getOpcode() == ISD::FTRUNC)
+        Src = Src.getOperand(0);
       SDValue C = DAG.getNode(Signed ? AGXISD::CVT_F_TO_S8 : AGXISD::CVT_F_TO_U8,
-                              DL, MVT::i16, Op.getOperand(0));
+                              DL, MVT::i16, Src);
       if (Signed)
         C = DAG.getNode(ISD::SIGN_EXTEND_INREG, DL, MVT::i16, C,
                         DAG.getValueType(MVT::i8));
@@ -1883,6 +1887,23 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       X = X.getOperand(0);
     }
     return signedByteALU(DCI.DAG, SDLoc(N), X, P);
+  }
+  case AGXISD::STORE_V2_I8:
+  case AGXISD::STORE_V4_I8: {
+    // Only each value's low byte is stored: a sign or zero extension of it
+    // (a saturating 8-bit conversion's) goes.
+    unsigned NumElts = N->getOpcode() == AGXISD::STORE_V2_I8 ? 2 : 4;
+    SmallVector<SDValue, 6> Ops(N->op_begin(), N->op_end());
+    bool Changed = false;
+    APInt Low = APInt::getLowBitsSet(16, 8);
+    for (unsigned I = 1; I <= NumElts; ++I)
+      if (SDValue V = SimplifyMultipleUseDemandedBits(Ops[I], Low, DCI.DAG)) {
+        Ops[I] = V;
+        Changed = true;
+      }
+    if (!Changed)
+      return SDValue();
+    return SDValue(DCI.DAG.UpdateNodeOperands(N, Ops), 0);
   }
   case ISD::MULHU:
   case ISD::MULHS: {
