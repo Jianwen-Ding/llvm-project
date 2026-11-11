@@ -16,6 +16,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGXTargetMachine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/SimplifyCFGOptions.h"
 #include "AGX.h"
 #include "AGXAliasAnalysis.h"
 #include "AGXMachineFunctionInfo.h"
@@ -479,6 +481,11 @@ void AGXPassConfig::addIRPasses() {
   TargetPassConfig::addIRPasses();
 }
 
+static cl::opt<unsigned> AGXPreISelSimplifyCFG(
+    "agx-preisel-simplifycfg", cl::init(2), cl::Hidden,
+    cl::desc("SimplifyCFG before structurization with this bonus instruction "
+             "threshold (0: not run)"));
+
 bool AGXPassConfig::addPreISel() {
   // After loop strength reduction, which makes 64-bit counters of PTX's
   // 64-bit address arithmetic.
@@ -487,6 +494,16 @@ bool AGXPassConfig::addPreISel() {
   // After loop strength reduction, which would form 64-bit offsets from
   // the bounded indices (EXPERIMENTS.md L14-E1).
   addPass(createAGXSpecialRegisterRangesPass());
+  // The phis of an if's empty side (left by AGXCodeGenPrepare's merging of
+  // || and && conditions) become selects, as SimplifyCFG folds two-entry
+  // phis: an if is execution mask operations, which cost more than the
+  // speculated selects. Without SimplifyCFG's branch simplification, which
+  // would make switches of comparison chains.
+  if (getOptLevel() != CodeGenOptLevel::None && AGXPreISelSimplifyCFG)
+    addPass(createCFGSimplificationPass(
+        SimplifyCFGOptions()
+            .bonusInstThreshold(AGXPreISelSimplifyCFG)
+            .setSimplifyCondBranch(false)));
   // Bring the CFG into the structured form AGXAnnotateControlFlow expects.
   addPass(createLowerSwitchPass());
   addPass(createFixIrreduciblePass());

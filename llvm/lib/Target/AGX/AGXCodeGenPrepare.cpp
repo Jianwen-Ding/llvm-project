@@ -2463,6 +2463,46 @@ static Bytes4 byteSources(Value *V, unsigned Depth,
 /// into the other's half (and a shift or a sign fill for the byte), the
 /// halves the 32-bit register's, where that takes fewer instructions than
 /// the tree.
+static cl::opt<unsigned> AGXFoldConditionChains(
+    "agx-fold-condition-chains", cl::init(2), cl::Hidden,
+    cl::desc("merge a branch on a condition a few more instructions decide "
+             "(an || or && of comparisons in their own blocks) into its "
+             "predecessor's, with this many speculated instructions at most "
+             "(0: off)"));
+
+/// SimplifyCFG's foldBranchToCommonDest on every conditional branch: a
+/// block that computes the second half of an || or && and branches to one
+/// of its predecessor's successors joins the predecessor's branch (its
+/// instructions speculated there). Every branch is execution mask
+/// operations (an if, a pop, often a jump over the body), which cost more
+/// than a few comparisons; the phis of the empty side that remains become
+/// selects in the SimplifyCFG before structurization. (Only this fold:
+/// SimplifyCFG's branch simplification would also make switches of
+/// comparison chains, whose lowered trees the structurizer cannot always
+/// handle.)
+static bool foldConditionChains(Function &F, const TargetTransformInfo &TTI) {
+  if (!AGXFoldConditionChains)
+    return false;
+  bool Changed = false;
+  for (unsigned Round = 0; Round < 8; ++Round) {
+    SmallVector<WeakTrackingVH, 16> Branches;
+    for (BasicBlock &BB : F)
+      if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator()))
+        Branches.push_back(BI);
+    bool Local = false;
+    for (WeakTrackingVH &V : Branches)
+      if (auto *BI = dyn_cast_or_null<CondBrInst>(V))
+        Local |= foldBranchToCommonDest(BI, nullptr, nullptr, &TTI, nullptr,
+                                        AGXFoldConditionChains);
+    if (!Local)
+      break;
+    Changed = true;
+  }
+  if (Changed)
+    removeUnreachableBlocks(F);
+  return Changed;
+}
+
 static cl::opt<bool> AGXWordBFloatLoads(
     "agx-word-bfloat-loads", cl::init(true), cl::Hidden,
     cl::desc("a vector of bfloats loaded only to be extended to floats as "
@@ -2759,6 +2799,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= mergeMaskedOrs(F);
   Changed |= permuteBytes(F);
   Changed |= loadBFloatsAsWords(F);
+  Changed |= foldConditionChains(F, TTI);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

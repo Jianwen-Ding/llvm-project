@@ -144,26 +144,26 @@
   "waits": 4
  },
  "cuda_argmax.ll:argmax:agx-g13g": {
-  "bytes": 1038,
-  "cycles": 14638.7,
+  "bytes": 950,
+  "cycles": 14630.2,
   "gprs": 14,
   "groups": 96,
-  "instructions": 163,
+  "instructions": 142,
   "launch_inputs": true,
   "tg_bytes": 256,
-  "tput": 666.6,
+  "tput": 649.1,
   "uniform_halves": 16,
   "waits": 1
  },
  "cuda_argmax.ll:argmax:agx-g14c": {
-  "bytes": 1038,
-  "cycles": 14638.7,
+  "bytes": 950,
+  "cycles": 14630.2,
   "gprs": 14,
   "groups": 96,
-  "instructions": 163,
+  "instructions": 142,
   "launch_inputs": true,
   "tg_bytes": 256,
-  "tput": 666.6,
+  "tput": 649.1,
   "uniform_halves": 16,
   "waits": 1
  },
@@ -415,7 +415,7 @@
   "instructions": 162,
   "launch_inputs": true,
   "tg_bytes": 128,
-  "tput": 130.3,
+  "tput": 129.0,
   "uniform_halves": 26,
   "waits": 3
  },
@@ -427,7 +427,7 @@
   "instructions": 162,
   "launch_inputs": true,
   "tg_bytes": 128,
-  "tput": 130.3,
+  "tput": 129.0,
   "uniform_halves": 26,
   "waits": 3
  },
@@ -727,7 +727,7 @@
   "instructions": 242,
   "launch_inputs": true,
   "tg_bytes": 256,
-  "tput": 165.2,
+  "tput": 165.7,
   "uniform_halves": 16,
   "waits": 2
  },
@@ -739,7 +739,7 @@
   "instructions": 242,
   "launch_inputs": true,
   "tg_bytes": 256,
-  "tput": 165.2,
+  "tput": 165.7,
   "uniform_halves": 16,
   "waits": 2
  },

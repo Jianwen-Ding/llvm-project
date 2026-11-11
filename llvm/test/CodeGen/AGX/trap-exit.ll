@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
 
 ; An executed trap does nothing on G14C (ptx-re-blockers B21), so a thread
 ; that reaches llvm.trap and unreachable (as in __assertfail) returns there:
