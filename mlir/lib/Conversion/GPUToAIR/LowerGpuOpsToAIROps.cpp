@@ -584,6 +584,60 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
       nan, result);
 }
 
+/// math.expm1 and math.log1p accurate for small arguments, where MathToLLVM's
+/// exp(x) - 1 and log(1 + x) cancel to 0 (expm1(6e-8) was 0). For |x| < 1/2,
+/// Kahan's and Goldberg's forms, in f32 for f16 and bf16 (then rounded once):
+///   expm1(x) = x where u = exp(x) is 1, else (u - 1) x / log(u);
+///   log1p(x) = x where u = 1 + x is 1, else log(u) x / (u - 1);
+/// from 1/2, u - 1 and log(u), which do not cancel there (1 + x is exact
+/// below -1/2), and whose products would overflow (expm1(88), log1p(3e38)).
+/// A NaN propagates; -0 gives -0; infinities as exp and log give them.
+template <typename OpTy>
+static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
+  auto type = dyn_cast<FloatType>(op.getType());
+  if (!type || !(type.isF16() || type.isBF16() || type.isF32()))
+    return failure();
+  Location loc = op.getLoc();
+  Type f32 = rewriter.getF32Type();
+  Value x = op.getOperand();
+  if (!type.isF32())
+    x = arith::ExtFOp::create(rewriter, loc, f32, x);
+  auto c = [&](float v) {
+    return arith::ConstantOp::create(rewriter, loc, f32,
+                                     rewriter.getF32FloatAttr(v));
+  };
+  auto eq = [&](Value a, Value b) {
+    return arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ, a, b);
+  };
+  auto sel = [&](Value cnd, Value a, Value b) {
+    return arith::SelectOp::create(rewriter, loc, cnd, a, b);
+  };
+  Value one = c(1.0f);
+  Value small = arith::CmpFOp::create(
+      rewriter, loc, arith::CmpFPredicate::OLT,
+      math::AbsFOp::create(rewriter, loc, x), c(0.5f));
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::ExpM1Op>) {
+    Value u = math::ExpOp::create(rewriter, loc, x);
+    Value um1 = arith::SubFOp::create(rewriter, loc, u, one);
+    Value q = arith::DivFOp::create(
+        rewriter, loc, arith::MulFOp::create(rewriter, loc, um1, x),
+        math::LogOp::create(rewriter, loc, u));
+    r = sel(small, sel(eq(u, one), x, q), um1);
+  } else {
+    Value u = arith::AddFOp::create(rewriter, loc, one, x);
+    Value lu = math::LogOp::create(rewriter, loc, u);
+    Value q = arith::DivFOp::create(
+        rewriter, loc, arith::MulFOp::create(rewriter, loc, lu, x),
+        arith::SubFOp::create(rewriter, loc, u, one));
+    r = sel(small, sel(eq(u, one), x, q), lu);
+  }
+  if (!type.isF32())
+    r = arith::TruncFOp::create(rewriter, loc, type, r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
 /// Whether GPUSubgroupReduceOpLowering takes \p op to an AIR SIMD-group or
 /// quad-group reduction: of i32 or a float (maximumf / minimumf of f32), over
 /// the whole SIMD-group or clusters of 4 or 32 consecutive lanes.
@@ -1356,6 +1410,8 @@ struct LowerGpuOpsToAIROpsPass final
       RewritePatternSet patterns(ctx);
       populateGpuAllReducePatterns(patterns);
       populateGpuShufflePatterns(patterns);
+      patterns.add(rewriteAccurateM1<math::ExpM1Op>);
+      patterns.add(rewriteAccurateM1<math::Log1pOp>);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR

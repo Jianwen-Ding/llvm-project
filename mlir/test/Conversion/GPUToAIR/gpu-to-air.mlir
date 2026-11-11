@@ -647,3 +647,31 @@ gpu.module @shuffle_reduce {
     gpu.return
   }
 }
+
+// -----
+
+// expm1 and log1p accurate for small arguments (MathToLLVM's exp(x) - 1 and
+// log(1 + x) cancel to 0 there): for |x| < 1/2, (u - 1) x / log(u) with
+// u = exp(x), and log(u) x / (u - 1) with u = 1 + x (x where u is 1); from
+// 1/2, u - 1 and log(u). Half in float.
+gpu.module @accurate_m1 {
+  // CHECK-LABEL: llvm.func @expm1(
+  gpu.func @expm1(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf32, 1>
+    // CHECK: %[[U:.*]] = llvm.intr.exp(%[[X:.*]]) : (f32) -> f32
+    // CHECK: %[[UM1:.*]] = llvm.fsub %[[U]], %{{.*}} : f32
+    // CHECK: %[[P:.*]] = llvm.fmul %[[UM1]], %[[X]] : f32
+    // CHECK: %[[L:.*]] = llvm.intr.log(%[[U]]) : (f32) -> f32
+    // CHECK: llvm.fdiv %[[P]], %[[L]] : f32
+    %r = math.expm1 %v : f32
+    memref.store %r, %a[%c0] : memref<8xf32, 1>
+    // CHECK: llvm.fpext %{{.*}} : f16 to f32
+    // CHECK: llvm.intr.log(%{{.*}}) : (f32) -> f32
+    // CHECK: llvm.fptrunc %{{.*}} : f32 to f16
+    %w = memref.load %h[%c0] : memref<8xf16, 1>
+    %q = math.log1p %w : f16
+    memref.store %q, %h[%c0] : memref<8xf16, 1>
+    gpu.return
+  }
+}
