@@ -587,19 +587,15 @@ gpu.module @simdgroup_all_reduce {
 
 // -----
 
-// A reduction over clusters of the SIMD-group is xor shuffles at 1, 2, 4
-// within each cluster (the order AIR's whole-group reductions add in).
+// A reduction over clusters of 8 or 16 lanes is AIR's quad-group reduction
+// (lanes 1 and 2) and xor shuffles at 4 (and 8); over clusters of 2, one xor
+// shuffle at 1: the order AIR's whole-group reductions add in.
 gpu.module @clustered_reduce {
   // CHECK-LABEL: llvm.func @cluster8(
   gpu.func @cluster8(%a: memref<64xf32, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<64xf32, 1>
-    // CHECK: %[[M1:.*]] = llvm.mlir.constant(1 : i16) : i16
-    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M1]])
-    // CHECK: llvm.fadd
-    // CHECK: %[[M2:.*]] = llvm.mlir.constant(2 : i16) : i16
-    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M2]])
-    // CHECK: llvm.fadd
+    // CHECK: llvm.call @air.quad_sum.f32
     // CHECK: %[[M4:.*]] = llvm.mlir.constant(4 : i16) : i16
     // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M4]])
     // CHECK: llvm.fadd
@@ -607,6 +603,18 @@ gpu.module @clustered_reduce {
     // CHECK: llvm.store
     %r = gpu.subgroup_reduce add %v cluster(size = 8) : (f32) -> f32
     memref.store %r, %a[%c0] : memref<64xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @cluster2(
+  gpu.func @cluster2(%a: memref<64xi32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xi32, 1>
+    // CHECK: %[[M1:.*]] = llvm.mlir.constant(1 : i16) : i16
+    // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M1]])
+    // CHECK: llvm.intr.umax
+    // CHECK-NOT: simd_shuffle
+    %r = gpu.subgroup_reduce maxui %v cluster(size = 2) : (i32) -> i32
+    memref.store %r, %a[%c0] : memref<64xi32, 1>
     gpu.return
   }
 }
