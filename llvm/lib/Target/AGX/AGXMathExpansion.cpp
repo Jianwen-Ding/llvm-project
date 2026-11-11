@@ -24,12 +24,19 @@
 
 #include "AGX.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include <cmath>
 
 using namespace llvm;
+using namespace llvm::PatternMatch;
+
+static cl::opt<bool> NegatedClamp(
+    "agx-exp-negated-clamp",
+    cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
+    cl::Hidden);
 
 static cl::opt<bool> IntegerLdexp(
     "agx-exp-integer-scale",
@@ -361,9 +368,20 @@ public:
   /// its n within ldexp's range (exp2, exp10), and the result over- and
   /// underflows by itself: no clamp of hi here and no +inf / +0 selects.
   Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false) {
-    Value *C = Bounded ? Hi
-                       : sel(gt(Hi, 89.0), k(89.0),
-                             sel(lt(Hi, -104.0), k(-104.0), Hi));
+    Value *C;
+    Value *Y;
+    if (!Bounded && NegatedClamp && match(Hi, m_FNeg(m_Value(Y)))) {
+      // e^-y (sigmoid, silu): clamp y to the mirrored bounds and negate the
+      // result, the same value (a NaN y stays a NaN), so that the negation
+      // folds into the multiplication's constant and the fma's .neg instead
+      // of being an xor (a select's operand takes no modifier).
+      C = B.CreateFNeg(sel(lt(Y, -89.0), k(-89.0),
+                           sel(gt(Y, 104.0), k(104.0), Y)));
+    } else {
+      C = Bounded ? Hi
+                  : sel(gt(Hi, 89.0), k(89.0),
+                        sel(lt(Hi, -104.0), k(-104.0), Hi));
+    }
     Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
