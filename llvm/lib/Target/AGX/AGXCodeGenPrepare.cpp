@@ -44,6 +44,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -3249,6 +3250,65 @@ static bool permuteBytes(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXHoistAddressParts(
+    "agx-hoist-address-parts", cl::init(true), cl::Hidden,
+    cl::desc("A loop's integer address ((inv + i) << c) + base as "
+             "(base + (inv << c)) + (i << c), the sum before the loop"));
+
+/// An address that PTX computes in 64-bit integers, ((Inv + I) << C) + Base
+/// with Inv and Base the same every iteration (a row's offset and a buffer)
+/// and I the loop's index (a sign-extended 32-bit counter), is
+/// (Base + (Inv << C)) + (I << C) modulo 2^64: the first sum goes before
+/// the loop, and the access takes the base and the 32-bit index (two 64-bit
+/// additions less each iteration). Loop strength reduction does not see it:
+/// I's add has no nsw, so its extension is not a recurrence.
+static bool hoistInvariantAddressParts(Function &F) {
+  if (!AGXHoistAddressParts)
+    return false;
+  using namespace PatternMatch;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *Pre = L->getLoopPreheader();
+    if (!Pre)
+      continue;
+    auto Inv = [&](Value *V) { return L->isLoopInvariant(V); };
+    for (BasicBlock *BB : L->blocks()) {
+      if (LI.getLoopFor(BB) != L)
+        continue;
+      for (Instruction &I : make_early_inc_range(*BB)) {
+        Value *X, *Base, *A, *Bv;
+        const APInt *C = nullptr;
+        if (!I.getType()->isIntegerTy(64) ||
+            !match(&I, m_c_Add(m_Value(X), m_Value(Base))) || !Inv(Base) ||
+            Inv(X) || !X->hasOneUse() ||
+            !all_of(I.users(), [](User *U) { return isa<IntToPtrInst>(U); }))
+          continue;
+        Value *Y = X;
+        if (match(X, m_Shl(m_Value(Y), m_APInt(C))) &&
+            (C->uge(64) || !Y->hasOneUse()))
+          continue;
+        if (!match(Y, m_c_Add(m_Value(A), m_Value(Bv))) || !isa<Instruction>(Y))
+          continue;
+        if (!Inv(A))
+          std::swap(A, Bv);
+        if (!Inv(A) || Inv(Bv))
+          continue;
+        IRBuilder<> P(Pre->getTerminator());
+        Value *Hoisted = P.CreateAdd(Base, C ? P.CreateShl(A, *C) : A);
+        IRBuilder<> B(&I);
+        Value *New = B.CreateAdd(Hoisted, C ? B.CreateShl(Bv, *C) : Bv);
+        New->takeName(&I);
+        I.replaceAllUsesWith(New);
+        RecursivelyDeleteTriviallyDeadInstructions(&I);
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -3277,6 +3337,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= loadBytesApart(F);
   Changed |= storeBytesTogether(F);
   Changed |= sinkMulExtensions(F);
+  Changed |= hoistInvariantAddressParts(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);
