@@ -86,6 +86,11 @@ FunctionPass *llvm::createAGXNarrowInductionsPass() {
   return new AGXNarrowInductions();
 }
 
+static cl::opt<bool> AGXSignedNarrowing(
+    "agx-signed-narrowing", cl::init(true), cl::Hidden,
+    cl::desc("Narrow 64-bit inductions whose signed range fits 32 bits, "
+             "with sign-extended uses"));
+
 static bool fitsSigned32(ScalarEvolution &SE, Value *V) {
   return SE.getUnsignedRange(SE.getSCEV(V)).getUnsignedMax().ult(1u << 31);
 }
@@ -100,8 +105,19 @@ static bool narrow(PHINode &Phi, Loop &L, ScalarEvolution &SE) {
   if (!Inc || !match(Inc, m_c_Add(m_Specific(&Phi), m_Value(Step))) ||
       !L.isLoopInvariant(Step))
     return false;
-  if (!fitsSigned32(SE, &Phi) || !fitsSigned32(SE, Inc) ||
-      !fitsSigned32(SE, Step))
+  // [0, 2^31): zero-extended uses. Otherwise a signed range within 32 bits
+  // (LSR's counters from a negative start, {-4, +, 4} to 508): sign-extended
+  // uses, the narrow add without unsigned wrap flags.
+  bool Unsigned = fitsSigned32(SE, &Phi) && fitsSigned32(SE, Inc) &&
+                  fitsSigned32(SE, Step);
+  auto SignedFits = [&](Value *V) {
+    ConstantRange R = SE.getSignedRange(SE.getSCEV(V));
+    return R.getSignedMin().sge(APInt::getSignedMinValue(32).sext(64)) &&
+           R.getSignedMax().sle(APInt::getSignedMaxValue(32).sext(64));
+  };
+  if (!Unsigned &&
+      (!AGXSignedNarrowing || !SignedFits(&Phi) || !SignedFits(Inc) ||
+       !SignedFits(Step)))
     return false;
 
   SE.forgetLoop(&L);
@@ -114,20 +130,43 @@ static bool narrow(PHINode &Phi, Loop &L, ScalarEvolution &SE) {
   B.SetInsertPoint(Inc);
   Value *NarrowInc =
       B.CreateAdd(NarrowPhi, NarrowStep, Inc->getName() + ".lo",
-                  /*HasNUW=*/true, /*HasNSW=*/true);
+                  /*HasNUW=*/Unsigned, /*HasNSW=*/true);
   NarrowPhi->addIncoming(NarrowStart, Preheader);
   NarrowPhi->addIncoming(NarrowInc, Latch);
 
   B.SetInsertPoint(Phi.getParent(), Phi.getParent()->getFirstInsertionPt());
-  Value *WidePhi = B.CreateZExt(NarrowPhi, Phi.getType(), Phi.getName());
+  Value *WidePhi =
+      Unsigned ? B.CreateZExt(NarrowPhi, Phi.getType(), Phi.getName())
+               : B.CreateSExt(NarrowPhi, Phi.getType(), Phi.getName());
   B.SetInsertPoint(Inc);
-  Value *WideInc = B.CreateZExt(NarrowInc, Inc->getType(), Inc->getName());
+  Value *WideInc =
+      Unsigned ? B.CreateZExt(NarrowInc, Inc->getType(), Inc->getName())
+               : B.CreateSExt(NarrowInc, Inc->getType(), Inc->getName());
   // The zero extension of the increment replaces it after it is computed.
   cast<Instruction>(WideInc)->moveAfter(cast<Instruction>(NarrowInc));
   Inc->replaceAllUsesWith(WideInc);
   Phi.replaceAllUsesWith(WidePhi);
   Inc->eraseFromParent();
   Phi.eraseFromParent();
+  // A compare of a sign-extended value with a constant C is of the 32-bit
+  // value with C where C is in [0, 2^31) (a negative value is above C
+  // unsigned either way) or the predicate is signed and C in 32 bits.
+  if (!Unsigned)
+    for (auto [Wide, Narrow] : {std::pair<Value *, Value *>(WidePhi, NarrowPhi),
+                                {WideInc, NarrowInc}})
+      for (User *U : make_early_inc_range(Wide->users())) {
+        auto *C = dyn_cast<ICmpInst>(U);
+        auto *K = C ? dyn_cast<ConstantInt>(C->getOperand(1)) : nullptr;
+        if (!K || C->getOperand(0) != Wide)
+          continue;
+        const APInt &V = K->getValue();
+        bool Fits = C->isSigned() ? V.isSignedIntN(32)
+                                  : V.isNonNegative() && V.ult(1u << 31);
+        if (!Fits)
+          continue;
+        C->setOperand(0, Narrow);
+        C->setOperand(1, ConstantInt::get(I32, V.trunc(32)));
+      }
   return true;
 }
 
