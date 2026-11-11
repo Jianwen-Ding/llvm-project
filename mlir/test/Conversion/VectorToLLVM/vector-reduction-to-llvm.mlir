@@ -3,13 +3,13 @@
 
 // CHECK-LABEL: @reduce_add_f32(
 // CHECK-SAME: %[[A:.*]]: vector<16xf32>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f32, vector<16xf32>) -> f32
 //      CHECK: return %[[V]] : f32
 //
 // REASSOC-LABEL: @reduce_add_f32(
 // REASSOC-SAME: %[[A:.*]]: vector<16xf32>)
-//      REASSOC: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      REASSOC: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      REASSOC: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]])
 // REASSOC-SAME: fastmath<reassoc> : (f32, vector<16xf32>) -> f32
 //      REASSOC: return %[[V]] : f32
@@ -23,7 +23,7 @@ func.func @reduce_add_f32(%arg0: vector<16xf32>) -> f32 {
 
 // CHECK-LABEL: @reduce_add_f32_always_reassoc(
 // CHECK-SAME: %[[A:.*]]: vector<16xf32>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]])
 /// Note: the reassoc flag remains even though the pass sets reassociate-fp-reduction to false.
 /// Ponder whether this flag really is a property of the pass / pattern..
@@ -32,7 +32,7 @@ func.func @reduce_add_f32(%arg0: vector<16xf32>) -> f32 {
 //
 // REASSOC-LABEL: @reduce_add_f32_always_reassoc(
 // REASSOC-SAME: %[[A:.*]]: vector<16xf32>)
-//      REASSOC: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      REASSOC: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      REASSOC: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]])
 // REASSOC-SAME: fastmath<reassoc> : (f32, vector<16xf32>) -> f32
 //      REASSOC: return %[[V]] : f32

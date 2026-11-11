@@ -889,7 +889,7 @@ func.func @reduce_0d_f32(%arg0: vector<f32>) -> f32 {
 // CHECK-LABEL: @reduce_0d_f32(
 // CHECK-SAME: %[[A:.*]]: vector<f32>)
 //      CHECK: %[[CA:.*]] = builtin.unrealized_conversion_cast %[[A]] : vector<f32> to vector<1xf32>
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[CA]]) : (f32, vector<1xf32>) -> f32
 //      CHECK: return %[[V]] : f32
 
@@ -901,7 +901,7 @@ func.func @reduce_f16(%arg0: vector<16xf16>) -> f16 {
 }
 // CHECK-LABEL: @reduce_f16(
 // CHECK-SAME: %[[A:.*]]: vector<16xf16>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f16) : f16
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f16) : f16
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f16, vector<16xf16>) -> f16
 //      CHECK: return %[[V]] : f16
 
@@ -913,7 +913,7 @@ func.func @reduce_f16_scalable(%arg0: vector<[16]xf16>) -> f16 {
 }
 // CHECK-LABEL: @reduce_f16_scalable(
 // CHECK-SAME: %[[A:.*]]: vector<[16]xf16>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f16) : f16
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f16) : f16
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f16, vector<[16]xf16>) -> f16
 //      CHECK: return %[[V]] : f16
 
@@ -925,7 +925,7 @@ func.func @reduce_f32(%arg0: vector<16xf32>) -> f32 {
 }
 // CHECK-LABEL: @reduce_f32(
 // CHECK-SAME: %[[A:.*]]: vector<16xf32>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f32, vector<16xf32>) -> f32
 //      CHECK: return %[[V]] : f32
 
@@ -937,7 +937,7 @@ func.func @reduce_f32_scalable(%arg0: vector<[16]xf32>) -> f32 {
 }
 // CHECK-LABEL: @reduce_f32_scalable(
 // CHECK-SAME: %[[A:.*]]: vector<[16]xf32>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f32) : f32
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f32) : f32
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f32, vector<[16]xf32>) -> f32
 //      CHECK: return %[[V]] : f32
 
@@ -949,7 +949,7 @@ func.func @reduce_f64(%arg0: vector<16xf64>) -> f64 {
 }
 // CHECK-LABEL: @reduce_f64(
 // CHECK-SAME: %[[A:.*]]: vector<16xf64>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f64) : f64
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f64) : f64
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f64, vector<16xf64>) -> f64
 //      CHECK: return %[[V]] : f64
 
@@ -961,7 +961,7 @@ func.func @reduce_f64_scalable(%arg0: vector<[16]xf64>) -> f64 {
 }
 // CHECK-LABEL: @reduce_f64_scalable(
 // CHECK-SAME: %[[A:.*]]: vector<[16]xf64>)
-//      CHECK: %[[C:.*]] = llvm.mlir.constant(0.000000e+00 : f64) : f64
+//      CHECK: %[[C:.*]] = llvm.mlir.constant(-0.000000e+00 : f64) : f64
 //      CHECK: %[[V:.*]] = llvm.intr.vector.reduce.fadd(%[[C]], %[[A]]) : (f64, vector<[16]xf64>) -> f64
 //      CHECK: return %[[V]] : f64
 
