@@ -2367,8 +2367,15 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
     SDValue AB = Bits(A);
     SDValue A1 = Flt(DAG.getNode(ISD::OR, DL, MVT::i32, And(AB, 0x807fffff),
                                  C(0x3f800000)));
-    SDValue Q0 = Mul(A1, Y);
-    SDValue Q = Fma(Fma(NegD, Q0, A1), Y, Q0);
+    SDValue Q;
+    if (CA && CA->getValueAPF().isNormal() &&
+        (CA->getValueAPF().bitcastToAPInt().getZExtValue() & 0x7fffff) == 0) {
+      // a = +-2^k: a1 = +-1, so q = +-y, already the rounded quotient.
+      Q = CA->isNegative() ? DAG.getNode(ISD::FNEG, DL, VT, Y) : Y;
+    } else {
+      SDValue Q0 = Mul(A1, Y);
+      Q = Fma(Fma(NegD, Q0, A1), Y, Q0);
+    }
     SDValue PA = Flt(And(AB, 0x7f800000));
     auto *CPB = dyn_cast<ConstantFPSDNode>(PB);
     if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {

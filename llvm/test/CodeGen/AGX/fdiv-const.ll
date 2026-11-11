@@ -209,3 +209,43 @@ define agx_kernel void @by_huge(ptr addrspace(1) %p) {
   store float %r, ptr addrspace(1) %q
   ret void
 }
+
+; A dividend +-2^k: its significand is 1, so the quotient is the rounded
+; reciprocal itself, without the correction step.
+define agx_kernel void @two_over(ptr addrspace(1) %p) {
+; CHECK-LABEL: two_over:
+; CHECK:         // uniform registers: 10 x 16-bit (threadgroups_per_grid at u2)
+; CHECK-NEXT:    // general purpose registers: 5 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    bfi r3, r2, 128, 23, mask 0xFF
+; CHECK-NEXT:    rcp r4, r3
+; CHECK-NEXT:    fmadd32 r3, r3.neg, r4, 1.0
+; CHECK-NEXT:    fmadd32 r3, r3, r4, r4
+; CHECK-NEXT:    mov_imm r4, 2139095040
+; CHECK-NEXT:    fadd32 r3, r3.neg, r3.neg
+; CHECK-NEXT:    bitop 0100, r4, r4, r2
+; CHECK-NEXT:    fmul32 r3, r3, r4
+; CHECK-NEXT:    mov_imm r4, 2143289344
+; CHECK-NEXT:    fcmpsel eq, r2, r2, r2, r3, r4
+; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr float, ptr addrspace(1) %p, i32 %t
+  %x = load float, ptr addrspace(1) %q
+  %r = fdiv float -2.0, %x
+  store float %r, ptr addrspace(1) %q
+  ret void
+}
