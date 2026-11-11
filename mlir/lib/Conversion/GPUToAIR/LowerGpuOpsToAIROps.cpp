@@ -843,6 +843,88 @@ static Value narrowIndex(OpBuilder &b, Value v, DenseMap<Value, Value> &done,
   return n;
 }
 
+/// An upper bound below 2^64 of index \p v, if it is a sum of products of
+/// values that are not negative (GPU ids and sizes, constants, unsigned casts
+/// of i32), each product of one constant of at least 1: then no partial sum
+/// or product wraps (each is below 2^64), and each is at most \p v's value.
+static std::optional<uint64_t> nonNegativeTree(Value v, unsigned depth = 0) {
+  APInt c;
+  if (matchPattern(v, m_ConstantInt(&c))) {
+    if (c.isNegative() || c.getActiveBits() > 32)
+      return std::nullopt;
+    return c.getZExtValue();
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def || depth >= 16)
+    return std::nullopt;
+  if (isa<gpu::ThreadIdOp, gpu::BlockIdOp, gpu::GlobalIdOp, gpu::BlockDimOp,
+          gpu::GridDimOp, gpu::LaneIdOp, gpu::SubgroupIdOp,
+          gpu::NumSubgroupsOp, gpu::SubgroupSizeOp>(def))
+    return uint64_t(UINT32_MAX); // AIR's are i32.
+  if (auto cast = dyn_cast<arith::IndexCastUIOp>(def)) {
+    if (!cast.getIn().getType().isInteger(32))
+      return std::nullopt;
+    return uint64_t(UINT32_MAX);
+  }
+  bool overflow = false;
+  if (isa<arith::AddIOp>(def)) {
+    std::optional<uint64_t> x = nonNegativeTree(def->getOperand(0), depth + 1);
+    std::optional<uint64_t> y = nonNegativeTree(def->getOperand(1), depth + 1);
+    if (!x || !y)
+      return std::nullopt;
+    uint64_t r = llvm::SaturatingAdd(*x, *y, &overflow);
+    return overflow ? std::nullopt : std::optional<uint64_t>(r);
+  }
+  if (isa<arith::MulIOp>(def)) {
+    APInt k;
+    for (unsigned i = 0; i < 2; ++i)
+      if (matchPattern(def->getOperand(i), m_ConstantInt(&k)) &&
+          k.isStrictlyPositive() && k.getActiveBits() <= 32) {
+        std::optional<uint64_t> x =
+            nonNegativeTree(def->getOperand(1 - i), depth + 1);
+        if (!x)
+          return std::nullopt;
+        uint64_t r = llvm::SaturatingMultiply(*x, k.getZExtValue(), &overflow);
+        return overflow ? std::nullopt : std::optional<uint64_t>(r);
+      }
+  }
+  return std::nullopt;
+}
+
+/// The i32 additions narrowIndex built for the tree of \p v do not wrap
+/// unsigned where the tree is one of values that are not negative
+/// (nonNegativeTree) and its value is an in-bounds index of at most 2^32
+/// elements: each is at most the index, below 2^32. (An access out of bounds
+/// is undefined; a shared subtree is below the index of every access that
+/// runs.) With nuw, the LLVM optimizer takes zext(i + c) as zext(i) + c, and
+/// the backend the constant as an offset (x[i], x[i + 1] as one vector load).
+/// Not the multiplications: a power of two's becomes a shl nuw, through which
+/// LLVM moves the zext, and the address arithmetic becomes 64-bit (L15-E177).
+static void flagNarrowTree(Value v, DenseMap<Value, Value> &done,
+                           unsigned depth = 0) {
+  Operation *def = v.getDefiningOp();
+  if (!def || depth >= 16 || !isa<arith::AddIOp, arith::MulIOp>(def))
+    return;
+  Operation *n = done.lookup(v) ? done.lookup(v).getDefiningOp() : nullptr;
+  // Not i + k of the counter k of a loop of a trip count not constant (one
+  // that is not unrolled): with nuw, LLVM widens i + k to 64 bits in it.
+  auto isCounter = [](Value x) {
+    auto c = x.getDefiningOp<arith::IndexCastUIOp>();
+    auto a = c ? dyn_cast<BlockArgument>(c.getIn()) : BlockArgument();
+    auto loop = a ? dyn_cast<scf::ForOp>(a.getOwner()->getParentOp())
+                  : scf::ForOp();
+    return loop && (!getConstantIntValue(loop.getLowerBound()) ||
+                    !getConstantIntValue(loop.getUpperBound()));
+  };
+  if (isa<arith::AddIOp>(def) &&
+      (isCounter(def->getOperand(0)) || isCounter(def->getOperand(1))))
+    n = nullptr;
+  if (auto a = dyn_cast_or_null<arith::AddIOp>(n))
+    a.setOverflowFlags(a.getOverflowFlags() | arith::IntegerOverflowFlags::nuw);
+  flagNarrowTree(def->getOperand(0), done, depth + 1);
+  flagNarrowTree(def->getOperand(1), done, depth + 1);
+}
+
 /// A memref.load's or memref.store's index is below its dimension's size
 /// (an access out of bounds is undefined), so where the size is static and at
 /// most 2^32 the index is its value mod 2^32 zero-extended, and the
@@ -868,6 +950,8 @@ static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize) {
       if (!def || !isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def))
         continue;
       Value n = narrowIndex(b, index.get(), done);
+      if (nonNegativeTree(index.get()).has_value())
+        flagNarrowTree(index.get(), done);
       b.setInsertionPoint(op);
       index.set(arith::IndexCastUIOp::create(b, op->getLoc(),
                                              b.getIndexType(), n));

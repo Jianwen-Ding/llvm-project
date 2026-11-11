@@ -340,6 +340,24 @@ gpu.module @narrow_indices {
     memref.store %v, %a[%c0, %c0] : memref<1024x16xf32, 1>
     gpu.return
   }
+  // A sum of ids and constants that are not negative (no partial sum or
+  // product wraps in index) is at most the index, below 2^32: its i32
+  // additions do not wrap unsigned. One of an argument (perhaps negative)
+  // may.
+  // CHECK-LABEL: llvm.func @nuw(
+  gpu.func @nuw(%a: memref<65538xf32, 1>, %k: index) kernel {
+    // CHECK: %[[X:.*]] = llvm.add %{{.*}}, %{{.*}} overflow<nuw> : i32
+    // CHECK: llvm.zext %[[X]] : i32 to i64
+    // CHECK: %[[Y:.*]] = llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.zext %[[Y]] : i32 to i64
+    %c2 = arith.constant 2 : index
+    %i = gpu.thread_id x
+    %x = arith.addi %i, %c2 : index
+    %v = memref.load %a[%x] : memref<65538xf32, 1>
+    %y = arith.addi %i, %k : index
+    memref.store %v, %a[%y] : memref<65538xf32, 1>
+    gpu.return
+  }
   // CHECK-LABEL: llvm.func @wide(
   gpu.func @wide(%a: memref<8589934592xf32, 1>, %i: index, %ld: index) kernel {
     // CHECK-NOT: llvm.trunc
