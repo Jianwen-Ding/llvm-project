@@ -1441,7 +1441,25 @@ bool AGXCodeGenPrepare::lowerConstrainedFP(Function &F) {
 
 /// Replace the returns, and unreachable terminators, by branches to a single
 /// return block.
-bool AGXCodeGenPrepare::unifyExits(Function &F) {
+static bool agxUnifyExits(Function &F);
+bool AGXCodeGenPrepare::unifyExits(Function &F) { return agxUnifyExits(F); }
+
+namespace {
+/// unifyExits again after the pre-ISel SimplifyCFG, which ends a block that
+/// calls llvm.trap (noreturn) with unreachable once more: the structurizer
+/// then fails on those exits (PTX-formalization tc-*, fabric*, G14G).
+class AGXUnifyExits : public FunctionPass {
+public:
+  static char ID;
+  AGXUnifyExits() : FunctionPass(ID) {}
+  StringRef getPassName() const override { return "AGX unify exits"; }
+  bool runOnFunction(Function &F) override { return agxUnifyExits(F); }
+};
+} // namespace
+char AGXUnifyExits::ID = 0;
+FunctionPass *llvm::createAGXUnifyExitsPass() { return new AGXUnifyExits(); }
+
+static bool agxUnifyExits(Function &F) {
   SmallVector<Instruction *, 4> Exits;
   for (BasicBlock &BB : F) {
     Instruction *T = BB.getTerminator();

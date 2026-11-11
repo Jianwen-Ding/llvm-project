@@ -548,6 +548,11 @@ bool AGXPassConfig::addPreISel() {
         SimplifyCFGOptions()
             .bonusInstThreshold(AGXPreISelSimplifyCFG)
             .setSimplifyCondBranch(false)));
+  // (SimplifyCFG ends the blocks of a llvm.trap, noreturn, with unreachable
+  // again: back to branches to the single return, as AGXCodeGenPrepare left
+  // them)
+  if (getOptLevel() != CodeGenOptLevel::None && AGXPreISelSimplifyCFG)
+    addPass(createAGXUnifyExitsPass());
   // Bring the CFG into the structured form AGXAnnotateControlFlow expects.
   addPass(createLowerSwitchPass());
   addPass(createFixIrreduciblePass());

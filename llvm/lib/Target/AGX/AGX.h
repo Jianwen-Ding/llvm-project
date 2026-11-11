@@ -46,6 +46,7 @@ ModulePass *createAGXLowerAIRPass(const AGXTargetMachine *TM);
 ModulePass *createAGXPromoteKernelArgsPass();
 ModulePass *createAGXCheckedAccessesPass(const AGXTargetMachine *TM);
 FunctionPass *createAGXCodeGenPreparePass();
+FunctionPass *createAGXUnifyExitsPass();
 FunctionPass *createAGXStrictFPPass();
 FunctionPass *createAGXLowerFPEnvPass();
 FunctionPass *createAGXSoftF64Pass();
