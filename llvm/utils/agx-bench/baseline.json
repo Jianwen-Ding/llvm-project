@@ -919,7 +919,7 @@
   "instructions": 59,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 109.0,
+  "tput": 98.3,
   "uniform_halves": 26,
   "waits": 3
  },
@@ -931,7 +931,7 @@
   "instructions": 59,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 109.0,
+  "tput": 98.3,
   "uniform_halves": 26,
   "waits": 3
  },
