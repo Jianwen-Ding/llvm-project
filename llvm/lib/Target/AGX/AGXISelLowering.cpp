@@ -109,7 +109,8 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setTargetDAGCombine({ISD::SHL, ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
-                       ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND});
+                       ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
+                       ISD::MULHS});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1691,6 +1692,11 @@ static cl::opt<bool> XorShiftCommute(
     cl::desc("(x ^ c) << s as (x << s) ^ (c << s)"), cl::init(true),
     cl::Hidden);
 
+static cl::opt<bool> MulLoHiPairs(
+    "agx-mul-lohi-pairs", cl::init(true), cl::Hidden,
+    cl::desc("a mulhu / mulhs and a mul of the same operands as one "
+             "widening multiply"));
+
 static cl::opt<bool> SignSelect(
     "agx-sign-select",
     cl::desc("select on x > -1 as a select on x < 0, arms swapped"),
@@ -1860,6 +1866,26 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       X = X.getOperand(0);
     }
     return signedByteALU(DCI.DAG, SDLoc(N), X, P);
+  }
+  case ISD::MULHU:
+  case ISD::MULHS: {
+    // A multiply-high whose low half is also computed (mul of the same
+    // operands, as Philox's mul.hi / mul.lo pairs): one 32 x 32 -> 64-bit
+    // multiply for both.
+    if (!MulLoHiPairs || N->getValueType(0) != MVT::i32)
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    SDValue A = N->getOperand(0), B = N->getOperand(1);
+    SDNode *Lo = DAG.getNodeIfExists(ISD::MUL, DAG.getVTList(MVT::i32), {A, B},
+                                     /*AllowCommute=*/true);
+    if (!Lo)
+      return SDValue();
+    SDValue LoHi = DAG.getNode(N->getOpcode() == ISD::MULHU ? ISD::UMUL_LOHI
+                                                            : ISD::SMUL_LOHI,
+                               SDLoc(N), DAG.getVTList(MVT::i32, MVT::i32), A,
+                               B);
+    DCI.CombineTo(Lo, LoHi.getValue(0));
+    return LoHi.getValue(1);
   }
   case ISD::SRA: {
     if (AGXSignedBytesALU < 2 ||
