@@ -651,64 +651,180 @@ static cl::opt<bool> AGXSignedCounterIndices(
     cl::desc("pointerFromCounter also for a counter from below zero, as a "
              "signed index"));
 
+static cl::opt<bool> AGXIntegerAddressCounters(
+    "agx-integer-address-counters", cl::init(false), cl::Hidden,
+    cl::desc("pointerFromCounter also for i64 addresses (inttoptr users)"));
+static cl::opt<bool> AGXRelativeCounters(
+    "agx-relative-counters", cl::init(true), cl::Hidden,
+    cl::desc("pointerFromCounter with the counter less its start, where the "
+             "trip count bounds it"));
+static cl::opt<bool> AGXRuntimeCounterStarts(
+    "agx-runtime-counter-starts", cl::init(true), cl::Hidden,
+    cl::desc("pointerFromCounter also for a counter whose start is not a "
+             "constant"));
+
 static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
-  if (!Pre || !Latch || !P.getType()->isPointerTy() ||
-      P.getNumIncomingValues() != 2)
+  if (!Pre || !Latch || P.getNumIncomingValues() != 2)
     return false;
-  auto *Inc = dyn_cast<GetElementPtrInst>(P.getIncomingValueForBlock(Latch));
+  // A pointer stepped by a GEP of bytes, or (the PTX front end's addresses)
+  // an i64 stepped by an add whose other users are inttoptrs.
+  bool IsInt = P.getType()->isIntegerTy(64);
+  if (!P.getType()->isPointerTy() && !(IsInt && AGXIntegerAddressCounters))
+    return false;
+  auto *Inc = dyn_cast<Instruction>(P.getIncomingValueForBlock(Latch));
   const APInt *Sp;
-  if (!Inc || Inc->getPointerOperand() != &P || Inc->getNumIndices() != 1 ||
-      !Inc->getSourceElementType()->isIntegerTy(8) ||
-      !match(Inc->getOperand(1), m_APInt(Sp)) || !Inc->hasOneUse() ||
-      Sp->isNegative() || Sp->isZero())
+  if (!Inc || !Inc->hasOneUse())
     return false;
-  // the accesses: P itself, of 32-bit elements
-  for (User *U : P.users()) {
-    if (U == Inc)
-      continue;
+  if (IsInt) {
+    if (!match(Inc, m_Add(m_Specific(&P), m_APInt(Sp))))
+      return false;
+  } else {
+    auto *G = dyn_cast<GetElementPtrInst>(Inc);
+    if (!G || G->getPointerOperand() != &P || G->getNumIndices() != 1 ||
+        !G->getSourceElementType()->isIntegerTy(8) ||
+        !match(G->getOperand(1), m_APInt(Sp)))
+      return false;
+  }
+  if (Sp->isNegative() || Sp->isZero())
+    return false;
+  // the accesses: P itself (through an inttoptr for an i64), of 32-bit
+  // elements
+  auto Access = [&](User *U, Value *Ptr) {
     Type *T = nullptr;
     if (auto *Ld = dyn_cast<LoadInst>(U))
       T = Ld->getType();
     else if (auto *St = dyn_cast<StoreInst>(U))
-      T = St->getPointerOperand() == &P ? St->getValueOperand()->getType()
-                                        : nullptr;
-    if (!T || T->getScalarSizeInBits() != 32 || !L.contains(cast<Instruction>(U)))
+      T = St->getPointerOperand() == Ptr ? St->getValueOperand()->getType()
+                                         : nullptr;
+    return T && T->getScalarSizeInBits() == 32 &&
+           L.contains(cast<Instruction>(U));
+  };
+  // For an i64: each pointer an access takes, inttoptr(P) or a constant
+  // GEP of bytes from it, with its offset (folded into a base of its own).
+  SmallVector<std::pair<Instruction *, int64_t>, 4> Ptrs;
+  for (User *U : P.users()) {
+    if (U == Inc)
+      continue;
+    if (!IsInt) {
+      if (!Access(U, &P))
+        return false;
+      continue;
+    }
+    auto *I2P = dyn_cast<IntToPtrInst>(U);
+    if (!I2P || !L.contains(I2P) || I2P->use_empty())
       return false;
+    for (User *V : I2P->users()) {
+      if (Access(V, I2P))
+        continue;
+      auto *G = dyn_cast<GetElementPtrInst>(V);
+      const APInt *C;
+      if (!G || G->getPointerOperand() != I2P || G->getNumIndices() != 1 ||
+          !G->getSourceElementType()->isIntegerTy(8) ||
+          !match(G->getOperand(1), m_APInt(C)) || G->use_empty() ||
+          !all_of(G->users(), [&](User *W) { return Access(W, G); }))
+        return false;
+      Ptrs.push_back({G, C->getSExtValue()});
+    }
+    Ptrs.push_back({I2P, 0});
   }
   for (PHINode &J : L.getHeader()->phis()) {
     if (!J.getType()->isIntegerTy(32) || J.getNumIncomingValues() != 2)
       continue;
-    const APInt *J0, *T;
+    const APInt *T;
+    Value *J0 = J.getIncomingValueForBlock(Pre);
     auto *JInc = dyn_cast<BinaryOperator>(J.getIncomingValueForBlock(Latch));
-    if (!match(J.getIncomingValueForBlock(Pre), m_APInt(J0)) || !JInc ||
-        !match(JInc, m_Add(m_Specific(&J), m_APInt(T))) || T->isZero() ||
-        T->isNegative() || Sp->getZExtValue() % T->getZExtValue())
+    if (!JInc || !match(JInc, m_Add(m_Specific(&J), m_APInt(T))) ||
+        T->isZero())
       continue;
-    uint64_t M = Sp->getZExtValue() / T->getZExtValue();
+    // The counter relative to its start, k |t| after k iterations, where the
+    // trip count bounds it below 2^31: an index for any counter (one up from
+    // a runtime start, one down), at one subtraction each iteration.
+    uint64_t AbsT = T->abs().getZExtValue();
+    auto *MaxBTC =
+        dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
+    bool Bounded = AGXRelativeCounters && MaxBTC &&
+                   MaxBTC->getAPInt().getActiveBits() <= 31 &&
+                   (MaxBTC->getAPInt().getZExtValue() + 1) * AbsT <
+                       (uint64_t(1) << 31);
+    bool Relative =
+        Bounded && (T->isNegative() ||
+                    (!isa<ConstantInt>(J0) && !SE.getUnsignedRange(SE.getSCEV(&J))
+                                                   .getUnsignedMax()
+                                                   .ult(1u << 31)));
+    if ((T->isNegative() && !Relative) || Sp->getZExtValue() % AbsT)
+      continue;
+    // A start that is not a constant: computed before the loop (AGX:
+    // -agx-runtime-counter-starts).
+    if (!isa<ConstantInt>(J0) &&
+        (!AGXRuntimeCounterStarts || !L.isLoopInvariant(J0)))
+      continue;
+    uint64_t M = Sp->getZExtValue() / AbsT;
     if (M != 4 && M != 8 && M != 16)
       continue;
     // j zero-extended where it is in [0, 2^31); else, a counter LSR starts
     // below zero (from -t), j sign-extended where its recurrence does not
     // wrap signed (j_k = j0 + t k exactly: the hardware's signed index).
     bool Signed = false;
-    if (!SE.getUnsignedRange(SE.getSCEV(&J)).getUnsignedMax().ult(1u << 31)) {
+    if (!Relative &&
+        !SE.getUnsignedRange(SE.getSCEV(&J)).getUnsignedMax().ult(1u << 31)) {
       auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(&J));
       if (!AGXSignedCounterIndices || !AR || AR->getLoop() != &L ||
           !AR->hasNoSignedWrap())
         continue;
       Signed = true;
     }
-    // p0 - M j0, then base + ext(j) * M before the first access
+    // p0 - M j0, then base + ext(j) * M before the first access (relative:
+    // p0, then base + zext(+-(j - j0)) * M)
     IRBuilder<> PB(Pre->getTerminator());
-    Value *Base = PB.CreatePtrAdd(
-        P.getIncomingValueForBlock(Pre),
-        ConstantInt::get(Type::getInt64Ty(P.getContext()),
-                         -int64_t(M) * J0->getSExtValue()));
+    Type *I64 = PB.getInt64Ty();
+    Value *Off;
+    if (Relative)
+      Off = ConstantInt::get(I64, 0);
+    else if (auto *C = dyn_cast<ConstantInt>(J0))
+      Off = ConstantInt::get(I64, -int64_t(M) * C->getSExtValue());
+    else
+      Off = PB.CreateNeg(PB.CreateShl(Signed ? PB.CreateSExt(J0, I64)
+                                             : PB.CreateZExt(J0, I64),
+                                      Log2_64(M)));
+    Value *P0 = P.getIncomingValueForBlock(Pre);
     IRBuilder<> B(L.getHeader(), L.getHeader()->getFirstInsertionPt());
-    Value *Z = Signed ? B.CreateSExt(&J, B.getInt64Ty())
-                      : B.CreateZExt(&J, B.getInt64Ty());
+    Value *Z;
+    if (Relative)
+      Z = B.CreateZExt(T->isNegative() ? B.CreateSub(J0, &J) : B.CreateSub(&J, J0),
+                       I64);
+    else
+      Z = Signed ? B.CreateSExt(&J, I64) : B.CreateZExt(&J, I64);
+    if (IsInt) {
+      // inttoptr(base + c + (ext(j) << log2 M)) for each offset c: the
+      // access's base and index register.
+      Value *Scaled = B.CreateShl(Z, Log2_64(M));
+      DenseMap<std::pair<int64_t, unsigned>, Value *> ByOffset;
+      for (auto [I, C] : Ptrs) {
+        unsigned AS = cast<PointerType>(I->getType())->getAddressSpace();
+        Value *&V = ByOffset[{C, AS}];
+        if (!V) {
+          Value *BaseC = PB.CreateAdd(PB.CreateAdd(P0, Off),
+                                      ConstantInt::get(I64, C));
+          V = B.CreateIntToPtr(B.CreateAdd(BaseC, Scaled, P.getName()),
+                               I->getType());
+        }
+        I->replaceAllUsesWith(V);
+      }
+      for (auto [I, C] : Ptrs)
+        if (isa<GetElementPtrInst>(I))
+          I->eraseFromParent();
+      for (auto [I, C] : Ptrs)
+        if (isa<IntToPtrInst>(I))
+          I->eraseFromParent();
+      Inc->replaceAllUsesWith(PoisonValue::get(Inc->getType()));
+      Inc->eraseFromParent();
+      P.replaceAllUsesWith(PoisonValue::get(P.getType()));
+      P.eraseFromParent();
+      return true;
+    }
+    Value *Base = PB.CreatePtrAdd(P0, Off);
     Value *Addr = B.CreateGEP(B.getIntNTy(8 * M), Base, Z, P.getName());
     P.replaceUsesWithIf(Addr, [&](Use &U) { return U.getUser() != Inc; });
     Inc->replaceAllUsesWith(PoisonValue::get(Inc->getType()));
@@ -744,7 +860,7 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
     if (AGXPointersFromCounters && L->isInnermost()) {
       SmallVector<PHINode *, 4> Ptrs;
       for (PHINode &Phi : L->getHeader()->phis())
-        if (Phi.getType()->isPointerTy())
+        if (Phi.getType()->isPointerTy() || Phi.getType()->isIntegerTy(64))
           Ptrs.push_back(&Phi);
       for (PHINode *Phi : Ptrs)
         Changed |= pointerFromCounter(*Phi, *L, SE);
