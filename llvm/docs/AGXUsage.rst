@@ -737,8 +737,8 @@ atomic operations are monotonic accesses between the fences of their scope
 25 ns before a store and 250 ns after a load; the sequentially consistent
 sequence costs 0.4 to 0.65 us.
 
-Not supported: ``frem`` and vector arithmetic on ``double`` (see `Double
-precision`_; diagnosed as unsupported), textures and graphics shaders, calls
+Not supported: vector arithmetic and the transcendental functions on
+``double`` (see `Double precision`_; diagnosed as unsupported), textures and graphics shaders, calls
 to functions that are not defined in the module, recursion through variadic
 functions or ``musttail`` calls, and dynamic ``alloca`` in recursive functions.
 
@@ -932,8 +932,10 @@ without changing a result. NaN results are ``0x7fffffffffffffff`` with
 to integers saturate, and NaN converts to 0.
 
 Values that are only moved (loads, stores, ``phi``, ``select``, arguments)
-stay ``double`` and become ``i64`` in type legalization. ``frem`` and vector
-arithmetic on ``double`` are diagnosed as unsupported. The code is large: in
+stay ``double`` and become ``i64`` in type legalization. ``frem`` is the
+exact ``fmod``, one bit of the quotient an iteration (8 instructions
+for each binade between the operands). Vector arithmetic and the
+transcendental functions on ``double`` are diagnosed as unsupported. The code is large: in
 instructions per operation, about 215 for an addition or a multiplication,
 430 for a fused multiply-add, 290 for a division or a square root, 100 for a
 conversion and 30 for a comparison.

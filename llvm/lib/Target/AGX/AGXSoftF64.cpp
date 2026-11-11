@@ -1119,6 +1119,7 @@ bool AGX::isDoubleArithmetic(const Instruction &I) {
   case Instruction::FSub:
   case Instruction::FMul:
   case Instruction::FDiv:
+  case Instruction::FRem:
   case Instruction::FNeg:
   case Instruction::FPTrunc:
   case Instruction::SIToFP:
@@ -1203,6 +1204,99 @@ static Value *withSlowPath(Instruction &I, IRBuilder<> &B, Value *Fast,
   return Phi;
 }
 
+/// frem of the doubles of bits X and Y, exact, on integers (before I, which
+/// ends up in the join block): with a = mx 2^ex and b = my 2^ey (mx, my of 53
+/// bits, denormals normalized), mx 2^(ex - ey) mod my one bit at a time (r =
+/// 2 r - my where that is not negative), then normalized at b's exponent (a
+/// denormal result shifted back: exact, the remainder a multiple of the
+/// smaller of a's and b's last bits). The result has the sign of a: zero
+/// where b divides a, a itself where |a| < |b| (also an infinite b or a zero
+/// a), and NaN for an infinite or NaN a, a NaN or zero b (the first NaN
+/// operand quieted, or the canonical NaN).
+static Value *fmodBits(Instruction &I, IRBuilder<> &B, Value *X, Value *Y,
+                       bool CanonicalNaN) {
+  LLVMContext &Ctx = I.getContext();
+  Type *I32 = B.getInt32Ty(), *I64 = B.getInt64Ty();
+  auto K = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  const uint64_t Sign = 0x8000000000000000ull, Abs = ~Sign,
+                 Inf = 0x7ff0000000000000ull, Frac = (1ull << 52) - 1,
+                 One = 1ull << 52, Quiet = 1ull << 51;
+  Value *SX = B.CreateAnd(X, K(Sign));
+  Value *AX = B.CreateAnd(X, K(Abs)), *AY = B.CreateAnd(Y, K(Abs));
+  Value *XNaN = B.CreateICmpUGT(AX, K(Inf)), *YNaN = B.CreateICmpUGT(AY, K(Inf));
+  Value *NaN = B.CreateOr(B.CreateOr(B.CreateICmpUGE(AX, K(Inf)), YNaN),
+                          B.CreateICmpEQ(AY, K(0)));
+  Value *NaNR = K(CanonicalNaN ? 0x7fffffffffffffffull : 0x7ff8000000000000ull);
+  if (!CanonicalNaN)
+    NaNR = B.CreateSelect(XNaN, B.CreateOr(X, K(Quiet)),
+                          B.CreateSelect(YNaN, B.CreateOr(Y, K(Quiet)), NaNR));
+  Value *Small = B.CreateICmpULT(AX, AY);
+  Value *Special = B.CreateOr(B.CreateOr(NaN, Small), B.CreateICmpEQ(AX, AY));
+  Value *SpecialR =
+      B.CreateSelect(NaN, NaNR, B.CreateSelect(Small, X, SX));
+  // The significand of 53 bits and its exponent (a denormal's 1 - s, s the
+  // shift normalizing it); only used for finite nonzero operands.
+  auto Split = [&](Value *V) -> std::pair<Value *, Value *> {
+    Value *E = B.CreateTrunc(B.CreateLShr(V, 52), I32);
+    Value *Denormal = B.CreateICmpEQ(E, B.getInt32(0));
+    Value *S = B.CreateSub(
+        B.CreateTrunc(B.CreateBinaryIntrinsic(Intrinsic::ctlz, V, B.getTrue()),
+                      I32),
+        B.getInt32(11));
+    Value *M = B.CreateSelect(Denormal, B.CreateShl(V, B.CreateZExt(S, I64)),
+                              B.CreateOr(B.CreateAnd(V, K(Frac)), K(One)));
+    return {M, B.CreateSelect(Denormal, B.CreateSub(B.getInt32(1), S), E)};
+  };
+  auto [MX, EX] = Split(AX);
+  auto [MY, EY] = Split(AY);
+  Value *N0 = B.CreateSub(EX, EY);
+  Instruction *ThenTerm =
+      SplitBlockAndInsertIfThen(B.CreateNot(Special), I.getIterator(), false);
+  BasicBlock *Head = ThenTerm->getParent()->getSinglePredecessor();
+  BasicBlock *Pre = ThenTerm->getParent();
+  BasicBlock *Join = I.getParent();
+  Function *Fn = Join->getParent();
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "fmod.loop", Fn, Join);
+  BasicBlock *Tail = BasicBlock::Create(Ctx, "fmod.tail", Fn, Join);
+  ThenTerm->eraseFromParent();
+  IRBuilder<>(Pre).CreateBr(Loop);
+
+  IRBuilder<> LB(Loop);
+  PHINode *N = LB.CreatePHI(I32, 2);
+  PHINode *M = LB.CreatePHI(I64, 2);
+  N->addIncoming(N0, Pre);
+  M->addIncoming(MX, Pre);
+  Value *D = LB.CreateSub(M, MY);
+  Value *R = LB.CreateSelect(LB.CreateICmpSGE(D, K(0)), D, M);
+  N->addIncoming(LB.CreateSub(N, LB.getInt32(1)), Loop);
+  M->addIncoming(LB.CreateShl(R, K(1)), Loop);
+  LB.CreateCondBr(LB.CreateICmpEQ(N, LB.getInt32(0)), Tail, Loop);
+
+  // r below 2^53 at b's exponent: normalized (r = 0 is a signed zero).
+  IRBuilder<> TB(Tail);
+  Value *Z = TB.CreateTrunc(
+      TB.CreateBinaryIntrinsic(Intrinsic::ctlz, R, TB.getFalse()), I32);
+  Value *S = TB.CreateSub(Z, TB.getInt32(11));
+  Value *E = TB.CreateSub(EY, S);
+  Value *RN = TB.CreateShl(R, TB.CreateZExt(S, I64));
+  Value *Normal = TB.CreateOr(TB.CreateAnd(RN, K(Frac)),
+                              TB.CreateShl(TB.CreateZExt(E, I64), K(52)));
+  Value *Denormal = TB.CreateLShr(
+      RN, TB.CreateZExt(TB.CreateSub(TB.getInt32(1), E), I64));
+  Value *Bits = TB.CreateSelect(TB.CreateICmpSGT(E, TB.getInt32(0)), Normal,
+                                Denormal);
+  Bits = TB.CreateSelect(TB.CreateICmpEQ(R, K(0)), K(0), Bits);
+  Value *LoopR = TB.CreateOr(Bits, SX);
+  TB.CreateBr(Join);
+
+  B.SetInsertPoint(Join->begin());
+  PHINode *Result = B.CreatePHI(I64, 2);
+  Result->addIncoming(SpecialR, Head);
+  Result->addIncoming(LoopR, Tail);
+  B.SetInsertPoint(&I);
+  return Result;
+}
+
 Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
                                   bool CanonicalNaN, bool FastPathsHere) {
   if (!isDoubleArithmetic(I))
@@ -1259,6 +1353,9 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     }, Rounding, CanonicalNaN));
     break;
   }
+  case Instruction::FRem:
+    R = Dbl(fmodBits(I, B, Bits(0), Bits(1), CanonicalNaN));
+    break;
   case Instruction::FNeg:
     R = Dbl(B.CreateXor(Bits(0), SD.c64(F64.signBit())));
     break;

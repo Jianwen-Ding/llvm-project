@@ -1516,6 +1516,93 @@ void EmulateF64::doublesToBits() {
       F.eraseFromParent();
 }
 
+/// fmod of the doubles of bits X and Y (frem), exact, on integers: with
+/// a = mx 2^ex and b = my 2^ey (mx, my of 53 bits, denormals normalized),
+/// mx 2^(ex - ey) mod my one bit at a time (r = 2 r - my where that is not
+/// negative), then normalized at b's exponent (a denormal result shifted
+/// back: exact, the remainder a multiple of the smaller of a's and b's
+/// last bits). The result has the sign of a: zero where b divides a, a
+/// itself where |a| < |b| (also an infinite b or a zero a), and a quiet NaN
+/// for an infinite or NaN a, a NaN or zero b. Leaves B at the end, which
+/// the result is defined in.
+static Value *fmodBits(IRBuilder<> &B, Value *X, Value *Y) {
+  LLVMContext &Ctx = B.getContext();
+  Function *Fn = B.GetInsertBlock()->getParent();
+  Type *I32 = B.getInt32Ty(), *I64 = B.getInt64Ty();
+  auto K = [&](uint64_t V) { return ConstantInt::get(I64, V); };
+  const uint64_t Sign = 0x8000000000000000ull, Abs = ~Sign,
+                 Inf = 0x7ff0000000000000ull, Frac = (1ull << 52) - 1,
+                 One = 1ull << 52;
+  Value *SX = B.CreateAnd(X, K(Sign));
+  Value *AX = B.CreateAnd(X, K(Abs)), *AY = B.CreateAnd(Y, K(Abs));
+  Value *NaN = B.CreateOr(B.CreateOr(B.CreateICmpUGE(AX, K(Inf)),
+                                     B.CreateICmpUGT(AY, K(Inf))),
+                          B.CreateICmpEQ(AY, K(0)));
+  Value *Small = B.CreateICmpULT(AX, AY);
+  Value *Equal = B.CreateICmpEQ(AX, AY);
+  // The significand of 53 bits and its exponent (a denormal's 1 - s, s the
+  // shift normalizing it).
+  auto Split = [&](Value *V) -> std::pair<Value *, Value *> {
+    Value *E = B.CreateTrunc(B.CreateLShr(V, 52), I32);
+    Value *Denormal = B.CreateICmpEQ(E, B.getInt32(0));
+    Value *S = B.CreateSub(
+        B.CreateTrunc(B.CreateBinaryIntrinsic(Intrinsic::ctlz, V, B.getTrue()),
+                      I32),
+        B.getInt32(11));
+    Value *M = B.CreateSelect(Denormal, B.CreateShl(V, B.CreateZExt(S, I64)),
+                              B.CreateOr(B.CreateAnd(V, K(Frac)), K(One)));
+    return {M, B.CreateSelect(Denormal, B.CreateSub(B.getInt32(1), S), E)};
+  };
+  BasicBlock *Entry = B.GetInsertBlock();
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "fmod.loop", Fn);
+  BasicBlock *Tail = BasicBlock::Create(Ctx, "fmod.tail", Fn);
+  BasicBlock *Done = BasicBlock::Create(Ctx, "fmod.done", Fn);
+  Value *Special = B.CreateOr(B.CreateOr(NaN, Small), Equal);
+  Value *SpecialR = B.CreateSelect(
+      NaN, K(0x7ff8000000000000ull), B.CreateSelect(Small, X, SX));
+  // Split only where the operands are finite and nonzero (and a's ctlz
+  // defined): a zero a is Small or NaN.
+  auto [MX, EX] = Split(AX);
+  auto [MY, EY] = Split(AY);
+  Value *N0 = B.CreateSub(EX, EY);
+  B.CreateCondBr(Special, Done, Loop);
+
+  B.SetInsertPoint(Loop);
+  PHINode *N = B.CreatePHI(I32, 2);
+  PHINode *M = B.CreatePHI(I64, 2);
+  N->addIncoming(N0, Entry);
+  M->addIncoming(MX, Entry);
+  Value *D = B.CreateSub(M, MY);
+  Value *R = B.CreateSelect(B.CreateICmpSGE(D, K(0)), D, M);
+  N->addIncoming(B.CreateSub(N, B.getInt32(1)), Loop);
+  M->addIncoming(B.CreateShl(R, K(1)), Loop);
+  B.CreateCondBr(B.CreateICmpEQ(N, B.getInt32(0)), Tail, Loop);
+
+  // r below 2^53 at b's exponent: normalized (r = 0 is a signed zero).
+  B.SetInsertPoint(Tail);
+  Value *Z = B.CreateTrunc(B.CreateBinaryIntrinsic(Intrinsic::ctlz, R,
+                                                   B.getFalse()),
+                           I32);
+  Value *S = B.CreateSub(Z, B.getInt32(11));
+  Value *E = B.CreateSub(EY, S);
+  Value *RN = B.CreateShl(R, B.CreateZExt(S, I64));
+  Value *Normal = B.CreateOr(B.CreateAnd(RN, K(Frac)),
+                             B.CreateShl(B.CreateZExt(E, I64), K(52)));
+  Value *Denormal = B.CreateLShr(
+      RN, B.CreateZExt(B.CreateSub(B.getInt32(1), E), I64));
+  Value *Bits = B.CreateSelect(B.CreateICmpSGT(E, B.getInt32(0)), Normal,
+                               Denormal);
+  Bits = B.CreateSelect(B.CreateICmpEQ(R, K(0)), K(0), Bits);
+  Value *LoopR = B.CreateOr(Bits, SX);
+  B.CreateBr(Done);
+
+  B.SetInsertPoint(Done);
+  PHINode *Result = B.CreatePHI(I64, 2);
+  Result->addIncoming(SpecialR, Entry);
+  Result->addIncoming(LoopR, Tail);
+  return Result;
+}
+
 /// The body of emulation F, of the operation Key.
 void EmulateF64::emulate(Function &F, StringRef Key) {
   F.setLinkage(GlobalValue::InternalLinkage);
@@ -1797,6 +1884,8 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
       R = RLib("__air_f64_div", I64, {A[0], A[1]});
     else if (B2 == "fma" || B2 == "fmuladd")
       R = RLib("__air_f64_fma", I64, {A[0], A[1], A[2]});
+    else if (B2 == "frem")
+      R = fmodBits(B, A[0], A[1]);
     else if (B2 == "sqrt")
       R = RLib("__air_f64_sqrt", I64, {A[0]});
     else if (B2 == "fneg")
