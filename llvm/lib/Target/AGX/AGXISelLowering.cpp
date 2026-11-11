@@ -210,9 +210,10 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                      MVT::f32, Custom);
   setOperationAction(ISD::FDIV, MVT::f16, Custom);
   setOperationAction(ISD::FSQRT, {MVT::f32, MVT::f16}, Custom);
-  setOperationAction({ISD::FREM, ISD::FSIN, ISD::FCOS, ISD::FEXP, ISD::FEXP10,
-                      ISD::FLOG, ISD::FLOG10, ISD::FPOW},
+  setOperationAction({ISD::FREM, ISD::FEXP, ISD::FEXP10, ISD::FLOG,
+                      ISD::FLOG10, ISD::FPOW},
                      MVT::f16, Promote);
+  setOperationAction({ISD::FSIN, ISD::FCOS}, MVT::f16, Custom);
   setOperationAction({ISD::FP16_TO_FP, ISD::FP_TO_FP16}, MVT::f32, Expand);
   // bfloat16 is not a legal type: conversions are integer operations.
   setOperationAction({ISD::BF16_TO_FP, ISD::FP_TO_BF16},
@@ -2893,6 +2894,11 @@ SDValue AGXTargetLowering::lowerFREM(SDValue Op, SelectionDAG &DAG) const {
                      A);
 }
 
+static cl::opt<bool> PreciseHalfTrig(
+    "agx-precise-half-trig",
+    cl::desc("half sin / cos with an exact reduction to turns"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerTrig(SDValue Op, SelectionDAG &DAG) const {
   // The hardware evaluates sin(x * pi / 2) for x in [0, 4): reduce the
   // argument to turns, take the fraction and scale to quadrants. cos(x) is
@@ -2904,6 +2910,36 @@ SDValue AGXTargetLowering::lowerTrig(SDValue Op, SelectionDAG &DAG) const {
   // below 2^-12.)
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
+  if (VT == MVT::f16) {
+    // In float. Without afn, the turns of a half x exactly: x / 2pi with
+    // 1 / 2pi = c_hi + c_mid, c_hi of 13 bits so that x c_hi (11 bits by 13)
+    // is exact and so is its fraction; then x c_mid added by an fma and the
+    // fraction taken again. x / 2pi rounded to float was up to 2^-24 t turns
+    // off, which put half sin / cos up to 1,517 / 4,800 ulp off for large x
+    // (simulator, every half).
+    SDValue X = DAG.getNode(ISD::FP_EXTEND, DL, MVT::f32, Op.getOperand(0));
+    SDValue R;
+    if (Op->getFlags().hasApproximateFuncs() || !PreciseHalfTrig) {
+      R = lowerTrig(DAG.getNode(Op.getOpcode(), DL, MVT::f32, X, Op->getFlags()),
+                    DAG);
+    } else {
+      auto KF = [&](double V) { return DAG.getConstantFP(V, DL, MVT::f32); };
+      auto Frac = [&](SDValue T) {
+        return DAG.getNode(ISD::FSUB, DL, MVT::f32, T,
+                           DAG.getNode(ISD::FFLOOR, DL, MVT::f32, T));
+      };
+      SDValue T = Frac(DAG.getNode(ISD::FMUL, DL, MVT::f32, X,
+                                   KF(0.159149169921875)));
+      if (Op.getOpcode() == ISD::FCOS)
+        T = DAG.getNode(ISD::FADD, DL, MVT::f32, T, KF(0.25));
+      T = Frac(DAG.getNode(ISD::FMA, DL, MVT::f32, X,
+                           KF(5.773169959866209e-06), T));
+      R = DAG.getNode(AGXISD::SIN_QUADRANTS, DL, MVT::f32,
+                      DAG.getNode(ISD::FMUL, DL, MVT::f32, T, KF(4.0)));
+    }
+    return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, R,
+                       DAG.getTargetConstant(0, DL, MVT::i32));
+  }
   auto K = [&](double V) { return DAG.getConstantFP(V, DL, VT); };
   bool Precise = DAG.getSubtarget<AGXSubtarget>().hasIEEEFP32();
   SDValue Turns =
