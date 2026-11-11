@@ -2110,6 +2110,24 @@ def : Pat<(i32 (srl (sra i32:$x, (i32 31)), agx_low_mask_shift:$s)),
           (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0,
                        (i32 (agx_low_mask_of_shift $s)), 0, (i32 0))>;
 
+// The same on 16 bits: (x < 0) ? m : 0 from and(sra(x, 15), m) and
+// srl(sra(x, 15), 16 - k).
+def agx_imm8_16 : ImmLeaf<i16, [{ return isUInt<8>(Imm); }]>;
+def agx_low_mask_shift16 : ImmLeaf<i16, [{ return Imm >= 8 && Imm < 16; }]>;
+def agx_low_mask_of_shift16 : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant((1u << (16 - N->getZExtValue())) - 1,
+                                   SDLoc(N), MVT::i16);
+}]>;
+def agx_imm16_keep : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(N->getZExtValue(), SDLoc(N), MVT::i16);
+}]>;
+def : Pat<(i16 (and (sra i16:$x, (i16 15)), agx_imm8_16:$m)),
+          (ICMPSEL_I16 IC_SLT, 0, $x, 0, (i16 0), 0,
+                       (i16 (agx_imm16_keep $m)), 0, (i16 0))>;
+def : Pat<(i16 (srl (sra i16:$x, (i16 15)), agx_low_mask_shift16:$s)),
+          (ICMPSEL_I16 IC_SLT, 0, $x, 0, (i16 0), 0,
+                       (i16 (agx_low_mask_of_shift16 $s)), 0, (i16 0))>;
+
 // x - ((x + b) & -2^k) (a signed remainder by 2^k, b its bias) is
 // ((x + b) & (2^k - 1)) - b: the mask an 8-bit immediate instead of a
 // mov_imm of -2^k, one subtraction fewer.
@@ -2123,6 +2141,17 @@ def agx_not_imm : SDNodeXForm<imm, [{
 def : Pat<(i32 (sub i32:$x, (and (add i32:$x, i32:$b), agx_neg_pow2_8:$c))),
           (ISUB_I32 0, (BITOP_I32 TT_AND, 0, (IADD_I32 0, $x, 0, $b, 0), 0,
                                   (i32 (agx_not_imm $c))),
+                    0, $b, 0)>;
+def agx_neg_pow2_8_16 : ImmLeaf<i16, [{
+  return Imm < -1 && Imm >= -256 && isPowerOf2_64(uint64_t(-Imm));
+}]>;
+def agx_not_imm16 : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(uint16_t(~uint16_t(N->getZExtValue())),
+                                   SDLoc(N), MVT::i16);
+}]>;
+def : Pat<(i16 (sub i16:$x, (and (add i16:$x, i16:$b), agx_neg_pow2_8_16:$c))),
+          (ISUB_I16 0, (BITOP_I16 TT_AND, 0, (IADD_I16 0, $x, 0, $b, 0), 0,
+                                  (i16 (agx_not_imm16 $c))),
                     0, $b, 0)>;
 
 // The sign bit as a truth value: x >= 0 (the shift of its complement, as
