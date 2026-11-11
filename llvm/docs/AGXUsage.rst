@@ -849,6 +849,13 @@ could reach 2^24, then a last step by |b| truncates the correctly rounded
 quotient and keeps whichever of a - q |b| and a - (q - 1) |b| lies in
 [0, |b|).
 
+``llvm.fma`` on ``bfloat`` is rounded once in every mode (a ``float`` fma
+rounded again to ``bfloat`` would round twice): in ``float`` where that is
+exact (the product of normal ``bfloat`` values, TwoSum's error, the sum
+rounded to odd, then to nearest ``bfloat``), the exact software fma behind an
+unlikely branch otherwise (which keeps denormal operands and results).
+``llvm.fmuladd`` on ``bfloat`` is the ``bfloat`` multiplication and addition.
+
 Two features, off by default, implement IEEE 754 and PTX behavior in software
 (``AGXStrictFP.cpp``):
 

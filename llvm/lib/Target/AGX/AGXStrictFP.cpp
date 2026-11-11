@@ -1335,10 +1335,90 @@ static bool lowerFlushing(Instruction &I) {
 /// hardware flushes), with the result rounded back. Float has more than
 /// twice the precision of bfloat, so rounding twice gives the correctly
 /// rounded result. Returns false if I is not a bfloat operation.
+static cl::opt<bool> BF16FMA(
+    "agx-bf16-fma", cl::init(true), cl::Hidden,
+    cl::desc("bfloat fma rounded once without ieee-fp32 too (not a float fma "
+             "rounded again to bfloat)"));
+
 static cl::opt<bool> BF16FastFMA(
     "agx-strict-bf16-fast-fma", cl::init(true), cl::Hidden,
     cl::desc("Strict bfloat fma in float where that is exact (the software "
              "fma otherwise)"));
+
+/// bfloat fma, rounded once: in float where that is exact (BF16FastFMA), the
+/// exact software fma behind an unlikely branch otherwise.
+static void lowerBF16FMA(Instruction &I, bool CanonicalNaN) {
+  // In float where that is exact: the product of two normal bfloats is
+  // exact in float (8-bit significands) while it is normal; with it and
+  // the addend zero or in [2^-102, 2^126), TwoSum gives the sum's exact
+  // error (no value of it is denormal or overflows), the sum rounded to
+  // odd (the odd neighbour where it is inexact) then rounded to nearest
+  // bfloat rounds once, float keeping 16 bits more. Otherwise (bfloat
+  // denormals, which the float hardware flushes, tiny or huge products,
+  // infinities, NaNs) the exact software fma.
+  Value *X0 = I.getOperand(0), *Y0 = I.getOperand(1), *Z0 = I.getOperand(2);
+  replaceWithSlowPath(
+      I,
+      [&](SoftFloat &, IRBuilderBase &B) -> std::pair<Value *, Value *> {
+        Type *F32 = B.getFloatTy(), *I32 = B.getInt32Ty();
+        auto C = [&](uint32_t V) { return B.getInt32(V); };
+        auto Bits = [&](Value *V) { return B.CreateBitCast(V, I32); };
+        Value *X = B.CreateFPExt(X0, F32), *Y = B.CreateFPExt(Y0, F32),
+              *Z = B.CreateFPExt(Z0, F32);
+        auto Mag = [&](Value *V) {
+          return B.CreateAnd(Bits(V), C(0x7fffffff));
+        };
+        // zero or in [Lo, Hi) (on the bits: a flushed denormal is not zero)
+        auto In = [&](Value *M, uint32_t Lo, uint32_t Hi) {
+          return B.CreateOr(
+              B.CreateICmpEQ(M, C(0)),
+              B.CreateICmpULT(B.CreateSub(M, C(Lo)), C(Hi - Lo)));
+        };
+        Value *MX = Mag(X), *MY = Mag(Y);
+        Value *P = B.CreateFMul(X, Y);
+        Value *ZeroOperand =
+            B.CreateOr(B.CreateICmpEQ(MX, C(0)), B.CreateICmpEQ(MY, C(0)));
+        Value *Valid = B.CreateAnd(In(MX, 0x00800000, 0x7f800000),
+                                   In(MY, 0x00800000, 0x7f800000));
+        // a nonzero product of nonzero operands in range (a zero product
+        // of nonzero ones flushed)
+        Value *MP = Mag(P);
+        Value *POk =
+            B.CreateSelect(ZeroOperand, B.getTrue(),
+                           B.CreateICmpULT(B.CreateSub(MP, C(0x0c800000)),
+                                           C(0x7e800000 - 0x0c800000)));
+        Valid = B.CreateAnd(B.CreateAnd(Valid, POk),
+                            In(Mag(Z), 0x0c800000, 0x7e800000));
+        Value *S = B.CreateFAdd(P, Z);
+        Value *BV = B.CreateFSub(S, P);
+        Value *Err = B.CreateFAdd(B.CreateFSub(P, B.CreateFSub(S, BV)),
+                                  B.CreateFSub(Z, BV));
+        // to odd: one unit toward the exact value where S is inexact and
+        // even (a unit on the bits is one on the magnitude, the sign kept)
+        Value *SB = Bits(S);
+        Value *Inexact = B.CreateFCmpUNE(Err, ConstantFP::get(F32, 0.0));
+        Value *Even = B.CreateICmpEQ(B.CreateAnd(SB, C(1)), C(0));
+        Value *Away =
+            B.CreateICmpEQ(B.CreateICmpSLT(SB, C(0)),
+                           B.CreateFCmpOLT(Err, ConstantFP::get(F32, 0.0)));
+        Value *Odd =
+            B.CreateSelect(B.CreateAnd(Inexact, Even),
+                           B.CreateSelect(Away, B.CreateAdd(SB, C(1)),
+                                          B.CreateSub(SB, C(1))),
+                           SB);
+        // to nearest even bfloat
+        Value *Lsb = B.CreateAnd(B.CreateLShr(Odd, C(16)), C(1));
+        Value *R = B.CreateLShr(B.CreateAdd(Odd, B.CreateAdd(Lsb, C(0x7fff))),
+                                C(16));
+        Value *Fast =
+            B.CreateBitCast(B.CreateTrunc(R, B.getInt16Ty()), I.getType());
+        return {Fast, Valid};
+      },
+      [&](SoftFloat &, IRBuilderBase &B) {
+        return AGX::buildSoftFMA(B, X0, Y0, Z0, B.getInt32(RoundNearestEven),
+                                 CanonicalNaN);
+      });
+}
 
 static bool promoteBFloat(Instruction &I, bool CanonicalNaN) {
   bool IsCmp = isa<FCmpInst>(I);
@@ -1376,76 +1456,7 @@ static bool promoteBFloat(Instruction &I, bool CanonicalNaN) {
   }
   IRBuilder<> B(&I);
   if ((ID == Intrinsic::fma || ID == Intrinsic::fmuladd) && BF16FastFMA) {
-    // In float where that is exact: the product of two normal bfloats is
-    // exact in float (8-bit significands) while it is normal; with it and
-    // the addend zero or in [2^-102, 2^126), TwoSum gives the sum's exact
-    // error (no value of it is denormal or overflows), the sum rounded to
-    // odd (the odd neighbour where it is inexact) then rounded to nearest
-    // bfloat rounds once, float keeping 16 bits more. Otherwise (bfloat
-    // denormals, which the float hardware flushes, tiny or huge products,
-    // infinities, NaNs) the exact software fma.
-    Value *X0 = I.getOperand(0), *Y0 = I.getOperand(1), *Z0 = I.getOperand(2);
-    replaceWithSlowPath(
-        I,
-        [&](SoftFloat &, IRBuilderBase &B) -> std::pair<Value *, Value *> {
-          Type *F32 = B.getFloatTy(), *I32 = B.getInt32Ty();
-          auto C = [&](uint32_t V) { return B.getInt32(V); };
-          auto Bits = [&](Value *V) { return B.CreateBitCast(V, I32); };
-          Value *X = B.CreateFPExt(X0, F32), *Y = B.CreateFPExt(Y0, F32),
-                *Z = B.CreateFPExt(Z0, F32);
-          auto Mag = [&](Value *V) {
-            return B.CreateAnd(Bits(V), C(0x7fffffff));
-          };
-          // zero or in [Lo, Hi) (on the bits: a flushed denormal is not zero)
-          auto In = [&](Value *M, uint32_t Lo, uint32_t Hi) {
-            return B.CreateOr(
-                B.CreateICmpEQ(M, C(0)),
-                B.CreateICmpULT(B.CreateSub(M, C(Lo)), C(Hi - Lo)));
-          };
-          Value *MX = Mag(X), *MY = Mag(Y);
-          Value *P = B.CreateFMul(X, Y);
-          Value *ZeroOperand =
-              B.CreateOr(B.CreateICmpEQ(MX, C(0)), B.CreateICmpEQ(MY, C(0)));
-          Value *Valid = B.CreateAnd(In(MX, 0x00800000, 0x7f800000),
-                                     In(MY, 0x00800000, 0x7f800000));
-          // a nonzero product of nonzero operands in range (a zero product
-          // of nonzero ones flushed)
-          Value *MP = Mag(P);
-          Value *POk =
-              B.CreateSelect(ZeroOperand, B.getTrue(),
-                             B.CreateICmpULT(B.CreateSub(MP, C(0x0c800000)),
-                                             C(0x7e800000 - 0x0c800000)));
-          Valid = B.CreateAnd(B.CreateAnd(Valid, POk),
-                              In(Mag(Z), 0x0c800000, 0x7e800000));
-          Value *S = B.CreateFAdd(P, Z);
-          Value *BV = B.CreateFSub(S, P);
-          Value *Err = B.CreateFAdd(B.CreateFSub(P, B.CreateFSub(S, BV)),
-                                    B.CreateFSub(Z, BV));
-          // to odd: one unit toward the exact value where S is inexact and
-          // even (a unit on the bits is one on the magnitude, the sign kept)
-          Value *SB = Bits(S);
-          Value *Inexact = B.CreateFCmpUNE(Err, ConstantFP::get(F32, 0.0));
-          Value *Even = B.CreateICmpEQ(B.CreateAnd(SB, C(1)), C(0));
-          Value *Away =
-              B.CreateICmpEQ(B.CreateICmpSLT(SB, C(0)),
-                             B.CreateFCmpOLT(Err, ConstantFP::get(F32, 0.0)));
-          Value *Odd =
-              B.CreateSelect(B.CreateAnd(Inexact, Even),
-                             B.CreateSelect(Away, B.CreateAdd(SB, C(1)),
-                                            B.CreateSub(SB, C(1))),
-                             SB);
-          // to nearest even bfloat
-          Value *Lsb = B.CreateAnd(B.CreateLShr(Odd, C(16)), C(1));
-          Value *R = B.CreateLShr(B.CreateAdd(Odd, B.CreateAdd(Lsb, C(0x7fff))),
-                                  C(16));
-          Value *Fast =
-              B.CreateBitCast(B.CreateTrunc(R, B.getInt16Ty()), I.getType());
-          return {Fast, Valid};
-        },
-        [&](SoftFloat &, IRBuilderBase &B) {
-          return AGX::buildSoftFMA(B, X0, Y0, Z0, B.getInt32(RoundNearestEven),
-                                   CanonicalNaN);
-        });
+    lowerBF16FMA(I, CanonicalNaN);
     return true;
   }
   if (ID == Intrinsic::fma || ID == Intrinsic::fmuladd) {
@@ -1527,6 +1538,36 @@ bool AGXStrictFP::runOnFunction(Function &F) {
       S->eraseFromParent();
       if (Cmp)
         RecursivelyDeleteTriviallyDeadInstructions(Cmp);
+      Changed = true;
+    }
+  }
+
+  // bfloat fma rounded once in any mode (the float fma and a rounding to
+  // bfloat would round twice); fmuladd, which may round the product, as the
+  // bfloat multiplication and addition (each a float operation rounded once
+  // to bfloat: the product is exact in float, and float keeps more than
+  // twice bfloat's precision for the sum).
+  if (!ST.hasIEEEFP32() && BF16FMA) {
+    SmallVector<Instruction *, 4> FMAs;
+    for (Instruction &I : instructions(F))
+      if (I.getType()->isBFloatTy() &&
+          (getIntrinsicID(I) == Intrinsic::fma ||
+           getIntrinsicID(I) == Intrinsic::fmuladd))
+        FMAs.push_back(&I);
+    for (Instruction *I : FMAs) {
+      if (getIntrinsicID(*I) == Intrinsic::fmuladd) {
+        IRBuilder<> B(I);
+        auto *Mul = cast<Instruction>(
+            B.CreateFMul(I->getOperand(0), I->getOperand(1)));
+        Mul->copyFastMathFlags(I);
+        auto *Add = cast<Instruction>(B.CreateFAdd(Mul, I->getOperand(2)));
+        Add->copyFastMathFlags(I);
+        Add->takeName(I);
+        I->replaceAllUsesWith(Add);
+        I->eraseFromParent();
+      } else {
+        lowerBF16FMA(*I, CanonicalNaN);
+      }
       Changed = true;
     }
   }
