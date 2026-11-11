@@ -31,6 +31,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/PatternMatch.h"
@@ -63,6 +64,7 @@ public:
   StringRef getPassName() const override { return "AGX Narrow Inductions"; }
   bool runOnFunction(Function &F) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<DominatorTreeWrapperPass>();
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addRequired<ScalarEvolutionWrapperPass>();
   }
@@ -74,6 +76,7 @@ char AGXNarrowInductions::ID = 0;
 
 INITIALIZE_PASS_BEGIN(AGXNarrowInductions, DEBUG_TYPE, "AGX Narrow Inductions",
                       false, false)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_END(AGXNarrowInductions, DEBUG_TYPE, "AGX Narrow Inductions",
@@ -360,11 +363,81 @@ static void splitWideCounter(const WideCounter &W) {
   W.Phi->eraseFromParent();
 }
 
+static cl::opt<bool> AGXSplitOffsetInductions(
+    "agx-split-offset-inductions", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit offset induction only added to invariant bases as "
+             "one induction per base"));
+
+/// After loop strength reduction, PTX's walk of several buffers by one 64-bit
+/// byte offset o (o += s; each address base_k + o in integers) is still k
+/// 64-bit additions and the increment every iteration, with o and every base
+/// live. Where o has no other use and no two bases differ by a constant
+/// (which one register and immediate offsets would serve), each address is
+/// its own induction p_k = base_k + o, p_k += s (the same modulo 2^64): k
+/// increments, one register less, and no addition before the accesses.
+/// Only additions that run every iteration (conv3x3's are in the bounds
+/// checks' blocks, which the SIMD-group may skip).
+/// (Before loop strength reduction it redoes the shared offset, L15-E163.)
+static bool splitOffsets(PHINode &O, Loop &L, ScalarEvolution &SE,
+                         DominatorTree &DT) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch || O.getNumIncomingValues() != 2)
+    return false;
+  Value *Init = O.getIncomingValueForBlock(Pre);
+  auto *Inc = dyn_cast<BinaryOperator>(O.getIncomingValueForBlock(Latch));
+  Value *S;
+  if (!Init || !Inc || !match(Inc, m_c_Add(m_Specific(&O), m_Value(S))) ||
+      !L.isLoopInvariant(S) || !Inc->hasOneUse())
+    return false;
+  SmallVector<std::pair<BinaryOperator *, Value *>, 4> Adds;
+  for (User *U : O.users()) {
+    if (U == Inc)
+      continue;
+    auto *A = dyn_cast<BinaryOperator>(U);
+    Value *Base;
+    // (a base computed in the loop from invariant values, such as PTX's
+    // casts of a kernel argument, goes before it)
+    bool Hoisted;
+    if (!A || !L.contains(A) || !DT.dominates(A->getParent(), Latch) ||
+        !match(A, m_c_Add(m_Specific(&O), m_Value(Base))) ||
+        !L.makeLoopInvariant(Base, Hoisted, Pre->getTerminator()))
+      return false;
+    Adds.push_back({A, Base});
+  }
+  if (Adds.empty())
+    return false;
+  for (unsigned I = 0; I < Adds.size(); ++I)
+    for (unsigned J = I + 1; J < Adds.size(); ++J)
+      if (isa<SCEVConstant>(SE.getMinusSCEV(SE.getSCEV(Adds[I].second),
+                                             SE.getSCEV(Adds[J].second))))
+        return false;
+  for (auto [A, Base] : Adds) {
+    IRBuilder<> P(Pre->getTerminator());
+    Value *Start = P.CreateAdd(Base, Init);
+    PHINode *Ph = PHINode::Create(O.getType(), 2, A->getName() + ".iv");
+    Ph->insertBefore(O.getIterator());
+    IRBuilder<> B(Inc);
+    Value *Next = B.CreateAdd(Ph, S, A->getName() + ".iv.next");
+    Ph->addIncoming(Start, Pre);
+    Ph->addIncoming(Next, Latch);
+    SE.forgetValue(A);
+    A->replaceAllUsesWith(Ph);
+    A->eraseFromParent();
+  }
+  SE.forgetValue(&O);
+  Inc->replaceAllUsesWith(PoisonValue::get(Inc->getType()));
+  Inc->eraseFromParent();
+  O.eraseFromParent();
+  return true;
+}
+
 bool AGXNarrowInductions::runOnFunction(Function &F) {
   if (!AGXNarrowInductionsOpt || skipFunction(F))
     return false;
   LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+  DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   bool Changed = false;
   for (Loop *L : LI.getLoopsInPreorder()) {
     SmallVector<PHINode *, 4> Phis;
@@ -373,6 +446,14 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
         Phis.push_back(&Phi);
     for (PHINode *Phi : Phis)
       Changed |= narrow(*Phi, *L, SE);
+    if (AGXSplitOffsetInductions && L->isInnermost()) {
+      SmallVector<PHINode *, 4> Wide;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isIntegerTy(64))
+          Wide.push_back(&Phi);
+      for (PHINode *Phi : Wide)
+        Changed |= splitOffsets(*Phi, *L, SE, DT);
+    }
   }
   if (!AGXSplitWideCounters)
     return Changed;
