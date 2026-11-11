@@ -5,7 +5,8 @@
 ; whole bytes, low masks) is a byte vector load, each byte zero-extended in a
 ; 16-bit half: no shifts or masks. Signed bytes keep the word (their shared
 ; xor of it, E86). Only the bytes up to the last one used are loaded (1, 2 or
-; 4 from the word's address): byte0, bytes01.
+; 4 from the word's address): byte0, bytes01. A byte extended to 64 bits is
+; loaded into a 32-bit register, not a 16-bit half and a move: byte64.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @bytes4(ptr addrspace(1) %p, ptr addrspace(1) %o) {
@@ -219,5 +220,37 @@ define agx_kernel void @bytes01(ptr addrspace(1) %p, ptr addrspace(1) %o) {
   %f = fadd float %f0, %f1
   %h = getelementptr inbounds float, ptr addrspace(1) %o, i64 %z
   store float %f, ptr addrspace(1) %h
+  ret void
+}
+
+define agx_kernel void @byte64(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+; CHECK-LABEL: byte64:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    mov_imm r3, 0
+; CHECK-NEXT:    device_load 0, i8, x, r2, u0_u1, r1, unsigned, lsl 2
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u2_u3, r1, unsigned, lsl 1
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %z = zext i32 %i to i64
+  %g = getelementptr inbounds i32, ptr addrspace(1) %p, i64 %z
+  %v = load i32, ptr addrspace(1) %g, align 4
+  %b = and i32 %v, 255
+  %b64 = zext i32 %b to i64
+  %h = getelementptr inbounds i64, ptr addrspace(1) %o, i64 %z
+  store i64 %b64, ptr addrspace(1) %h
   ret void
 }

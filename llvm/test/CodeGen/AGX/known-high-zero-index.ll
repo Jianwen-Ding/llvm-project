@@ -15,10 +15,9 @@ define agx_kernel void @atomic_byte(ptr addrspace(1) %p, ptr addrspace(1) %h, i3
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    bitop 0101, r1, u4, 0
 ; CHECK-NEXT:    mov_imm r2, 1
-; CHECK-NEXT:    device_load 0, i8, x, r1l, u0_u1, r1, unsigned, lsl 2
+; CHECK-NEXT:    device_load 0, i8, x, r1, u0_u1, r1, unsigned, lsl 2
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    memory_barrier 0, 3, 3
-; CHECK-NEXT:    bitop 0101, r1, r1l, 0
 ; CHECK-NEXT:    atomic add, 0, _, u2_u3, r1, unsigned, r2, 0
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    memory_barrier 3, 1, 9
@@ -34,21 +33,16 @@ define agx_kernel void @atomic_byte(ptr addrspace(1) %p, ptr addrspace(1) %h, i3
 ;
 ; OFF-LABEL: atomic_byte:
 ; OFF:         // uniform registers: 16 x 16-bit (threadgroups_per_grid at u5)
-; OFF-NEXT:    // general purpose registers: 6 x 32-bit (up to 1024 threads per threadgroup)
+; OFF-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
 ; OFF-NEXT:    // threadgroup memory: 0 bytes
 ; OFF-NEXT:    // stack size: 0 bytes
 ; OFF-NEXT:  // %bb.0:
 ; OFF-NEXT:    bitop 0101, r1, u4, 0
-; OFF-NEXT:    bitop 0101, r2, u2, 0
-; OFF-NEXT:    device_load 0, i8, x, r1l, u0_u1, r1, unsigned, lsl 2
-; OFF-NEXT:    bitop 0101, r3, u3, 0
-; OFF-NEXT:    mov_imm r5, 0
+; OFF-NEXT:    mov_imm r2, 1
+; OFF-NEXT:    device_load 0, i8, x, r1, u0_u1, r1, unsigned, lsl 2
 ; OFF-NEXT:    wait 0
 ; OFF-NEXT:    memory_barrier 0, 3, 3
-; OFF-NEXT:    bitop 0101, r4, r1l, 0
-; OFF-NEXT:    mov_imm r1, 1
-; OFF-NEXT:    iadd r2_r3, r2_r3, r4_r5, lsl 2
-; OFF-NEXT:    atomic add, 0, _, r2_r3, 0, signed, r1, 0
+; OFF-NEXT:    atomic add, 0, _, u2_u3, r1, unsigned, r2, 0
 ; OFF-NEXT:    wait 0
 ; OFF-NEXT:    memory_barrier 3, 1, 9
 ; OFF-NEXT:    stop

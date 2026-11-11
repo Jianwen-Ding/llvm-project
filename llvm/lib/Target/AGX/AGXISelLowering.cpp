@@ -1723,6 +1723,11 @@ static cl::opt<bool> SignSelect(
     cl::desc("select on x > -1 as a select on x < 0, arms swapped"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> WideByteLoads(
+    "agx-wide-byte-loads", cl::init(true), cl::Hidden,
+    cl::desc("A byte loaded zero-extended to 16 bits and extended further is "
+             "loaded into a 32-bit register"));
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
@@ -1996,10 +2001,29 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     return DCI.DAG.getNode(AGXISD::FSAT, SDLoc(N), VT, X);
   }
   case ISD::ZERO_EXTEND: {
+    SDValue A = N->getOperand(0);
+    // A byte loaded zero-extended to 16 bits (an i64 zero-extending load of
+    // a byte is expanded so), extended further: the byte loaded into the
+    // 32-bit register, zero-extended, instead of a 16-bit half and a move.
+    if (auto *L = dyn_cast<LoadSDNode>(A);
+        WideByteLoads && L && A.getValueType() == MVT::i16 &&
+        (N->getValueType(0) == MVT::i32 || N->getValueType(0) == MVT::i64) &&
+        L->getExtensionType() == ISD::ZEXTLOAD && L->getMemoryVT() == MVT::i8 &&
+        !L->isIndexed() && L->isSimple() && A.hasOneUse()) {
+      // (Device, threadgroup and stack loads of a byte into 32 bits all
+      // have patterns.)
+      SelectionDAG &DAG = DCI.DAG;
+      SDLoc DL(N);
+      SDValue W = DAG.getExtLoad(ISD::ZEXTLOAD, DL, MVT::i32, L->getChain(),
+                                 L->getBasePtr(), MVT::i8, L->getMemOperand());
+      DAG.ReplaceAllUsesOfValueWith(SDValue(L, 1), W.getValue(1));
+      return N->getValueType(0) == MVT::i32
+                 ? W
+                 : DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i64, W);
+    }
     // Booleans (i1 promoted to i16) combined with and / or / xor and then
     // extended to 32 bits (for a branch): compute them in 32 bits, where
     // compares produce them directly, instead of a 16-bit chain and a move.
-    SDValue A = N->getOperand(0);
     if (N->getValueType(0) != MVT::i32 || A.getValueType() != MVT::i16 ||
         !isBoolean16(A, DCI.DAG, 0))
       return SDValue();
