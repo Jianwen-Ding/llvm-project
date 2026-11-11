@@ -118,6 +118,11 @@ def SDT_AGXBfiField : SDTypeProfile<1, 4, [SDTCisInt<0>, SDTCisSameAs<1, 0>,
 def AGXbfi_field : SDNode<"AGXISD::BFI_FIELD", SDT_AGXBfiField>;
 // The low halves of Lo and Hi as the low and high halves of a 32-bit value.
 def AGXpack16 : SDNode<"AGXISD::PACK16", SDTIntBinOp>;
+// Float to an 8-bit integer, saturated to its range (NaN 0), in a 16-bit
+// register zero-extended from 8 bits (the convert's 8-bit modes, B27).
+def SDTAGXCvtF8 : SDTypeProfile<1, 1, [SDTCisVT<0, i16>, SDTCisFP<1>]>;
+def AGXcvt_f_to_u8 : SDNode<"AGXISD::CVT_F_TO_U8", SDTAGXCvtF8>;
+def AGXcvt_f_to_s8 : SDNode<"AGXISD::CVT_F_TO_S8", SDTAGXCvtF8>;
 // Clamp to [0, 1], a NaN to +0 (the .sat output modifier).
 def AGXfsat : SDNode<"AGXISD::FSAT", SDTFPUnaryOp>;
 // The 64-bit product of two 32-bit values, unsigned or signed (one imadd).

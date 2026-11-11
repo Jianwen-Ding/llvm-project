@@ -760,6 +760,11 @@ static SDValue lowerLogicSelect64(SDValue Op, SelectionDAG &DAG) {
                 DAG.getNode(Opc, DL, MVT::i32, AHi, BHi));
 }
 
+static cl::opt<bool> Convert8(
+    "agx-convert8", cl::init(true), cl::Hidden,
+    cl::desc("a float saturated to an 8-bit integer as the convert's 8-bit "
+             "mode"));
+
 static cl::opt<bool> SatConvertClamp(
     "agx-sat-convert-clamp",
     cl::desc("narrow saturating float conversions as the 16-bit convert and "
@@ -928,9 +933,21 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
       return SDValue();
     bool Signed = Op.getOpcode() == ISD::FP_TO_SINT_SAT;
     SDLoc DL(Op);
+    unsigned W = Sat.getSizeInBits();
+    EVT SrcVT = Op.getOperand(0).getValueType();
+    if (W == 8 && Convert8 && (SrcVT == MVT::f32 || SrcVT == MVT::f16)) {
+      // The convert's 8-bit modes saturate to the byte's range (NaN 0) and
+      // zero-extend it (B27): unsigned is that, signed its sign extension
+      // (which a byte store, reading only the byte, drops).
+      SDValue C = DAG.getNode(Signed ? AGXISD::CVT_F_TO_S8 : AGXISD::CVT_F_TO_U8,
+                              DL, MVT::i16, Op.getOperand(0));
+      if (Signed)
+        C = DAG.getNode(ISD::SIGN_EXTEND_INREG, DL, MVT::i16, C,
+                        DAG.getValueType(MVT::i8));
+      return Signed ? DAG.getSExtOrTrunc(C, DL, VT) : DAG.getZExtOrTrunc(C, DL, VT);
+    }
     SDValue C = DAG.getNode(Op.getOpcode(), DL, MVT::i16, Op.getOperand(0),
                             DAG.getValueType(MVT::i16));
-    unsigned W = Sat.getSizeInBits();
     if (W < 16) {
       if (Signed) {
         C = DAG.getNode(ISD::SMAX, DL, MVT::i16, C,

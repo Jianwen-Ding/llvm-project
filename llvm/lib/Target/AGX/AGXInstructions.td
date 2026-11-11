@@ -1468,6 +1468,24 @@ def : Pat<(i16 (fp_to_sint_sat f32:$a, i16)), (CONVERT_16_32 CVT_F_TO_S16, 0, $a
 def : Pat<(i16 (fp_to_uint_sat f32:$a, i16)), (CONVERT_16_32 CVT_F_TO_U16, 0, $a, ROUND_RTZ)>;
 def : Pat<(i16 (fp_to_sint_sat f16:$a, i16)), (CONVERT_16_16 CVT_F_TO_S16, 0, $a, ROUND_RTZ)>;
 def : Pat<(i16 (fp_to_uint_sat f16:$a, i16)), (CONVERT_16_16 CVT_F_TO_U16, 0, $a, ROUND_RTZ)>;
+// The 8-bit saturating modes (mode 0 / 1 with the direction field clear; as
+// for 16 and 32 bits, mode bit 1 rounds to nearest even, for a rint, roundeven
+// or nearbyint with no other use).
+defvar CVT_F_TO_U8 = 0;
+defvar CVT_F_TO_S8 = 1;
+defvar CVT_F_TO_U8_RN = 2;
+defvar CVT_F_TO_S8_RN = 3;
+def : Pat<(i16 (AGXcvt_f_to_u8 f32:$a)), (CONVERT_16_32 CVT_F_TO_U8, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_s8 f32:$a)), (CONVERT_16_32 CVT_F_TO_S8, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_u8 f16:$a)), (CONVERT_16_16 CVT_F_TO_U8, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_s8 f16:$a)), (CONVERT_16_16 CVT_F_TO_S8, 0, $a, ROUND_RTZ)>;
+foreach R = [frint, froundeven, fnearbyint] in {
+defvar RN8 = PatFrag<(ops node:$a), (R node:$a), [{ return N->hasOneUse(); }]>;
+def : Pat<(i16 (AGXcvt_f_to_u8 (f32 (RN8 f32:$a)))), (CONVERT_16_32 CVT_F_TO_U8_RN, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_s8 (f32 (RN8 f32:$a)))), (CONVERT_16_32 CVT_F_TO_S8_RN, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_u8 (f16 (RN8 f16:$a)))), (CONVERT_16_16 CVT_F_TO_U8_RN, 0, $a, ROUND_RTZ)>;
+def : Pat<(i16 (AGXcvt_f_to_s8 (f16 (RN8 f16:$a)))), (CONVERT_16_16 CVT_F_TO_S8_RN, 0, $a, ROUND_RTZ)>;
+}
 def : Pat<(f32 (sint_to_fp i32:$a)), (CONVERT_32_32 CVT_S32_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (uint_to_fp i32:$a)), (CONVERT_32_32 CVT_U32_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (sint_to_fp i16:$a)), (CONVERT_32_16 CVT_S16_TO_F, 0, $a, ROUND_RTE)>;

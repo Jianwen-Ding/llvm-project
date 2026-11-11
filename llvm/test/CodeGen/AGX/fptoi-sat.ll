@@ -36,9 +36,11 @@ define agx_kernel void @sat16(ptr addrspace(1) %out, float %a, half %h) {
 
 ; CHECK-LABEL: sat8:
 ; CHECK-NOT:     fcmpsel
-; CHECK:         convert f_to_s16, [[S:r[0-9]+l]]
-; CHECK:         icmpsel sgt, [[S]], [[S]], {{r[0-9]+[lh]}}
-; CHECK-NEXT:    icmpsel slt, [[S]], [[S]], 127, [[S]], 127
+; The convert's 8-bit mode saturates to the byte (mode 1, printed by its
+; integer-to-float name, with the float-to-integer direction rtz); the byte
+; store needs no sign extension.
+; CHECK:         convert s8_to_f, {{r[0-9]+l}}, {{u[0-9]+}}, rtz
+; CHECK-NOT:     icmpsel
 ; CHECK:         stop
 define agx_kernel void @sat8(ptr addrspace(1) %out, float %a) {
   %s = call i8 @llvm.fptosi.sat.i8.f32(float %a)
@@ -48,8 +50,8 @@ define agx_kernel void @sat8(ptr addrspace(1) %out, float %a) {
 
 ; CHECK-LABEL: usat8:
 ; CHECK-NOT:     fcmpsel
-; CHECK:         convert f_to_u16, [[U:r[0-9]+l]], {{u[0-9]+l}}, rtz
-; CHECK-NEXT:    icmpsel ult, [[U]], [[U]], 255, [[U]], 255
+; CHECK:         convert u8_to_f, {{r[0-9]+l}}, {{u[0-9]+l}}, rtz
+; CHECK-NOT:     icmpsel
 ; CHECK:         stop
 define agx_kernel void @usat8(ptr addrspace(1) %out, half %a) {
   %s = call i8 @llvm.fptoui.sat.i8.f16(half %a)
