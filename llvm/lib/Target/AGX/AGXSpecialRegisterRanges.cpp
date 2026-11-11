@@ -21,6 +21,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
@@ -39,10 +40,11 @@ static cl::opt<bool> AGXSpecialRegisterRanges(
     cl::desc("Bound the thread and threadgroup indices before instruction "
              "selection"));
 
-static cl::opt<bool> AGXKnownGridRanges(
-    "agx-known-grid-ranges", cl::init(false), cl::Hidden,
+static cl::opt<cl::boolOrDefault> AGXKnownGridRanges(
+    "agx-known-grid-ranges", cl::Hidden,
     cl::desc("Bound grid positions by the kernel's known grid "
-             "(agx-threads-per-grid, agx-threadgroups-per-grid)"));
+             "(agx-threads-per-grid, agx-threadgroups-per-grid); by default "
+             "in kernels without loops"));
 
 namespace {
 class AGXSpecialRegisterRangesPass : public FunctionPass {
@@ -144,12 +146,21 @@ std::optional<uint64_t> AGX::knownGridExtent(const Function &F,
 bool AGX::addSpecialRegisterRanges(Function &F,
                                    SmallVectorImpl<WeakVH> *Added) {
   bool Changed = false;
+  // The known grid's bounds only in a kernel without loops: in a loop, the
+  // offsets they let the DAG fold into addresses become immediates of a
+  // 64-bit base recomputed each iteration (L15-E191).
+  bool GridRanges = AGXKnownGridRanges == cl::boolOrDefault::BOU_TRUE;
+  if (AGXKnownGridRanges == cl::boolOrDefault::BOU_UNSET) {
+    SmallVector<std::pair<const BasicBlock *, const BasicBlock *>, 4> Edges;
+    FindFunctionBackedges(F, Edges);
+    GridRanges = Edges.empty();
+  }
   for (Instruction &I : instructions(F)) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
     if (!II || !II->getType()->isIntegerTy(32))
       continue;
     auto B = bounds(II->getIntrinsicID());
-    if (AGXKnownGridRanges)
+    if (GridRanges)
       if (auto G = gridBounds(F, II->getIntrinsicID()))
         if (!B || G->second - G->first < B->second - B->first)
           B = G;
