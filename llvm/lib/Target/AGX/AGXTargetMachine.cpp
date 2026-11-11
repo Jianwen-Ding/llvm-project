@@ -23,6 +23,7 @@
 #include "AGXMachineFunctionInfo.h"
 #include "AGXTargetTransformInfo.h"
 #include "TargetInfo/AGXTargetInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/Passes.h"
@@ -30,6 +31,8 @@
 #include "llvm/CodeGen/RegisterPressure.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Metadata.h"
@@ -364,6 +367,11 @@ static cl::opt<bool> AGXEarlySRRanges(
     cl::desc("Special register ranges during straight-line strength "
              "reduction (taken off before loop strength reduction)"));
 
+static cl::opt<bool> AGXNonNegativeSignSplats(
+    "agx-nonnegative-sign-splats", cl::init(true), cl::Hidden,
+    cl::desc("x >> (bits - 1) of an x known not negative from the special "
+             "register ranges as 0"));
+
 namespace {
 /// Straight-line strength reduction, n-ary reassociation and the CSE after
 /// them, on functions of at most AGXStraightLineSRMaxInstructions
@@ -413,6 +421,25 @@ public:
     if (AGXEarlySRRanges)
       AGX::addSpecialRegisterRanges(F, &Ranged);
     bool Changed = !FPM.run(F, FAM).areAllPreserved();
+    // With the bounds, an index that starts at a thread position and steps
+    // up without signed overflow is known not negative: the sign splat of
+    // a signed division or remainder by a power of two (x >> 31, the
+    // correction) is 0, so they select as shifts and masks.
+    if (AGXEarlySRRanges && AGXNonNegativeSignSplats && !Ranged.empty()) {
+      using namespace PatternMatch;
+      SimplifyQuery SQ(F.getDataLayout());
+      for (Instruction &I : make_early_inc_range(instructions(F))) {
+        Value *X;
+        const APInt *C;
+        if (match(&I, m_AShr(m_Value(X), m_APInt(C))) &&
+            *C == I.getType()->getScalarSizeInBits() - 1 &&
+            isKnownNonNegative(X, SQ.getWithInstruction(&I))) {
+          I.replaceAllUsesWith(Constant::getNullValue(I.getType()));
+          I.eraseFromParent();
+          Changed = true;
+        }
+      }
+    }
     for (WeakVH &V : Ranged)
       if (auto *CI = dyn_cast_or_null<CallBase>(V))
         CI->removeRetAttr(Attribute::Range);
