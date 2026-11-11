@@ -2691,6 +2691,70 @@ static bool storeBytesTogether(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXSinkMulExtensions(
+    "agx-sink-mul-extensions", cl::init(true), cl::Hidden,
+    cl::desc("a 64-bit multiply's operand that is a 32-bit value extended "
+             "(and shifted) in another block, extended again next to it"));
+
+/// A 64-bit multiply whose operand is a sext / zext of a 32-bit value, or
+/// such a value shifted left by a constant, computed in another block (a
+/// loop-invariant stride LICM hoisted): the extension (and shift) are made
+/// again next to the multiply, so that instruction selection, which sees
+/// one block, makes it a 32 x 32 -> 64-bit multiply (and the shift part of
+/// the address addition) instead of the four-multiply 64-bit product
+/// (index_add's row offsets).
+static bool sinkMulExtensions(Function &F) {
+  if (!AGXSinkMulExtensions)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : instructions(F)) {
+    if (I.getOpcode() != Instruction::Mul || !I.getType()->isIntegerTy(64))
+      continue;
+    // The extension (and a shift of it) of a 32-bit value, and its kind.
+    auto ExtOf = [](Value *V, const APInt *&C) -> Instruction * {
+      using namespace PatternMatch;
+      C = nullptr;
+      Value *X;
+      if (!match(V, m_Shl(m_Value(X), m_APInt(C))))
+        X = V;
+      auto *E = dyn_cast<CastInst>(X);
+      if (!E || !isa<SExtInst, ZExtInst>(E) ||
+          !E->getSrcTy()->isIntegerTy(32))
+        return nullptr;
+      return E;
+    };
+    // Only a multiply of two extensions of one kind is the 32 x 32 -> 64-bit
+    // multiply the cloned extension lets the DAG see.
+    const APInt *C0, *C1;
+    Instruction *E0 = ExtOf(I.getOperand(0), C0);
+    Instruction *E1 = ExtOf(I.getOperand(1), C1);
+    if (!E0 || !E1 || E0->getOpcode() != E1->getOpcode())
+      continue;
+    for (Use &U : I.operands()) {
+      auto *Op = dyn_cast<Instruction>(U.get());
+      if (!Op || Op->getParent() == I.getParent())
+        continue;
+      const APInt *C;
+      ExtOf(Op, C);
+      IRBuilder<> B(&I);
+      Instruction *Ext = C ? cast<Instruction>(Op->getOperand(0)) : Op;
+      Instruction *NewExt = Ext->clone();
+      B.Insert(NewExt);
+      Value *New = NewExt;
+      if (C) {
+        Instruction *NewShl = Op->clone();
+        NewShl->setOperand(0, NewExt);
+        B.Insert(NewShl);
+        New = NewShl;
+      }
+      U.set(New);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSatConvertClamps(
     "agx-sat-convert-clamps", cl::init(true), cl::Hidden,
     cl::desc("a float clamped above at an 8- or 16-bit integer's maximum and "
@@ -3135,6 +3199,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);
   Changed |= storeBytesTogether(F);
+  Changed |= sinkMulExtensions(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

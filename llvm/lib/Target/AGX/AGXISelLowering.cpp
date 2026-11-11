@@ -2288,6 +2288,24 @@ SDValue AGXTargetLowering::lowerMUL64(SDValue Op, SelectionDAG &DAG) const {
     return DAG.getNode(AGXISD::MUL_WIDE_U, DL, MVT::i64, ALo, BLo);
   if (DAG.ComputeNumSignBits(A) > 32 && DAG.ComputeNumSignBits(B) > 32)
     return DAG.getNode(AGXISD::MUL_WIDE_S, DL, MVT::i64, ALo, BLo);
+  // x * (y << k) = (x * y) << k (mod 2^64): an extended 32-bit value shifted
+  // (a byte stride, shared by several products, so the DAG combiner's
+  // one-use form does not apply) multiplies as the 32 x 32 -> 64-bit
+  // product, the shift left for the address addition.
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue S = I ? B : A, O = I ? A : B;
+    if (S.getOpcode() != ISD::SHL || !isa<ConstantSDNode>(S.getOperand(1)))
+      continue;
+    SDValue X = S.getOperand(0);
+    bool Wide = (DAG.ComputeNumSignBits(X) > 32 && DAG.ComputeNumSignBits(O) > 32) ||
+                (DAG.computeKnownBits(X).countMinLeadingZeros() >= 32 &&
+                 DAG.computeKnownBits(O).countMinLeadingZeros() >= 32);
+    if (!Wide || S.getConstantOperandVal(1) >= 64)
+      continue;
+    return DAG.getNode(ISD::SHL, DL, MVT::i64,
+                       DAG.getNode(ISD::MUL, DL, MVT::i64, X, O),
+                       S.getOperand(1));
+  }
 
   // lo(a) * lo(b) as a 64-bit product, plus the cross products in the high
   // half.
