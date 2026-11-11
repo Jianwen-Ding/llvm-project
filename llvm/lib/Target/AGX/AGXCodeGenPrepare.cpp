@@ -3689,8 +3689,41 @@ static bool convertIntsToBFloatOnce(Function &F) {
   return !Casts.empty();
 }
 
+/// lround / llround / lrint / llrint (no libcalls on AGX; half could not be
+/// selected): the integral value (round: halfway away from zero; rint: to
+/// nearest even, the only rounding direction here) converted, frozen (an
+/// out-of-range or NaN operand gives an unspecified value, not poison).
+static bool expandRoundToInt(Function &F) {
+  SmallVector<IntrinsicInst *, 4> Calls;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::lround:
+      case Intrinsic::llround:
+      case Intrinsic::lrint:
+      case Intrinsic::llrint:
+        Calls.push_back(II);
+        break;
+      default:
+        break;
+      }
+  for (IntrinsicInst *II : Calls) {
+    IRBuilder<> B(II);
+    Intrinsic::ID ID = II->getIntrinsicID();
+    bool Away = ID == Intrinsic::lround || ID == Intrinsic::llround;
+    Value *X = II->getArgOperand(0);
+    Value *R = B.CreateUnaryIntrinsic(Away ? Intrinsic::round : Intrinsic::rint, X);
+    R = B.CreateFreeze(B.CreateFPToSI(R, II->getType()));
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
+  return !Calls.empty();
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
-  bool Changed = expandPowI(F);
+  bool Changed = expandRoundToInt(F);
+  Changed |= expandPowI(F);
   Changed |= expandFRem(F, ST);
   Changed |= convertIntsToBFloatOnce(F);
   // An expansion may use functions that are expanded in turn (tan's sin).

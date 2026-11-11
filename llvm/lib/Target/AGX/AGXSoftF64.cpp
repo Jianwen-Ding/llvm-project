@@ -1636,6 +1636,34 @@ bool AGXSoftF64::runOnFunction(Function &F) {
       PowIs.push_back(II);
   for (IntrinsicInst *II : PowIs)
     expandPowI(*II);
+  // lround / llround / lrint / llrint of a double (no libcalls): the
+  // integral value converted, frozen (an out-of-range operand gives an
+  // unspecified value), as AGXCodeGenPrepare does for the other types.
+  SmallVector<IntrinsicInst *, 2> RoundToInts;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::lround:
+      case Intrinsic::llround:
+      case Intrinsic::lrint:
+      case Intrinsic::llrint:
+        if (isDouble(II->getArgOperand(0)))
+          RoundToInts.push_back(II);
+        break;
+      default:
+        break;
+      }
+  for (IntrinsicInst *II : RoundToInts) {
+    IRBuilder<> B(II);
+    Intrinsic::ID ID = II->getIntrinsicID();
+    bool Away = ID == Intrinsic::lround || ID == Intrinsic::llround;
+    Value *R = B.CreateUnaryIntrinsic(Away ? Intrinsic::round : Intrinsic::rint,
+                                      II->getArgOperand(0));
+    R = B.CreateFreeze(B.CreateFPToSI(R, II->getType()));
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
   SmallVector<Instruction *, 16> Worklist;
   for (Instruction &I : instructions(F))
     if (AGX::isDoubleArithmetic(I))
