@@ -53,6 +53,7 @@ private:
   // Complex patterns.
   bool SelectIntSrc(SDValue N, SDValue &Src);
   bool SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods);
+  bool SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods);
   bool SelectDeviceAddr(SDValue Addr, unsigned ElemLog2, SDValue &Base,
                         SDValue &Index, SDValue &Signed, SDValue &Shift);
   bool SelectDeviceAddr8(SDValue Addr, SDValue &Base, SDValue &Index,
@@ -437,6 +438,52 @@ bool AGXDAGToDAGISel::SelectIntSrc(SDValue N, SDValue &Src) {
     }
   }
   Src = N;
+  return true;
+}
+
+/// A 32-bit integer source that is a 16-bit value sign or zero extended: the
+/// 16-bit register (a half of a 32-bit one for x >> 16 and the low 16 bits of
+/// x) read with or without .sx, instead of the extension.
+bool AGXDAGToDAGISel::SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods) {
+  SDLoc DL(N);
+  auto Half = [&](SDValue X, unsigned SubReg) {
+    return CurDAG->getTargetExtractSubreg(SubReg, DL, MVT::i16, X);
+  };
+  unsigned M = 0;
+  switch (N.getOpcode()) {
+  case ISD::SIGN_EXTEND:
+    M = AGX::SRC_MOD_SX;
+    [[fallthrough]];
+  case ISD::ZERO_EXTEND:
+    if (N.getOperand(0).getValueType() != MVT::i16)
+      return false;
+    Src = N.getOperand(0);
+    break;
+  case ISD::SIGN_EXTEND_INREG:
+    if (cast<VTSDNode>(N.getOperand(1))->getVT() != MVT::i16)
+      return false;
+    M = AGX::SRC_MOD_SX;
+    Src = Half(N.getOperand(0), AGX::lo16);
+    break;
+  case ISD::AND:
+    if (!isa<ConstantSDNode>(N.getOperand(1)) ||
+        N.getConstantOperandVal(1) != 0xffff)
+      return false;
+    Src = Half(N.getOperand(0), AGX::lo16);
+    break;
+  case ISD::SRA:
+    M = AGX::SRC_MOD_SX;
+    [[fallthrough]];
+  case ISD::SRL:
+    if (!isa<ConstantSDNode>(N.getOperand(1)) ||
+        N.getConstantOperandVal(1) != 16)
+      return false;
+    Src = Half(N.getOperand(0), AGX::hi16);
+    break;
+  default:
+    return false;
+  }
+  Mods = getI32Imm(M, DL);
   return true;
 }
 

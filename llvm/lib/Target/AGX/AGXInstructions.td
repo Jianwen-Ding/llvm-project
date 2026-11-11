@@ -187,7 +187,9 @@ def : Pat<(i32 (and (srl i32:$a, (i32 16)), agx_uimm16:$c)),
 
 // A 32-bit value masked by 0xffff (too wide for the 8-bit immediate): a
 // move of its low 16 bits, zero-extended by the bitop, instead of a mov_imm
-// of the constant and the and.
+// of the constant and the and (and on the ALU, not a bfeil on the unit
+// integer multiplies and bit fields share).
+let AddedComplexity = 1 in
 def : Pat<(i32 (and i32:$a, 65535)),
           (BITOP_I32_FROM16 TT_MOV, 0, (i16 (EXTRACT_SUBREG $a, lo16)), 0,
                             (i16 0))>;
@@ -475,6 +477,61 @@ defm IMADD_I32 : IMAddPseudos<GPR32, Src32Op, Src32Op, i32, AGXIntSrc32>;
 def : Pat<(i32 (add (mul AGXIntSrc32:$a, AGXIntSrc32:$b),
                    (shl AGXIntSrc32:$c, agx_iadd_shift:$s))),
           (IMADD_I32 0, $a, 0, $b, 0, $c, imm:$s)>;
+
+// 32-bit adds, subtracts and multiply-adds of 16-bit values sign or zero
+// extended read the 16-bit registers (with .sx for the sign) instead of
+// extending them first: a 32-bit operation takes 16-bit sources.
+def IADD_I32_A16 : AGXALUPseudo<IADD_g13, (outs GPR32:$dst),
+                                (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                     SrcMods:$src1_mods, Src32Op:$src1,
+                                     i32imm:$shift)>;
+def ISUB_I32_A16 : AGXALUPseudo<ISUB_g13, (outs GPR32:$dst),
+                                (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                     SrcMods:$src1_mods, Src32Op:$src1,
+                                     i32imm:$shift)>;
+def ISUB_I32_B16 : AGXALUPseudo<ISUB_g13, (outs GPR32:$dst),
+                                (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                     SrcMods:$src1_mods, Src16Op:$src1,
+                                     i32imm:$shift)>;
+def ISUB_I32_FROM16 : AGXALUPseudo<ISUB_g13, (outs GPR32:$dst),
+                                   (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                        SrcMods:$src1_mods, Src16Op:$src1,
+                                        i32imm:$shift)>;
+def IMADD_I32_A16 : AGXALUPseudo<IMADD_g13, (outs GPR32:$dst),
+                                 (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                      SrcMods:$src1_mods, Src32Op:$src1,
+                                      SrcMods:$src2_mods, Src32Op:$src2,
+                                      i32imm:$shift), [], [WriteIMul]>;
+def IMADD_I32_AB16 : AGXALUPseudo<IMADD_g13, (outs GPR32:$dst),
+                                  (ins SrcMods:$src0_mods, Src16Op:$src0,
+                                       SrcMods:$src1_mods, Src16Op:$src1,
+                                       SrcMods:$src2_mods, Src32Op:$src2,
+                                       i32imm:$shift), [], [WriteIMul]>;
+
+let AddedComplexity = 4 in {
+def : Pat<(i32 (add (AGXExt16Src i16:$a, i32:$am), (AGXExt16Src i16:$b, i32:$bm))),
+          (IADD_I32_FROM16 $am, $a, $bm, $b, 0)>;
+def : Pat<(i32 (sub (AGXExt16Src i16:$a, i32:$am), (AGXExt16Src i16:$b, i32:$bm))),
+          (ISUB_I32_FROM16 $am, $a, $bm, $b, 0)>;
+def : Pat<(i32 (mul (AGXExt16Src i16:$a, i32:$am), (AGXExt16Src i16:$b, i32:$bm))),
+          (IMADD_I32_AB16 $am, $a, $bm, $b, 0, (i32 0), 0)>;
+def : Pat<(i32 (add (mul (AGXExt16Src i16:$a, i32:$am), (AGXExt16Src i16:$b, i32:$bm)),
+                    AGXIntSrc32:$c)),
+          (IMADD_I32_AB16 $am, $a, $bm, $b, 0, $c, 0)>;
+}
+let AddedComplexity = 3 in {
+def : Pat<(i32 (add (AGXExt16Src i16:$a, i32:$am), AGXIntSrc32:$b)),
+          (IADD_I32_A16 $am, $a, 0, $b, 0)>;
+def : Pat<(i32 (sub (AGXExt16Src i16:$a, i32:$am), AGXIntSrc32:$b)),
+          (ISUB_I32_A16 $am, $a, 0, $b, 0)>;
+def : Pat<(i32 (sub AGXIntSrc32:$a, (AGXExt16Src i16:$b, i32:$bm))),
+          (ISUB_I32_B16 0, $a, $bm, $b, 0)>;
+def : Pat<(i32 (mul (AGXExt16Src i16:$a, i32:$am), AGXIntSrc32:$b)),
+          (IMADD_I32_A16 $am, $a, 0, $b, 0, (i32 0), 0)>;
+def : Pat<(i32 (add (mul (AGXExt16Src i16:$a, i32:$am), AGXIntSrc32:$b),
+                    AGXIntSrc32:$c)),
+          (IMADD_I32_A16 $am, $a, 0, $b, 0, $c, 0)>;
+}
 
 // 32 x 32 -> 64-bit multiply-add.
 def IMADD_I64_FROM32 : AGXALUPseudo<IMADD_g13, (outs GPR64:$dst),

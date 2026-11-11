@@ -3,20 +3,44 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -filetype=obj < %s -o /dev/null
 
 ; x & 0xffff is a move of the low 16 bits zero-extended, instead of a
-; mov_imm of the constant and an and. A 16-bit value's widening masked by a
+; mov_imm of the constant and an and (or, for an add or a multiply, the low
+; 16-bit register read as a source). A 16-bit value's widening masked by a
 ; constant wider than the 8-bit ALU immediate keeps the constant in a
 ; register.
+
+define agx_kernel void @low16_xor(ptr addrspace(1) %p, i32 %a, i32 %b) {
+; CHECK-LABEL: low16_xor:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 2 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r1, u2l, 0
+; CHECK-NEXT:    xor r1, r1, u3
+; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %x = and i32 %a, 65535
+  %r = xor i32 %x, %b
+  store i32 %r, ptr addrspace(1) %p
+  ret void
+}
 
 define agx_kernel void @low16(ptr addrspace(1) %p, i32 %a, i32 %b) {
 ; CHECK-LABEL: low16:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 2 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bfeil r1, 0, u2, 0, mask 0xFFFF
-; CHECK-NEXT:    bitop 0101, r2, u3l, 0
-; CHECK-NEXT:    imadd r1, r1, r2, 0
+; CHECK-NEXT:    imadd r1, u2l, u3l, 0
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

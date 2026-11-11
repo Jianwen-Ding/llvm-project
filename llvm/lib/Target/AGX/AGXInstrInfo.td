@@ -153,6 +153,9 @@ def AGXIntSrc64 : ComplexPattern<i64, 1, "SelectIntSrc", [], [], -2>;
 // Floating point source with abs/neg modifiers: (value, mods). The value may
 // be an 8-bit floating point immediate.
 def AGXFPSrc16 : ComplexPattern<f16, 2, "SelectFPSrc", [], [], -2>;
+// A 32-bit integer source that is an extended 16-bit value.
+def AGXExt16Src : ComplexPattern<i32, 2, "SelectExt16Src",
+                                 [sext, zext, sext_inreg, and, sra, srl], [], -2>;
 def AGXFPSrc32 : ComplexPattern<f32, 2, "SelectFPSrc", [], [], -2>;
 
 // Device memory addresses: (base, index, signedness, shift) for an element
