@@ -525,6 +525,10 @@ void AGXPassConfig::addIRPasses() {
   TargetPassConfig::addIRPasses();
 }
 
+static cl::opt<bool> AGXUnifyExitsAfterSimplifyCFG(
+    "agx-unify-exits-after-simplifycfg", cl::init(true), cl::Hidden,
+    cl::desc("Unify the exits again after the pre-ISel SimplifyCFG"));
+
 static cl::opt<unsigned> AGXPreISelSimplifyCFG(
     "agx-preisel-simplifycfg", cl::init(2), cl::Hidden,
     cl::desc("SimplifyCFG before structurization with this bonus instruction "
@@ -551,7 +555,8 @@ bool AGXPassConfig::addPreISel() {
   // (SimplifyCFG ends the blocks of a llvm.trap, noreturn, with unreachable
   // again: back to branches to the single return, as AGXCodeGenPrepare left
   // them)
-  if (getOptLevel() != CodeGenOptLevel::None && AGXPreISelSimplifyCFG)
+  if (getOptLevel() != CodeGenOptLevel::None && AGXPreISelSimplifyCFG &&
+      AGXUnifyExitsAfterSimplifyCFG)
     addPass(createAGXUnifyExitsPass());
   // Bring the CFG into the structured form AGXAnnotateControlFlow expects.
   addPass(createLowerSwitchPass());
