@@ -480,11 +480,11 @@
   "waits": 3
  },
  "cuda_permute4d.ll:permute4d:agx-g13g": {
-  "bytes": 13516,
+  "bytes": 13372,
   "cycles": 1587.2,
   "gprs": 56,
   "groups": 24,
-  "instructions": 1815,
+  "instructions": 1791,
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 297.0,
@@ -492,11 +492,11 @@
   "waits": 4
  },
  "cuda_permute4d.ll:permute4d:agx-g14c": {
-  "bytes": 13516,
+  "bytes": 13372,
   "cycles": 1587.2,
   "gprs": 56,
   "groups": 24,
-  "instructions": 1815,
+  "instructions": 1791,
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 297.0,

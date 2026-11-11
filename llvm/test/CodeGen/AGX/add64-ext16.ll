@@ -5,7 +5,9 @@
 ; 16-bit register (.sx for the sign) instead of building the 64-bit value
 ; (a mov_imm of the high word and a move of the low). A pair with a zero high
 ; word (64-bit logic done on the halves) is a zero extension likewise, and a
-; 32-bit one is the 32-bit source of a 64-bit add or subtract.
+; 32-bit one is the 32-bit source of a 64-bit add or subtract. A pair of a
+; value and its sign, or of a sign mask twice ((x ^ s) - s of a 64-bit absolute
+; value), is the 32-bit value sign-extended: a source with .sx, no move.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @add_z16(ptr addrspace(1) %p) {
@@ -466,4 +468,86 @@ define agx_kernel void @bp_shr(ptr addrspace(1) %p, i64 %a, i64 %b) {
   store i64 %r, ptr addrspace(1) %p
   ret void
 }
+define agx_kernel void @abs64(ptr addrspace(1) %p, i64 %x) {
+; CHECK-LABEL: abs64:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    asr r1, u3, 31
+; CHECK-NEXT:    xor r3, u3, r1
+; CHECK-NEXT:    xor r2, u2, r1
+; CHECK-NEXT:    isub r2_r3, r2_r3, r1.sx
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %r = call i64 @llvm.abs.i64(i64 %x, i1 false)
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @sub_sext(ptr addrspace(1) %p, i64 %a, i32 %x) {
+; CHECK-LABEL: sub_sext:
+; CHECK:         // uniform registers: 16 x 16-bit (threadgroups_per_grid at u5)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    isub r2_r3, r2_r3, u4.sx
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %s = sext i32 %x to i64
+  %h = ashr i32 %x, 31
+  %lo = zext i32 %x to i64
+  %hi = zext i32 %h to i64
+  %hs = shl i64 %hi, 32
+  %v = or i64 %lo, %hs
+  %r = sub i64 %a, %v
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+define agx_kernel void @add_signmask(ptr addrspace(1) %p, i64 %a, i64 %y) {
+; CHECK-LABEL: add_signmask:
+; CHECK:         // uniform registers: 18 x 16-bit (threadgroups_per_grid at u6)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    asr r1, u5, 31
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, 0, signed
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+  %s = ashr i64 %y, 63
+  %r = add i64 %a, %s
+  store i64 %r, ptr addrspace(1) %p
+  ret void
+}
+declare i64 @llvm.abs.i64(i64, i1)
 !0 = !{}

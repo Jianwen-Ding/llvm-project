@@ -495,38 +495,37 @@ define agx_kernel void @convert(ptr addrspace(1) %out, float %a, i32 %i, i64 %l)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    asr r2, u5, 31
+; CHECK-NEXT:    asr r1, u5, 31
 ; CHECK-NEXT:    mov_imm r7, 796917760
 ; CHECK-NEXT:    convert u32_to_f, r6, u3, rte
-; CHECK-NEXT:    xor r5, u5, r2
-; CHECK-NEXT:    xor r4, u4, r2
-; CHECK-NEXT:    bitop 0101, r3, r2, 0
+; CHECK-NEXT:    xor r3, u5, r1
+; CHECK-NEXT:    xor r2, u4, r1
 ; CHECK-NEXT:    trunc r6, r6
-; CHECK-NEXT:    isub r4_r5, r4_r5, r2_r3
+; CHECK-NEXT:    isub r2_r3, r2_r3, r1.sx
 ; CHECK-NEXT:    mov_imm r8, -813694976
 ; CHECK-NEXT:    fmul32 r7, r6, r7
 ; CHECK-NEXT:    floor r7, r7
-; CHECK-NEXT:    icmpsel ueq, r1, r5, 0, r4, r5
-; CHECK-NEXT:    icmpsel ueq, r3, r5, 0, 63, 31
-; CHECK-NEXT:    ffs r1, r1
-; CHECK-NEXT:    isub r1, r3, r1
-; CHECK-NEXT:    isub r3, 64, r1
-; CHECK-NEXT:    extr r3, 0, r4, r3
-; CHECK-NEXT:    bfi r4, 0, r4, r1
-; CHECK-NEXT:    bfi r3, r3, r5, r1
-; CHECK-NEXT:    icmpsel ueq, r4, r4, 0, 0, 1
-; CHECK-NEXT:    isub r1, 159, r1
-; CHECK-NEXT:    or r3, r3, r4
-; CHECK-NEXT:    bfi r1, 0, r1, 23
-; CHECK-NEXT:    convert u32_to_f, r3, r3, rte
+; CHECK-NEXT:    icmpsel ueq, r4, r3, 0, r2, r3
+; CHECK-NEXT:    icmpsel ueq, r5, r3, 0, 63, 31
+; CHECK-NEXT:    ffs r4, r4
+; CHECK-NEXT:    isub r4, r5, r4
+; CHECK-NEXT:    isub r5, 64, r4
+; CHECK-NEXT:    extr r5, 0, r2, r5
+; CHECK-NEXT:    bfi r2, 0, r2, r4
+; CHECK-NEXT:    bfi r3, r5, r3, r4
+; CHECK-NEXT:    icmpsel ueq, r2, r2, 0, 0, 1
 ; CHECK-NEXT:    convert f_to_s32, r5, u2, rtz
+; CHECK-NEXT:    or r2, r3, r2
+; CHECK-NEXT:    isub r3, 159, r4
+; CHECK-NEXT:    convert u32_to_f, r2, r2, rte
+; CHECK-NEXT:    bfi r3, 0, r3, 23
 ; CHECK-NEXT:    fmadd32 r4, r7, r8, r6
-; CHECK-NEXT:    fmul32 r1, r3, r1
-; CHECK-NEXT:    mov_imm r3, -2147483648
-; CHECK-NEXT:    and r2, r2, r3
-; CHECK-NEXT:    convert s32_to_f, r3, r5, rte
-; CHECK-NEXT:    or r1, r1, r2
 ; CHECK-NEXT:    convert f_to_u32, r7, r7, rtz
+; CHECK-NEXT:    fmul32 r2, r2, r3
+; CHECK-NEXT:    mov_imm r3, -2147483648
+; CHECK-NEXT:    and r1, r1, r3
+; CHECK-NEXT:    convert s32_to_f, r3, r5, rte
+; CHECK-NEXT:    or r1, r2, r1
 ; CHECK-NEXT:    convert f_to_u32, r6, r4, rtz
 ; CHECK-NEXT:    fadd32 r1, r3, r1
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed

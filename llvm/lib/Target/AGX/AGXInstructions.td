@@ -389,6 +389,24 @@ def : Pat<(i64 (sub i64:$a, (zext i32:$x))), (ISUB_I64_I32 0, $a, 0, $x, 0)>;
 def : Pat<(i64 (sub i64:$a, (sext i32:$x))), (ISUB_I64_I32 0, $a, MOD_SX, $x, 0)>;
 def : Pat<(i64 (sub i64:$a, (agx_build_pair i32:$x, (i32 0)))),
           (ISUB_I64_I32 0, $a, 0, $x, 0)>;
+// A pair that is a 32-bit value and its sign, (x, x >> 31), or a sign mask
+// twice, (s, s) for s = y >> 31 (0 or -1, its own sign): the sign-extended
+// 32-bit value, a 32-bit source with .sx (the 64-bit (x ^ s) - s of an
+// absolute value, without the move that pairs s with itself).
+def agx_sext_pair : PatFrag<(ops node:$lo, node:$hi),
+                            (agx_build_pair node:$lo, node:$hi), [{
+  SDValue Lo = N->getOperand(0), Hi = N->getOperand(1);
+  if (Hi.getOpcode() == ISD::SRA && Hi.getOperand(0) == Lo &&
+      isa<ConstantSDNode>(Hi.getOperand(1)) && Hi.getConstantOperandVal(1) == 31)
+    return true;
+  return Lo == Hi && CurDAG->ComputeNumSignBits(Lo) == 32;
+}]>;
+foreach Op = [[IADD_I64_I32, add], [ISUB_I64_I32, sub]] in {
+defvar Inst = !cast<Instruction>(Op[0]);
+defvar Node = !cast<SDNode>(Op[1]);
+def : Pat<(i64 (Node i64:$a, (agx_sext_pair i32:$x, srcvalue))),
+          (Inst 0, $a, MOD_SX, $x, 0)>;
+}
 // A constant that fits 32 bits (beyond the 8-bit immediates) is added as a zero-extended 32-bit register: one
 // mov_imm and one GPR instead of a materialized 64-bit pair.
 def agx_u32_not_imm8 : ImmLeaf<i64, [{ return Imm > 0xff && isUInt<32>(Imm); }]>;
