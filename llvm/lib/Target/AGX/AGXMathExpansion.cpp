@@ -146,9 +146,13 @@ public:
 
   /// e^a / 2 for a >= 0, without overflow below the largest float.
   Value *halfExp(Value *A) {
-    // One exponential: e^a / 2, or e^(a - ln 2) from 88 on.
+    // One exponential: e^a / 2, or e^(a - ln 2) from 88 on, a - ln 2 as
+    // (a - 0.693359375) + 2.12194440e-4 (the first exact for a >= 88: a
+    // rounded a - ln 2 put the result up to 24 ulp off near the overflow).
     Value *Lt = lt(A, 88.0);
-    return mul(sel(Lt, k(0.5), k(1.0)), exp(sel(Lt, A, sub(A, k(M_LN2)))));
+    return mul(sel(Lt, k(0.5), k(1.0)),
+               expHiLo(sel(Lt, A, sub(A, k(0.693359375))),
+                       sel(Lt, k(0.0), k(2.12194440e-4))));
   }
 
   /// 0.25 / h for h = e^a / 2 >= 0.5 (or a NaN): 0.25 times the correctly
