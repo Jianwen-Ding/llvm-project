@@ -689,8 +689,8 @@ gpu.module @inverse_hyperbolic {
     %v = memref.load %a[%c0] : memref<8xf32, 1>
     // CHECK-NOT: math.
     // CHECK: llvm.intr.log
-    // CHECK: llvm.intr.exp2
     // CHECK: llvm.intr.log2
+    // CHECK: llvm.intr.exp2
     %s = math.asinh %v : f32
     %t = math.cbrt %s : f32
     %u = math.erf %t : f32
