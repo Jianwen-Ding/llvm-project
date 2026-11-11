@@ -54,6 +54,7 @@ private:
   bool SelectIntSrc(SDValue N, SDValue &Src);
   bool SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods);
   bool SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods);
+  bool SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods);
   bool SelectDeviceAddr(SDValue Addr, unsigned ElemLog2, SDValue &Base,
                         SDValue &Index, SDValue &Signed, SDValue &Shift);
   bool SelectDeviceAddr8(SDValue Addr, SDValue &Base, SDValue &Index,
@@ -485,6 +486,27 @@ bool AGXDAGToDAGISel::SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods) {
   }
   Mods = getI32Imm(M, DL);
   return true;
+}
+
+/// A 64-bit source that is a 16-bit value sign or zero extended: directly
+/// (sext / zext of an i16), or a 32-bit such value extended the same way.
+bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
+  unsigned Opc = N.getOpcode();
+  if (Opc != ISD::SIGN_EXTEND && Opc != ISD::ZERO_EXTEND)
+    return false;
+  SDValue X = N.getOperand(0);
+  if (X.getValueType() == MVT::i16) {
+    Src = X;
+    Mods = getI32Imm(Opc == ISD::SIGN_EXTEND ? AGX::SRC_MOD_SX : 0, SDLoc(N));
+    return true;
+  }
+  if (X.getValueType() != MVT::i32 || !SelectExt16Src(X, Src, Mods))
+    return false;
+  // The inner extension must be the outer one's kind (zext of a sign
+  // extension is not a sign extension to 64 bits), except that a zero
+  // extension sign-extended is still a zero extension.
+  bool InnerSX = cast<ConstantSDNode>(Mods)->getZExtValue() & AGX::SRC_MOD_SX;
+  return Opc == ISD::SIGN_EXTEND || !InnerSX;
 }
 
 /// Floating point sources fold neg and abs into modifiers, and constants

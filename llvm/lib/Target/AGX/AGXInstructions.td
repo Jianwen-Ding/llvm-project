@@ -348,6 +348,23 @@ def IADD_I64_I32 : AGXALUPseudo<IADD_g13, (outs GPR64:$dst),
                                      SrcMods:$src1_mods, Src32Op:$src1,
                                      i32imm:$shift), [], [WriteALU64]>;
 
+// A 64-bit add or subtract of a 16-bit value sign or zero extended: the
+// 16-bit register as the source, instead of building the 64-bit value.
+def IADD_I64_I16 : AGXALUPseudo<IADD_g13, (outs GPR64:$dst),
+                                (ins SrcMods:$src0_mods, Src64Op:$src0,
+                                     SrcMods:$src1_mods, Src16Op:$src1,
+                                     i32imm:$shift), [], [WriteALU64]>;
+def ISUB_I64_I16 : AGXALUPseudo<ISUB_g13, (outs GPR64:$dst),
+                                (ins SrcMods:$src0_mods, Src64Op:$src0,
+                                     SrcMods:$src1_mods, Src16Op:$src1,
+                                     i32imm:$shift), [], [WriteALU64]>;
+let AddedComplexity = 3 in {
+def : Pat<(i64 (add i64:$a, (AGXExt16Src64 i16:$b, i32:$bm))),
+          (IADD_I64_I16 0, $a, $bm, $b, 0)>;
+def : Pat<(i64 (sub i64:$a, (AGXExt16Src64 i16:$b, i32:$bm))),
+          (ISUB_I64_I16 0, $a, $bm, $b, 0)>;
+}
+
 // The iadd shift amount, 0 to 4.
 def agx_iadd_shift : ImmLeaf<i32, [{ return Imm >= 0 && Imm <= 4; }]>;
 
