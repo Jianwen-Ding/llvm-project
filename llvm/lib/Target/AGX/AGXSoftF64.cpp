@@ -1563,12 +1563,69 @@ INITIALIZE_PASS_END(AGXSoftF64, DEBUG_TYPE, "AGX Soft F64", false, false)
 
 FunctionPass *llvm::createAGXSoftF64Pass() { return new AGXSoftF64(); }
 
+/// powi(x, n) of a double as compiler-rt's __powidf2: r = 1; for each bit
+/// of |n| from the lowest, r *= x where it is set and x *= x while bits
+/// remain (n / 2 rounded toward zero); 1 / r for a negative n.
+static void expandPowI(IntrinsicInst &II) {
+  LLVMContext &Ctx = II.getContext();
+  Value *X = II.getArgOperand(0), *N = II.getArgOperand(1);
+  Type *NT = N->getType(), *Dbl = II.getType();
+  BasicBlock *Entry = II.getParent();
+  BasicBlock *Done = Entry->splitBasicBlock(&II, "powi.done");
+  Function *Fn = Entry->getParent();
+  BasicBlock *Loop = BasicBlock::Create(Ctx, "powi.loop", Fn, Done);
+  BasicBlock *Next = BasicBlock::Create(Ctx, "powi.next", Fn, Done);
+  Entry->getTerminator()->eraseFromParent();
+  IRBuilder<> B(Entry);
+  B.CreateBr(Loop);
+  B.SetInsertPoint(Loop);
+  PHINode *R = B.CreatePHI(Dbl, 2), *XP = B.CreatePHI(Dbl, 2),
+          *NP = B.CreatePHI(NT, 2);
+  R->addIncoming(ConstantFP::get(Dbl, 1.0), Entry);
+  XP->addIncoming(X, Entry);
+  NP->addIncoming(N, Entry);
+  // r *= x where the bit is set (a branch: the multiplication is long)
+  BasicBlock *MulBB = BasicBlock::Create(Ctx, "powi.mul", Fn, Done);
+  BasicBlock *Step = BasicBlock::Create(Ctx, "powi.step", Fn, Done);
+  B.CreateCondBr(B.CreateTrunc(NP, B.getInt1Ty()), MulBB, Step);
+  B.SetInsertPoint(MulBB);
+  Value *Prod = B.CreateFMul(R, XP);
+  B.CreateBr(Step);
+  B.SetInsertPoint(Step);
+  PHINode *RN = B.CreatePHI(Dbl, 2);
+  RN->addIncoming(Prod, MulBB);
+  RN->addIncoming(R, Loop);
+  Value *Half = B.CreateSDiv(NP, ConstantInt::get(NT, 2));
+  B.CreateCondBr(B.CreateICmpEQ(Half, ConstantInt::get(NT, 0)), Done, Next);
+  B.SetInsertPoint(Next);
+  Value *XN = B.CreateFMul(XP, XP);
+  B.CreateBr(Loop);
+  R->addIncoming(RN, Next);
+  XP->addIncoming(XN, Next);
+  NP->addIncoming(Half, Next);
+  B.SetInsertPoint(&II);
+  Value *Res = B.CreateSelect(B.CreateICmpSLT(N, ConstantInt::get(NT, 0)),
+                              B.CreateFDiv(ConstantFP::get(Dbl, 1.0), RN), RN);
+  Res->takeName(&II);
+  II.replaceAllUsesWith(Res);
+  II.eraseFromParent();
+}
+
 bool AGXSoftF64::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
   const TargetMachine &TM =
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
+  // powi of a double (SelectionDAG cannot soften it): compiler-rt's
+  // __powidf2 in double operations, which the lowering below takes.
+  SmallVector<IntrinsicInst *, 2> PowIs;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && II->getIntrinsicID() == Intrinsic::powi && isDouble(II))
+      PowIs.push_back(II);
+  for (IntrinsicInst *II : PowIs)
+    expandPowI(*II);
   SmallVector<Instruction *, 16> Worklist;
   for (Instruction &I : instructions(F))
     if (AGX::isDoubleArithmetic(I))

@@ -296,7 +296,7 @@ bool emulatesDouble(StringRef Base) {
        "nearbyint", "minnum",   "maxnum",     "minimum",   "maximum",
        "minimumnum", "maximumnum", "fcmp",    "fcmps",     "fptosi",
        "fptoui",  "sitofp",     "uitofp",     "fpext",     "fptrunc",
-       "canonicalize"},
+       "canonicalize", "is", "powi"},
       Base);
 }
 
@@ -1316,6 +1316,10 @@ void EmulateF64::replaceOperations(Function &F) {
                      ? "llvm.experimental.constrained.sitofp.f64.i32"
                      : "llvm.experimental.constrained.uitofp.f64.i32";
       }
+      // llvm.is.fpclass: its test (an immediate) specializes the emulation.
+      if (Name.starts_with("llvm.is.fpclass") && CI->arg_size() == 2)
+        if (auto *T = dyn_cast<ConstantInt>(CI->getArgOperand(1)))
+          MD += "|test:" + utostr(T->getZExtValue());
       if (MDNode *Round = CI->getMetadata("air.round"))
         MD += "|round:" +
               cast<MDString>(Round->getOperand(0))->getString().str();
@@ -1886,6 +1890,120 @@ void EmulateF64::emulate(Function &F, StringRef Key) {
       R = RLib("__air_f64_fma", I64, {A[0], A[1], A[2]});
     else if (B2 == "frem")
       R = fmodBits(B, A[0], A[1]);
+    else if (B2 == "is" && Ret->isIntegerTy(1) && A.size() == 2) {
+      // llvm.is.fpclass: the classes of the bits, each where the test mask
+      // (A[1], an immediate) has it.
+      Value *X = A[0];
+      Value *Abs = B.CreateAnd(X, B.getInt64(AbsMask));
+      Value *Neg = B.CreateICmpSLT(X, B.getInt64(0));
+      const uint64_t Inf = 0x7ff0000000000000ull;
+      Value *NaN = B.CreateICmpUGT(Abs, B.getInt64(Inf));
+      Value *QNaN = B.CreateICmpUGE(Abs, B.getInt64(0x7ff8000000000000ull));
+      Value *IsInf = B.CreateICmpEQ(Abs, B.getInt64(Inf));
+      Value *Zero = B.CreateICmpEQ(Abs, B.getInt64(0));
+      Value *Sub = B.CreateAnd(B.CreateNot(Zero),
+                               B.CreateICmpULT(Abs, B.getInt64(1ull << 52)));
+      Value *Normal = B.CreateAnd(B.CreateICmpUGE(Abs, B.getInt64(1ull << 52)),
+                                  B.CreateICmpULT(Abs, B.getInt64(Inf)));
+      Value *Pos = B.CreateNot(Neg);
+      // in FPClassTest's order: sNaN, qNaN, -inf, -normal, -subnormal, -0,
+      // +0, +subnormal, +normal, +inf
+      Value *Classes[] = {B.CreateAnd(NaN, B.CreateNot(QNaN)), QNaN,
+                          B.CreateAnd(IsInf, Neg), B.CreateAnd(Normal, Neg),
+                          B.CreateAnd(Sub, Neg), B.CreateAnd(Zero, Neg),
+                          B.CreateAnd(Zero, Pos), B.CreateAnd(Sub, Pos),
+                          B.CreateAnd(Normal, Pos), B.CreateAnd(IsInf, Pos)};
+      // A test of classes the same for both signs and adjacent in magnitude
+      // (zero, subnormal, normal, infinity, sNaN, qNaN: the ranges of |x|
+      // [0], [1, 2^52), [2^52, inf), [inf], (inf, 2^63 - 2^51), [2^63 -
+      // 2^51, 2^63)): one range test of |x|.
+      unsigned Test = 0;
+      bool Known = false;
+      for (StringRef P : drop_begin(Parts, 2))
+        if (P.consume_front("test:"))
+          Known = !P.getAsInteger(10, Test);
+      // the classes by magnitude, as (negative, positive) FPClassTest bits
+      const std::pair<unsigned, unsigned> ByMagnitude[] = {
+          {fcNegZero, fcPosZero}, {fcNegSubnormal, fcPosSubnormal},
+          {fcNegNormal, fcPosNormal}, {fcNegInf, fcPosInf},
+          {fcSNan, fcSNan}, {fcQNan, fcQNan}};
+      const uint64_t Lower[] = {0, 1, 1ull << 52, Inf, Inf + 1,
+                                0x7ff8000000000000ull, 1ull << 63};
+      int First = -1, Last = -1;
+      bool Symmetric = Known && (Test & ~unsigned(fcAllFlags)) == 0;
+      for (auto [K, NP] : enumerate(ByMagnitude)) {
+        bool N = Test & NP.first, P = Test & NP.second;
+        if (N != P)
+          Symmetric = false;
+        if (P) {
+          if (First < 0)
+            First = K;
+          else if (Last != int(K) - 1)
+            Symmetric = false;
+          Last = K;
+        }
+      }
+      if (Known && Test == 0) {
+        R = B.getFalse();
+      } else if (Symmetric && First >= 0) {
+        uint64_t Lo = Lower[First], Hi = Lower[Last + 1]; // [Lo, Hi)
+        if (Lo == 0)
+          R = B.CreateICmpULT(Abs, B.getInt64(Hi));
+        else if (Hi == (1ull << 63)) // up to the largest NaN
+          R = B.CreateICmpUGE(Abs, B.getInt64(Lo));
+        else if (Hi - Lo == 1)
+          R = B.CreateICmpEQ(Abs, B.getInt64(Lo));
+        else
+          R = B.CreateICmpULT(B.CreateSub(Abs, B.getInt64(Lo)),
+                              B.getInt64(Hi - Lo));
+      } else {
+        R = B.getFalse();
+        for (auto [K, C] : enumerate(Classes))
+          R = B.CreateOr(R, B.CreateAnd(C, B.CreateTrunc(B.CreateLShr(A[1], K),
+                                                         B.getInt1Ty())));
+      }
+    } else if (B2 == "powi" && A.size() == 2 && A[1]->getType()->isIntegerTy()) {
+      // compiler-rt's __powidf2: r = 1; for |n|: r *= x where the bit is
+      // set, x *= x while bits remain; 1 / r for a negative n.
+      Function *Fn = B.GetInsertBlock()->getParent();
+      BasicBlock *Entry = B.GetInsertBlock();
+      BasicBlock *Loop = BasicBlock::Create(Ctx, "powi.loop", Fn);
+      BasicBlock *Done = BasicBlock::Create(Ctx, "powi.done", Fn);
+      Value *N = A[1];
+      Type *NT = N->getType();
+      Value *One = B.getInt64(0x3ff0000000000000ull);
+      B.CreateBr(Loop);
+      B.SetInsertPoint(Loop);
+      PHINode *RP = B.CreatePHI(I64, 2), *XP = B.CreatePHI(I64, 2),
+              *NP = B.CreatePHI(NT, 2);
+      RP->addIncoming(One, Entry);
+      XP->addIncoming(A[0], Entry);
+      NP->addIncoming(N, Entry);
+      // r *= x where the bit is set (a branch: the multiplication is long)
+      BasicBlock *MulBB = BasicBlock::Create(Ctx, "powi.mul", Fn);
+      BasicBlock *Step = BasicBlock::Create(Ctx, "powi.step", Fn);
+      B.CreateCondBr(B.CreateTrunc(NP, B.getInt1Ty()), MulBB, Step);
+      B.SetInsertPoint(MulBB);
+      Value *Prod = Lib("__air_f64_mul", I64, {RP, XP});
+      B.CreateBr(Step);
+      B.SetInsertPoint(Step);
+      PHINode *RN = B.CreatePHI(I64, 2);
+      RN->addIncoming(Prod, MulBB);
+      RN->addIncoming(RP, Loop);
+      // n / 2 rounded toward zero, as C's
+      Value *Half = B.CreateSDiv(NP, ConstantInt::get(NT, 2));
+      BasicBlock *Next = BasicBlock::Create(Ctx, "powi.next", Fn);
+      B.CreateCondBr(B.CreateICmpEQ(Half, ConstantInt::get(NT, 0)), Done, Next);
+      B.SetInsertPoint(Next);
+      Value *XN = Lib("__air_f64_mul", I64, {XP, XP});
+      B.CreateBr(Loop);
+      RP->addIncoming(RN, Next);
+      XP->addIncoming(XN, Next);
+      NP->addIncoming(Half, Next);
+      B.SetInsertPoint(Done);
+      Value *Recip = Lib("__air_f64_div", I64, {One, RN});
+      R = B.CreateSelect(B.CreateICmpSLT(N, ConstantInt::get(NT, 0)), Recip, RN);
+    }
     else if (B2 == "sqrt")
       R = RLib("__air_f64_sqrt", I64, {A[0]});
     else if (B2 == "fneg")

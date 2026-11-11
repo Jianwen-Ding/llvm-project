@@ -934,7 +934,10 @@ to integers saturate, and NaN converts to 0.
 Values that are only moved (loads, stores, ``phi``, ``select``, arguments)
 stay ``double`` and become ``i64`` in type legalization. ``frem`` is the
 exact ``fmod``, one bit of the quotient an iteration (8 instructions
-for each binade between the operands). Vector arithmetic and the
+for each binade between the operands); ``powi`` is compiler-rt's
+``__powidf2`` (a multiplication for each bit of the exponent and a squaring
+for each but the last, each rounded; the reciprocal for a negative
+exponent). Vector arithmetic and the
 transcendental functions on ``double`` are diagnosed as unsupported. The code is large: in
 instructions per operation, about 215 for an addition or a multiplication,
 430 for a fused multiply-add, 290 for a division or a square root, 100 for a
