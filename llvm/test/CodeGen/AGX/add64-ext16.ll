@@ -52,7 +52,7 @@ define agx_kernel void @add_z16(ptr addrspace(1) %p) {
 define agx_kernel void @add_bool(ptr addrspace(1) %p) {
 ; CHECK-LABEL: add_bool:
 ; CHECK:         // uniform registers: 10 x 16-bit (threadgroups_per_grid at u2)
-; CHECK-NEXT:    // general purpose registers: 7 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 6 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
@@ -62,11 +62,10 @@ define agx_kernel void @add_bool(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
 ; CHECK-NEXT:    device_load 1, i32, xy, r2_r3, r2_r3, 2, signed
-; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    icmpsel slt, r6, r5, 0, 1, 0
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    or r2, r2, r3
-; CHECK-NEXT:    icmpsel ueq, r3, r5, 0, 0, r6
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    icmpsel slt, r3, r5, 0, 1, 0
 ; CHECK-NEXT:    icmpsel ueq, r2, r2, 0, 0, r3
 ; CHECK-NEXT:    iadd r2_r3, r4_r5, r2
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2

@@ -2407,6 +2407,11 @@ static ISD::CondCode getUnsignedCondCode(ISD::CondCode CC) {
   }
 }
 
+static cl::opt<bool> AGXHighHalfCompares(
+    "agx-high-half-compares", cl::init(true), cl::Hidden,
+    cl::desc("Compare only the high halves of a 64-bit value and a constant "
+             "whose low half decides nothing"));
+
 SDValue AGXTargetLowering::lowerSETCC64(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   EVT VT = Op.getValueType();
@@ -2422,8 +2427,20 @@ SDValue AGXTargetLowering::lowerSETCC64(SDValue Op, SelectionDAG &DAG) const {
 
   // The high halves decide unless they are equal; the low halves always
   // compare unsigned.
-  SDValue HiEq = DAG.getSetCC(DL, VT, AHi, BHi, ISD::SETEQ);
   SDValue HiCmp = DAG.getSetCC(DL, VT, AHi, BHi, CC);
+  // A constant whose low half fixes the low comparison to what CC gives for
+  // equal values (x < c, c's low half 0: never; x <= c, all ones: always;
+  // > and >= alike, signed or not; x < 0 and x > -1 the sign tests): the high
+  // halves alone.
+  if (AGXHighHalfCompares)
+    if (auto *C = dyn_cast<ConstantSDNode>(BLo)) {
+      uint64_t L = C->getZExtValue() & 0xffffffffu;
+      ISD::CondCode U = getUnsignedCondCode(CC);
+      if (((U == ISD::SETULT || U == ISD::SETUGE) && L == 0) ||
+          ((U == ISD::SETUGT || U == ISD::SETULE) && L == 0xffffffffu))
+        return HiCmp;
+    }
+  SDValue HiEq = DAG.getSetCC(DL, VT, AHi, BHi, ISD::SETEQ);
   SDValue LoCmp = DAG.getSetCC(DL, VT, ALo, BLo, getUnsignedCondCode(CC));
   return DAG.getSelect(DL, VT, HiEq, LoCmp, HiCmp);
 }
