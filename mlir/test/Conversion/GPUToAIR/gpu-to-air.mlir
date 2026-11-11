@@ -451,6 +451,26 @@ gpu.module @narrow_loops {
     }
     gpu.return
   }
+  // An AIR matrix load or store indexes its memref as memref.load does
+  // (base[i + r, j + c] in bounds): k < 64 bounds the loop.
+  // CHECK-LABEL: llvm.func @matrix(
+  // CHECK: ^bb1(%[[O:.*]]: i32, %{{.*}}: vector<64xf32>):
+  // CHECK: llvm.icmp "ult" %[[O]], %{{.*}} : i32
+  // OFF-LABEL: llvm.func @matrix(
+  // OFF: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+  gpu.func @matrix(%a: memref<8x64xf32, 1>, %c: memref<8x8xf32, 1>, %kdim: index) kernel {
+    %c0 = arith.constant 0 : index
+    %c8 = arith.constant 8 : index
+    %zero = arith.constant 0.0 : f32
+    %init = air.simdgroup_matrix_fill %zero : vector<64xf32>
+    %acc = scf.for %k = %c0 to %kdim step %c8 iter_args(%t = %init) -> vector<64xf32> {
+      %m = air.simdgroup_matrix_load %a[%c0, %k] : memref<8x64xf32, 1> -> vector<64xf32>
+      %d = air.simdgroup_matrix_multiply_accumulate %m, %m, %t : vector<64xf32>
+      scf.yield %d : vector<64xf32>
+    }
+    air.simdgroup_matrix_store %acc, %c[%c0, %c0] : vector<64xf32> -> memref<8x8xf32, 1>
+    gpu.return
+  }
 }
 
 // -----

@@ -1051,9 +1051,9 @@ static std::optional<int64_t> ivCoefficient(scf::ForOp loop, Value v,
 
 /// A bound B <= 2^31 on the offsets o = iv - lb of the iterations that
 /// `loop` executes (without undefined behaviour): its constant extent
-/// ub - lb, or the size of a static dimension that a memref.load or
-/// memref.store each iteration executes indexes by x + iv or x - iv, x loop
-/// invariant. (The accessed indices x + lb + o, o = 0, step, 2 step, ...,
+/// ub - lb, or the size of a static dimension that a memref.load,
+/// memref.store or AIR matrix load or store each iteration executes indexes
+/// by x + iv or x - iv, x loop invariant. (The accessed indices x + lb + o, o = 0, step, 2 step, ...,
 /// are below the size S, which keeps a step of S or more to one iteration
 /// and the offsets of more below S.)
 static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
@@ -1078,6 +1078,14 @@ static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
       type = load.getMemRefType(), indices = load.getIndices();
     else if (auto store = dyn_cast<memref::StoreOp>(op))
       type = store.getMemRefType(), indices = store.getIndices();
+    // An 8x8 matrix at [i, j] accesses base[i + r, j + c] (or [i + c, j + r])
+    // for r, c in [0, 8): i and j themselves are in bounds.
+    else if (auto load = dyn_cast<air::MatrixLoadOp>(op))
+      type = cast<MemRefType>(load.getBase().getType()),
+      indices = load.getIndices();
+    else if (auto store = dyn_cast<air::MatrixStoreOp>(op))
+      type = cast<MemRefType>(store.getBase().getType()),
+      indices = store.getIndices();
     else
       continue;
     for (auto [size, index] : llvm::zip(type.getShape(), indices)) {

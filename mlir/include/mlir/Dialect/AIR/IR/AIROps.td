@@ -107,6 +107,7 @@ def AIR_MatrixLoadOp : AIR_Op<"simdgroup_matrix_load"> {
     Loads the 8x8 matrix whose element (r, c) is `base[i + r, j + c]`, or
     `base[i + c, j + r]` with `transpose`, from a 2-D memref (any strides).
     Every thread of the SIMD-group must execute it with the same operands.
+    As for `memref.load`, an element out of bounds is undefined behavior.
     ```mlir
     %m = air.simdgroup_matrix_load %A[%i, %j] : memref<?x?xf32, strided<[?, 1]>, 1> -> vector<64xf32>
     ```
@@ -126,7 +127,8 @@ def AIR_MatrixStoreOp : AIR_Op<"simdgroup_matrix_store"> {
   let summary = "Store an 8x8 SIMD-group matrix";
   let description = [{
     Stores the matrix to `base[i + r, j + c]` (`base[i + c, j + r]` with
-    `transpose`), as `air.simdgroup_matrix_load` reads it.
+    `transpose`), as `air.simdgroup_matrix_load` reads it. As for
+    `memref.store`, an element out of bounds is undefined behavior.
   }];
   let arguments = (ins AIR_Matrix:$value,
                    Arg<MemRefRankOf<[F16, BF16, F32], [2]>, "",
