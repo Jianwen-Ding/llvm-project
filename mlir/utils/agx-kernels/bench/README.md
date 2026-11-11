@@ -34,5 +34,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `rowsum` | row sums, one thread per row: an `scf.for` over a static row |
 | `rowsum_f16` | the same over f16, accumulated in f32 |
 | `rowcopy_vec4` | a row copy by `vector<4xf32>`: an `scf.for` of step 4 over a static row |
+| `two_index` | a row dot product reading one array at stride 2: two accesses that step differently |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

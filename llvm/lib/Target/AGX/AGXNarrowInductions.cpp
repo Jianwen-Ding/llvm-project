@@ -604,6 +604,77 @@ static bool elementIndex(PHINode &P, Loop &L) {
   return true;
 }
 
+static cl::opt<bool> AGXPointersFromCounters(
+    "agx-pointers-from-counters", cl::init(true), cl::Hidden,
+    cl::desc("A pointer induction of 32-bit-element accesses stepping a "
+             "power-of-two multiple of an integer counter's step as an index "
+             "of that counter"));
+
+/// LSR walks an array with a pointer induction p (p += s bytes, a 64-bit add
+/// each iteration) next to a 32-bit counter j (j += t) that another access
+/// already takes as its index. Where s = t * 4 * 2^k (k at most 2: the
+/// index's shift field) for 32-bit elements, and scalar evolution keeps j in
+/// [0, 2^31), p = p0 + (s / t) (j - j0): the accesses take the base
+/// p0 - (s / t) j0 and zext(j) << (2 + k) as their index, and p and its add
+/// go (one 64-bit add and a register pair less).
+static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch || !P.getType()->isPointerTy() ||
+      P.getNumIncomingValues() != 2)
+    return false;
+  auto *Inc = dyn_cast<GetElementPtrInst>(P.getIncomingValueForBlock(Latch));
+  const APInt *Sp;
+  if (!Inc || Inc->getPointerOperand() != &P || Inc->getNumIndices() != 1 ||
+      !Inc->getSourceElementType()->isIntegerTy(8) ||
+      !match(Inc->getOperand(1), m_APInt(Sp)) || !Inc->hasOneUse() ||
+      Sp->isNegative() || Sp->isZero())
+    return false;
+  // the accesses: P itself, of 32-bit elements
+  for (User *U : P.users()) {
+    if (U == Inc)
+      continue;
+    Type *T = nullptr;
+    if (auto *Ld = dyn_cast<LoadInst>(U))
+      T = Ld->getType();
+    else if (auto *St = dyn_cast<StoreInst>(U))
+      T = St->getPointerOperand() == &P ? St->getValueOperand()->getType()
+                                        : nullptr;
+    if (!T || T->getScalarSizeInBits() != 32 || !L.contains(cast<Instruction>(U)))
+      return false;
+  }
+  for (PHINode &J : L.getHeader()->phis()) {
+    if (!J.getType()->isIntegerTy(32) || J.getNumIncomingValues() != 2)
+      continue;
+    const APInt *J0, *T;
+    auto *JInc = dyn_cast<BinaryOperator>(J.getIncomingValueForBlock(Latch));
+    if (!match(J.getIncomingValueForBlock(Pre), m_APInt(J0)) || !JInc ||
+        !match(JInc, m_Add(m_Specific(&J), m_APInt(T))) || T->isZero() ||
+        T->isNegative() || Sp->getZExtValue() % T->getZExtValue())
+      continue;
+    uint64_t M = Sp->getZExtValue() / T->getZExtValue();
+    if (M != 4 && M != 8 && M != 16)
+      continue;
+    if (!SE.getUnsignedRange(SE.getSCEV(&J)).getUnsignedMax().ult(1u << 31))
+      continue;
+    // p0 - M j0, then base + zext(j) * M before the first access
+    IRBuilder<> PB(Pre->getTerminator());
+    Value *Base = PB.CreatePtrAdd(
+        P.getIncomingValueForBlock(Pre),
+        ConstantInt::get(Type::getInt64Ty(P.getContext()),
+                         -int64_t(M * J0->getZExtValue())));
+    IRBuilder<> B(L.getHeader(), L.getHeader()->getFirstInsertionPt());
+    Value *Z = B.CreateZExt(&J, B.getInt64Ty());
+    Value *Addr = B.CreateGEP(B.getIntNTy(8 * M), Base, Z, P.getName());
+    P.replaceUsesWithIf(Addr, [&](Use &U) { return U.getUser() != Inc; });
+    Inc->replaceAllUsesWith(PoisonValue::get(Inc->getType()));
+    Inc->eraseFromParent();
+    P.eraseFromParent();
+    return true;
+  }
+  return false;
+}
+
 bool AGXNarrowInductions::runOnFunction(Function &F) {
   if (!AGXNarrowInductionsOpt || skipFunction(F))
     return false;
@@ -625,6 +696,14 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
           Narrow.push_back(&Phi);
       for (PHINode *Phi : Narrow)
         Changed |= elementIndex(*Phi, *L);
+    }
+    if (AGXPointersFromCounters && L->isInnermost()) {
+      SmallVector<PHINode *, 4> Ptrs;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isPointerTy())
+          Ptrs.push_back(&Phi);
+      for (PHINode *Phi : Ptrs)
+        Changed |= pointerFromCounter(*Phi, *L, SE);
     }
     if (AGXSplitOffsetInductions && L->isInnermost()) {
       SmallVector<PHINode *, 4> Wide;
