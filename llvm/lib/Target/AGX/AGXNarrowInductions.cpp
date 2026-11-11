@@ -390,17 +390,24 @@ static bool splitOffsets(PHINode &O, Loop &L, ScalarEvolution &SE,
   if (!Init || !Inc || !match(Inc, m_c_Add(m_Specific(&O), m_Value(S))) ||
       !L.isLoopInvariant(S) || !Inc->hasOneUse())
     return false;
-  SmallVector<std::pair<BinaryOperator *, Value *>, 4> Adds;
+  // base + o in integers, or a byte GEP of a base pointer by o
+  SmallVector<std::pair<Instruction *, Value *>, 4> Adds;
   for (User *U : O.users()) {
     if (U == Inc)
       continue;
-    auto *A = dyn_cast<BinaryOperator>(U);
-    Value *Base;
+    auto *A = dyn_cast<Instruction>(U);
+    Value *Base = nullptr;
+    if (auto *G = dyn_cast_or_null<GetElementPtrInst>(A)) {
+      if (G->getNumIndices() == 1 && G->getOperand(1) == &O &&
+          G->getSourceElementType()->isIntegerTy(8))
+        Base = G->getPointerOperand();
+    } else if (A) {
+      match(A, m_c_Add(m_Specific(&O), m_Value(Base)));
+    }
     // (a base computed in the loop from invariant values, such as PTX's
     // casts of a kernel argument, goes before it)
     bool Hoisted;
-    if (!A || !L.contains(A) || !DT.dominates(A->getParent(), Latch) ||
-        !match(A, m_c_Add(m_Specific(&O), m_Value(Base))) ||
+    if (!Base || !L.contains(A) || !DT.dominates(A->getParent(), Latch) ||
         !L.makeLoopInvariant(Base, Hoisted, Pre->getTerminator()))
       return false;
     Adds.push_back({A, Base});
@@ -414,11 +421,13 @@ static bool splitOffsets(PHINode &O, Loop &L, ScalarEvolution &SE,
         return false;
   for (auto [A, Base] : Adds) {
     IRBuilder<> P(Pre->getTerminator());
-    Value *Start = P.CreateAdd(Base, Init);
-    PHINode *Ph = PHINode::Create(O.getType(), 2, A->getName() + ".iv");
+    bool Ptr = isa<GetElementPtrInst>(A);
+    Value *Start = Ptr ? P.CreatePtrAdd(Base, Init) : P.CreateAdd(Base, Init);
+    PHINode *Ph = PHINode::Create(A->getType(), 2, A->getName() + ".iv");
     Ph->insertBefore(O.getIterator());
     IRBuilder<> B(Inc);
-    Value *Next = B.CreateAdd(Ph, S, A->getName() + ".iv.next");
+    Value *Next = Ptr ? B.CreatePtrAdd(Ph, S, A->getName() + ".iv.next")
+                      : B.CreateAdd(Ph, S, A->getName() + ".iv.next");
     Ph->addIncoming(Start, Pre);
     Ph->addIncoming(Next, Latch);
     SE.forgetValue(A);

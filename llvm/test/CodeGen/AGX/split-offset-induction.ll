@@ -74,3 +74,67 @@ done:
   store float %acc1, ptr addrspace(1) %out
   ret void
 }
+
+; The same with byte GEPs of the bases (MLIR's saxpy after LSR).
+define agx_kernel void @two_gep(ptr addrspace(1) %a, ptr addrspace(1) %b, i64 %o0, i64 %s, i32 %n, float %x) {
+; CHECK-LABEL: two_gep:
+; CHECK:         // uniform registers: 26 x 16-bit (threadgroups_per_grid at u10)
+; CHECK-NEXT:    // general purpose registers: 10 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0: // %entry
+; CHECK-NEXT:    mov_imm r0l, 0
+; CHECK-NEXT:    bitop 0101, r4, u4, 0
+; CHECK-NEXT:    bitop 0101, r5, u5, 0
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
+; CHECK-NEXT:    bitop 0101, r3, u3, 0
+; CHECK-NEXT:    bitop 0101, r6, u0, 0
+; CHECK-NEXT:    bitop 0101, r7, u1, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4_r5
+; CHECK-NEXT:    iadd r4_r5, r6_r7, r4_r5
+; CHECK-NEXT:    bitop 0101, r8, u6, 0
+; CHECK-NEXT:    bitop 0101, r9, u7, 0
+; CHECK-NEXT:    mov_imm r1, 0
+; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
+; CHECK-NEXT:  .LBB1_1: // %loop
+; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
+; CHECK-NEXT:    device_load 0, i32, x, r6, r4_r5, 0, signed
+; CHECK-NEXT:    device_load 0, i32, x, r7, r2_r3, 0, signed
+; CHECK-NEXT:    iadd r4_r5, r4_r5, r8_r9
+; CHECK-NEXT:    iadd r1, r1, 1
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    fmadd32 r6, u9, r6, r7
+; CHECK-NEXT:    device_store 0, i32, x, r6, r2_r3, 0, signed
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r8_r9
+; CHECK-NEXT:    while_icmp r0l, slt, r1, u8, 1
+; CHECK-NEXT:    jmp_exec_any .LBB1_1
+; CHECK-NEXT:  // %bb.2: // %done
+; CHECK-NEXT:    pop_exec r0l, 1
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %o = phi i64 [ %o0, %entry ], [ %o1, %loop ]
+  %qa = getelementptr i8, ptr addrspace(1) %a, i64 %o
+  %va = load float, ptr addrspace(1) %qa, align 4
+  %qb = getelementptr i8, ptr addrspace(1) %b, i64 %o
+  %vb = load float, ptr addrspace(1) %qb, align 4
+  %r = call float @llvm.fma.f32(float %x, float %va, float %vb)
+  store float %r, ptr addrspace(1) %qb, align 4
+  %o1 = add i64 %o, %s
+  %i1 = add i32 %i, 1
+  %c = icmp slt i32 %i1, %n
+  br i1 %c, label %loop, label %done
+done:
+  ret void
+}
+declare float @llvm.fma.f32(float, float, float)
