@@ -1758,6 +1758,58 @@ bool AGXTargetLowering::shouldFoldConstantShiftPairToMask(
   return M.isIntN(8);
 }
 
+static cl::opt<bool> MulRotates(
+    "agx-mul-rotates", cl::init(true), cl::Hidden,
+    cl::desc("Recover the rotate of a product that InstCombine split into a "
+             "second multiply"));
+
+/// rotl(x * c1, k) is (x * c1 << k) | (x * c1 >> (32 - k)), which InstCombine
+/// turns into (x * (c1 << k)) | ((x * c1) >> (32 - k)): a second multiply (on
+/// the unit integer multiplies share) where the rotate was one extr (a hash's
+/// mix step). or(x * c2, (x * c1) >> r) with c2 = c1 * 2^(32 - r) mod 2^32 is
+/// rotl(x * c1, 32 - r) exactly: x * c1 * 2^(32 - r) mod 2^32 is x * c2.
+static SDValue performMulRotateCombine(SDNode *N,
+                                       TargetLowering::DAGCombinerInfo &DCI) {
+  if (!MulRotates || N->getValueType(0) != MVT::i32)
+    return SDValue();
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue A = N->getOperand(I), B = N->getOperand(1 - I);
+    if (A.getOpcode() != ISD::MUL || B.getOpcode() != ISD::SRL)
+      continue;
+    SDValue M = B.getOperand(0);
+    auto *R = dyn_cast<ConstantSDNode>(B.getOperand(1));
+    if (M.getOpcode() != ISD::MUL || !R || R->getZExtValue() == 0 ||
+        R->getZExtValue() >= 32)
+      continue;
+    SDValue X = M.getOperand(0);
+    auto *C1 = dyn_cast<ConstantSDNode>(M.getOperand(1));
+    auto *C2 = dyn_cast<ConstantSDNode>(A.getOperand(1));
+    if (!C1 || !C2 || A.getOperand(0) != X)
+      continue;
+    unsigned K = 32 - R->getZExtValue();
+    if (C2->getAPIntValue() != C1->getAPIntValue().shl(K))
+      continue;
+    SDLoc DL(N);
+    SelectionDAG &DAG = DCI.DAG;
+    SDValue Rot = DAG.getNode(ISD::ROTL, DL, MVT::i32, M,
+                              DAG.getConstant(K, DL, MVT::i32));
+    // Other uses (x * c2) >> s, s >= k, are rot >> s (the rotate's low k
+    // bits, x * c1's high ones, shifted out): the second multiply goes.
+    SmallVector<SDNode *, 4> Shifts;
+    for (SDNode *U : A->users())
+      if (U != N && U->getOpcode() == ISD::SRL &&
+          isa<ConstantSDNode>(U->getOperand(1)) &&
+          U->getConstantOperandVal(1) >= K &&
+          U->getConstantOperandVal(1) < 32)
+        Shifts.push_back(U);
+    for (SDNode *U : Shifts)
+      DCI.CombineTo(U, DAG.getNode(ISD::SRL, SDLoc(U), MVT::i32, Rot,
+                                   U->getOperand(1)));
+    return Rot;
+  }
+  return SDValue();
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
@@ -1833,6 +1885,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::AND:
     return performBooleanLogicCombine(N, DCI);
   case ISD::OR: {
+    if (SDValue V = performMulRotateCombine(N, DCI))
+      return V;
     if (SDValue V = performBooleanLogicCombine(N, DCI))
       return V;
     if (SDValue V = performBfiInsertCombine(N, DCI))
