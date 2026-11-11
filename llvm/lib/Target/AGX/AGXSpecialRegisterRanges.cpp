@@ -39,6 +39,11 @@ static cl::opt<bool> AGXSpecialRegisterRanges(
     cl::desc("Bound the thread and threadgroup indices before instruction "
              "selection"));
 
+static cl::opt<bool> AGXKnownGridRanges(
+    "agx-known-grid-ranges", cl::init(false), cl::Hidden,
+    cl::desc("Bound grid positions by the kernel's known grid "
+             "(agx-threads-per-grid, agx-threadgroups-per-grid)"));
+
 namespace {
 class AGXSpecialRegisterRangesPass : public FunctionPass {
 public:
@@ -91,6 +96,51 @@ static std::optional<std::pair<uint64_t, uint64_t>> bounds(Intrinsic::ID ID) {
   }
 }
 
+/// The extents "a,b,c" a kernel attribute gives (agx-threads-per-grid,
+/// agx-threadgroups-per-grid: the launch's known grid), each in [1, 2^32).
+static std::optional<std::array<uint64_t, 3>> extents(const Function &F,
+                                                      StringRef Name) {
+  Attribute A = F.getFnAttribute(Name);
+  if (!A.isStringAttribute())
+    return std::nullopt;
+  SmallVector<StringRef, 3> Parts;
+  A.getValueAsString().split(Parts, ',');
+  if (Parts.size() != 3)
+    return std::nullopt;
+  std::array<uint64_t, 3> E;
+  for (unsigned D = 0; D < 3; ++D)
+    if (Parts[D].getAsInteger(10, E[D]) || E[D] == 0 || E[D] >= (1ull << 32))
+      return std::nullopt;
+  return E;
+}
+
+/// [0, extent) of a grid position the kernel's known grid bounds.
+static std::optional<std::pair<uint64_t, uint64_t>>
+gridBounds(const Function &F, Intrinsic::ID ID) {
+  unsigned D;
+  StringRef Name;
+  switch (ID) {
+  case Intrinsic::agx_thread_position_in_grid_x: D = 0; Name = "agx-threads-per-grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_y: D = 1; Name = "agx-threads-per-grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_z: D = 2; Name = "agx-threads-per-grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_x: D = 0; Name = "agx-threadgroups-per-grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_y: D = 1; Name = "agx-threadgroups-per-grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_z: D = 2; Name = "agx-threadgroups-per-grid"; break;
+  default:
+    return std::nullopt;
+  }
+  if (auto E = extents(F, Name))
+    return std::pair(uint64_t(0), (*E)[D]);
+  return std::nullopt;
+}
+
+std::optional<uint64_t> AGX::knownGridExtent(const Function &F,
+                                            unsigned IntrinsicID) {
+  if (auto G = gridBounds(F, Intrinsic::ID(IntrinsicID)))
+    return G->second;
+  return std::nullopt;
+}
+
 bool AGX::addSpecialRegisterRanges(Function &F,
                                    SmallVectorImpl<WeakVH> *Added) {
   bool Changed = false;
@@ -99,6 +149,10 @@ bool AGX::addSpecialRegisterRanges(Function &F,
     if (!II || !II->getType()->isIntegerTy(32))
       continue;
     auto B = bounds(II->getIntrinsicID());
+    if (AGXKnownGridRanges)
+      if (auto G = gridBounds(F, II->getIntrinsicID()))
+        if (!B || G->second - G->first < B->second - B->first)
+          B = G;
     if (!B || II->getRetAttributes().hasAttribute(Attribute::Range))
       continue;
     II->addRetAttr(Attribute::get(

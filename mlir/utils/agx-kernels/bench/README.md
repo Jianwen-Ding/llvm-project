@@ -41,5 +41,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `dot_vec4` | row dot products by `vector<4xf32>` fma and a `vector.reduction` of the lanes |
 | `shfl_sum` | SIMD-group sums by an xor shuffle tree, one store per group |
 | `hash` | a 32-bit hash mix: multiplies, rotates of products, an xor shift |
+| `h2` | `vector<2xf16>` accesses split into halves (2-byte alignment) and f16 arithmetic |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

@@ -13,6 +13,7 @@
 #ifndef LLVM_LIB_TARGET_AGX_AGX_H
 #define LLVM_LIB_TARGET_AGX_AGX_H
 
+#include <optional>
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Intrinsics.h"
@@ -61,6 +62,9 @@ namespace AGX {
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
 bool addSpecialRegisterRanges(Function &F,
                               SmallVectorImpl<WeakVH> *Added = nullptr);
+/// The extent of the grid position an intrinsic reads that the kernel's known
+/// grid gives (agx-threads-per-grid, agx-threadgroups-per-grid), if any.
+std::optional<uint64_t> knownGridExtent(const Function &F, unsigned IntrinsicID);
 } // namespace AGX
 FunctionPass *createAGXVectorAccessesPass(bool BeforeVectorizer);
 FunctionPass *createAGXLowerGenericAddressesPass();

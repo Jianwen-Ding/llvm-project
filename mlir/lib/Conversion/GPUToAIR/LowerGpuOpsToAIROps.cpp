@@ -1394,6 +1394,30 @@ struct LowerGpuOpsToAIROpsPass final
             ctx, {StringAttr::get(ctx, "agx-max-threads-per-threadgroup"),
                   StringAttr::get(ctx, std::to_string(threads))}));
       }
+      // The grid's extents when known (the launch promises them): the AGX
+      // backend bounds the position special registers by them just before
+      // instruction selection.
+      auto knownGridSize = gpuDialect->getKnownGridSizeAttrHelper();
+      if (DenseI32ArrayAttr grid = knownGridSize.getAttr(f)) {
+        auto join = [](ArrayRef<int64_t> v) {
+          std::string out;
+          for (int64_t x : v)
+            out += (out.empty() ? "" : ",") + std::to_string(x);
+          return out;
+        };
+        SmallVector<int64_t> groups(grid.asArrayRef());
+        passthrough.push_back(ArrayAttr::get(
+            ctx, {StringAttr::get(ctx, "agx-threadgroups-per-grid"),
+                  StringAttr::get(ctx, join(groups))}));
+        if (DenseI32ArrayAttr size = knownBlockSize.getAttr(f)) {
+          SmallVector<int64_t> threads;
+          for (auto [g, b] : llvm::zip(grid.asArrayRef(), size.asArrayRef()))
+            threads.push_back(int64_t(g) * b);
+          passthrough.push_back(ArrayAttr::get(
+              ctx, {StringAttr::get(ctx, "agx-threads-per-grid"),
+                    StringAttr::get(ctx, join(threads))}));
+        }
+      }
       f.setPassthroughAttr(ArrayAttr::get(ctx, passthrough));
     });
   }

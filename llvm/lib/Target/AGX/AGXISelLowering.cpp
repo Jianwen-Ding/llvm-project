@@ -110,7 +110,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
-                       ISD::MULHS});
+                       ISD::MULHS, ISD::ADD});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1810,9 +1810,117 @@ static SDValue performMulRotateCombine(SDNode *N,
   return SDValue();
 }
 
+static cl::opt<unsigned> AGXOffsetIndexMax(
+    "agx-offset-index-max", cl::init(1), cl::Hidden,
+    cl::desc("Most constant offsets from one address that each become an index"));
+
+static cl::opt<bool> OffsetIndices(
+    "agx-offset-indices", cl::init(true), cl::Hidden,
+    cl::desc("A device address base + (zext(x) << s) + c with no other "
+             "constant offset is base + (zext((x << s - t) + c >> t) << t)"));
+
+/// The element size, log2, of a device load or store whose address is A.
+static std::optional<unsigned> deviceAccessElemLog2(SDNode *U, SDValue A) {
+  auto *M = dyn_cast<MemSDNode>(U);
+  if (!M || M->getAddressSpace() != AGX::DEVICE_ADDRESS || !M->isSimple())
+    return std::nullopt;
+  if (auto *L = dyn_cast<LoadSDNode>(U)) {
+    if (L->getBasePtr() != A || L->isIndexed())
+      return std::nullopt;
+  } else if (auto *St = dyn_cast<StoreSDNode>(U)) {
+    if (St->getBasePtr() != A || St->isIndexed())
+      return std::nullopt;
+  } else {
+    return std::nullopt;
+  }
+  uint64_t Bytes = M->getMemoryVT().getScalarSizeInBits() / 8;
+  if (Bytes != 1 && Bytes != 2 && Bytes != 4 && Bytes != 8)
+    return std::nullopt;
+  return Log2_64(std::min<uint64_t>(Bytes, 4));
+}
+
+/// (b + (zext(x) << s)) + c: device accesses at b + (zext(x) << s) take b and
+/// the index register x, but the one at + c (the second half of a split
+/// vector, a field of a struct element) took the 64-bit sum b + (x << s) as
+/// its base: a 64-bit add, and copies of a uniform b to registers. Where c is
+/// one of at most three constant offsets from that sum, and (x << (s - t)) + (c >> t), t
+/// the trailing zeros of c (at most s), is below 2^32 (known bits), it is
+/// b + (zext of that 32-bit sum << t): one 32-bit add, the index register.
+static SDValue performOffsetIndexCombine(SDNode *N,
+                                         TargetLowering::DAGCombinerInfo &DCI) {
+  if (!OffsetIndices || N->getValueType(0) != MVT::i64)
+    return SDValue();
+  auto *C = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  SDValue P = N->getOperand(0);
+  if (!C || P.getOpcode() != ISD::ADD || C->isZero() ||
+      C->getAPIntValue().isNegative())
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue B = P.getOperand(I), Sh = P.getOperand(1 - I);
+    if (Sh.getOpcode() != ISD::SHL || !isa<ConstantSDNode>(Sh.getOperand(1)) ||
+        Sh.getOperand(0).getOpcode() != ISD::ZERO_EXTEND ||
+        Sh.getOperand(0).getOperand(0).getValueType() != MVT::i32)
+      continue;
+    unsigned S = Sh.getConstantOperandVal(1);
+    uint64_t CV = C->getZExtValue();
+    unsigned T = std::min<unsigned>(S, llvm::countr_zero(CV));
+    SDValue X = Sh.getOperand(0).getOperand(0);
+    // (x << (s - t)) + (c >> t) below 2^32.
+    APInt Max = DAG.computeKnownBits(X).getMaxValue().zext(64);
+    // A grid position: below the kernel's known grid extent.
+    if (X.getOpcode() == ISD::INTRINSIC_WO_CHAIN)
+      if (auto E = AGX::knownGridExtent(DAG.getMachineFunction().getFunction(),
+                                        X.getConstantOperandVal(0)))
+        Max = APIntOps::umin(Max, APInt(64, *E - 1));
+    if (S - T >= 32 || (CV >> T) >= (uint64_t(1) << 32) ||
+        Max.ugt(APInt::getAllOnes(64).lshr(32 + S - T)))
+      return SDValue();
+    if ((Max.shl(S - T) + (CV >> T)).uge(APInt(64, 1).shl(32)))
+      return SDValue();
+    // Every user of p: this add or an access at p; of this add: accesses,
+    // each of an element size t indexes (t in [e, e + 2]).
+    auto Fits = [&](SDValue A, SDNode *U) {
+      std::optional<unsigned> E = deviceAccessElemLog2(U, A);
+      return E && T >= *E && T <= *E + 2;
+    };
+    bool OK = !N->use_empty();
+    for (SDNode *U : N->users())
+      OK &= Fits(SDValue(N, 0), U);
+    // p's other users: accesses at p, or at most two more constant offsets
+    // (each one 32-bit add, against the 64-bit sum and, for a uniform b, its
+    // two copies).
+    unsigned Offsets = 1;
+    for (SDNode *U : P->users()) {
+      if (U == N || deviceAccessElemLog2(U, P))
+        continue;
+      if (U->getOpcode() == ISD::ADD && U->getOperand(0) == P &&
+          isa<ConstantSDNode>(U->getOperand(1)) && ++Offsets <= AGXOffsetIndexMax)
+        continue;
+      OK = false;
+    }
+    if (!OK)
+      return SDValue();
+    SDLoc DL(N);
+    SDValue Y = DAG.getNode(
+        ISD::ADD, DL, MVT::i32,
+        DAG.getNode(ISD::SHL, DL, MVT::i32, X,
+                    DAG.getConstant(S - T, DL, MVT::i32)),
+        DAG.getConstant(CV >> T, DL, MVT::i32), SDNodeFlags::NoUnsignedWrap);
+    return DAG.getNode(
+        ISD::ADD, DL, MVT::i64, B,
+        DAG.getNode(ISD::SHL, DL, MVT::i64,
+                    DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i64, Y),
+                    DAG.getConstant(T, DL, MVT::i32)));
+  }
+  return SDValue();
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
+  case ISD::ADD:
+    return performOffsetIndexCombine(N, DCI);
   case ISD::SHL: {
     // (x ^ c) << s -> (x << s) ^ (c << s) for c << s an 8-bit immediate: the
     // shifted x is the one other indices use (tg[t] beside tg[t ^ 1]), so

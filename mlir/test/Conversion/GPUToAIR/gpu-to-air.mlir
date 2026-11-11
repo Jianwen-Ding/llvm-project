@@ -291,7 +291,10 @@ gpu.module @global_id {
     memref.store %g, %out[%c0] : memref<8xindex, 1>
     gpu.return
   }
+  // The known grid is an AGX hint too (the backend bounds positions by it
+  // where an address needs the bound, L15-E190).
   // CHECK-LABEL: llvm.func @known(
+  // CHECK-SAME: ["agx-threadgroups-per-grid", "4096,1,1"], ["agx-threads-per-grid", "1048576,1,1"]
   gpu.func @known(%out: memref<8xindex, 1>) kernel
       attributes {known_block_size = array<i32: 256, 1, 1>,
                   known_grid_size = array<i32: 4096, 1, 1>} {
