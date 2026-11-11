@@ -12,7 +12,7 @@
 // pass inserts a wait on a group before any instruction reads or overwrites a
 // register with a pending result in it, both groups before barriers and at the
 // end of every block with pending results (so that no wait is needed across
-// control flow). At most eight requests are kept outstanding.
+// control flow). At most sixteen requests are kept outstanding (-agx-max-pending).
 //
 // A write of part of a register pair carries an implicit use and def of the
 // pair, which keep its other half live; they neither read nor write that
@@ -63,7 +63,14 @@ INITIALIZE_PASS(AGXInsertWaits, DEBUG_TYPE, "AGX Insert Waits", false, false)
 
 FunctionPass *llvm::createAGXInsertWaitsPass() { return new AGXInsertWaits(); }
 
-static constexpr unsigned MaxPending = 8;
+#include "llvm/Support/CommandLine.h"
+// Sixteen requests outstanding (Mesa keeps eight): measured correct on G14C
+// (32 M loads checked; tile GEMMs, llama.cpp and PTX-formalization identical)
+// and 1-4% faster in the tile GEMMs (playground novel-results 2026-11-11-
+// pending-loads-shared-unit). Larger values are untested.
+static cl::opt<unsigned> MaxPending(
+    "agx-max-pending", cl::init(16), cl::Hidden,
+    cl::desc("Asynchronous requests kept outstanding before a wait"));
 
 static bool isBarrier(const MachineInstr &MI) {
   return MI.getOpcode() == AGX::THREADGROUP_BARRIER ||
