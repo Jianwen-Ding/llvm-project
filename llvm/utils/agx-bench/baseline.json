@@ -23,6 +23,30 @@
   "uniform_halves": 34,
   "waits": 2
  },
+ "axpy_bf16.ll:axpy_bf16:agx-g13g": {
+  "bytes": 234,
+  "cycles": 200.0,
+  "gprs": 11,
+  "groups": 96,
+  "instructions": 35,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 11.5,
+  "uniform_halves": 16,
+  "waits": 2
+ },
+ "axpy_bf16.ll:axpy_bf16:agx-g14c": {
+  "bytes": 234,
+  "cycles": 200.0,
+  "gprs": 11,
+  "groups": 96,
+  "instructions": 35,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 11.5,
+  "uniform_halves": 16,
+  "waits": 2
+ },
  "bilinear_resize.ll:bilinear_resize:agx-g13g": {
   "bytes": 326,
   "cycles": 225.3,
@@ -788,6 +812,30 @@
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 32.5,
+  "uniform_halves": 20,
+  "waits": 2
+ },
+ "gemv_bf16.ll:gemv_bf16:agx-g13g": {
+  "bytes": 262,
+  "cycles": 5526.8,
+  "gprs": 12,
+  "groups": 96,
+  "instructions": 42,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 163.8,
+  "uniform_halves": 20,
+  "waits": 2
+ },
+ "gemv_bf16.ll:gemv_bf16:agx-g14c": {
+  "bytes": 262,
+  "cycles": 5526.8,
+  "gprs": 12,
+  "groups": 96,
+  "instructions": 42,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 163.8,
   "uniform_halves": 20,
   "waits": 2
  },

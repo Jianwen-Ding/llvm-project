@@ -2463,6 +2463,113 @@ static Bytes4 byteSources(Value *V, unsigned Depth,
 /// into the other's half (and a shift or a sign fill for the byte), the
 /// halves the 32-bit register's, where that takes fewer instructions than
 /// the tree.
+static cl::opt<bool> AGXWordBFloatLoads(
+    "agx-word-bfloat-loads", cl::init(true), cl::Hidden,
+    cl::desc("a vector of bfloats loaded only to be extended to floats as "
+             "32-bit words, each pair's floats the word's halves, and "
+             "vectors of bfloats stored as 16-bit integers"));
+
+/// A <2k x bfloat> load whose only users extend it to floats: bfloat is not
+/// a register type, so the load was split into a 16-bit load per element,
+/// each shifted into a float. Loaded as <2k x i16> instead (one load, as k
+/// words), each element zero-extended and shifted left by 16: the DAG makes
+/// the high element of a word the word with its low half cleared (an and on
+/// the ALU), the low element the word shifted left by 16.
+static bool loadBFloatsAsWords(Function &F) {
+  if (!AGXWordBFloatLoads)
+    return false;
+  bool Changed = false;
+  SmallVector<LoadInst *, 8> Loads;
+  for (Instruction &I : instructions(F)) {
+    // A <2k x bfloat> store likewise, as <2k x i16> (the same bits element
+    // by element): one store of k words instead of one per element.
+    if (auto *St = dyn_cast<StoreInst>(&I)) {
+      auto *VT = dyn_cast<FixedVectorType>(St->getValueOperand()->getType());
+      if (VT && VT->getElementType()->isBFloatTy() &&
+          VT->getNumElements() % 2 == 0 && St->isSimple() &&
+          St->getAlign() >= 4) {
+        // Element by element (the scalarizer's elements, gathered), so
+        // that the DAG sees each element's 16 bits.
+        IRBuilder<> B(St);
+        unsigned N = VT->getNumElements();
+        Value *V = PoisonValue::get(FixedVectorType::get(B.getInt16Ty(), N));
+        for (unsigned E = 0; E < N; ++E)
+          V = B.CreateInsertElement(
+              V,
+              B.CreateBitCast(B.CreateExtractElement(St->getValueOperand(), E),
+                              B.getInt16Ty()),
+              E);
+        St->setOperand(0, V);
+        Changed = true;
+      }
+      continue;
+    }
+    auto *L = dyn_cast<LoadInst>(&I);
+    auto *VT = L ? dyn_cast<FixedVectorType>(L->getType()) : nullptr;
+    if (!VT || !VT->getElementType()->isBFloatTy() ||
+        VT->getNumElements() % 2 || !L->isSimple() || L->getAlign() < 4 ||
+        L->user_empty())
+      continue;
+    auto IsFloatExt = [](const User *U) {
+      auto *E = dyn_cast<FPExtInst>(U);
+      return E && E->getType()->getScalarType()->isFloatTy();
+    };
+    // The vector extended, or (after the scalarizer) its elements each.
+    if (all_of(L->users(), [&](const User *U) {
+          if (IsFloatExt(U))
+            return true;
+          auto *X = dyn_cast<ExtractElementInst>(U);
+          return X && isa<ConstantInt>(X->getIndexOperand()) &&
+                 !X->user_empty() && all_of(X->users(), IsFloatExt);
+        }))
+      Loads.push_back(L);
+  }
+  for (LoadInst *L : Loads) {
+    unsigned N = cast<FixedVectorType>(L->getType())->getNumElements();
+    IRBuilder<> B(L);
+    // As 16-bit integers, which keeps each element's poison its own (a word
+    // with a poison half would be poison whole); the DAG sees the vector as
+    // words, each element's float a half of one.
+    auto *HT = FixedVectorType::get(B.getInt16Ty(), N);
+    LoadInst *W = B.CreateAlignedLoad(HT, L->getPointerOperand(),
+                                      L->getAlign(), L->getName() + ".bits");
+    W->setAAMetadata(L->getAAMetadata());
+    for (unsigned K : {LLVMContext::MD_nontemporal,
+                       LLVMContext::MD_invariant_load})
+      if (MDNode *MD = L->getMetadata(K))
+        W->setMetadata(K, MD);
+    SmallVector<Value *, 8> Floats;
+    for (unsigned I = 0; I < N; ++I) {
+      Value *E = B.CreateZExt(B.CreateExtractElement(W, I), B.getInt32Ty());
+      Floats.push_back(B.CreateBitCast(B.CreateShl(E, 16), B.getFloatTy()));
+    }
+    Value *V = nullptr;
+    for (User *U : make_early_inc_range(L->users())) {
+      auto *E = cast<Instruction>(U);
+      if (auto *X = dyn_cast<ExtractElementInst>(E)) {
+        uint64_t Idx = cast<ConstantInt>(X->getIndexOperand())->getZExtValue();
+        Value *Fl = Idx < N ? Floats[Idx]
+                            : PoisonValue::get(B.getFloatTy());
+        for (User *XU : make_early_inc_range(X->users())) {
+          cast<Instruction>(XU)->replaceAllUsesWith(Fl);
+          cast<Instruction>(XU)->eraseFromParent();
+        }
+        X->eraseFromParent();
+        continue;
+      }
+      if (!V) {
+        V = PoisonValue::get(FixedVectorType::get(B.getFloatTy(), N));
+        for (unsigned I = 0; I < N; ++I)
+          V = B.CreateInsertElement(V, Floats[I], I);
+      }
+      E->replaceAllUsesWith(V);
+      E->eraseFromParent();
+    }
+    L->eraseFromParent();
+  }
+  return Changed || !Loads.empty();
+}
+
 static bool permuteBytes(Function &F) {
   if (!AGXBytePermutes)
     return false;
@@ -2651,6 +2758,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= expandDivisions(F);
   Changed |= mergeMaskedOrs(F);
   Changed |= permuteBytes(F);
+  Changed |= loadBFloatsAsWords(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

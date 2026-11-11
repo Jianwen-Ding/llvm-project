@@ -675,6 +675,24 @@ def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
 def : Pat<(i16 (and (agx_srl_oneuse AGXIntSrc16:$a, (i16 imm:$s)),
                     agx_field_mask:$m)),
           (BFEIL_I16 0, (i16 0), 0, $a, 0, (i16 imm:$s), (AGXFieldWidth $m))>;
+// A half that is x >> 16 is x's high half register (a float rounded to
+// bfloat, packed with another), without the shift.
+let AddedComplexity = 2 in
+foreach Sh = [srl, sra] in {
+def : Pat<(i32 (AGXpack16 (i32 (Sh i32:$lo, (i32 16))), (i32 (Sh i32:$hi, (i32 16))))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, hi16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+def : Pat<(i32 (AGXpack16 (i32 (Sh i32:$lo, (i32 16))), (i32 (anyext i16:$hi)))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, hi16)), lo16, $hi, hi16)>;
+def : Pat<(i32 (AGXpack16 (i32 (anyext i16:$lo)), (i32 (Sh i32:$hi, (i32 16))))),
+          (REG_SEQUENCE GPR32, $lo, lo16, (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+def : Pat<(i32 (AGXpack16 (i32 (Sh i32:$lo, (i32 16))), i32:$hi)),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, hi16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
+def : Pat<(i32 (AGXpack16 i32:$lo, (i32 (Sh i32:$hi, (i32 16))))),
+          (REG_SEQUENCE GPR32, (i16 (EXTRACT_SUBREG $lo, lo16)), lo16,
+                               (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+}
 def : Pat<(i32 (AGXpack16 (i32 (anyext i16:$lo)), (i32 (anyext i16:$hi)))),
           (REG_SEQUENCE GPR32, $lo, lo16, $hi, hi16)>;
 def : Pat<(i32 (AGXpack16 (i32 (anyext i16:$lo)), i32:$hi)),
