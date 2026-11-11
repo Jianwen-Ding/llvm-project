@@ -24,10 +24,10 @@ define agx_kernel void @dp4a_word(ptr addrspace(1) noalias readonly %a, ptr addr
 ; CHECK-NEXT:    xor r4, r3, r4
 ; CHECK-NEXT:    and r6, r5, 255
 ; CHECK-NEXT:    bfeil r7, 0, r5, 8, mask 0xFF
-; CHECK-NEXT:    bfeil r5, 0, r5, 16, mask 0xFF
+; CHECK-NEXT:    and r5, r5h, 255
 ; CHECK-NEXT:    and r8, r4, 255
 ; CHECK-NEXT:    bfeil r9, 0, r4, 8, mask 0xFF
-; CHECK-NEXT:    bfeil r4, 0, r4, 16, mask 0xFF
+; CHECK-NEXT:    and r4, r4h, 255
 ; CHECK-NEXT:    asr r2, r2, 24
 ; CHECK-NEXT:    asr r3, r3, 24
 ; CHECK-NEXT:    isub r5, r5, 128

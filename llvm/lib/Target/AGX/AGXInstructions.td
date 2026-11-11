@@ -177,6 +177,14 @@ foreach Ext = [zext, anyext] in
 def : Pat<(i32 (and (Ext i16:$a), agx_uimm16:$c)),
           (BITOP_I32_FROM16 TT_AND, 0, $a, 0, (i16 (agx_imm_to_i16 $c)))>;
 
+// (x >> 16) & m for an 8-bit m (byte 2 of a word): the and of the high half,
+// zero-extended by the bitop, on the ALU instead of a bfeil on the unit
+// integer multiplies and bit fields share.
+let AddedComplexity = 3 in
+def : Pat<(i32 (and (srl i32:$a, (i32 16)), agx_uimm16:$c)),
+          (BITOP_I32_FROM16 TT_AND, 0, (i16 (EXTRACT_SUBREG $a, hi16)), 0,
+                            (i16 (agx_imm_to_i16 $c)))>;
+
 // A 32-bit value masked by 0xffff (too wide for the 8-bit immediate): a
 // move of its low 16 bits, zero-extended by the bitop, instead of a mov_imm
 // of the constant and the and.
