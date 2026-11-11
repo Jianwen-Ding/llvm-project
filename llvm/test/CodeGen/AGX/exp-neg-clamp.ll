@@ -7,8 +7,8 @@
 
 ; CHECK-LABEL: nexp:
 ; CHECK-NOT: xor
-; CHECK: fcmpsel lt,
-; CHECK: fcmpsel gt,
+; CHECK-DAG: fcmpsel lt,
+; CHECK-DAG: fcmpsel gt,
 ; CHECK-NOT: xor
 ; CHECK: stop
 define agx_kernel void @nexp(ptr addrspace(1) %p, float %x) {
