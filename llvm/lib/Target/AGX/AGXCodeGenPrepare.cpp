@@ -1706,7 +1706,7 @@ static bool isLaneMovement(const Value *V) {
 /// Shuffles that undo each other: a value whose every thread (and element)
 /// is, through shuffles, selects and element moves that depend only on the
 /// thread index, the same thread's (and element's) bits of one earlier value
-/// is that value. ZLUDA's mma emulation moves the elements of D from the
+/// is that value. The PTX front end's mma emulation moves the elements of D from the
 /// matrix unit's layout to the PTX fragment layout and the next mma's C back:
 /// a chain of mmas keeps its accumulator in the unit's layout. Each candidate
 /// is checked in all 32 threads.
