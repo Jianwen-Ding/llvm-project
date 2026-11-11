@@ -835,6 +835,76 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
   return false;
 }
 
+static cl::opt<bool> AGXMergeDownCounters(
+    "agx-merge-down-counters", cl::init(true), cl::Hidden,
+    cl::desc("Exit on an index rather than on a counter down to zero that "
+             "only the exit test uses"));
+
+/// LSR counts a loop down to zero beside the index it steps (c = n, n - 1,
+/// ..., exit when c' = c - 1 is 0; i = i0, i0 + s, ...), at an add each
+/// iteration. Where c is used by the exit test only and s is odd, c' = 0 is
+/// i' = i0 + s c0 exactly (mod 2^32: s is invertible, and c reaches zero at
+/// the same iteration): the test on i', and c goes. An even s = 2^m odd
+/// where the loop runs fewer than 2^(32 - m) times.
+static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch || !C.getType()->isIntegerTy(32) ||
+      C.getNumIncomingValues() != 2)
+    return false;
+  auto *Cn = dyn_cast<BinaryOperator>(C.getIncomingValueForBlock(Latch));
+  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_AllOnes())) ||
+      Cn->getParent() != Latch || !C.hasOneUse())
+    return false;
+  // c' only in the phi and one exit test against zero by the latch's branch
+  ICmpInst *Cmp = nullptr;
+  for (User *U : Cn->users()) {
+    if (U == &C)
+      continue;
+    auto *I = dyn_cast<ICmpInst>(U);
+    if (Cmp || !I || !I->isEquality() || !match(I->getOperand(1), m_Zero()) ||
+        I->getOperand(0) != Cn || !I->hasOneUse() ||
+        I->user_back() != Latch->getTerminator())
+      return false;
+    Cmp = I;
+  }
+  if (!Cmp)
+    return false;
+  for (PHINode &I : L.getHeader()->phis()) {
+    if (&I == &C || !I.getType()->isIntegerTy(32) ||
+        I.getNumIncomingValues() != 2)
+      continue;
+    auto *In = dyn_cast<BinaryOperator>(I.getIncomingValueForBlock(Latch));
+    const APInt *S;
+    if (!In || !match(In, m_Add(m_Specific(&I), m_APInt(S))) || S->isZero() ||
+        In->getParent() != Latch || !In->comesBefore(Latch->getTerminator()))
+      continue;
+    // s = 2^m odd: s c' = s n holds for c' = n mod 2^(32 - m) only, so with
+    // fewer than 2^(32 - m) iterations (the trip count's constant bound).
+    if (unsigned M = S->countr_zero()) {
+      auto *Max =
+          dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
+      if (!Max || Max->getAPInt().getActiveBits() > 32 - M ||
+          !(Max->getAPInt().zext(64) + 1).ult(APInt(64, 1).shl(32 - M)))
+        continue;
+    }
+    IRBuilder<> PB(Pre->getTerminator());
+    Value *End = PB.CreateAdd(
+        I.getIncomingValueForBlock(Pre),
+        PB.CreateMul(C.getIncomingValueForBlock(Pre),
+                     ConstantInt::get(C.getType(), *S)));
+    IRBuilder<> B(Latch->getTerminator());
+    Value *NewCmp = B.CreateICmp(Cmp->getPredicate(), In, End);
+    Cmp->replaceAllUsesWith(NewCmp);
+    Cmp->eraseFromParent();
+    Cn->replaceAllUsesWith(PoisonValue::get(Cn->getType()));
+    Cn->eraseFromParent();
+    C.eraseFromParent();
+    return true;
+  }
+  return false;
+}
+
 bool AGXNarrowInductions::runOnFunction(Function &F) {
   if (!AGXNarrowInductionsOpt || skipFunction(F))
     return false;
@@ -864,6 +934,17 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
           Ptrs.push_back(&Phi);
       for (PHINode *Phi : Ptrs)
         Changed |= pointerFromCounter(*Phi, *L, SE);
+    }
+    if (AGXMergeDownCounters && L->isInnermost()) {
+      SmallVector<PHINode *, 4> Counters;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isIntegerTy(32))
+          Counters.push_back(&Phi);
+      for (PHINode *Phi : Counters)
+        if (mergeDownCounter(*Phi, *L, SE)) {
+          Changed = true;
+          break;
+        }
     }
     if (AGXSplitOffsetInductions && L->isInnermost()) {
       SmallVector<PHINode *, 4> Wide;
