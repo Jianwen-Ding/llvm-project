@@ -1664,6 +1664,31 @@ bool AGXSoftF64::runOnFunction(Function &F) {
     II->replaceAllUsesWith(R);
     II->eraseFromParent();
   }
+  // modf of a double (SelectionDAG cannot soften it): the integral part
+  // trunc(x), the fraction x - trunc(x) (exact) with x's sign, zero for an
+  // infinite x; double operations, which the lowering below takes.
+  SmallVector<IntrinsicInst *, 2> Modfs;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && II->getIntrinsicID() == Intrinsic::modf &&
+        isDouble(II->getArgOperand(0)))
+      Modfs.push_back(II);
+  for (IntrinsicInst *II : Modfs) {
+    IRBuilder<> B(II);
+    Value *X = II->getArgOperand(0);
+    Value *Int = B.CreateUnaryIntrinsic(Intrinsic::trunc, X);
+    Value *Inf = B.CreateFCmpOEQ(B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
+                                 ConstantFP::getInfinity(X->getType()));
+    Value *Frac = B.CreateCopySign(
+        B.CreateSelect(Inf, ConstantFP::get(X->getType(), 0.0),
+                       B.CreateFSub(X, Int)),
+        X);
+    Value *R = B.CreateInsertValue(
+        B.CreateInsertValue(PoisonValue::get(II->getType()), Frac, 0), Int, 1);
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
   SmallVector<Instruction *, 16> Worklist;
   for (Instruction &I : instructions(F))
     if (AGX::isDoubleArithmetic(I))
