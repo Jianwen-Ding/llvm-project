@@ -929,6 +929,25 @@ def : Pat<(f16 (fminnum f16:$a, (f16 agx_fpimm0))),
           (FCMPSEL_F16 FC_LTN, 0, $a, 0, (i16 0), 0, $a, 0, (i16 0))>;
 }
 
+// The same for a float select on an integer comparison (the integer
+// immediate 0 is +0.0's bits).
+multiclass ICmpSelectZeroArmPats<Instruction inst, ValueType cvt,
+                                 ValueType vt, ComplexPattern cpat,
+                                 ValueType zt> {
+  foreach C = AGXIntConds in {
+    def : Pat<(vt (select (i32 (setcc cpat:$a, cpat:$b, C.CC)),
+                          (vt agx_fpimm0), vt:$y)),
+              !if(C.Swap, (inst C.HW, 0, $a, 0, $b, 0, $y, 0, (zt 0)),
+                          (inst C.HW, 0, $a, 0, $b, 0, (zt 0), 0, $y))>;
+    def : Pat<(vt (select (i32 (setcc cpat:$a, cpat:$b, C.CC)),
+                          vt:$x, (vt agx_fpimm0))),
+              !if(C.Swap, (inst C.HW, 0, $a, 0, $b, 0, (zt 0), 0, $x),
+                          (inst C.HW, 0, $a, 0, $b, 0, $x, 0, (zt 0)))>;
+  }
+}
+let AddedComplexity = 2 in
+defm : ICmpSelectZeroArmPats<ICMPSEL_I32, i32, f32, AGXIntSrc32, i32>;
+
 let AddedComplexity = 2 in {
 defm : SelectZeroArmPats<FCMPSEL_F32, f32, AGXFPSrc32, i32>;
 defm : SelectZeroArmPats<FCMPSEL_F16, f16, AGXFPSrc16, i16>;
