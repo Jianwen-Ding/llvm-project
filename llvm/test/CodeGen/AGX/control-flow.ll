@@ -161,8 +161,8 @@ define agx_kernel void @nested_loops(ptr addrspace(1) %out, i32 %n, i32 %m) {
 ; CHECK-NEXT:    if_icmp r0l, nueq, r1, r3, 1
 ; CHECK-NEXT:  // %bb.3: // %inner.c
 ; CHECK-NEXT:    // in Loop: Header=BB3_2 Depth=2
-; CHECK-NEXT:    iadd r4, r3, 1
 ; CHECK-NEXT:    icmpsel ult, r6, r3, u3, 0, 1
+; CHECK-NEXT:    iadd r4, r3, 1
 ; CHECK-NEXT:    mov_imm r5l, 0
 ; CHECK-NEXT:  // %bb.4: // %Flow
 ; CHECK-NEXT:    // in Loop: Header=BB3_2 Depth=2

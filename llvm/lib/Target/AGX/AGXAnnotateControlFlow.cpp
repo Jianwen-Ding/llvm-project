@@ -48,6 +48,11 @@ static cl::opt<bool> AGXWidenBooleanPhis(
     "agx-widen-boolean-phis", cl::init(true), cl::Hidden,
     cl::desc("Booleans live across blocks as i32 phis (32-bit registers)"));
 
+static cl::opt<bool> AGXSinkLoopCarriedDefs(
+    "agx-sink-loop-carried-defs", cl::init(true), cl::Hidden,
+    cl::desc("A loop-carried variable's new value computed after the old "
+             "value's last use in its block"));
+
 #define DEBUG_TYPE "agx-annotate-control-flow"
 
 namespace {
@@ -75,6 +80,7 @@ class AGXAnnotateControlFlowImpl {
   bool closeControlFlow(BasicBlock *BB);
   bool layoutBlocks();
   bool widenBooleanPhis();
+  bool sinkLoopCarriedDefs();
 
   CallInst *createCall(IRBuilder<> &IRB, Intrinsic::ID ID,
                        ArrayRef<Value *> Args = {}) {
@@ -219,9 +225,9 @@ bool AGXAnnotateControlFlowImpl::closeControlFlow(BasicBlock *BB) {
 }
 
 bool AGXAnnotateControlFlowImpl::run() {
+  bool Changed = AGXSinkLoopCarriedDefs && sinkLoopCarriedDefs();
   prepareLoops();
 
-  bool Changed = false;
   for (df_iterator<BasicBlock *> I = df_begin(&F.getEntryBlock()),
                                  E = df_end(&F.getEntryBlock());
        I != E; ++I) {
@@ -261,6 +267,54 @@ bool AGXAnnotateControlFlowImpl::run() {
   Changed |= layoutBlocks();
   if (AGXWidenBooleanPhis)
     Changed |= widenBooleanPhis();
+  return Changed;
+}
+
+/// The new value of a loop-carried variable computed before the old one's
+/// last use in its block keeps both live, and the old one's register takes a
+/// copy of it each iteration (mandelbrot's z: z.re' = ... computed before
+/// 2 z.re): the new value goes after that use where nothing between needs
+/// it. (Instruction selection keeps the order of the block here.) The new
+/// value is the header phi's, or that of the structurizer's flow phi which
+/// gives it.
+bool AGXAnnotateControlFlowImpl::sinkLoopCarriedDefs() {
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder())
+    for (PHINode &HP : L->getHeader()->phis())
+      for (unsigned I = 0, E = HP.getNumIncomingValues(); I != E; ++I) {
+        if (!L->contains(HP.getIncomingBlock(I)))
+          continue;
+        SmallVector<std::pair<Value *, BasicBlock *>, 4> News;
+        auto *P = dyn_cast<PHINode>(HP.getIncomingValue(I));
+        if (P && P != &HP && L->contains(P->getParent())) {
+          for (unsigned J = 0, N = P->getNumIncomingValues(); J != N; ++J)
+            News.push_back({P->getIncomingValue(J), P->getIncomingBlock(J)});
+        } else {
+          News.push_back({HP.getIncomingValue(I), HP.getIncomingBlock(I)});
+        }
+        for (auto [V, From] : News) {
+          auto *Def = dyn_cast<Instruction>(V);
+          if (!Def || isa<PHINode>(Def) || Def->getParent() != From ||
+              !L->contains(From) || Def->mayReadOrWriteMemory() ||
+              Def->mayHaveSideEffects() || Def->isTerminator())
+            continue;
+          // the last use of the old value after Def in its block
+          Instruction *Last = nullptr;
+          for (Instruction *It = Def->getNextNode(); It; It = It->getNextNode())
+            if (is_contained(It->operands(), &HP))
+              Last = It;
+          if (!Last || isa<PHINode>(Last) || Last->isTerminator())
+            continue;
+          bool UsedBefore = false;
+          for (Instruction *It = Def->getNextNode(); It != Last->getNextNode();
+               It = It->getNextNode())
+            UsedBefore |= is_contained(It->operands(), Def);
+          if (UsedBefore)
+            continue;
+          Def->moveAfter(Last);
+          Changed = true;
+        }
+      }
   return Changed;
 }
 
