@@ -215,6 +215,13 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                       ISD::FLOG10, ISD::FPOW},
                      MVT::f16, Promote);
   setOperationAction({ISD::FSIN, ISD::FCOS}, MVT::f16, Custom);
+  // ldexp of half in float: exact there (half values scaled within float's
+  // range, and what underflows float is far below half's denormals), so the
+  // rounding to half is the only one. The generic expansion in half scales
+  // by at most 2^-6 before clamping n to the exponent range: ldexp(91.6, -37)
+  // came out 8.7e-5, not 0.
+  setOperationAction(ISD::FLDEXP, MVT::f16, Promote);
+  AddPromotedToType(ISD::FLDEXP, MVT::f16, MVT::f32);
   setOperationAction({ISD::FP16_TO_FP, ISD::FP_TO_FP16}, MVT::f32, Expand);
   // bfloat16 is not a legal type: conversions are integer operations.
   setOperationAction({ISD::BF16_TO_FP, ISD::FP_TO_BF16},
