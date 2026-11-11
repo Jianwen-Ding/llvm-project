@@ -106,7 +106,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ATOMIC_LOAD_SUB, MVT::i32, Custom);
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
-  setTargetDAGCombine({ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
+  setTargetDAGCombine({ISD::SHL, ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND});
@@ -1673,6 +1673,11 @@ static cl::opt<bool> SelectOfSelect(
              "selects"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> XorShiftCommute(
+    "agx-xor-shift-commute",
+    cl::desc("(x ^ c) << s as (x << s) ^ (c << s)"), cl::init(true),
+    cl::Hidden);
+
 static cl::opt<bool> SignSelect(
     "agx-sign-select",
     cl::desc("select on x > -1 as a select on x < 0, arms swapped"),
@@ -1681,6 +1686,27 @@ static cl::opt<bool> SignSelect(
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
+  case ISD::SHL: {
+    // (x ^ c) << s -> (x << s) ^ (c << s) for c << s an 8-bit immediate: the
+    // shifted x is the one other indices use (tg[t] beside tg[t ^ 1]), so
+    // one xor instead of an xor and a shift (add and or fold into the
+    // shifted iadd already).
+    SDValue X = N->getOperand(0);
+    auto *S = dyn_cast<ConstantSDNode>(N->getOperand(1));
+    if (!XorShiftCommute || N->getValueType(0) != MVT::i32 || !S ||
+        X.getOpcode() != ISD::XOR || !X.hasOneUse() ||
+        !isa<ConstantSDNode>(X.getOperand(1)))
+      return SDValue();
+    uint64_t Sh = S->getZExtValue(), C = X.getConstantOperandVal(1);
+    if (Sh >= 32 || (C << Sh) > 255)
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    SDLoc DL(N);
+    return DAG.getNode(ISD::XOR, DL, MVT::i32,
+                       DAG.getNode(ISD::SHL, DL, MVT::i32, X.getOperand(0),
+                                   N->getOperand(1)),
+                       DAG.getConstant(C << Sh, DL, MVT::i32));
+  }
   case ISD::SETCC:
     return performClassCompareCombine(N, DCI);
   case ISD::FP_TO_SINT:

@@ -130,15 +130,14 @@ define agx_kernel void @wide(ptr addrspace(1) %a, ptr addrspace(1) %out) {
 define agx_kernel void @threadgroup(ptr addrspace(1) %out) {
 ; CHECK-LABEL: threadgroup:
 ; CHECK:         // uniform registers: 10 x 16-bit (threadgroups_per_grid at u2)
-; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 256 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr51 (thread_index_in_threadgroup)
 ; CHECK-NEXT:    iadd r2, 0, r1, lsl 2
-; CHECK-NEXT:    xor r3, r1, 1
 ; CHECK-NEXT:    threadgroup_store i32, x, r1, r2l, 0
-; CHECK-NEXT:    iadd r2, 0, r3, lsl 2
+; CHECK-NEXT:    xor r2, r2, 4
 ; CHECK-NEXT:    threadgroup_barrier
 ; CHECK-NEXT:    threadgroup_load i32, x, r2, r2l, 0
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, unsigned
