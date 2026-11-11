@@ -19,16 +19,14 @@
 ; CHECK: stop
 
 ; By default the switches' n > 3 and n > 7, which only branches read, are
-; each branch's own comparison of n; n == 2, which a select reads too, stays
-; an icmpsel, which the flow block computes for the threads of both sides.
+; each branch's own comparison of n (if_icmp); n == 2, which a select reads
+; too, stays an icmpsel, hoisted out of the flow block into the if block
+; above, which runs for the threads of both sides: computed once, not before
+; the else for the then side and again after it for the else side.
 ; FOLD-LABEL: k:
-; FOLD-NOT: icmpsel
-; FOLD: if_icmp r0l, sgt, [[N:r[0-9]+]], 3, 1
-; FOLD: if_icmp r0l, sgt, [[N]], 7, 1
-; FOLD: icmpsel ueq, [[C:r[0-9]+]], [[N]], 2, 0, 1
-; FOLD-NEXT: else_fcmp
-; FOLD-NEXT: icmpsel ueq, [[C]], [[N]], 2, 0, 1
+; FOLD: icmpsel ueq, [[C:r[0-9]+]], [[N:r[0-9]+]], 2, 0, 1
 ; FOLD: if_icmp r0l, sgt, [[N]], 3, 1
+; FOLD: if_icmp r0l, sgt, [[N]], 7, 1
 ; FOLD-NOT: icmpsel ueq, {{r[0-9]+}}, {{r[0-9]+}}, 2, 0, 1
 ; FOLD: stop
 

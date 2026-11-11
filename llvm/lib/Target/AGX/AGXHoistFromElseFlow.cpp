@@ -93,7 +93,12 @@ bool AGXHoistFromElseFlow::runOnMachineFunction(MachineFunction &MF) {
     if (!Node || !Node->getIDom())
       continue;
     MachineBasicBlock *If = Node->getIDom()->getBlock();
-    if (!endsInOpcode(*If, AGX::AGX_IF))
+    // AGX_IF, or an if whose condition AGXFoldOperands made the comparison
+    // itself (whose flow blocks AGXLowerControlFlow otherwise runs twice).
+    if (!endsInOpcode(*If, AGX::AGX_IF) &&
+        !endsInOpcode(*If, AGX::AGX_IF_ICMP) &&
+        !endsInOpcode(*If, AGX::AGX_IF_FCMP) &&
+        !endsInOpcode(*If, AGX::AGX_IF_ICMP16))
       continue;
 
     for (MachineInstr &MI : llvm::make_early_inc_range(
