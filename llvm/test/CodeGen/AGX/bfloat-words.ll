@@ -96,27 +96,21 @@ define agx_kernel void @bfdot_loop(ptr addrspace(1) noalias readonly captures(no
 ; CHECK-NEXT:  .LBB2_1: // %loop
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
 ; CHECK-NEXT:    iadd r6, r2, r3
-; CHECK-NEXT:    bitop 0101, r8, u0, 0
-; CHECK-NEXT:    bitop 0101, r9, u1, 0
-; CHECK-NEXT:    iadd r6_r7, r8_r9, r6.sx, lsl 1
-; CHECK-NEXT:    bitop 0101, r8, u2, 0
-; CHECK-NEXT:    bitop 0101, r9, u3, 0
-; CHECK-NEXT:    iadd r8_r9, r8_r9, r3.sx, lsl 1
-; CHECK-NEXT:    device_load 0, i32, xy, r6_r7, r6_r7, 0, signed
-; CHECK-NEXT:    device_load 1, i32, xy, r8_r9, r8_r9, 0, signed
+; CHECK-NEXT:    device_load 0, i16, xyzw, r8l_r8h_r9l_r9h, u2_u3, r3, signed
+; CHECK-NEXT:    device_load 1, i16, xyzw, r6l_r6h_r7l_r7h, u0_u1, r6, signed
 ; CHECK-NEXT:    iadd r3, r3, 4
 ; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    bfi r12, 0, r8, 16
+; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    bfi r10, 0, r6, 16
 ; CHECK-NEXT:    and r6, r6, r4
-; CHECK-NEXT:    bfi r11, 0, r7, 16
-; CHECK-NEXT:    and r7, r7, r4
-; CHECK-NEXT:    wait 1
-; CHECK-NEXT:    bfi r12, 0, r8, 16
 ; CHECK-NEXT:    and r8, r8, r4
-; CHECK-NEXT:    bfi r13, 0, r9, 16
 ; CHECK-NEXT:    fmul32 r10, r10, r12
+; CHECK-NEXT:    bfi r11, 0, r7, 16
+; CHECK-NEXT:    bfi r13, 0, r9, 16
 ; CHECK-NEXT:    fmul32 r6, r6, r8
 ; CHECK-NEXT:    fadd32 r5, r5, r10
+; CHECK-NEXT:    and r7, r7, r4
 ; CHECK-NEXT:    and r9, r9, r4
 ; CHECK-NEXT:    fmul32 r8, r11, r13
 ; CHECK-NEXT:    fadd32 r5, r5, r6

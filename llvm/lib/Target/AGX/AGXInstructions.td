@@ -1552,6 +1552,18 @@ multiclass DeviceStorePat<PatFrag frag, ValueType vt, Instruction inst,
             (inst 0, fmt, mask, $val, $base, $idx, $sgn, $shift)>;
 }
 
+// 4 and 8 bytes at an index in 16-bit units: the 16-bit format into the same
+// register halves, the index folded (SelectDeviceAddr32Via16).
+let AddedComplexity = 1 in {
+defm : DeviceLoadPat<device_load, i32, DEVICE_LOAD_32_H16, AGXDeviceAddr32Via16, FMT_I16, 3>;
+defm : DeviceLoadPat<device_load, f32, DEVICE_LOAD_32_H16, AGXDeviceAddr32Via16, FMT_I16, 3>;
+defm : DeviceLoadPat<device_load, i64, DEVICE_LOAD_64_H16, AGXDeviceAddr32Via16, FMT_I16, 15>;
+defm : DeviceLoadPat<device_load, f64, DEVICE_LOAD_64_H16, AGXDeviceAddr32Via16, FMT_I16, 15>;
+defm : DeviceStorePat<device_store, i32, DEVICE_STORE_32_H16, AGXDeviceAddr32Via16, FMT_I16, 3>;
+defm : DeviceStorePat<device_store, f32, DEVICE_STORE_32_H16, AGXDeviceAddr32Via16, FMT_I16, 3>;
+defm : DeviceStorePat<device_store, i64, DEVICE_STORE_64_H16, AGXDeviceAddr32Via16, FMT_I16, 15>;
+defm : DeviceStorePat<device_store, f64, DEVICE_STORE_64_H16, AGXDeviceAddr32Via16, FMT_I16, 15>;
+}
 defm : DeviceLoadPat<device_load, i32, DEVICE_LOAD_32, AGXDeviceAddr32, FMT_I32, 1>;
 defm : DeviceLoadPat<device_load, f32, DEVICE_LOAD_32, AGXDeviceAddr32, FMT_I32, 1>;
 defm : DeviceLoadPat<device_load, i64, DEVICE_LOAD_64, AGXDeviceAddr32, FMT_I32, 3>;

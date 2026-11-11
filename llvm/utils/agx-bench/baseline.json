@@ -863,6 +863,30 @@
   "uniform_halves": 20,
   "waits": 1
  },
+ "gemv_f16_rowptr.ll:gemv_f16_rowptr:agx-g13g": {
+  "bytes": 198,
+  "cycles": 2890.6,
+  "gprs": 9,
+  "groups": 96,
+  "instructions": 32,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 87.7,
+  "uniform_halves": 20,
+  "waits": 1
+ },
+ "gemv_f16_rowptr.ll:gemv_f16_rowptr:agx-g14c": {
+  "bytes": 198,
+  "cycles": 2890.6,
+  "gprs": 9,
+  "groups": 96,
+  "instructions": 32,
+  "launch_inputs": true,
+  "tg_bytes": 0,
+  "tput": 87.7,
+  "uniform_halves": 20,
+  "waits": 1
+ },
  "histogram.ll:histogram:agx-g13g": {
   "bytes": 124,
   "cycles": 251.4,

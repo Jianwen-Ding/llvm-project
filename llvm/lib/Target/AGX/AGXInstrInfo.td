@@ -168,6 +168,7 @@ def AGXFPSrc32 : ComplexPattern<f32, 2, "SelectFPSrc", [], [], -2>;
 def AGXDeviceAddr8 : ComplexPattern<i64, 4, "SelectDeviceAddr8", [], [], -10>;
 def AGXDeviceAddr16 : ComplexPattern<i64, 4, "SelectDeviceAddr16", [], [], -10>;
 def AGXDeviceAddr32 : ComplexPattern<i64, 4, "SelectDeviceAddr32", [], [], -10>;
+def AGXDeviceAddr32Via16 : ComplexPattern<i64, 4, "SelectDeviceAddr32Via16", [], [], -9>;
 
 // Threadgroup memory addresses: (base, index) for an element size of 1, 2 or
 // 4 bytes.

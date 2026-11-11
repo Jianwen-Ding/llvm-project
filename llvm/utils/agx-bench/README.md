@@ -38,6 +38,7 @@ The kernels in `kernels/` cover the common shapes of CUDA code:
 | `cross_entropy` | per-row log-sum-exp loss: a max loop, an exp-sum loop, a log and a gathered label |
 | `pcm_mix` | int16 audio mixing: saturating sample sums and a gain clamped to 16 bits, two samples per thread |
 | `gemv_f16` | LLM decode GEMV in f16: half2 loads, float fmas, a SIMD-group per row |
+| `gemv_f16_rowptr` | gemv_f16 over a `const half *` row (W + row * K, K at run time): half2 loads at element offsets |
 | `gemv_bf16` | the same GEMV in bf16: bfloat2 loads extended to float, two fmas per step, a bf16 store |
 | `axpy_bf16` | bf16 axpy: four bf16s of x and y per thread, float fmas, RNE back to bf16, one 8-byte store |
 | `bitonic_simd32` | bitonic sort of 32 keys in registers: 15 shuffle-xor compare-exchange steps (warp sort, top-k) |

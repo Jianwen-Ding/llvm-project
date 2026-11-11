@@ -69,6 +69,8 @@ private:
                           SDValue &Signed, SDValue &Shift) {
     return SelectDeviceAddr(Addr, 2, Base, Index, Signed, Shift);
   }
+  bool SelectDeviceAddr32Via16(SDValue Addr, SDValue &Base, SDValue &Index,
+                               SDValue &Signed, SDValue &Shift);
   bool SelectLocalAddr(SDValue Addr, SDValue &Base, SDValue &Index,
                        unsigned Unit);
   bool SelectLocalAddr8(SDValue Addr, SDValue &Base, SDValue &Index) {
@@ -237,6 +239,11 @@ bool AGXDAGToDAGISel::trySelectFieldInsert(SDNode *N) {
   return false;
 }
 
+static cl::opt<bool> Via16Addresses(
+    "agx-via16-addresses", cl::init(true), cl::Hidden,
+    cl::desc("4- and 8-byte device accesses at a 16-bit-unit index in the "
+             "16-bit format, the index folded"));
+
 // The i32 format and the masks of 2, 3 and 4 consecutive values.
 static constexpr unsigned FmtI32 = 2;
 static unsigned vectorMask(unsigned NumElts) { return (1u << NumElts) - 1; }
@@ -268,10 +275,17 @@ void AGXDAGToDAGISel::selectVectorLoad(SDNode *N, unsigned NumElts) {
                                   {Fmt, Mask, Base, Index, Chain});
   } else {
     SDValue Base, Index, Signed, Shift;
-    SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
     unsigned Opc = NumElts == 2   ? AGX::DEVICE_LOAD_64
                    : NumElts == 3 ? AGX::DEVICE_LOAD_96
                                   : AGX::DEVICE_LOAD_128;
+    if (NumElts == 2 && Via16Addresses &&
+        SelectDeviceAddr32Via16(Addr, Base, Index, Signed, Shift)) {
+      Opc = AGX::DEVICE_LOAD_64_H16;
+      Fmt = CurDAG->getTargetConstant(1, DL, MVT::i32);
+      Mask = CurDAG->getTargetConstant(vectorMask(4), DL, MVT::i32);
+    } else {
+      SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
+    }
     SDValue G = CurDAG->getTargetConstant(0, DL, MVT::i32);
     Load = CurDAG->getMachineNode(
         Opc, DL, MVT::Untyped, MVT::Other,
@@ -386,10 +400,17 @@ void AGXDAGToDAGISel::selectVectorStore(SDNode *N, unsigned NumElts) {
                                    {Fmt, Mask, Val, Base, Index, Chain});
   } else {
     SDValue Base, Index, Signed, Shift;
-    SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
     unsigned Opc = NumElts == 2   ? AGX::DEVICE_STORE_64
                    : NumElts == 3 ? AGX::DEVICE_STORE_96
                                   : AGX::DEVICE_STORE_128;
+    if (NumElts == 2 && Via16Addresses &&
+        SelectDeviceAddr32Via16(Addr, Base, Index, Signed, Shift)) {
+      Opc = AGX::DEVICE_STORE_64_H16;
+      Fmt = CurDAG->getTargetConstant(1, DL, MVT::i32);
+      Mask = CurDAG->getTargetConstant(vectorMask(4), DL, MVT::i32);
+    } else {
+      SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
+    }
     SDValue G = CurDAG->getTargetConstant(0, DL, MVT::i32);
     Store = CurDAG->getMachineNode(
         Opc, DL, MVT::Other,
@@ -710,6 +731,21 @@ bool AGXDAGToDAGISel::SelectDeviceAddr(SDValue Addr, unsigned ElemLog2,
   Base = Addr;
   Index = CurDAG->getTargetConstant(0, DL, MVT::i32);
   return true;
+}
+
+/// A 4- or 8-byte access whose index is in 16-bit units (base + 2 * i, a
+/// half or bfloat vector at an element index) does not fold into the 32-bit
+/// format's index, which would compute the 64-bit address; the 16-bit format
+/// (xy / xyzw into the same register halves) takes it. Only where the 32-bit
+/// form would not fold.
+bool AGXDAGToDAGISel::SelectDeviceAddr32Via16(SDValue Addr, SDValue &Base,
+                                              SDValue &Index, SDValue &Signed,
+                                              SDValue &Shift) {
+  SelectDeviceAddr32(Addr, Base, Index, Signed, Shift);
+  if (Base != Addr)
+    return false;
+  SelectDeviceAddr16(Addr, Base, Index, Signed, Shift);
+  return Base != Addr;
 }
 
 /// Threadgroup addresses are 16-bit byte offsets in the base register. The
