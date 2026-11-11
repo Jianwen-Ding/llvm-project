@@ -14,8 +14,10 @@
 #define LLVM_LIB_TARGET_AGX_AGX_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Pass.h"
 
 namespace llvm {
@@ -54,6 +56,12 @@ FunctionPass *createAGXThreadgroupAddressesPass();
 FunctionPass *createAGXHoistGuardedLoadsPass();
 FunctionPass *createAGXNarrowInductionsPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
+namespace AGX {
+/// Gives the special register reads of F their range return attributes (see
+/// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
+bool addSpecialRegisterRanges(Function &F,
+                              SmallVectorImpl<WeakVH> *Added = nullptr);
+} // namespace AGX
 FunctionPass *createAGXVectorAccessesPass(bool BeforeVectorizer);
 FunctionPass *createAGXLowerGenericAddressesPass();
 

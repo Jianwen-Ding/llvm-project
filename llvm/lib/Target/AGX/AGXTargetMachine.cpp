@@ -359,6 +359,11 @@ static cl::opt<unsigned> AGXStraightLineSRMaxInstructions(
     cl::desc("Straight-line strength reduction and n-ary reassociation only "
              "for functions of at most this many instructions (0: all)"));
 
+static cl::opt<bool> AGXEarlySRRanges(
+    "agx-early-sr-ranges", cl::init(true), cl::Hidden,
+    cl::desc("Special register ranges during straight-line strength "
+             "reduction (taken off before loop strength reduction)"));
+
 namespace {
 /// Straight-line strength reduction, n-ary reassociation and the CSE after
 /// them, on functions of at most AGXStraightLineSRMaxInstructions
@@ -399,7 +404,19 @@ public:
       FPM.addPass(GVNPass());
     else
       FPM.addPass(EarlyCSEPass());
-    return !FPM.run(F, FAM).areAllPreserved();
+    // The thread indices' bounds let these passes see an index plus a
+    // constant (zext(tid + 256)) as the index and a constant offset, which
+    // memory accesses take as an immediate. They are taken off again: with
+    // them, loop strength reduction makes 64-bit offsets (L14-E1); the
+    // special register ranges pass gives them back after it.
+    SmallVector<WeakVH, 8> Ranged;
+    if (AGXEarlySRRanges)
+      AGX::addSpecialRegisterRanges(F, &Ranged);
+    bool Changed = !FPM.run(F, FAM).areAllPreserved();
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<CallBase>(V))
+        CI->removeRetAttr(Attribute::Range);
+    return Changed;
   }
 };
 char AGXStraightLineSRPass::ID = 0;
