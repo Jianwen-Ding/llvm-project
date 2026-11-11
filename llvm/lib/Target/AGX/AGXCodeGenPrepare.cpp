@@ -2463,6 +2463,110 @@ static Bytes4 byteSources(Value *V, unsigned Depth,
 /// into the other's half (and a shift or a sign fill for the byte), the
 /// halves the 32-bit register's, where that takes fewer instructions than
 /// the tree.
+static cl::opt<bool> AGXByteLoads(
+    "agx-byte-loads", cl::init(true), cl::Hidden,
+    cl::desc("a word loaded only to take its bytes apart as a vector of "
+             "bytes (each zero-extended in a 16-bit half)"));
+
+/// A device i32 load whose users only take its bytes apart (trunc, lshr by
+/// whole bytes, and with low masks, zext), every value used otherwise being
+/// one byte zero-extended, is a <4 x i8> load: the byte format's access puts
+/// each byte, zero-extended, in a 16-bit half, without the shifts and masks
+/// (RGBA8 pixels). A byte vector load is no more poisonous than the word.
+static bool loadBytesApart(Function &F) {
+  if (!AGXByteLoads)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<LoadInst *, 8> Loads;
+  for (Instruction &I : instructions(F))
+    if (auto *L = dyn_cast<LoadInst>(&I);
+        L && L->getType()->isIntegerTy(32) && L->isSimple() &&
+        L->getAlign() >= 4 &&
+        L->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+      Loads.push_back(L);
+  bool Changed = false;
+  for (LoadInst *L : Loads) {
+    // The bits [Lo, Hi) of the word each value holds, zero-extended above.
+    DenseMap<Value *, std::pair<unsigned, unsigned>> Range;
+    SmallVector<Instruction *, 16> Work{L};
+    SmallVector<std::pair<Instruction *, unsigned>, 8> Bytes;
+    Range[L] = {0, 32};
+    bool OK = true;
+    while (OK && !Work.empty()) {
+      Instruction *V = Work.pop_back_val();
+      auto [Lo, Hi] = Range[V];
+      bool UsedOutside = false;
+      for (User *U : V->users()) {
+        auto *UI = cast<Instruction>(U);
+        unsigned NLo = Lo, NHi = Hi;
+        const APInt *C;
+        if (isa<TruncInst>(UI))
+          NHi = std::min(Hi, Lo + UI->getType()->getScalarSizeInBits());
+        else if (isa<ZExtInst>(UI))
+          ;
+        else if (match(UI, m_LShr(m_Specific(V), m_APInt(C))) &&
+                 C->getZExtValue() % 8 == 0)
+          NLo = Lo + C->getZExtValue();
+        else if (match(UI, m_And(m_Specific(V), m_APInt(C))) && C->isMask())
+          NHi = std::min(Hi, Lo + unsigned(C->countr_one()));
+        else {
+          UsedOutside = true;
+          continue;
+        }
+        if (NLo >= NHi || !UI->getType()->isIntegerTy()) {
+          OK = false;
+          break;
+        }
+        auto It = Range.find(UI);
+        if (It == Range.end()) {
+          Range[UI] = {NLo, NHi};
+          Work.push_back(UI);
+        } else if (It->second != std::make_pair(NLo, NHi)) {
+          OK = false;
+        }
+      }
+      if (!OK)
+        break;
+      if (!UsedOutside)
+        continue;
+      // A value used outside the chain must be one byte (not the word), and
+      // not sign-extended: signed bytes share one xor of the word instead
+      // (E86), which zero-extended halves would lose.
+      if (V == L || Hi - Lo != 8 || Lo % 8 ||
+          any_of(V->users(), [](const User *U) {
+            return isa<SExtInst>(U) || isa<SIToFPInst>(U);
+          })) {
+        OK = false;
+        break;
+      }
+      Bytes.push_back({V, Lo / 8});
+    }
+    if (!OK || Bytes.empty())
+      continue;
+    IRBuilder<> B(L);
+    auto *VT = FixedVectorType::get(B.getInt8Ty(), 4);
+    LoadInst *NL = B.CreateAlignedLoad(VT, L->getPointerOperand(),
+                                       L->getAlign(), L->getName() + ".bytes");
+    NL->setAAMetadata(L->getAAMetadata());
+    for (auto [V, K] : Bytes) {
+      // The byte's value is used outside the chain: its uses there take
+      // the vector element instead.
+      B.SetInsertPoint(NL->getNextNode());
+      Value *E = B.CreateZExt(B.CreateExtractElement(NL, K), V->getType());
+      V->replaceUsesWithIf(E, [&](Use &U) { return !Range.count(U.getUser()); });
+    }
+    for (auto It = Range.begin(); It != Range.end(); ++It)
+      if (auto *I = dyn_cast<Instruction>(It->first); I && I != L)
+        I->dropAllReferences();
+    for (auto It = Range.begin(); It != Range.end(); ++It)
+      if (auto *I = dyn_cast<Instruction>(It->first); I && I != L)
+        I->eraseFromParent();
+    L->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSatConvertClamps(
     "agx-sat-convert-clamps", cl::init(true), cl::Hidden,
     cl::desc("a float clamped above at an 8- or 16-bit integer's maximum and "
@@ -2903,6 +3007,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= loadBFloatsAsWords(F);
   Changed |= foldConditionChains(F, TTI);
   Changed |= satConvertClamps(F);
+  Changed |= loadBytesApart(F);
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);

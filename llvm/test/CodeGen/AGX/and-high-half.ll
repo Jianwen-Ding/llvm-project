@@ -107,11 +107,9 @@ define agx_kernel void @loaded(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
+; CHECK-NEXT:    device_load 0, i8, xyzw, r2l_r2h_r3l_r3h, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    bfeil r3, 0, r2, 24
-; CHECK-NEXT:    and r2, r2h, 255
-; CHECK-NEXT:    iadd r2, r2, r3
+; CHECK-NEXT:    iadd r2, r3l, r3h
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
