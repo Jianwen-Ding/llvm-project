@@ -3513,17 +3513,18 @@ bool AGXCodeGenPrepare::combineUniformAtomics(Function &F,
   return Changed;
 }
 
-/// powi(x, n) with a variable n: pow(|x|, n) (AGX has no powi library
-/// function, and SelectionDAG's fallback, pow(x, n), is NaN for a negative x),
-/// with the sign of x for an odd n. A constant n is left to SelectionDAG's
-/// multiplications.
+/// powi(x, n) with a variable n (float, half or bfloat, in float):
+/// pow(|x|, n) (AGX has no powi library function, and SelectionDAG's
+/// fallback, pow(x, n), is NaN for a negative x), with the sign of x for an
+/// odd n. A constant n is left to SelectionDAG's multiplications.
 static bool expandPowI(Function &F) {
   SmallVector<IntrinsicInst *, 4> Calls;
   for (Instruction &I : instructions(F))
     if (auto *II = dyn_cast<IntrinsicInst>(&I);
         II && II->getIntrinsicID() == Intrinsic::powi &&
         !isa<Constant>(II->getArgOperand(1)) &&
-        (II->getType()->isFloatTy() || II->getType()->isHalfTy()))
+        (II->getType()->isFloatTy() || II->getType()->isHalfTy() ||
+         II->getType()->isBFloatTy()))
       Calls.push_back(II);
   for (IntrinsicInst *II : Calls) {
     IRBuilder<> B(II);
