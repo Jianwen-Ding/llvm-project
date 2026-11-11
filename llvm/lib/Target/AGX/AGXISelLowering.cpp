@@ -2306,6 +2306,11 @@ static SDValue getAGXIntrinsic(SelectionDAG &DAG, const SDLoc &DL,
 /// once into the flushed or infinite range. pa first could flush a tiny a's
 /// intermediate, pb first a huge b's, so a below 2^-124 takes pb first (both
 /// at once flush the result anyway). NaNs are selected at the end.
+static cl::opt<bool> ConstDivisorFold(
+    "agx-fdiv-const-divisor", cl::init(true), cl::Hidden,
+    cl::desc("a constant divisor's significand, reciprocal and exponent "
+             "factor at compile time in the correctly rounded division"));
+
 SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   const MVT VT = MVT::f32;
@@ -2326,16 +2331,34 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   };
   EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
 
-  SDValue DB = Bits(B);
-  SDValue D = Flt(DAG.getNode(ISD::OR, DL, MVT::i32, And(DB, 0x807fffff),
-                              C(0x40000000)));
-  SDValue NegD = DAG.getNode(ISD::FNEG, DL, VT, D);
-  SDValue Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, VT, D);
-  SDValue Y = Fma(Fma(NegD, Y0, K(1.0f)), Y0, Y0);
-  SDValue PB = Flt(DAG.getNode(ISD::SUB, DL, MVT::i32, C(0x7f800000),
-                               And(DB, 0x7f800000)));
+  SDValue D, NegD, Y, PB;
+  SmallVector<SDValue, 2> NaNOperands;
+  auto *CB = dyn_cast<ConstantFPSDNode>(B);
+  if (CB && ConstDivisorFold && CB->getValueAPF().isNormal()) {
+    // A constant (normal) divisor: d, its correctly rounded reciprocal and
+    // the factor 2^(128 - eb) are constants, as rcp and the Newton step
+    // would make them (y is the rounded 1 / d either way), and b is no NaN.
+    uint32_t Bb = CB->getValueAPF().bitcastToAPInt().getZExtValue();
+    uint32_t Db = (Bb & 0x807fffff) | 0x40000000;
+    APFloat DV(APFloat::IEEEsingle(), APInt(32, Db));
+    APFloat YV(APFloat::IEEEsingle(), "1");
+    YV.divide(DV, APFloat::rmNearestTiesToEven);
+    D = DAG.getConstantFP(DV, DL, VT);
+    NegD = DAG.getConstantFP(-DV, DL, VT);
+    Y = DAG.getConstantFP(YV, DL, VT);
+    PB = Flt(C(0x7f800000 - (Bb & 0x7f800000)));
+  } else {
+    SDValue DB = Bits(B);
+    D = Flt(DAG.getNode(ISD::OR, DL, MVT::i32, And(DB, 0x807fffff),
+                        C(0x40000000)));
+    NegD = DAG.getNode(ISD::FNEG, DL, VT, D);
+    SDValue Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, VT, D);
+    Y = Fma(Fma(NegD, Y0, K(1.0f)), Y0, Y0);
+    PB = Flt(DAG.getNode(ISD::SUB, DL, MVT::i32, C(0x7f800000),
+                         And(DB, 0x7f800000)));
+    NaNOperands.push_back(B);
+  }
   SDValue R;
-  SmallVector<SDValue, 2> NaNOperands = {B};
   auto *CA = dyn_cast<ConstantFPSDNode>(A);
   if (CA && CA->isExactlyValue(1.0)) {
     // 1 / b: y is already the rounded quotient.
@@ -2347,14 +2370,23 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
     SDValue Q0 = Mul(A1, Y);
     SDValue Q = Fma(Fma(NegD, Q0, A1), Y, Q0);
     SDValue PA = Flt(And(AB, 0x7f800000));
-    SDValue Small =
-        DAG.getSetCC(DL, CCVT, DAG.getNode(ISD::FABS, DL, VT, A), K(0x1p-124f),
-                     ISD::SETOLT);
-    R = Mul(Mul(Q, DAG.getSelect(DL, VT, Small, PB, PA)),
-            DAG.getSelect(DL, VT, Small, PA, PB));
+    auto *CPB = dyn_cast<ConstantFPSDNode>(PB);
+    if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {
+      // A constant b of moderate size: q (in [1/4, 1)) times pb is exact
+      // (neither flushed nor infinite), so pb first is right for every a and
+      // the product with pa rounds once; no test of a's size.
+      if (!CPB->isExactlyValue(1.0))
+        Q = Mul(Q, PB);
+      R = Mul(Q, PA);
+    } else {
+      SDValue Small = DAG.getSetCC(DL, CCVT, DAG.getNode(ISD::FABS, DL, VT, A),
+                                   K(0x1p-124f), ISD::SETOLT);
+      R = Mul(Mul(Q, DAG.getSelect(DL, VT, Small, PB, PA)),
+              DAG.getSelect(DL, VT, Small, PA, PB));
+    }
     NaNOperands.push_back(A);
   }
-  if (Op->getFlags().hasNoNaNs())
+  if (Op->getFlags().hasNoNaNs() || NaNOperands.empty())
     return R;
   // One compare-and-select per operand.
   SDValue NaN =
