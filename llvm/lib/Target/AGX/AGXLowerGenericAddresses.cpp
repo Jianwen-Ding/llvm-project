@@ -45,6 +45,8 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 
 using namespace llvm;
 
@@ -151,6 +153,12 @@ static cl::opt<bool> AGXGenericDeviceProvenance(
     cl::desc("Test a generic access only for the memories its pointer can "
              "name (from where it comes from and, for called functions, what "
              "their callers pass), and not at all when that is one memory"));
+
+static cl::opt<unsigned> AGXGenericGroupMax(
+    "agx-generic-group-max", cl::init(64), cl::Hidden,
+    cl::desc("Most instructions from the first to the last of a run of generic "
+             "accesses whose pointers name the same memory that share one tag "
+             "test (the run is copied for each memory; 0: a test per access)"));
 
 static cl::opt<bool> AGXGenericProvenanceReport(
     "agx-generic-provenance-report", cl::init(false), cl::Hidden,
@@ -344,6 +352,92 @@ private:
 };
 } // namespace
 
+/// The value whose tag a generic pointer (or its 64-bit integer) has: through
+/// GEPs, casts and plain offsets, as AddressKinds follows them.
+static const Value *tagRoot(const Value *V) {
+  for (unsigned Depth = 0; Depth < 64; ++Depth) {
+    const auto *O = dyn_cast<Operator>(V);
+    if (!O)
+      return V;
+    switch (O->getOpcode()) {
+    case Instruction::GetElementPtr:
+    case Instruction::BitCast:
+    case Instruction::IntToPtr:
+    case Instruction::PtrToInt:
+    case Instruction::Freeze:
+      V = O->getOperand(0);
+      continue;
+    case Instruction::AddrSpaceCast:
+      if (cast<PointerType>(O->getOperand(0)->getType())->getAddressSpace() !=
+          Generic)
+        return V;
+      V = O->getOperand(0);
+      continue;
+    case Instruction::Add:
+    case Instruction::Or:
+      if (AddressKinds::isPlainOffset(O->getOperand(1))) {
+        V = O->getOperand(0);
+        continue;
+      }
+      if (AddressKinds::isPlainOffset(O->getOperand(0))) {
+        V = O->getOperand(1);
+        continue;
+      }
+      return V;
+    case Instruction::Sub:
+      if (AddressKinds::isPlainOffset(O->getOperand(1))) {
+        V = O->getOperand(0);
+        continue;
+      }
+      return V;
+    default:
+      return V;
+    }
+  }
+  return V;
+}
+
+namespace {
+/// Generic accesses with equal keys have pointers with the same tag at run
+/// time: the same root, phis of one block that receive one memory each on
+/// every edge, the same memory on the same edges, or selects on one condition
+/// whose operands name one memory each, the same ones.
+struct TagKey {
+  const void *Root = nullptr;
+  SmallVector<unsigned, 4> EdgeKinds;
+  unsigned Kinds = 0;
+  bool operator==(const TagKey &O) const {
+    return Root == O.Root && EdgeKinds == O.EdgeKinds && Kinds == O.Kinds;
+  }
+};
+} // namespace
+
+static TagKey tagKey(const Value *P, unsigned K, AddressKinds &Kinds) {
+  TagKey Key;
+  Key.Kinds = K;
+  const Value *R = tagRoot(P);
+  Key.Root = R;
+  if (const auto *Phi = dyn_cast<PHINode>(R)) {
+    SmallVector<unsigned, 4> Edges;
+    for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+      unsigned E = Kinds.of(Phi->getIncomingValue(I));
+      if (!isPowerOf2_32(E))
+        return Key;
+      Edges.push_back(E);
+    }
+    Key.Root = Phi->getParent();
+    Key.EdgeKinds = std::move(Edges);
+  } else if (const auto *Sel = dyn_cast<SelectInst>(R)) {
+    // (selects on one condition, as InstCombine leaves a GEP of a select)
+    unsigned T = Kinds.of(Sel->getTrueValue()), E = Kinds.of(Sel->getFalseValue());
+    if (isPowerOf2_32(T) && isPowerOf2_32(E)) {
+      Key.Root = Sel->getCondition();
+      Key.EdgeKinds = {T, E};
+    }
+  }
+  return Key;
+}
+
 static void setPointer(Instruction &I, Value *P) {
   if (auto *L = dyn_cast<LoadInst>(&I))
     L->setOperand(LoadInst::getPointerOperandIndex(), P);
@@ -487,13 +581,71 @@ bool AGXLowerGenericAddresses::runOnFunction(Function &F) {
   if (ToGeneric.empty() && FromGeneric.empty() && !HasShared && !HasPrivate)
     return Changed;
 
-  // The memories each access may reach, found before the casts change form.
+  // The memories a generic access may reach in this function, the tagged ones
+  // first; the last one is device memory.
+  SmallVector<unsigned, 3> AllSpaces;
+  if (HasShared)
+    AllSpaces.push_back(AGX::THREADGROUP_ADDRESS);
+  if (HasPrivate)
+    AllSpaces.push_back(AGX::PRIVATE_ADDRESS);
+  AllSpaces.push_back(AGX::DEVICE_ADDRESS);
+  // Only the memories the pointer may name (PTX leaves atomics on generic
+  // addresses of local memory undefined); device memory when none.
+  auto SpacesOf = [&](const Instruction *I, unsigned K) {
+    SmallVector<unsigned, 3> Spaces;
+    for (unsigned AS : AllSpaces)
+      if ((kindOfSpace(AS) & K) &&
+          !(AS == AGX::PRIVATE_ADDRESS && isa<AtomicRMWInst, AtomicCmpXchgInst>(I)))
+        Spaces.push_back(AS);
+    if (Spaces.empty())
+      Spaces.push_back(AGX::DEVICE_ADDRESS);
+    return Spaces;
+  };
+
+  // The memories each access may reach, found before the casts change form,
+  // and the runs of accesses in a block whose pointers have one tag at run
+  // time (tagKey), to test once for all of them.
   DenseMap<const Instruction *, unsigned> AccessKinds;
+  SmallVector<SmallVector<Instruction *, 8>, 8> Groups;
   if (AGXGenericDeviceProvenance) {
     AddressKinds Kinds(ParamKinds);
     for (Instruction &I : instructions(F))
       if (Value *P = genericPointer(I))
         AccessKinds[&I] = Kinds.of(P);
+    if (AGXGenericGroupMax)
+      for (BasicBlock &BB : F) {
+        SmallVector<Instruction *, 8> Run;
+        TagKey RunKey;
+        unsigned Since = 0;
+        auto End = [&]() {
+          if (Run.size() > 1)
+            Groups.push_back(Run);
+          Run.clear();
+        };
+        for (Instruction &I : BB) {
+          if (!Run.empty() && ++Since > AGXGenericGroupMax)
+            End();
+          if (Value *P = genericPointer(I)) {
+            unsigned K = AccessKinds.lookup(&I);
+            if (SpacesOf(&I, K).size() > 1) {
+              TagKey Key = tagKey(P, K, Kinds);
+              if (Run.empty() || !(Key == RunKey)) {
+                End();
+                RunKey = std::move(Key);
+                Since = 0;
+              }
+              Run.push_back(&I);
+              continue;
+            }
+          }
+          // (what cannot be copied into the branches of the test)
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (I.isTerminator() || isa<PHINode, AllocaInst>(I) ||
+              I.getType()->isTokenTy() || (CB && CB->isConvergent()))
+            End();
+        }
+        End();
+      }
   }
 
   LLVMContext &Ctx = F.getContext();
@@ -516,14 +668,99 @@ bool AGXLowerGenericAddresses::runOnFunction(Function &F) {
     C->eraseFromParent();
   }
 
-  // The memories a generic access may reach in this function, the tagged ones
-  // first; the last one is device memory.
-  SmallVector<unsigned, 3> AllSpaces;
-  if (HasShared)
-    AllSpaces.push_back(AGX::THREADGROUP_ADDRESS);
-  if (HasPrivate)
-    AllSpaces.push_back(AGX::PRIVATE_ADDRESS);
-  AllSpaces.push_back(AGX::DEVICE_ADDRESS);
+  // An access of a known memory: its pointer in that address space.
+  auto Retarget = [&](Instruction &A, unsigned AS) {
+    IRBuilder<> B(&A);
+    Value *Bits = B.CreatePtrToInt(genericPointer(A), I64);
+    setPointer(A, AS == AGX::DEVICE_ADDRESS
+                      ? B.CreateIntToPtr(Bits, DevicePtr)
+                      : B.CreateIntToPtr(B.CreateTrunc(Bits, I32),
+                                         PointerType::get(Ctx, AS)));
+  };
+  // Branch from the end of Head to Arms[N] when the tag of Bits is that of
+  // Spaces[N] (the last one, device memory, without a test).
+  auto BuildTests = [&](BasicBlock *Head, Value *Bits,
+                        ArrayRef<unsigned> Spaces, ArrayRef<BasicBlock *> Arms,
+                        BasicBlock *Before) {
+    IRBuilder<> B(Head);
+    // The tags are the top two bits of the high word, cheaper to test than
+    // the 64-bit value: 2 or 3 is threadgroup, 1 private, 0 device.
+    Value *Top = B.CreateLShr(B.CreateTrunc(B.CreateLShr(Bits, 32), I32), 30);
+    BasicBlock *Test = Head;
+    for (unsigned N = 0; N + 1 < Spaces.size(); ++N) {
+      IRBuilder<> BT(Test);
+      Value *Is = Spaces[N] == AGX::THREADGROUP_ADDRESS
+                      ? BT.CreateICmpUGE(Top, ConstantInt::get(I32, 2))
+                      : BT.CreateICmpEQ(Top, ConstantInt::get(I32, 1));
+      BasicBlock *Else = N + 2 == Spaces.size()
+                             ? Arms.back()
+                             : BasicBlock::Create(Ctx, "generic.test", &F, Before);
+      BT.CreateCondBr(Is, Arms[N], Else);
+      Test = Else;
+    }
+  };
+
+  // Each run: the code from its first access to its last, once for each
+  // memory, after one test.
+  for (auto &G : Groups) {
+    Instruction *First = G.front(), *Last = G.back();
+    SmallVector<unsigned, 3> Spaces = SpacesOf(First, AccessKinds.lookup(First));
+    BasicBlock *Head = First->getParent();
+    BasicBlock *Seg = Head->splitBasicBlock(First, "generic.run");
+    BasicBlock *Tail = Seg->splitBasicBlock(Last->getNextNode(), "generic.join");
+    Head->getTerminator()->eraseFromParent();
+    Value *Bits = IRBuilder<>(Head).CreatePtrToInt(genericPointer(*First), I64);
+    SmallVector<BasicBlock *, 3> Arms;
+    SmallVector<ValueToValueMapTy *, 3> Maps;
+    SmallVector<std::unique_ptr<ValueToValueMapTy>, 2> Owned;
+    for (unsigned N = 0; N + 1 < Spaces.size(); ++N) {
+      Owned.push_back(std::make_unique<ValueToValueMapTy>());
+      ValueToValueMapTy &VM = *Owned.back();
+      BasicBlock *C = CloneBasicBlock(Seg, VM, ".gen", &F);
+      C->moveBefore(Seg);
+      for (Instruction &I : *C)
+        RemapInstruction(&I, VM, RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
+      Arms.push_back(C);
+      Maps.push_back(&VM);
+    }
+    Arms.push_back(Seg);
+    Maps.push_back(nullptr);
+    BuildTests(Head, Bits, Spaces, Arms, Seg);
+    auto Mapped = [&](unsigned N, Instruction *I) -> Instruction * {
+      return Maps[N] ? cast<Instruction>((*Maps[N])[I]) : I;
+    };
+    // values the code after the run uses: phis of the copies
+    SmallVector<Instruction *, 16> Defs;
+    for (Instruction &I : *Seg)
+      if (!I.isTerminator())
+        Defs.push_back(&I);
+    for (Instruction *I : Defs) {
+      if (all_of(I->users(), [&](User *U) {
+            return cast<Instruction>(U)->getParent() == Seg;
+          }))
+        continue;
+      PHINode *Phi = PHINode::Create(I->getType(), Arms.size(), I->getName(),
+                                     Tail->begin());
+      for (unsigned N = 0; N < Arms.size(); ++N)
+        Phi->addIncoming(Mapped(N, I), Arms[N]);
+      I->replaceUsesWithIf(Phi, [&](Use &U) {
+        auto *UI = cast<Instruction>(U.getUser());
+        return UI != Phi && UI->getParent() != Seg;
+      });
+    }
+    // the run's accesses in each copy reach that copy's memory; the copies of
+    // other generic accesses keep what they may reach
+    for (unsigned N = 0; N < Arms.size(); ++N) {
+      for (Instruction *I : Defs)
+        if (Maps[N])
+          if (auto It = AccessKinds.find(I); It != AccessKinds.end()) {
+            unsigned K = It->second;
+            AccessKinds[Mapped(N, I)] = K;
+          }
+      for (Instruction *A : G)
+        Retarget(*Mapped(N, A), Spaces[N]);
+    }
+  }
 
   SmallVector<Instruction *, 16> Accesses;
   for (Instruction &I : instructions(F))
