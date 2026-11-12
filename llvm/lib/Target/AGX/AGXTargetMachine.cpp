@@ -493,6 +493,12 @@ void AGXPassConfig::addIRPasses() {
   addPass(createAGXCheckedAccessesPass(&getAGXTargetMachine()));
   // Generic pointers that may name threadgroup memory become tagged integers.
   addPass(createAGXLowerGenericAddressesPass());
+  // Atomics these made threadgroup ones (a generic float add's threadgroup
+  // branch, an address InferAddressSpaces resolved), which the first
+  // expansion saw as generic or device ones: threadgroup memory has no float
+  // atomics (Cycles with a __shared__ BVH stack: AtomicLoadFAdd on
+  // addrspace 3 could not be selected).
+  addPass(createAtomicExpandLegacyPass());
   // By-reference kernel arguments become uniform register values.
   addPass(createAGXPromoteKernelArgsPass());
   // Neighbouring 32-bit accesses become one vector access (after checked
