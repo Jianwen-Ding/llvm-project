@@ -1,5 +1,5 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g13g -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -agx-aggregate-atomics=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -agx-aggregate-atomics=0 -mcpu=agx-g13g -verify-machineinstrs < %s | FileCheck %s
 
 ; A device atomic whose old value is unused writes no register ("_") and
 ; needs no wait.
@@ -32,7 +32,7 @@ define agx_kernel void @used(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %v) {
 
 ; The G14 float add without a used result writes no register either
 ; (red.add.f32, ptx-re-blockers B24).
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s --check-prefix=FADD
+; RUN: llc -mtriple=agx -agx-aggregate-atomics=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s --check-prefix=FADD
 ; FADD-LABEL: fsum:
 ; FADD:         atomic sub, 0, _, u0_u1, 0, signed, r{{[0-9]+}}, 1
 ; FADD-NEXT:    stop

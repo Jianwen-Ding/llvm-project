@@ -78,12 +78,20 @@ static cl::opt<bool> CASBatch(
              "operations applied in lane order"));
 
 static cl::opt<unsigned> AggregateRounds(
-    "agx-aggregate-atomics", cl::init(4), cl::Hidden,
+    "agx-aggregate-atomics", cl::init(32), cl::Hidden,
     cl::desc("32-bit integer and (without ieee-fp32) float atomic additions "
              "on device memory: the threads of a SIMD group that add to the "
              "address of its lowest pending thread add their sum with one "
-             "atomic, for up to this many addresses while each has at least "
-             "two threads; the others add one by one (0: off)"));
+             "atomic, for up to this many addresses while each has "
+             "-agx-aggregate-atomics-min threads; the others add one by one "
+             "(0: off)"));
+
+static cl::opt<unsigned> AggregateMinThreads(
+    "agx-aggregate-atomics-min", cl::init(2), cl::Hidden,
+    cl::desc("Fewest threads of a SIMD group on one address that "
+             "-agx-aggregate-atomics adds together; a smaller group ends the "
+             "aggregation (atomics on distinct words of a sector combine in "
+             "the device, on one word they serialize)"));
 
 namespace {
 
@@ -626,12 +634,13 @@ static bool isAggregatable(const AtomicRMWInst &RMW, bool FloatOk) {
 /// on one word):
 ///
 ///   head:   first = lowest pending thread; same = my address == first's
-///           multi = more than one thread has first's address
+///           multi = at least Min threads have first's address
 ///           if (same && multi) {
 ///             s = sum over these threads; first: old = atomic(addr, s)
 ///             my result = old + exclusive prefix of my value; done
 ///           }
-///   latch:  repeat while multi, for up to Rounds addresses
+///   latch:  repeat while multi, for up to Rounds addresses (a SIMD group
+///           has 32 threads, so the default 32 is no limit)
 ///   rest:   the threads not done add one by one
 ///
 /// A uniform address needs one round and no test. The sum of a float group
@@ -676,8 +685,8 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
                                       B.getInt64Ty());
     Value *Same = B.CreateICmpEQ(Addr, shuffleWide(B, Addr, First, 64));
     Value *SameMask = B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {Same});
-    Multi = B.CreateICmpUGT(B.CreateUnaryIntrinsic(Intrinsic::ctpop, SameMask),
-                            B.getInt32(1));
+    Multi = B.CreateICmpUGE(B.CreateUnaryIntrinsic(Intrinsic::ctpop, SameMask),
+                            B.getInt32(std::max(2u, unsigned(AggregateMinThreads))));
     B.CreateCondBr(B.CreateAnd(Same, Multi), Group, Latch);
   }
 
@@ -705,7 +714,11 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
     Value *Base = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {OldI, First});
     if (Float)
       Base = B.CreateBitCast(Base, Ty);
-    GroupRes = Float ? B.CreateFAdd(Base, Prefix) : B.CreateAdd(Base, Prefix);
+    // (the lowest thread's result is the old value's bits: + 0.0 would flush
+    // a denormal one, as PTX's atom.add.ftz does not)
+    GroupRes = Float ? B.CreateSelect(B.CreateICmpEQ(Lane, First), Base,
+                                      B.CreateFAdd(Base, Prefix))
+                     : B.CreateAdd(Base, Prefix);
   }
   if (Uniform) {
     B.CreateBr(Exit);
