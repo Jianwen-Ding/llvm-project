@@ -30,10 +30,13 @@
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "Utils/AGXBaseInfo.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/IR/CallingConv.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
@@ -48,7 +51,7 @@ static cl::opt<bool> AGXUniformConstants(
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.
-static constexpr unsigned MaxConstants = 64;
+static constexpr unsigned MaxConstants = 128;
 
 namespace {
 
@@ -61,6 +64,8 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };
@@ -69,8 +74,11 @@ public:
 
 char AGXUniformConstantsPass::ID = 0;
 
-INITIALIZE_PASS(AGXUniformConstantsPass, DEBUG_TYPE, "AGX Uniform Constants",
-                false, false)
+INITIALIZE_PASS_BEGIN(AGXUniformConstantsPass, DEBUG_TYPE,
+                      "AGX Uniform Constants", false, false)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_END(AGXUniformConstantsPass, DEBUG_TYPE, "AGX Uniform Constants",
+                    false, false)
 
 FunctionPass *llvm::createAGXUniformConstantsPass() {
   return new AGXUniformConstantsPass();
@@ -86,24 +94,54 @@ bool AGXUniformConstantsPass::runOnMachineFunction(MachineFunction &MF) {
   auto *MFI = MF.getInfo<AGXMachineFunctionInfo>();
 
   unsigned Half = alignTo(MFI->getUniformHalfCount(), 2);
+  // The constants that take the slots are the ones read most, a use in a loop
+  // weighing 8 per level of depth (not the first ones in program order: a
+  // kernel with hundreds of distinct constants, as Cycles', would give the
+  // slots to the code before its loops).
+  const MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  struct Use {
+    uint64_t Weight = 0;
+    unsigned First = 0; // order of first appearance: ties keep program order
+  };
+  DenseMap<uint32_t, Use> Uses;
+  unsigned Order = 0;
+  for (MachineBasicBlock &MBB : MF) {
+    unsigned Depth = std::min(MLI.getLoopDepth(&MBB), 6u);
+    for (MachineInstr &MI : MBB)
+      if (MI.getOpcode() == AGX::MOV_IMM32 && MI.getOperand(1).isImm()) {
+        auto [It, New] =
+            Uses.try_emplace(uint32_t(MI.getOperand(1).getImm()));
+        if (New)
+          It->second.First = Order++;
+        It->second.Weight += uint64_t(1) << (3 * Depth);
+      }
+  }
+  SmallVector<std::tuple<uint64_t, unsigned, uint32_t>, 0> Ranked;
+  for (auto [Value, U] : Uses)
+    Ranked.push_back({U.Weight, U.First, Value});
+  llvm::sort(Ranked, [](const auto &A, const auto &B) {
+    return std::get<0>(A) != std::get<0>(B) ? std::get<0>(A) > std::get<0>(B)
+                                            : std::get<1>(A) < std::get<1>(B);
+  });
   DenseMap<uint32_t, MCRegister> Slots;
+  for (auto [W, First, Value] : Ranked) {
+    if (Slots.size() >= MaxConstants || Half + 2 > UniformHalves)
+      break;
+    MCRegister Reg = AGX::getRegister(AGX::RegKind::UGPR32, Half, *TRI);
+    if (!Reg)
+      break;
+    Slots[Value] = Reg;
+    MFI->UniformConstants.push_back({Half, Value});
+    Half += 2;
+  }
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
       if (MI.getOpcode() != AGX::MOV_IMM32 || !MI.getOperand(1).isImm())
         continue;
-      uint32_t Value = uint32_t(MI.getOperand(1).getImm());
-      MCRegister Reg = Slots.lookup(Value);
-      if (!Reg) {
-        if (Slots.size() >= MaxConstants || Half + 2 > UniformHalves)
-          continue;
-        Reg = AGX::getRegister(AGX::RegKind::UGPR32, Half, *TRI);
-        if (!Reg)
-          continue;
-        Slots[Value] = Reg;
-        MFI->UniformConstants.push_back({Half, Value});
-        Half += 2;
-      }
+      MCRegister Reg = Slots.lookup(uint32_t(MI.getOperand(1).getImm()));
+      if (!Reg)
+        continue;
       BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(TargetOpcode::COPY),
               MI.getOperand(0).getReg())
           .addReg(Reg);
