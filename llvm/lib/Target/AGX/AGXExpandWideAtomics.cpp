@@ -77,6 +77,14 @@ static cl::opt<bool> CASBatch(
              "address take one compare-and-swap of their group's result, the "
              "operations applied in lane order"));
 
+static cl::opt<unsigned> AggregateRounds(
+    "agx-aggregate-atomics", cl::init(4), cl::Hidden,
+    cl::desc("32-bit integer and (without ieee-fp32) float atomic additions "
+             "on device memory: the threads of a SIMD group that add to the "
+             "address of its lowest pending thread add their sum with one "
+             "atomic, for up to this many addresses while each has at least "
+             "two threads; the others add one by one (0: off)"));
+
 namespace {
 
 class AGXExpandWideAtomics : public FunctionPass {
@@ -597,6 +605,154 @@ static void expandCASBatch(Instruction &I) {
 }
 
 /// An 8- or 16-bit atomic load as an atomic load of its aligned 32-bit word,
+/// Whether RMW is a native 32-bit addition worth aggregating across the SIMD
+/// group (device or generic memory: threadgroup atomics are cheap already).
+static bool isAggregatable(const AtomicRMWInst &RMW, bool FloatOk) {
+  if (RMW.isVolatile() || RMW.getOrdering() != AtomicOrdering::Monotonic)
+    return false;
+  unsigned AS = RMW.getPointerAddressSpace();
+  if (AS != AGX::DEVICE_ADDRESS && AS != AGX::GENERIC_ADDRESS)
+    return false;
+  Type *Ty = RMW.getType();
+  if (RMW.getOperation() == AtomicRMWInst::Add)
+    return Ty->isIntegerTy(32);
+  if (RMW.getOperation() == AtomicRMWInst::FAdd)
+    return FloatOk && Ty->isFloatTy();
+  return false;
+}
+
+/// The atomic addition RMW for a SIMD group (Cycles' film accumulation: up to
+/// 30 threads of a group add to one pixel, and the device serializes atomics
+/// on one word):
+///
+///   head:   first = lowest pending thread; same = my address == first's
+///           multi = more than one thread has first's address
+///           if (same && multi) {
+///             s = sum over these threads; first: old = atomic(addr, s)
+///             my result = old + exclusive prefix of my value; done
+///           }
+///   latch:  repeat while multi, for up to Rounds addresses
+///   rest:   the threads not done add one by one
+///
+/// A uniform address needs one round and no test. The sum of a float group
+/// is rounded differently from any order of the single additions.
+static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
+  LLVMContext &Ctx = RMW.getContext();
+  const DataLayout &DL = RMW.getDataLayout();
+  Type *Ty = RMW.getType();
+  Type *I32 = Type::getInt32Ty(Ctx);
+  bool Float = Ty->isFloatTy();
+  unsigned Op = Float ? AGX::SIMD_FADD : AGX::SIMD_IADD;
+  bool Used = !RMW.use_empty();
+  Value *Ptr = RMW.getPointerOperand();
+  Value *Val = RMW.getValOperand();
+
+  BasicBlock *Pre = RMW.getParent();
+  Function *F = Pre->getParent();
+  BasicBlock *Exit = Pre->splitBasicBlock(RMW.getIterator(), "atomic.agg.end");
+  BasicBlock *Head = BasicBlock::Create(Ctx, "atomic.agg", F, Exit);
+  BasicBlock *Group = BasicBlock::Create(Ctx, "atomic.agg.group", F, Exit);
+  BasicBlock *Lead = BasicBlock::Create(Ctx, "atomic.agg.lead", F, Exit);
+  BasicBlock *GroupEnd = BasicBlock::Create(Ctx, "atomic.agg.result", F, Exit);
+  BasicBlock *Latch = Uniform ? nullptr : BasicBlock::Create(Ctx, "atomic.agg.latch", F, Exit);
+  BasicBlock *Cont = Uniform ? nullptr : BasicBlock::Create(Ctx, "atomic.agg.next", F, Exit);
+  BasicBlock *Rest = Uniform ? nullptr : BasicBlock::Create(Ctx, "atomic.agg.single", F, Exit);
+  Pre->getTerminator()->setSuccessor(0, Head);
+
+  IRBuilder<> B(Head);
+  PHINode *Round = nullptr;
+  if (!Uniform) {
+    Round = B.CreatePHI(I32, 2);
+    Round->addIncoming(B.getInt32(0), Pre);
+  }
+  Value *Pending = B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {B.getTrue()});
+  Value *First = B.CreateBinaryIntrinsic(Intrinsic::cttz, Pending, B.getTrue());
+  Value *Multi = nullptr;
+  if (Uniform) {
+    B.CreateBr(Group);
+  } else {
+    unsigned PtrBits = DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
+    Value *Addr = B.CreateZExtOrTrunc(B.CreatePtrToInt(Ptr, B.getIntNTy(PtrBits)),
+                                      B.getInt64Ty());
+    Value *Same = B.CreateICmpEQ(Addr, shuffleWide(B, Addr, First, 64));
+    Value *SameMask = B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {Same});
+    Multi = B.CreateICmpUGT(B.CreateUnaryIntrinsic(Intrinsic::ctpop, SameMask),
+                            B.getInt32(1));
+    B.CreateCondBr(B.CreateAnd(Same, Multi), Group, Latch);
+  }
+
+  B.SetInsertPoint(Group);
+  Value *Lane = B.CreateIntrinsic(I32, Intrinsic::agx_thread_index_in_simdgroup, {});
+  Value *Sum = B.CreateIntrinsic(Intrinsic::agx_simd_reduce, {Ty}, {Val, B.getInt32(Op)});
+  Value *Prefix = Used ? B.CreateIntrinsic(Intrinsic::agx_simd_prefix, {Ty},
+                                           {Val, B.getInt32(Op)})
+                       : nullptr;
+  B.CreateCondBr(B.CreateICmpEQ(Lane, First), Lead, GroupEnd);
+
+  B.SetInsertPoint(Lead);
+  AtomicRMWInst *One = cast<AtomicRMWInst>(RMW.clone());
+  One->setOperand(1, Sum); // the value added
+  B.Insert(One);
+  B.CreateBr(GroupEnd);
+
+  B.SetInsertPoint(GroupEnd);
+  Value *GroupRes = nullptr;
+  if (Used) {
+    PHINode *Old = B.CreatePHI(Ty, 2);
+    Old->addIncoming(One, Lead);
+    Old->addIncoming(PoisonValue::get(Ty), Group);
+    Value *OldI = Float ? B.CreateBitCast(Old, I32) : (Value *)Old;
+    Value *Base = B.CreateIntrinsic(Intrinsic::agx_simd_shuffle, {I32}, {OldI, First});
+    if (Float)
+      Base = B.CreateBitCast(Base, Ty);
+    GroupRes = Float ? B.CreateFAdd(Base, Prefix) : B.CreateAdd(Base, Prefix);
+  }
+  if (Uniform) {
+    B.CreateBr(Exit);
+    if (Used) {
+      B.SetInsertPoint(&RMW);
+      PHINode *Out = B.CreatePHI(Ty, 1);
+      Out->addIncoming(GroupRes, GroupEnd);
+      RMW.replaceAllUsesWith(Out);
+    }
+    RMW.eraseFromParent();
+    return;
+  }
+  B.CreateBr(Latch);
+
+  B.SetInsertPoint(Latch);
+  PHINode *Done = B.CreatePHI(B.getInt1Ty(), 2);
+  Done->addIncoming(B.getTrue(), GroupEnd);
+  Done->addIncoming(B.getFalse(), Head);
+  PHINode *Res = nullptr;
+  if (Used) {
+    Res = B.CreatePHI(Ty, 2);
+    Res->addIncoming(GroupRes, GroupEnd);
+    Res->addIncoming(PoisonValue::get(Ty), Head);
+  }
+  B.CreateCondBr(Done, Exit, Cont);
+
+  B.SetInsertPoint(Cont);
+  Value *Next = B.CreateAdd(Round, B.getInt32(1));
+  Round->addIncoming(Next, Cont);
+  B.CreateCondBr(B.CreateAnd(Multi, B.CreateICmpULT(Next, B.getInt32(Rounds))),
+                 Head, Rest);
+
+  B.SetInsertPoint(Rest);
+  Instruction *Single = RMW.clone();
+  B.Insert(Single);
+  B.CreateBr(Exit);
+
+  if (Used) {
+    B.SetInsertPoint(&RMW);
+    PHINode *Out = B.CreatePHI(Ty, 2);
+    Out->addIncoming(Res, Latch);
+    Out->addIncoming(Single, Rest);
+    RMW.replaceAllUsesWith(Out);
+  }
+  RMW.eraseFromParent();
+}
+
 /// shifted and truncated: AtomicExpand makes atomic loads compare-and-swaps
 /// and does not widen the narrow ones it makes (instruction selection has no
 /// 8- or 16-bit compare-and-swap).
@@ -629,6 +785,7 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   SmallVector<std::pair<Instruction *, unsigned>, 4> Wide;
   SmallVector<Instruction *, 4> CASLoops;
   SmallVector<LoadInst *, 4> NarrowLoads;
+  SmallVector<AtomicRMWInst *, 4> Aggregates;
   bool PrivateChanged = false;
   for (Instruction &I : instructions(F)) {
     // Private memory belongs to one thread (ld.volatile.local, st.volatile.local): the
@@ -674,6 +831,12 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
       CASLoops.push_back(RMW);
       continue;
     }
+    if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+        AggregateRounds && RMW && TM && !TM->getSubtargetImpl(F)->hasMesaISA() &&
+        isAggregatable(*RMW, !TM->getSubtargetImpl(F)->hasIEEEFP32())) {
+      Aggregates.push_back(RMW);
+      continue;
+    }
     // Wide operations the chip has an instruction for.
     if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
         RMW && TLI &&
@@ -685,6 +848,22 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   }
   for (LoadInst *LI : NarrowLoads)
     widenNarrowAtomicLoad(*LI);
+  // (before the CAS loops' analysis: these change the CFG; the uniformity of
+  // their addresses is found first)
+  if (!Aggregates.empty()) {
+    DominatorTree DT(F);
+    CycleInfo CI;
+    CI.compute(F);
+    TargetTransformInfo TTI = TM->getTargetTransformInfo(F);
+    UniformityInfo UI(DT, CI, &TTI);
+    UI.compute();
+    SmallVector<bool, 4> Uniform;
+    for (AtomicRMWInst *RMW : Aggregates)
+      Uniform.push_back(!UI.isDivergentAtUse(
+          RMW->getOperandUse(AtomicRMWInst::getPointerOperandIndex())));
+    for (unsigned K = 0; K < Aggregates.size(); ++K)
+      expandAggregate(*Aggregates[K], Uniform[K], AggregateRounds);
+  }
   if (!CASLoops.empty()) {
     DominatorTree DT(F);
     CycleInfo CI;
@@ -716,7 +895,8 @@ bool AGXExpandWideAtomics::runOnFunction(Function &F) {
   for (Instruction *CAS : CASLoops)
     expandCASBatch(*CAS);
   if (Wide.empty())
-    return PrivateChanged || !CASLoops.empty() || !NarrowLoads.empty();
+    return PrivateChanged || !CASLoops.empty() || !NarrowLoads.empty() ||
+           !Aggregates.empty();
   GlobalVariable *Locks = getLocks(*F.getParent());
   for (auto [I, Bits] : Wide)
     expand(*I, Bits, Locks);
