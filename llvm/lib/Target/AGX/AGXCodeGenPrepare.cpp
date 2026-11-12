@@ -218,6 +218,91 @@ static bool lowerIndirectCalls(Module &M) {
   return true;
 }
 
+// Single-call inlining on the experimental call path: a function that would
+// stay a real call although it has only one call site saves the call, the
+// callee-saved spills and restores around it, and the argument / result moves
+// when it is inlined into its caller instead, without duplicating any code.
+static cl::opt<unsigned> AGXInlineSingleCallMaxInstrs(
+    "agx-inline-single-call-max-instrs", cl::Hidden, cl::init(8000),
+    cl::desc("On the experimental call path, inline a function with a single "
+             "call site (from a kernel or another called function) of at most "
+             "this many IR instructions (0: never)"));
+static cl::opt<unsigned> AGXInlineSingleCallMaxMerged(
+    "agx-inline-single-call-max-merged", cl::Hidden, cl::init(0),
+    cl::desc("Upper bound on the IR instructions of a function after single "
+             "call inlining into it (0: no bound)"));
+static cl::opt<unsigned> AGXInlineSingleCallMaxDepth(
+    "agx-inline-single-call-max-depth", cl::Hidden, cl::init(0),
+    cl::desc("Upper bound on the levels of single-call functions inlined into "
+             "one function (0: no bound)"));
+static cl::opt<bool> AGXInlineSingleCallReport(
+    "agx-inline-single-call-report", cl::Hidden, cl::init(false),
+    cl::desc("Print each single-call inlining decision to stderr"));
+
+/// The functions among \p Kept to inline into their single caller instead of
+/// keeping their call (smallest first, as long as the function they end up
+/// in stays within the bounds).
+static SmallPtrSet<Function *, 16>
+selectSingleCallInlines(const SmallPtrSetImpl<Function *> &Kept) {
+  SmallPtrSet<Function *, 16> Inline;
+  if (AGXInlineSingleCallMaxInstrs == 0)
+    return Inline;
+  DenseMap<Function *, Function *> CallerOf;
+  SmallVector<Function *, 16> Candidates;
+  for (Function *F : Kept) {
+    if (!F->hasOneUse() || F->hasAddressTaken())
+      continue;
+    auto *CB = dyn_cast<CallBase>(F->user_back());
+    if (!CB || CB->getCalledFunction() != F)
+      continue;
+    Function *Caller = CB->getFunction();
+    // (a caller that is inlined itself would copy the call site)
+    if (Caller == F || (Caller->getCallingConv() != CallingConv::AGX_KERNEL &&
+                        !Kept.contains(Caller)))
+      continue;
+    if (F->getInstructionCount() > AGXInlineSingleCallMaxInstrs)
+      continue;
+    CallerOf[F] = Caller;
+    Candidates.push_back(F);
+  }
+  llvm::stable_sort(Candidates, [](Function *A, Function *B) {
+    return A->getInstructionCount() < B->getInstructionCount();
+  });
+  // Instructions and inlined levels of each function after the decisions
+  // so far.
+  DenseMap<Function *, unsigned> Size, Levels;
+  auto SizeOf = [&](Function *F) {
+    auto [It, New] = Size.try_emplace(F, 0);
+    if (New)
+      It->second = F->getInstructionCount();
+    return It->second;
+  };
+  auto Home = [&](Function *F) {
+    while (Inline.contains(F))
+      F = CallerOf[F];
+    return F;
+  };
+  for (Function *F : Candidates) {
+    Function *Into = Home(CallerOf[F]);
+    unsigned Merged = SizeOf(Into) + SizeOf(F);
+    unsigned Depth = std::max(Levels.lookup(Into), Levels.lookup(F) + 1);
+    bool Ok = (AGXInlineSingleCallMaxMerged == 0 ||
+               Merged <= AGXInlineSingleCallMaxMerged) &&
+              (AGXInlineSingleCallMaxDepth == 0 ||
+               Depth <= AGXInlineSingleCallMaxDepth);
+    if (AGXInlineSingleCallReport)
+      errs() << "inline single call: " << F->getName() << " ("
+             << SizeOf(F) << ") into " << Into->getName() << " (" << Merged
+             << ", depth " << Depth << ")" << (Ok ? "" : " skipped") << "\n";
+    if (!Ok)
+      continue;
+    Inline.insert(F);
+    Size[Into] = Merged;
+    Levels[Into] = Depth;
+  }
+  return Inline;
+}
+
 bool AGXAlwaysInline::runOnModule(Module &M) {
   bool Changed = lowerIndirectCalls(M);
   Changed |= lowerAGXRecursion(M);
@@ -278,6 +363,17 @@ bool AGXAlwaysInline::runOnModule(Module &M) {
     }
   }
 
+  SmallPtrSet<Function *, 16> SingleCallInlines;
+  if (agxExperimentalLeafCallsEnabled() && CallsWithinLimit) {
+    SmallPtrSet<Function *, 16> Kept;
+    for (Function &F : M)
+      if (!F.isDeclaration() && F.getCallingConv() != CallingConv::AGX_KERNEL &&
+          (HasKernels || F.hasLocalLinkage()) && !F.use_empty() &&
+          !F.hasFnAttribute(Attribute::NoInline) && canKeepExperimentalCall(F))
+        Kept.insert(&F);
+    SingleCallInlines = selectSingleCallInlines(Kept);
+  }
+
   SmallVector<Function *, 8> Dead;
   for (Function &F : M) {
     if (F.isDeclaration() || F.getCallingConv() == CallingConv::AGX_KERNEL)
@@ -299,7 +395,7 @@ bool AGXAlwaysInline::runOnModule(Module &M) {
     if (F.hasFnAttribute(Attribute::NoInline))
       continue;
     if (agxExperimentalLeafCallsEnabled() && CallsWithinLimit &&
-        canKeepExperimentalCall(F)) {
+        !SingleCallInlines.contains(&F) && canKeepExperimentalCall(F)) {
       F.addFnAttr(Attribute::NoInline);
       Changed = true;
       continue;
