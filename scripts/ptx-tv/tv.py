@@ -377,7 +377,10 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # Both results are NaNs that differ only in sign/payload/quiet bit.
     vals = re.findall(r"(Source|Target) value: [^\n]*?\((\w+)\)\s*$", alive_out, re.M)
     if vals and all(v[1] in ("QNaN", "SNaN") for v in vals) and len(vals) >= 2:
-        return "nan-payload"
+        # fneg/fabs/copysign must preserve NaN bits exactly (LangRef), so a
+        # NaN-only difference is still a real mismatch when they are involved
+        if not re.search(r"@llvm\.(fabs|copysign)|\bfneg\b", src_text):
+            return "nan-payload"
     if "partword" in body or (
             re.search(r"and\.b64\s+%rd\d+, %rd\d+, -4;", body) and
             re.search(r"atom\.[\w.:]*cas\.b32", body)):
