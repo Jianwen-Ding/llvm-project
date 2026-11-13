@@ -131,6 +131,17 @@ static cl::opt<unsigned> AGXDeviceUnrollNarrow(
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
              "are all of one or two bytes (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollStore(
+    "agx-device-unroll-store", cl::init(16), cl::Hidden,
+    cl::desc("The factor of agx-device-unroll for loops that also store to "
+             "device memory, where it divides the trip count (0: the same)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollStrided(
+    "agx-device-unroll-strided", cl::init(8), cl::Hidden,
+    cl::desc("The factor of agx-device-unroll for loops whose device loads "
+             "all step more than 64 bytes an iteration, where it divides the "
+             "trip count (0: the same)"));
+
 static cl::opt<unsigned> AGXDeviceUnroll(
     "agx-device-unroll", cl::init(4), cl::Hidden,
     cl::desc("Iterations a single-block loop that loads device memory, of a "
@@ -305,6 +316,68 @@ static unsigned contiguousThreadgroupFactor(Loop *L, ScalarEvolution &SE) {
   return Factor;
 }
 
+/// The bytes a device load's address steps each iteration of L, if constant:
+/// an add recurrence of L, or one of the 32-bit index a GEP extends (as
+/// MLIR's linearized indices are, whose additions carry no wrap flags).
+static std::optional<APInt> deviceLoadStride(const LoadInst &LI, const Loop *L,
+                                             ScalarEvolution &SE,
+                                             const DataLayout &DL) {
+  Value *P = const_cast<Value *>(LI.getPointerOperand());
+  const SCEV *X = SE.getSCEV(P);
+  uint64_t Scale = 1;
+  if (auto *G = dyn_cast<GetElementPtrInst>(P); G && G->getNumIndices() == 1) {
+    Value *Idx = G->getOperand(1);
+    if (isa<ZExtInst>(Idx) || isa<SExtInst>(Idx))
+      Idx = cast<CastInst>(Idx)->getOperand(0);
+    X = SE.getSCEV(Idx);
+    Scale = DL.getTypeAllocSize(G->getSourceElementType());
+  }
+  auto *AR = dyn_cast<SCEVAddRecExpr>(X);
+  if (!AR || AR->getLoop() != L)
+    return std::nullopt;
+  auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+  if (!Step)
+    return std::nullopt;
+  return Step->getAPInt().sextOrTrunc(64).abs() * Scale;
+}
+
+/// E187's factor for a single-block loop of Trips iterations that loads
+/// device memory (DeviceLoads), or 0 if it does not: 4, or where the factor
+/// divides the trip count, 16 for loads of one or two bytes (a half or int8
+/// row, an iteration's work small: L15-E234), 16 for a loop that also
+/// stores to device memory (a copy: L15-E235) and 8 for one whose loads all
+/// step more than 64 bytes (a column: L15-E235; 16 costs occupancy there).
+static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
+                                   const DataLayout &DL, unsigned Trips,
+                                   bool &DeviceLoads) {
+  bool Narrow = true, Stores = false, Strided = true;
+  DeviceLoads = false;
+  for (const BasicBlock *BB : L->blocks())
+    for (const Instruction &I : *BB) {
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        Stores |= SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+      auto *LI = dyn_cast<LoadInst>(&I);
+      if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+        continue;
+      DeviceLoads = true;
+      Narrow &= DL.getTypeStoreSize(LI->getType()) <= 2;
+      if (Strided) {
+        std::optional<APInt> S = deviceLoadStride(*LI, L, SE, DL);
+        Strided = S && S->ugt(64);
+      }
+    }
+  auto Divides = [&](unsigned F) { return F && Trips >= F && Trips % F == 0; };
+  if (!DeviceLoads)
+    return 0;
+  if (Narrow && Divides(AGXDeviceUnrollNarrow))
+    return AGXDeviceUnrollNarrow;
+  if (!Narrow && Stores && Divides(AGXDeviceUnrollStore))
+    return AGXDeviceUnrollStore;
+  if (!Narrow && !Stores && Strided && Divides(AGXDeviceUnrollStrided))
+    return AGXDeviceUnrollStrided;
+  return AGXDeviceUnroll;
+}
+
 void AGXTTIImpl::getUnrollingPreferences(
     Loop *L, ScalarEvolution &SE, TargetTransformInfo::UnrollingPreferences &UP,
     OptimizationRemarkEmitter *ORE) const {
@@ -320,27 +393,9 @@ void AGXTTIImpl::getUnrollingPreferences(
     // divides (no remainder loop: static shapes): unrolled, its loads of
     // several iterations are in flight at once instead of one wait each
     // (L15-E187; runtime trip counts lose, R12 / R20).
-    unsigned F = AGXDeviceUnroll;
     unsigned Trips = SE.getSmallConstantTripCount(L);
-    bool DeviceLoads = any_of(L->blocks(), [](const BasicBlock *BB) {
-      return any_of(*BB, [](const Instruction &I) {
-        auto *LI = dyn_cast<LoadInst>(&I);
-        return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
-      });
-    });
-    // Loads of one or two bytes (half, int8 rows): 16 where it divides the
-    // trip count, each iteration's work being small (L15-E234; 32 loses
-    // latency and occupancy).
-    bool Narrow = DeviceLoads && all_of(L->blocks(), [&](const BasicBlock *BB) {
-      return all_of(*BB, [&](const Instruction &I) {
-        auto *LI = dyn_cast<LoadInst>(&I);
-        return !LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
-               DL.getTypeStoreSize(LI->getType()) <= 2;
-      });
-    });
-    if (Narrow && AGXDeviceUnrollNarrow && Trips >= AGXDeviceUnrollNarrow &&
-        Trips % AGXDeviceUnrollNarrow == 0)
-      F = AGXDeviceUnrollNarrow;
+    bool DeviceLoads = false;
+    unsigned F = deviceUnrollFactor(L, SE, DL, Trips, DeviceLoads);
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
       UP.Partial = true;
       UP.MaxCount = F;
