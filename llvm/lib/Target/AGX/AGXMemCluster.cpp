@@ -17,16 +17,19 @@
 // generic load / store clustering needs base + offset operands; AGX addresses
 // are a base and a register index, so this clusters by program order instead.
 //
-// Device loads and stores and threadgroup stores are clustered by default,
-// in runs of up to 16. In agx-bench (agx_cost) stores alone lowered the
+// All four kinds are clustered by default, in runs of up to 16. In agx-bench (agx_cost) stores alone lowered the
 // PTX tests by 0.8% and agx_libs by 9.5%; the real-world CUDA kernels
 // (kernels/cuda_*.ll) showed what device loads add: decode attention -34%,
 // RGBA8 blur -28%, q4_0 / q8_0 mat-vec -10% / -5%, 3.8% in total, with only
 // index_add on G13 slower (+17%). Runs of 4 or 6 loads lose (+0.2% to +0.7%):
-// the attention loop's 8 loads must stay together. Threadgroup loads stay
-// apart: they speed up tiled SGEMM and n-body but take SGEMM from 70 to 77
-// GPRs (occupancy, which agx_cost does not model) and slow the f64 dot
-// product by 33%.
+// the attention loop's 8 loads must stay together. Threadgroup loads were
+// kept apart at first (SGEMM 70 -> 77 GPRs, the f64 dot product +33%); with
+// the measured threadgroup load issue hold in agx_cost (an ALU instruction
+// between two threadgroup loads, or between a load and its reader, delays
+// the load) and the post-RA preference for a load's reader, clustering them
+// takes SGEMM from 67 to 54 GPRs (EXPERIMENTS.md L15-E255). After register
+// allocation, the readers' other operands (store addresses) go before such a
+// run.
 //
 //===----------------------------------------------------------------------===//
 
@@ -47,9 +50,20 @@ static cl::opt<unsigned> AGXMemClusterSize(
              "keeps together (0 or 1: off)"));
 
 static cl::opt<unsigned> AGXMemClusterKinds(
-    "agx-mem-cluster-kinds", cl::Hidden, cl::init(11),
+    "agx-mem-cluster-kinds", cl::Hidden, cl::init(15),
     cl::desc("Mask of the AGX memory access kinds to cluster (1 device load, "
              "2 device store, 4 threadgroup load, 8 threadgroup store)"));
+
+static cl::opt<int> AGXMemClusterKindsPostRA(
+    "agx-mem-cluster-kinds-post-ra", cl::Hidden, cl::init(-1),
+    cl::desc("Mask of the kinds to cluster after register allocation (-1: "
+             "agx-mem-cluster-kinds)"));
+
+static cl::opt<unsigned> AGXTGLoadReaderOperandsFirst(
+    "agx-tg-load-reader-operands-first", cl::Hidden, cl::init(2),
+    cl::desc("Before a run of threadgroup loads, the other operands of their "
+             "readers that do not depend on the loads (1 before, 2 after "
+             "register allocation)"));
 
 namespace {
 
@@ -98,11 +112,15 @@ public:
 void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
   if (AGXMemClusterSize < 2)
     return;
+  bool PreRA = static_cast<ScheduleDAGMI *>(DAG)->hasVRegLiveness();
+  unsigned Kinds = AGXMemClusterKinds;
+  if (AGXMemClusterKindsPostRA >= 0 && !PreRA)
+    Kinds = AGXMemClusterKindsPostRA;
   EquivalenceClasses<SUnit *> Clusters;
   SmallVector<SUnit *, 16> Run[NumKinds];
   for (SUnit &SU : DAG->SUnits) {
     int K = memKind(*SU.getInstr());
-    if (K < 0 || !(AGXMemClusterKinds & (1u << K)))
+    if (K < 0 || !(Kinds & (1u << K)))
       continue;
     SmallVector<SUnit *, 16> &R = Run[K];
     bool Load = K == DeviceLoad || K == LocalLoad;
@@ -138,6 +156,36 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
     }
     R.push_back(&SU);
   }
+
+  // A threadgroup load completes its latency after the last ALU instruction
+  // issued before its result is read (agx_cost): the work its readers need
+  // besides the loads (store addresses) goes before the run, not between the
+  // loads and the readers.
+  if (AGXTGLoadReaderOperandsFirst & (PreRA ? 1 : 2))
+    for (const EquivalenceClasses<SUnit *>::ECValue *I : Clusters) {
+      if (!I->isLeader() || memKind(*I->getData()->getInstr()) != LocalLoad)
+        continue;
+      SmallVector<SUnit *, 16> Members(Clusters.members(*I));
+      SmallVector<SUnit *, 16> Operands;
+      for (SUnit *M : Members)
+        for (const SDep &R : M->Succs) {
+          if (R.getKind() != SDep::Data)
+            continue;
+          for (const SDep &D : R.getSUnit()->Preds) {
+            SUnit *P = D.getSUnit();
+            if (D.getKind() != SDep::Data || P->isBoundaryNode() ||
+                is_contained(Members, P) || is_contained(Operands, P) ||
+                memKind(*P->getInstr()) >= 0 ||
+                any_of(Members,
+                       [&](SUnit *L) { return DAG->IsReachable(P, L); }))
+              continue;
+            Operands.push_back(P);
+          }
+        }
+      for (SUnit *P : Operands)
+        for (SUnit *M : Members)
+          DAG->addEdge(M, SDep(P, SDep::Artificial));
+    }
 
   auto &All = DAG->getClusters();
   for (const EquivalenceClasses<SUnit *>::ECValue *I : Clusters) {

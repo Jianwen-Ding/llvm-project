@@ -3,13 +3,14 @@
 
 ; MLIR's tiled matrix product (mlir/utils/agx-kernels/bench/gemm_smem_tile):
 ; the machine scheduler hoists the inner loop's threadgroup loads ahead of
-; their fmas, 28 -> 60 register halves for the region, which still lets 1024
-; threads in a threadgroup but halves the SIMD-groups resident on a core. A
+; their fmas (clustered since L15-E255), 28 -> 60 or more register halves for
+; the region, which still lets 1024 threads in a threadgroup but halves the
+; SIMD-groups resident on a core. A
 ; region of fewer than 4 device loads whose schedule cuts those by 1.8 times
 ; keeps its original order (L15-E239).
 
 ; CHECK: general purpose registers: 19 x 32-bit
-; OFF: general purpose registers: 35 x 32-bit
+; OFF: general purpose registers: 42 x 32-bit
 
 target datalayout = "e-m:e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-i1:8-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-v16:16-v32:32-v64:64-v96:32-v128:128-n16:32:64-S32-A5-G1"
 target triple = "agx"
