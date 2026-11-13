@@ -2317,6 +2317,9 @@ class Lifter:
         vals = []
         for a, carg in zip(args, fixed):
             slot, pp = self.lookup(a)
+            if carg.byval_type():
+                vals.append("%s %s %s" % (carg.ty, carg.attrs, slot))
+                continue
             if carg.ty.startswith("ptr"):
                 v = self.ptr_from_slot(carg.ty, slot)
             else:
