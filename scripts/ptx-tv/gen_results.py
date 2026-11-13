@@ -33,6 +33,11 @@ def main(path, out, title, config):
     for k, v in st.most_common():
         L.append("| `%s` | %d | %.1f%% |" % (k, v, 100.0 * v / n))
     concl = st["correct"] + st["mismatch"] + st["mismatch-known"] + st["mismatch-param-oob"]
+    nprobe = sum(1 for r in fn if r["status"] == "correct" and r.get("probe"))
+    L.append("")
+    L.append("Of the correct results, %d rely on probe-derived opaque instructions "
+             "(probe.py): they check the surrounding code and operand plumbing, not "
+             "the instruction selection of the intrinsic itself." % nprobe)
     L.append("")
     L.append("Conclusive (proved correct or counterexample): %d (%.1f%%)." % (concl, 100.0 * concl / n))
     L.append("")

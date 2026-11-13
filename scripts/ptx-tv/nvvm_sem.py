@@ -14,6 +14,7 @@ import re
 from llvmsig import parse_sig, split_top
 import narrowcvt
 import mbar
+import probe
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -205,7 +206,25 @@ def synth_ptx(fname, ret, argtys, instr):
 CALL_RE = re.compile(r"@llvm\.nvvm\.([\w.]+)\(")
 
 
-def expand(text, lifter_mod):
+def call_ret_type(line, callee_pos):
+    """Return type of the call whose callee starts at callee_pos."""
+    from llvmsig import parse_type, TypeParseError
+    cm = re.search(r"\bcall\b", line[:callee_pos])
+    if not cm:
+        return None
+    head = line[cm.end():callee_pos].split()
+    for k in range(len(head)):
+        cand = " ".join(head[k:])
+        try:
+            t, e = parse_type(cand)
+            if e == len(cand):
+                return t
+        except TypeParseError:
+            continue
+    return None
+
+
+def expand(text, lifter_mod, llc_args=None):
     """Rewrite calls to modelled NVVM intrinsics; return new module text."""
     out_lines = []
     defs = {}
@@ -307,6 +326,27 @@ def expand(text, lifter_mod):
                 out_lines.append(line)
                 removed = True
                 continue
+        if llc_args is not None and probe.FAMILIES.match(name):
+            dm = re.search(r"^declare [^\n]*@llvm\.nvvm\.%s\([^\n]*$" % re.escape(name), text, re.M)
+            ret = call_ret_type(line, m.start())
+            if ret and dm:
+                tdtext = "\n".join(l for l in text.split("\n") if re.match(r"%[\w.\"]+ = type ", l))
+                tdefs = {mm.group(1): mm.group(2) for mm in re.finditer(r"^(%[\w.\"]+) = type (.*)$", text, re.M)}
+                mp = probe.mapping_for(name, ret, args, dm.group(0), llc_args, tdtext)
+                if mp is not None:
+                    key = ("probe", name, ret, tuple(args))
+                    if key not in defs:
+                        fname = "ptxtv_sem_%d" % len(defs)
+                        try:
+                            body, decl = probe.helper_body(fname, mp, ret, args, tdefs)
+                        except Exception:
+                            body = None
+                        if body:
+                            defs[key] = (fname, body, {mp.name: decl})
+                    if key in defs:
+                        line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+                        out_lines.append(line)
+                        continue
         nk = narrowcvt.intrinsic_key(name, args)
         if nk:
             cm = re.search(r"call\s+((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)

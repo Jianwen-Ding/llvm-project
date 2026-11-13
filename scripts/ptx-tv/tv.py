@@ -24,6 +24,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ptx_lift  # noqa: E402
 import nvvm_sem  # noqa: E402
+import probe  # noqa: E402
+probe.LLC = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin") + "/llc"
 from llvmsig import parse_sig, TypeParseError  # noqa: E402
 
 BIN = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin")
@@ -31,6 +33,8 @@ ALIVE = os.environ.get("PTXTV_ALIVE", "/home/user/alive2/build/alive-tv")
 WALL_TIMEOUT = int(os.environ.get("PTXTV_WALL_TIMEOUT", "0"))
 LLC_FLAGS = {}   # pid -> llc flags of the file being processed
 SKIP = {}        # file -> functions to skip (--skip-from)
+PROBE_LLC = {}   # pid -> llc args used for intrinsic probes
+probe_mod = None
 
 
 def run(cmd, inp=None, timeout=120):
@@ -169,7 +173,7 @@ def prepare_source(path, workdir):
     # semantics (inlined); the rest have no LLVM-level semantics in Alive2
     # and become uninterpreted external functions (immarg is only valid on
     # intrinsics).
-    out, expanded = nvvm_sem.expand(out, ptx_lift)
+    out, expanded = nvvm_sem.expand(out, ptx_lift, PROBE_LLC.get(os.getpid()))
     if expanded:
         tmp = os.path.join(workdir, "src.sem.ll")
         with open(tmp, "w") as f:
@@ -494,6 +498,8 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         res.update(status="timeout", detail="wall clock")
         return res
     st = classify(out, err, rc)
+    if L.used_probe:
+        res["probe"] = True   # relies on a probe-derived opaque instruction
     if st == "mismatch":
         oob = param_oob(ptx, ptxn)
         known = known_false_alarm(ptx, ptxn, out + err, ext, LLC_FLAGS.get(os.getpid(), ""))
@@ -524,6 +530,7 @@ def process_file(path, args):
         return [dict(base, status="no-llc-run")]
     workdir = tempfile.mkdtemp(prefix="ptxtv_", dir=args.workdir)
     LLC_FLAGS[os.getpid()] = " ".join(largs)
+    PROBE_LLC[os.getpid()] = largs
     try:
         rc, ptx, err = run([BIN + "/llc"] + largs + [path, "-o", "-"], timeout=300)
     except subprocess.TimeoutExpired:

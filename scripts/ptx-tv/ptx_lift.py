@@ -38,6 +38,7 @@ from llvmsig import parse_sig, int_bits, split_top
 import layout
 import narrowcvt
 import mbar
+import probe
 
 
 class Unsupported(Exception):
@@ -266,6 +267,7 @@ class Lifter:
                  indirect_sigs=None):
         self.typedefs = typedefs or {}
         self.indirect_sigs = indirect_sigs or []
+        self.used_probe = False
         self.pf = pfunc
         self.sig = sig
         self.name_map = name_map     # PTX symbol -> LLVM global/function name
@@ -743,6 +745,12 @@ class Lifter:
             self.declare("llvm.memcpy.p0.p0.i64",
                          "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")
             return
+        if ty == "ptr" and pp.size < 8:
+            # 32-bit pointers (e.g. tensor memory, p6:32:32) flattened to ptr
+            iv = self.op("ptrtoint ptr %s to i64" % val)
+            iv = self.op("trunc i64 %s to i%d" % (iv, pp.size * 8))
+            self.emit("store i%d %s, ptr %s" % (pp.size * 8, iv, slot))
+            return
         b = int_bits(ty)
         if b is not None and pp.scalar_bits and pp.scalar_bits > b:
             w = pp.scalar_bits
@@ -762,6 +770,10 @@ class Lifter:
         self.store_mem(layout.parse(ty, self.typedefs), val, slot, 0)
 
     def load_value(self, ty, slot, pp):
+        if ty == "ptr" and pp.size < 8:
+            v = self.op("load i%d, ptr %s" % (pp.size * 8, slot))
+            v = self.op("zext i%d %s to i64" % (pp.size * 8, v))
+            return self.op("inttoptr i64 %s to ptr" % v)
         b = int_bits(ty)
         if b is not None and pp.scalar_bits and pp.scalar_bits > b:
             v = self.op("load i%d, ptr %s" % (pp.scalar_bits, slot))
@@ -909,6 +921,10 @@ class Lifter:
             return self.cvt_narrow(opcode, ops)
         if base == "mbarrier":
             return self.mbarrier(opcode, ops)
+        if probe.PTX_FAMILIES.match(base):
+            name = probe.op_name(opcode, ops)
+            if name in self.decls:
+                return self.generic_op(name, ops)
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
@@ -1950,6 +1966,51 @@ class Lifter:
             r = self.op("call %s @%s(%s)" % (rty, k, ", ".join(args)))
             if dst != "_":
                 self.write(dst, r, int(rty[1:]))
+
+    def generic_op(self, name, ops):
+        """Instruction modelled through a probe-derived opaque call (probe.py)."""
+        self.used_probe = True
+        csig = self.decls[name]
+        flat = probe.flatten_operands(ops)
+        if flat is None:
+            raise Unsupported("generic op operands")
+        nd = 0 if csig.ret == "void" else csig.ret.count("i64")
+        dsts, args = flat[:nd], flat[nd:]
+        if len(args) != len(csig.args):
+            raise Unsupported("generic op arity")
+        vals = []
+        for (kind, text), carg in zip(args, csig.args):
+            if kind == "addr" and carg.ty == "i64":
+                base = text.split("+")[0].strip()
+                if base not in self.regs or "+" in text:
+                    raise Unsupported("generic op narrow address")
+                w = self.regs[base]
+                vals.append("i64 " + self.resize(self.read_reg(base, w), w, 64, False))
+            elif kind == "addr":
+                p = self.address("[" + text + "]", "generic")
+                if p.rsplit(" ", 1)[0] != carg.ty:
+                    raise Unsupported("generic op pointer type")
+                vals.append(p)
+            else:
+                if text in self.regs:
+                    w = self.regs[text]
+                    v = self.read_reg(text, w)
+                    v = self.resize(v, w, 64, False)
+                else:
+                    v = self.get(text, 64)
+                vals.append("i64 " + v)
+        if nd == 0:
+            self.emit("call void @%s(%s)" % (name, ", ".join(vals)))
+            return
+        r = self.op("call %s @%s(%s)" % (csig.ret, name, ", ".join(vals)))
+        for q, (kind, d) in enumerate(dsts):
+            if d == "_":
+                continue
+            e = self.op("extractvalue %s %s, %d" % (csig.ret, r, q))
+            w = self.regs.get(d)
+            if w is None:
+                raise Unsupported("generic op destination " + d)
+            self.write(d, self.resize(e, 64, w, False), w)
 
     def cvt_narrow(self, opcode, ops):
         """Narrow-format conversion as an uninterpreted function (narrowcvt)."""
