@@ -63,7 +63,7 @@ def intrinsic_key(name, args):
         m = re.fullmatch(r"(ff)\.to\.(\w+)((?:\.\w+)*)", "ff.to.%s%s" % (hm.group(1) or hm.group(3), rest))
     if m:
         src, dst, rest = m.group(1), m.group(2), m.group(3)
-        src = "f32" if src == "ff" else src
+        src = "f32" if src in ("ff", "f32x4") else src   # f32x4: four .f32 operands
     elif tf:
         src, dst, rest = "f32", "tf32", tf.group(1)
     else:

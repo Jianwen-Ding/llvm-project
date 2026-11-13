@@ -13,10 +13,11 @@ import re
 
 from llvmsig import parse_sig, split_top
 import narrowcvt
+import mbar
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
-          "i64": "i64", "double": "i64"}
+          "i64": "i64", "double": "i64", "<4 x i8>": "i32", "<2 x i8>": "i16"}
 
 TSUF = {"f": "f32", "d": "f64", "f16": "f16", "f16x2": "f16x2",
         "bf16": "bf16", "bf16x2": "bf16x2"}
@@ -206,10 +207,12 @@ def expand(text, lifter_mod):
     out_lines = []
     defs = {}
     removed = False
+    plain = {}   # declarations for renamed calls
     for line in text.split("\n"):
         if line.lstrip().startswith("declare") or "call " not in line:
             out_lines.append(line)
             continue
+        line = re.sub(r"/\*.*?\*/\s*", "", line)   # e.g. /* layout=v0 */
         m = CALL_RE.search(line)
         if not m:
             out_lines.append(line)
@@ -287,20 +290,47 @@ def expand(text, lifter_mod):
                     res.group(1), cm.group(1), args[0][0], args[0][1], args[1][1]))
                 removed = True
                 continue
+        mk = mbar.intrinsic_key(name, args)
+        if mk:
+            mk, keep = mk
+            kept = [args[i] for i in keep]
+            cm = re.search(r"call\s+((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)
+            if cm:
+                plain[mk] = "declare %s @%s(%s) nounwind" % (
+                    cm.group(1), mk, ", ".join(t for t, _ in kept))
+                line = line[:m.start()] + "@" + mk + "(" + \
+                    ", ".join("%s %s" % a for a in kept) + line[k:]
+                out_lines.append(line)
+                removed = True
+                continue
         nk = narrowcvt.intrinsic_key(name, args)
         if nk:
             cm = re.search(r"call\s+((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)
             ret = cm.group(1) if cm else None
             kname, keep, argw, retw = nk
             kept = [args[i] for i in keep]
+            # a <4 x float> operand is four separate f32 registers in PTX
+            if kept and kept[0][0] == "<4 x float>":
+                v = kept[0][1]
+                kept = [("float", "%%lane%d" % q) for q in range(4)] + kept[1:]
+                argw = [None] * 3 + list(argw)
+                lanes_of = v
+            else:
+                lanes_of = None
             itys = [INT_OF.get(t) for t, _ in kept]
             rty = INT_OF.get(ret)
             if ret and rty and None not in itys:
                 key = ("narrow", name, ret, tuple(t for t, _ in kept))
                 if key not in defs:
                     fname = "ptxtv_sem_%d" % len(defs)
-                    params = ", ".join("%s %%x%d" % (t, i) for i, (t, _) in enumerate(kept))
+                    if lanes_of:
+                        params = ", ".join(["<4 x float> %v4"] + ["%s %%x%d" % (t, i) for i, (t, _) in enumerate(kept) if i >= 4])
+                    else:
+                        params = ", ".join("%s %%x%d" % (t, i) for i, (t, _) in enumerate(kept))
                     body = ["define internal %s @%s(%s) alwaysinline {" % (ret, fname, params)]
+                    if lanes_of:
+                        for q in range(4):
+                            body.append("  %%x%d = extractelement <4 x float> %%v4, i32 %d" % (q, q))
                     cargs, ctys = [], []
                     for i, ((t, _), it) in enumerate(zip(kept, itys)):
                         v = "%%x%d" % i
@@ -327,8 +357,9 @@ def expand(text, lifter_mod):
                     decl = "declare %s @%s(%s) nounwind willreturn memory(none)" % (
                         "i%d" % retw if retw else rty, kname, ", ".join(itys))
                     defs[key] = (fname, "\n".join(body), {kname: decl})
+                call_args = ([("<4 x float>", lanes_of)] + kept[4:]) if lanes_of else kept
                 line = line[:m.start()] + "@" + defs[key][0] + "(" + \
-                    ", ".join("%s %s" % a for a in kept) + line[k:]
+                    ", ".join("%s %s" % a for a in call_args) + line[k:]
                 out_lines.append(line)
                 continue
         mp = mapping(name, args)
@@ -361,6 +392,8 @@ def expand(text, lifter_mod):
         new_args = ", ".join("%s %s" % a for a in kept)
         line = line[:m.start()] + "@" + fname + "(" + new_args + line[k:]
         out_lines.append(line)
+    have0 = set(re.findall(r"^declare [^@]*@([\w.$\"-]+)\(", text, re.M))
+    out_lines += [d for n, d in plain.items() if n not in have0]
     if not defs:
         return ("\n".join(out_lines), True) if removed else (text, False)
     extra = {}

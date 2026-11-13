@@ -37,6 +37,7 @@ import sys
 from llvmsig import parse_sig, int_bits, split_top
 import layout
 import narrowcvt
+import mbar
 
 
 class Unsupported(Exception):
@@ -904,11 +905,13 @@ class Lifter:
     }
 
     def instr(self, base, mods, ops, opcode):
+        if base == "cvt" and narrowcvt.is_narrow(mods, mods):
+            return self.cvt_narrow(opcode, ops)
+        if base == "mbarrier":
+            return self.mbarrier(opcode, ops)
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
-        if base == "cvt" and narrowcvt.is_narrow(mods, mods):
-            return self.cvt_narrow(opcode, ops)
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
                 raise Unsupported("modifier .%s in %s" % (m, opcode))
@@ -1914,6 +1917,37 @@ class Lifter:
         v = self.post(v, df, mods)
         self.writef(ops[0], v, dt)
 
+    def mbarrier(self, opcode, ops):
+        """mbarrier.* as an uninterpreted call (see mbar.py)."""
+        k = mbar.ptx_key(opcode)
+        dst = None
+        if ops and not ops[0].strip().startswith("["):
+            dst = ops[0].strip()
+            ops = ops[1:]
+        args = []
+        for o in ops:
+            o = o.strip()
+            if o.startswith("["):
+                args.append(self.address(o, "generic"))
+            else:
+                w = self.regs.get(o, 32)
+                args.append("i%d %s" % (w, self.get(o, w)))
+        if dst is None:
+            rty = "void"
+        elif dst == "_":
+            # arrive on shared::cluster has no state result
+            rty = "void" if "shared::cluster" in opcode else "i64"
+        else:
+            rty = "i%d" % self.regs[dst]
+        from llvmsig import parse_type
+        self.declare(k, "declare %s @%s(%s) nounwind" % (rty, k, ", ".join(parse_type(a)[0] for a in args)))
+        if rty == "void":
+            self.emit("call void @%s(%s)" % (k, ", ".join(args)))
+        else:
+            r = self.op("call %s @%s(%s)" % (rty, k, ", ".join(args)))
+            if dst != "_":
+                self.write(dst, r, int(rty[1:]))
+
     def cvt_narrow(self, opcode, ops):
         """Narrow-format conversion as an uninterpreted function (narrowcvt)."""
         k = narrowcvt.ptx_key(opcode)
@@ -1924,8 +1958,11 @@ class Lifter:
             raise Unsupported("narrow cvt destination " + d)
         w = self.regs[d]
         args, tys = [], []
+        flat = []
         for o in ops[1:]:
-            o = o.strip()
+            vo = self.vec_ops(o)
+            flat.extend(vo if vo else [o.strip()])   # {a, b, c, d}: one arg per lane
+        for o in flat:
             if o not in self.regs:
                 raise Unsupported("narrow cvt operand " + o)
             ow = self.regs[o]
