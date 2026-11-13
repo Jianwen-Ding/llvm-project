@@ -1394,6 +1394,142 @@ static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
   return bound;
 }
 
+/// A binary search's scf.while over index (lo, hi), lo from 0, continuing
+/// while lo < hi (unsigned: a signed test of a hi0 negative as an index would
+/// end the original loop at once with hi0, not its truncation), whose body loads a static 1-D memref of S <= 2^30 elements
+/// at mid = (lo + hi) >> 1 and yields lo, hi, mid or mid + 1 (or selects of
+/// them), in i32. Each yielded value is at most max(lo, hi, S); in the first
+/// iteration mid = hi0 >> 1 is below S (a load out of bounds is undefined),
+/// so hi0 < 2 S and every value stays below 2^31 and every lo + hi below
+/// 2^32: the i32 values are the index ones. A hi0 of 2^32 or more makes the
+/// first load out of bounds (or, truncated to 0, ends the loop at once, which
+/// is then as good), and with hi0 = 0 neither loop runs.
+static bool narrowBinarySearch(scf::WhileOp w, IRRewriter &rewriter) {
+  if (w.getNumOperands() != 2 || w.getNumResults() != 2)
+    return false;
+  for (Type t : w.getOperandTypes())
+    if (!t.isIndex())
+      return false;
+  if (!matchPattern(w.getInits()[0], m_Zero()))
+    return false;
+  Block &before = w.getBefore().front();
+  Block &after = w.getAfter().front();
+  auto cond = dyn_cast<scf::ConditionOp>(before.getTerminator());
+  if (!cond || before.getOperations().size() != 2 ||
+      cond.getArgs().size() != 2 || cond.getArgs()[0] != before.getArgument(0) ||
+      cond.getArgs()[1] != before.getArgument(1))
+    return false;
+  auto cmp = cond.getCondition().getDefiningOp<arith::CmpIOp>();
+  if (!cmp || cmp.getLhs() != before.getArgument(0) ||
+      cmp.getRhs() != before.getArgument(1) ||
+      cmp.getPredicate() != arith::CmpIPredicate::ult)
+    return false;
+  Value lo = after.getArgument(0), hi = after.getArgument(1);
+  // mid = (lo + hi) >> 1, loaded at before anything that could leave the
+  // body (only ops without regions or calls before the load)
+  Value mid, midInc;
+  arith::AddIOp sum;
+  arith::ShRUIOp half;
+  bool loaded = false;
+  for (Operation &op : after.without_terminator()) {
+    if (op.getNumRegions() || isa<CallOpInterface>(op))
+      break;
+    if (auto a = dyn_cast<arith::AddIOp>(op);
+        a && !sum &&
+        ((a.getLhs() == lo && a.getRhs() == hi) ||
+         (a.getLhs() == hi && a.getRhs() == lo)))
+      sum = a;
+    else if (auto sh = dyn_cast<arith::ShRUIOp>(op);
+             sh && sum && sh.getLhs() == sum.getResult() &&
+             matchPattern(sh.getRhs(), m_One()))
+      half = sh, mid = sh.getResult();
+    else if (auto load = dyn_cast<memref::LoadOp>(op);
+             load && mid && load.getIndices().size() == 1 &&
+             load.getIndices()[0] == mid) {
+      MemRefType t = load.getMemRefType();
+      if (t.getRank() == 1 && !t.isDynamicDim(0) &&
+          t.getDimSize(0) <= (int64_t(1) << 30))
+        loaded = true;
+    } else if (auto a = dyn_cast<arith::AddIOp>(op);
+               a && mid && a.getLhs() == mid &&
+               matchPattern(a.getRhs(), m_One()))
+      midInc = a.getResult();
+  }
+  if (!loaded)
+    return false;
+  auto yield = cast<scf::YieldOp>(after.getTerminator());
+  // the yielded values: lo, hi, mid, mid + 1, or selects of them
+  std::function<bool(Value, unsigned)> bounded = [&](Value v, unsigned d) {
+    if (v == lo || v == hi || v == mid || (midInc && v == midInc))
+      return true;
+    auto sel = v.getDefiningOp<arith::SelectOp>();
+    return sel && d < 4 && sel->getBlock() == &after &&
+           bounded(sel.getTrueValue(), d + 1) &&
+           bounded(sel.getFalseValue(), d + 1);
+  };
+  for (Value v : yield.getResults())
+    if (!bounded(v, 0))
+      return false;
+
+  Location loc = w.getLoc();
+  Type i32 = rewriter.getI32Type();
+  rewriter.setInsertionPoint(w);
+  Value init0 = arith::ConstantIntOp::create(rewriter, loc, i32, 0);
+  Value init1 = arith::IndexCastOp::create(rewriter, loc, i32, w.getInits()[1]);
+  auto beforeBuilder = [&](OpBuilder &b, Location l, ValueRange args) {
+    Value go = arith::CmpIOp::create(b, l, cmp.getPredicate(), args[0], args[1]);
+    scf::ConditionOp::create(b, l, go, args);
+  };
+  auto afterBuilder = [&](OpBuilder &b, Location l, ValueRange args) {
+    Value lo32 = args[0], hi32 = args[1];
+    Type idx = b.getIndexType();
+    Value sum32 = arith::AddIOp::create(b, l, lo32, hi32);
+    Value one = arith::ConstantIntOp::create(b, l, i32, 1);
+    Value mid32 = arith::ShRUIOp::create(b, l, sum32, one);
+    Value midInc32 = arith::AddIOp::create(b, l, mid32, one);
+    IRMapping map;
+    map.map(lo, arith::IndexCastUIOp::create(b, l, idx, lo32));
+    map.map(hi, arith::IndexCastUIOp::create(b, l, idx, hi32));
+    map.map(mid, arith::IndexCastUIOp::create(b, l, idx, mid32));
+    if (midInc)
+      map.map(midInc, arith::IndexCastUIOp::create(b, l, idx, midInc32));
+    for (Operation &op : after.without_terminator()) {
+      if (&op == sum.getOperation() || &op == half.getOperation() ||
+          (midInc && op.getNumResults() == 1 && op.getResult(0) == midInc))
+        continue;
+      b.clone(op, map);
+    }
+    std::function<Value(Value)> narrowed = [&](Value v) -> Value {
+      if (v == lo)
+        return lo32;
+      if (v == hi)
+        return hi32;
+      if (v == mid)
+        return mid32;
+      if (midInc && v == midInc)
+        return midInc32;
+      auto sel = v.getDefiningOp<arith::SelectOp>();
+      return arith::SelectOp::create(b, l, map.lookup(sel.getCondition()),
+                                     narrowed(sel.getTrueValue()),
+                                     narrowed(sel.getFalseValue()));
+    };
+    SmallVector<Value> ys;
+    for (Value v : yield.getResults())
+      ys.push_back(narrowed(v));
+    scf::YieldOp::create(b, l, ys);
+  };
+  auto nw = scf::WhileOp::create(rewriter, loc, TypeRange{i32, i32},
+                                 ValueRange{init0, init1}, beforeBuilder,
+                                 afterBuilder);
+  rewriter.setInsertionPointAfter(nw);
+  SmallVector<Value> results;
+  for (Value r : nw.getResults())
+    results.push_back(arith::IndexCastUIOp::create(rewriter, loc,
+                                                   rewriter.getIndexType(), r));
+  rewriter.replaceOp(w, results);
+  return true;
+}
+
 /// An scf.for over index whose offsets o = iv - lb are below a bound B <=
 /// 2^31 (loopOffsetBound) is a loop over o in i32, unsigned: from 0 to
 /// umin(ub - lb, B) (0 for ub <= lb) by umin(step, B), with iv = lb + o.
@@ -1403,6 +1539,13 @@ static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
 /// too. The offsets, below B + B <= 2^32, do not wrap. Index arithmetic of
 /// the iv that narrow-indices computes in i32 becomes lb + o in i32.
 static void narrowLoops(gpu::GPUModuleOp m) {
+  {
+    SmallVector<scf::WhileOp> whiles;
+    m.walk([&](scf::WhileOp w) { whiles.push_back(w); });
+    IRRewriter rewriter(m.getContext());
+    for (scf::WhileOp w : whiles)
+      narrowBinarySearch(w, rewriter);
+  }
   SmallVector<scf::ForOp> loops;
   m.walk([&](scf::ForOp loop) {
     if (loop.getInductionVar().getType().isIndex() && !loop.getUnsignedCmp())

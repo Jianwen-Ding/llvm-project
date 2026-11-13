@@ -735,3 +735,72 @@ gpu.module @erfc_isinf_ipowi {
     gpu.return
   }
 }
+
+// -----
+
+// A binary search over index (lo from 0, hi any index, while lo < hi, a load
+// of a static 2^20-element memref at mid = (lo + hi) >> 1 every iteration):
+// its values stay below 2^31 (or the first load is out of bounds), so the
+// loop runs in i32.
+gpu.module @binary_search {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%keys: memref<1048576xi32, 1>, %sorted: memref<1048576xi32, 1>, %n: index, %m: index) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %key = memref.load %keys[%c0] : memref<1048576xi32, 1>
+    // CHECK: llvm.icmp "ult" %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.lshr %{{.*}}, %{{.*}} : i32
+    %r:2 = scf.while (%lo = %c0, %hi = %n) : (index, index) -> (index, index) {
+      %go = arith.cmpi ult, %lo, %hi : index
+      scf.condition(%go) %lo, %hi : index, index
+    } do {
+    ^bb0(%l: index, %h: index):
+      %s = arith.addi %l, %h : index
+      %mid = arith.shrui %s, %c1 : index
+      %v = memref.load %sorted[%mid] : memref<1048576xi32, 1>
+      %lt = arith.cmpi slt, %v, %key : i32
+      %m1 = arith.addi %mid, %c1 : index
+      %nl = arith.select %lt, %m1, %l : index
+      %nh = arith.select %lt, %h, %mid : index
+      scf.yield %nl, %nh : index, index
+    }
+    // lo from an argument: not narrowed (lo + hi may wrap).
+    // CHECK: llvm.icmp "ult" %{{.*}}, %{{.*}} : i64
+    %q:2 = scf.while (%lo = %m, %hi = %n) : (index, index) -> (index, index) {
+      %go = arith.cmpi ult, %lo, %hi : index
+      scf.condition(%go) %lo, %hi : index, index
+    } do {
+    ^bb0(%l: index, %h: index):
+      %s = arith.addi %l, %h : index
+      %mid = arith.shrui %s, %c1 : index
+      %v = memref.load %sorted[%mid] : memref<1048576xi32, 1>
+      %lt = arith.cmpi slt, %v, %key : i32
+      %m1 = arith.addi %mid, %c1 : index
+      %nl = arith.select %lt, %m1, %l : index
+      %nh = arith.select %lt, %h, %mid : index
+      scf.yield %nl, %nh : index, index
+    }
+    // a signed test: not narrowed
+    // CHECK: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    %u:2 = scf.while (%lo = %c0, %hi = %n) : (index, index) -> (index, index) {
+      %go = arith.cmpi slt, %lo, %hi : index
+      scf.condition(%go) %lo, %hi : index, index
+    } do {
+    ^bb0(%l: index, %h: index):
+      %s = arith.addi %l, %h : index
+      %mid = arith.shrui %s, %c1 : index
+      %v = memref.load %sorted[%mid] : memref<1048576xi32, 1>
+      %lt = arith.cmpi slt, %v, %key : i32
+      %m1 = arith.addi %mid, %c1 : index
+      %nl = arith.select %lt, %m1, %l : index
+      %nh = arith.select %lt, %h, %mid : index
+      scf.yield %nl, %nh : index, index
+    }
+    %p0 = arith.addi %r#0, %q#0 : index
+    %p = arith.addi %p0, %u#1 : index
+    %pi = arith.index_cast %p : index to i32
+    memref.store %pi, %keys[%c0] : memref<1048576xi32, 1>
+    gpu.return
+  }
+}
