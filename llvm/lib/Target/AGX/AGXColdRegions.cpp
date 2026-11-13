@@ -93,6 +93,12 @@ static bool endsWithoutFallthrough(const MachineBasicBlock &MBB) {
 bool AGXColdRegions::runOnMachineFunction(MachineFunction &MF) {
   if (!EnableColdRegions || skipFunction(MF.getFunction()))
     return false;
+  // Not with ieee-fp32: its float operations' exact paths are "unlikely"
+  // but taken for zero operands (an addition of two values below 2^-101),
+  // which real data has often (padding, ReLU): out of line, each would take
+  // two jumps (agx_cost on strict agx-bench: mixed, up to +36% cycles).
+  if (MF.getSubtarget<AGXSubtarget>().hasIEEEFP32())
+    return false;
   const auto &TII =
       *static_cast<const AGXInstrInfo *>(MF.getSubtarget().getInstrInfo());
   const BranchProbability Cold(ColdRegionsPercent, 100);

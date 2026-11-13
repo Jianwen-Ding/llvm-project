@@ -16,14 +16,11 @@
 ; NOFLAG-NOT: +ieee-fp32
 
 ; The IEEE lowering: the hardware's add of the extended operands, then a
-; branch to the exact computation where an operand or the result is denormal
-; (out of line, after the end of the kernel: the branch is unlikely).
+; branch to the exact computation where an operand or the result is denormal.
 ; ASM-LABEL: k:
 ; ASM: fadd32
-; ASM: jmp_exec_any [[COLD:\.LBB[0-9_]+]]
+; ASM: jmp_exec_none
 ; ASM: stop
-; ASM: [[COLD]]:
-; ASM: jmp_exec_any
 define void @k(ptr addrspace(1) %out, bfloat %a, bfloat %b) "air-kernel" {
   %s = fadd bfloat %a, %b
   store bfloat %s, ptr addrspace(1) %out

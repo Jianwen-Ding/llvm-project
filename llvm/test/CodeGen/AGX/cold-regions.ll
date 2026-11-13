@@ -1,11 +1,13 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-cold-regions=false < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -mattr=+ieee-fp32 < %s | FileCheck %s --check-prefix=OFF
 
 ; An if-body entered with an unlikely edge (here double precision's general
 ; code, behind its short path) moves to the end of the kernel: skipping it is
 ; a jmp_exec_any not taken instead of a jmp_exec_none taken (a taken jump
 ; costs about 34 cycles on G14C, one not taken 1), and the body comes back
-; with an unconditional jump to the join.
+; with an unconditional jump to the join. Not with ieee-fp32, whose exact
+; paths are taken for zero operands.
 
 ; CHECK-LABEL: dmul:
 ; CHECK: jmp_exec_any [[COLD:\.LBB[0-9_]+]]
