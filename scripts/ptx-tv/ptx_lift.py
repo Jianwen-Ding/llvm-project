@@ -266,6 +266,8 @@ class Lifter:
         self.slots_used = set()
         self.base_of = {}            # 64-bit reg -> base object key
         self.slot_base = {}          # param slot -> base key of stored ptr
+        self.jump_tables = {}        # label -> [target labels]
+        self.last_label = None
         self.allocas = []
         self.blocks = []             # [label, lines]
         self.cur = None
@@ -500,6 +502,8 @@ class Lifter:
         if kind == "arg":
             a = self.sig.args[v]
             return a.ty, a.name
+        if kind == "dyn":
+            return "ptr", self.op("load ptr, ptr %s" % self.dyn_slot(v))
         try:
             return self.sym_ptr(v)
         except Unsupported:
@@ -580,6 +584,8 @@ class Lifter:
                         new = {NONE}
                 elif b == "sub" and len(srcs) == 2 and "cc" not in mods and ob(srcs[1]) == {NONE}:
                     new = ob(srcs[0])
+                elif b == "alloca":
+                    new = {("dyn", d)}
                 elif b == "ld" and "param" in mods and len(srcs) == 1:
                     m = re.fullmatch(r"\[\s*([\w$]+)\s*\]", srcs[0].strip())
                     new = {("arg", ptr_args[m.group(1)])} if m and m.group(1) in ptr_args else {NONE}
@@ -604,6 +610,10 @@ class Lifter:
             raise Unsupported("param count mismatch %d vs %d" %
                               (len(pf.params), len(sig.args)))
         for k, (pp, arg) in enumerate(zip(pf.params, sig.args)):
+            if arg.byval_type():
+                # the .param of a byval argument *is* the callee's copy
+                self.scopes[0][pp.name] = (arg.name, pp)
+                continue
             slot = "%%param.%d" % k
             self.allocas.append("%s = alloca [%d x i8], align %d" %
                                 (slot, pp.size, pp.align))
@@ -626,6 +636,7 @@ class Lifter:
         for item in items:
             kind = item[0]
             if kind == "label":
+                self.last_label = item[1]
                 lab = self.label(item[1])
                 if not self.terminated():
                     self.emit("br label %" + lab)
@@ -757,6 +768,9 @@ class Lifter:
                                 (slot, pp.size, pp.align))
             self.scopes[-1][pp.name] = (slot, pp)
             return
+        if s.startswith(".branchtargets"):
+            self.jump_tables[self.last_label] = [x.strip() for x in s[len(".branchtargets"):].split(",")]
+            return
         if s.startswith(".pragma") or s.startswith(".loc") or \
                 s.startswith(".file") or s.startswith(".maxnreg"):
             return
@@ -814,6 +828,7 @@ class Lifter:
         "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
         "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
         "number", "notanumber", "normal", "subnormal", "u32", "s32",
+        "u64",
     }
 
     def instr(self, base, mods, ops, opcode):
@@ -1485,12 +1500,11 @@ class Lifter:
         return self.call_intr(fty, "llvm.minnum.%s" % intname(fty), ["%s %s" % (fty, lo), "%s %s" % (fty, fconst(fty, 1.0))])
 
     def relu(self, v, fty):
-        if fty.startswith("<"):
-            raise Unsupported("vector relu")
-        isn = self.op("fcmp uno %s %s, 0.0" % (fty, v))
+        ct = "<%s x i1>" % fty[1:].split(" x ")[0] if fty.startswith("<") else "i1"
+        isn = self.op("fcmp uno %s %s, %s" % (fty, v, v))
         neg = self.op("fcmp olt %s %s, %s" % (fty, v, fconst(fty, 0.0)))
-        r = self.op("select i1 %s, %s %s, %s %s" % (neg, fty, fconst(fty, 0.0), fty, v))
-        return self.op("select i1 %s, %s %s, %s %s" % (isn, fty, v, fty, r))
+        r = self.op("select %s %s, %s %s, %s %s" % (ct, neg, fty, fconst(fty, 0.0), fty, v))
+        return self.op("select %s %s, %s %s, %s %s" % (ct, isn, fty, v, fty, r))
 
     def post(self, v, fty, mods):
         v = self.ftz_out(v, fty, "ftz" in mods)
@@ -2107,6 +2121,49 @@ class Lifter:
             self.write(dsts[0].strip(), self.op("extractvalue { i32, i1 } %s, 0" % r), 32)
         if len(dsts) > 1:
             self.write(dsts[1].strip(), self.op("extractvalue { i32, i1 } %s, 1" % r), 1)
+
+    def i_brx(self, mods, ops, opc):
+        if "idx" not in mods:
+            raise Unsupported(opc)
+        targets = self.jump_tables.get(ops[1].strip())
+        if not targets:
+            raise Unsupported("brx.idx without .branchtargets")
+        i = self.get(ops[0], 32)
+        dflt = "brxbad%d" % self.n
+        self.n += 1
+        cases = " ".join("i32 %d, label %%%s" % (k, self.label(t)) for k, t in enumerate(targets))
+        self.emit("switch i32 %s, label %%%s [ %s ]" % (i, dflt, cases))
+        # an index outside the table is undefined behaviour
+        self.new_block(dflt)
+        self.emit("unreachable")
+
+    def dyn_slot(self, reg):
+        slot = "%%dyn.%s" % re.sub(r"[^\w.]", "_", reg.lstrip("%"))
+        if slot not in self.slots_used:
+            self.slots_used.add(slot)
+            self.allocas.append("%s = alloca ptr" % slot)
+        return slot
+
+    def i_alloca(self, mods, ops, opc):
+        t = self.types_of(mods)[0]
+        bits = TBITS[t]
+        size = self.get(ops[1], bits)
+        al = self.imm(ops[2]) if len(ops) > 2 else 1
+        p = self.op("alloca i8, i%d %s, align %d" % (bits, size, al))
+        self.emit("store ptr %s, ptr %s" % (p, self.dyn_slot(ops[0].strip())))
+        self.write(ops[0], self.op("ptrtoint ptr %s to i%d" % (p, bits)), bits)
+
+    def i_clmad(self, mods, ops, opc):
+        a, b, c = (self.get(o, 64) for o in ops[1:4])
+        if "lo" in mods:
+            p = self.call_intr("i64", "llvm.clmul.i64", ["i64 " + a, "i64 " + b])
+        else:
+            wa = self.op("zext i64 %s to i128" % a)
+            wb = self.op("zext i64 %s to i128" % b)
+            w = self.call_intr("i128", "llvm.clmul.i128", ["i128 " + wa, "i128 " + wb])
+            w = self.op("lshr i128 %s, 64" % w)
+            p = self.op("trunc i128 %s to i64" % w)
+        self.write(ops[0], self.op("xor i64 %s, %s" % (p, c)), 64)
 
     def i_nanosleep(self, mods, ops, opc):
         self.ucall("void", "nanosleep", ["i32 " + self.get(ops[0], 32)])

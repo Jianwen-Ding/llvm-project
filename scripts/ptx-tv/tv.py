@@ -358,6 +358,18 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # aligned 32-bit word containing the value, which may extend past the
     # end of the object.  Hardware cannot fault inside an aligned word, but
     # Alive2's object bounds make the extra bytes out of bounds.
+    # A kernel byval argument whose address escapes is copied by the backend
+    # (NVPTXLowerArgs) from read-only param space to a local copy that is
+    # then used consistently.  Alive2 models the byval address as an input,
+    # so the change of object identity shows up as a mismatch.
+    if "byval(" in src_text and "__local_depot" in body and "st.local" in body \
+            and re.search(r"ld\.param[\w.:]*\s+%\w+, \[" + re.escape(name) + r"_param_\d+", body):
+        return "byval-copy-to-local"
+    # Dynamic alloca: counterexamples need sizes near 2^63, where the
+    # backend's round-up of the size wraps; Alive2 lets the source alloca
+    # of that size succeed.
+    if re.search(r"\balloca\.u(32|64)\b", body) and re.search(r"alloca [^,\n]+, i\d+ %", src_text):
+        return "dynamic-alloca-size-overflow"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
     if "rsqrt.approx" in body and "sqrt.approx" in src_text:
@@ -504,7 +516,18 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--root", default=None)
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--resume", action="store_true",
+                    help="skip files already present in --out")
     args = ap.parse_args()
+    if args.resume and args.out != "-" and os.path.exists(args.out):
+        done = set()
+        for l in open(args.out):
+            try:
+                done.add(json.loads(l)["file"])
+            except Exception:
+                pass
+        args.files = [f for f in args.files
+                      if (os.path.relpath(f, args.root) if args.root else f) not in done]
     out = sys.stdout if args.out == "-" else open(args.out, "a")
     if args.j <= 1:
         for f in args.files:
