@@ -302,8 +302,9 @@ class Lifter:
         self.extra_decls[name] = line
 
     def call_intr(self, ret, name, args, decl_args=None):
-        decl_args = decl_args or [a.split(" ")[0] if not a.startswith("<")
-                                  else a.rsplit(" ", 1)[0] for a in args]
+        if decl_args is None:
+            from llvmsig import parse_type
+            decl_args = [parse_type(a)[0] for a in args]
         self.declare(name, "declare %s @%s(%s)" % (ret, name,
                                                      ", ".join(decl_args)))
         if ret == "void":
@@ -692,7 +693,7 @@ class Lifter:
         return base if off == 0 else self.op("getelementptr i8, ptr %s, i64 %d" % (base, off))
 
     def store_mem(self, t, val, base, off):
-        if t.kind in ("struct", "arr"):
+        if t.kind in ("struct", "arr") and layout.has_sub_byte(t):
             n = len(t.elems) if t.kind == "struct" else t.n
             offs = layout.offsets(t) if t.kind == "struct" else \
                 [k * layout.alloc_size(t.elem) for k in range(n)]
@@ -706,13 +707,14 @@ class Lifter:
             nb = layout.bits(t)
             sb = layout.store_size(t) * 8
             x = self.op("bitcast %s %s to i%d" % (t.text, val, nb)) if t.kind == "vec" else val
-            x = self.op("zext i%d %s to i%d" % (nb, x, sb))
+            if sb != nb:
+                x = self.op("zext i%d %s to i%d" % (nb, x, sb))
             self.emit("store i%d %s, ptr %s, align 1" % (sb, x, p))
             return
         self.emit("store %s %s, ptr %s, align 1" % (t.text, val, p))
 
     def load_mem(self, t, base, off):
-        if t.kind in ("struct", "arr"):
+        if t.kind in ("struct", "arr") and layout.has_sub_byte(t):
             n = len(t.elems) if t.kind == "struct" else t.n
             offs = layout.offsets(t) if t.kind == "struct" else \
                 [k * layout.alloc_size(t.elem) for k in range(n)]
@@ -727,7 +729,8 @@ class Lifter:
             nb = layout.bits(t)
             sb = layout.store_size(t) * 8
             x = self.op("load i%d, ptr %s, align 1" % (sb, p))
-            x = self.op("trunc i%d %s to i%d" % (sb, x, nb))
+            if sb != nb:
+                x = self.op("trunc i%d %s to i%d" % (sb, x, nb))
             if t.kind == "vec":
                 x = self.op("bitcast i%d %s to %s" % (nb, x, t.text))
             return x
@@ -793,10 +796,33 @@ class Lifter:
             return
         self.instr(base, parts[1:], ops, opcode)
 
+    # Every modifier the lifter gives meaning to (or that is semantically
+    # irrelevant under its model).  Anything else makes the instruction
+    # unsupported rather than silently ignored.
+    KNOWN_MODS = set(TBITS) | {
+        "rn", "rz", "rm", "rp", "rni", "rzi", "rmi", "rpi", "ftz", "sat",
+        "relu", "approx", "full", "NaN", "abs", "lo", "hi", "wide", "cc",
+        "global", "shared", "local", "const", "param", "generic",
+        "shared::cta", "shared::cluster", "param::func", "param::entry",
+        "v2", "v4", "v8", "volatile", "relaxed", "acquire", "release",
+        "acq_rel", "sc", "weak", "cta", "gpu", "sys", "cluster", "gl",
+        "ca", "cg", "cs", "lu", "cv", "wb", "wt", "nc",
+        "eq", "ne", "lt", "le", "gt", "ge", "lo", "ls", "hs", "equ", "neu",
+        "ltu", "leu", "gtu", "geu", "num", "nan", "and", "or", "xor",
+        "add", "min", "max", "inc", "dec", "exch", "cas", "noftz",
+        "l", "r", "wrap", "clamp", "f4e", "b4e", "rc8", "ecl", "ecr", "rc16",
+        "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
+        "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
+        "number", "notanumber", "normal", "subnormal", "u32", "s32",
+    }
+
     def instr(self, base, mods, ops, opcode):
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
+        for m in mods:
+            if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
+                raise Unsupported("modifier .%s in %s" % (m, opcode))
         h(mods, ops, opcode)
 
     # helpers to classify modifiers
@@ -1396,9 +1422,26 @@ class Lifter:
         pred = self.ICMP[cmp][0 if is_signed(t) else 1]
         return self.op("icmp %s i%d %s, %s" % (pred, bits, a, b))
 
+    def setp_x2(self, cmp, t, mods, ops):
+        # setp.<cmp>.f16x2 p|q, a, b: p = low halves, q = high halves.
+        # (Lane order as used by the open-source NVPTX backend.)
+        if any(m in ("and", "or", "xor") for m in mods):
+            raise Unsupported("packed setp with bool op")
+        vt = FPTY[t]
+        a = self.ftz_in(self.getf(ops[1], t), vt, "ftz" in mods)
+        b = self.ftz_in(self.getf(ops[2], t), vt, "ftz" in mods)
+        c = self.op("fcmp %s %s %s, %s" % (self.FCMP[cmp], vt, a, b))
+        dsts = [d.strip() for d in ops[0].split("|")]
+        if len(dsts) != 2:
+            raise Unsupported("packed setp needs p|q")
+        self.write(dsts[0], self.op("extractelement <2 x i1> %s, i32 0" % c), 1)
+        self.write(dsts[1], self.op("extractelement <2 x i1> %s, i32 1" % c), 1)
+
     def i_setp(self, mods, ops, opc):
         cmp = mods[0]
         t = self.types_of(mods)[0]
+        if t in ("f16x2", "bf16x2"):
+            return self.setp_x2(cmp, t, mods, ops)
         boolop = [m for m in mods if m in ("and", "or", "xor")]
         r = self.compare(cmp, t, ops[1:3], "ftz" in mods)
         dsts = ops[0].split("|")
@@ -1457,11 +1500,22 @@ class Lifter:
             v = self.relu(v, fty)
         return v
 
+    def mixed_operand(self, op, t, at):
+        """Operand of PTX type `at` converted exactly to type `t` (mixed precision)."""
+        if at == t:
+            return self.getf(op, t)
+        if t.endswith("x2") or at.endswith("x2"):
+            raise Unsupported("packed mixed precision")
+        v = self.getf(op, at)
+        return self.op("fpext %s %s to %s" % (FPTY[at], v, FPTY[t]))
+
     def fbin(self, mods, ops, opc, llop):
-        t = self.types_of(mods)[0]
+        ts = self.types_of(mods)
+        t = ts[0]
+        at = ts[1] if len(ts) > 1 else t   # add.rn.f32.f16 d, a(f16), b(f32)
         fty = FPTY[t]
         ftz = "ftz" in mods
-        a = self.ftz_in(self.getf(ops[1], t), fty, ftz)
+        a = self.ftz_in(self.mixed_operand(ops[1], t, at), fty, ftz)
         b = self.ftz_in(self.getf(ops[2], t), fty, ftz)
         rm = self.rounding(mods)
         if "approx" in mods or "full" in mods:
@@ -1476,12 +1530,16 @@ class Lifter:
         self.writef(ops[0], self.post(r, fty, mods), t)
 
     def ffma(self, mods, ops, opc):
-        t = self.types_of(mods)[0]
+        ts = self.types_of(mods)
+        t = ts[0]
+        at = ts[1] if len(ts) > 1 else t   # fma.rn.f32.f16 d, a(f16), b(f16), c(f32)
         fty = FPTY[t]
         ftz = "ftz" in mods
         if not any(m in MODES for m in mods):
             raise Unsupported(opc + " (no rounding mode)")
-        a, b, c = (self.ftz_in(self.getf(o, t), fty, ftz) for o in ops[1:4])
+        a = self.ftz_in(self.mixed_operand(ops[1], t, at), fty, ftz)
+        b = self.ftz_in(self.mixed_operand(ops[2], t, at), fty, ftz)
+        c = self.ftz_in(self.getf(ops[3], t), fty, ftz)
         rm = self.rounding(mods)
         if rm == "rn":
             r = self.call_intr(fty, "llvm.fma.%s" % intname(fty),
@@ -1534,6 +1592,9 @@ class Lifter:
         fn = ("minimum" if is_min else "maximum") if "NaN" in mods else \
             ("minnum" if is_min else "maxnum")
         args = [self.ftz_in(self.getf(o, t), fty, "ftz" in mods) for o in ops[1:]]
+        if "abs" in mods:  # min.abs / max.abs: operate on |inputs|
+            args = [self.call_intr(fty, "llvm.fabs.%s" % intname(fty), ["%s %s" % (fty, x)])
+                    for x in args]
         r = args[0]
         for b in args[1:]:
             r = self.call_intr(fty, "llvm.%s.%s" % (fn, intname(fty)), ["%s %s" % (fty, r), "%s %s" % (fty, b)])
@@ -1724,7 +1785,8 @@ class Lifter:
         return t[0], vec, space[0] if space else "generic"
 
     def check_mem_mods(self, mods, opc):
-        bad = [m for m in mods if m in ("mmio",) or m.startswith("unified")]
+        bad = [m for m in mods if m in ("mmio", "async", "bulk", "multimem", "tensor")
+               or m.startswith("unified") or m.startswith("mbarrier")]
         if bad:
             raise Unsupported(opc)
 
@@ -1898,8 +1960,9 @@ class Lifter:
     # the backend emitted the right instruction with the right operands.
     def ucall(self, ret, name, args, attrs="nounwind"):
         fname = "nvvm." + name
+        from llvmsig import parse_type
         self.declare(fname, "declare %s @%s(%s) %s" % (
-            ret, fname, ", ".join(a.rsplit(" ", 1)[0] for a in args), attrs))
+            ret, fname, ", ".join(parse_type(a)[0] for a in args), attrs))
         if ret == "void":
             self.emit("call void @%s(%s)" % (fname, ", ".join(args)))
             return None
@@ -1994,6 +2057,56 @@ class Lifter:
             self.write(dsts[0].strip(), self.op("extractvalue { i32, i1 } %s, 0" % r), 32)
             if len(dsts) > 1:
                 self.write(dsts[1].strip(), self.op("extractvalue { i32, i1 } %s, 1" % r), 1)
+
+    def i_szext(self, mods, ops, opc):
+        t = self.types_of(mods)[0]
+        a, b = self.get(ops[1], 32), self.get(ops[2], 32)
+        if "wrap" in mods:
+            n = self.op("and i32 %s, 31" % b)
+        else:
+            n = self.call_intr("i32", "llvm.umin.i32", ["i32 " + b, "i32 32"])
+        z = self.op("icmp eq i32 %s, 0" % n)
+        full = self.op("icmp uge i32 %s, 32" % n)
+        nn = self.op("select i1 %s, i32 1, i32 %s" % (self.op("or i1 %s, %s" % (z, full)), n))
+        sh = self.op("sub i32 32, %s" % nn)
+        x = self.op("shl i32 %s, %s" % (a, sh))
+        x = self.op("%s i32 %s, %s" % ("ashr" if is_signed(t) else "lshr", x, sh))
+        x = self.op("select i1 %s, i32 %s, i32 %s" % (full, a, x))
+        self.write(ops[0], self.op("select i1 %s, i32 0, i32 %s" % (z, x)), 32)
+
+    def i_bmsk(self, mods, ops, opc):
+        a, b = self.get(ops[1], 32), self.get(ops[2], 32)
+        if "wrap" in mods:
+            a = self.op("and i32 %s, 31" % a)
+            b = self.op("and i32 %s, 31" % b)
+        else:
+            a = self.call_intr("i32", "llvm.umin.i32", ["i32 " + a, "i32 32"])
+            b = self.call_intr("i32", "llvm.umin.i32", ["i32 " + b, "i32 32"])
+        a64 = self.op("zext i32 %s to i64" % a)
+        b64 = self.op("zext i32 %s to i64" % b)
+        m = self.op("shl i64 1, %s" % b64)
+        m = self.op("sub i64 %s, 1" % m)
+        m = self.op("shl i64 %s, %s" % (m, a64))
+        self.write(ops[0], self.op("trunc i64 %s to i32" % m), 32)
+
+    def i_isspacep(self, mods, ops, opc):
+        space = [m for m in mods if m in ("global", "shared", "local", "const", "param")]
+        if not space:
+            raise Unsupported(opc)
+        a = self.get(ops[1], 64)
+        key = self.base_of.get(ops[1].strip())
+        p = self.rebase(key, a) if key is not None else None
+        p = p.rsplit(" ", 1)[1] if p and p.startswith("ptr ") else \
+            self.op("inttoptr i64 %s to ptr" % a)
+        self.write(ops[0], self.ucall("i1", "isspacep." + space[0], ["ptr " + p]), 1)
+
+    def i_elect(self, mods, ops, opc):
+        dsts = ops[0].split("|")
+        r = self.ucall("{ i32, i1 }", "elect.sync", ["i32 " + self.get(ops[1], 32)])
+        if dsts[0].strip() != "_":
+            self.write(dsts[0].strip(), self.op("extractvalue { i32, i1 } %s, 0" % r), 32)
+        if len(dsts) > 1:
+            self.write(dsts[1].strip(), self.op("extractvalue { i32, i1 } %s, 1" % r), 1)
 
     def i_nanosleep(self, mods, ops, opc):
         self.ucall("void", "nanosleep", ["i32 " + self.get(ops[0], 32)])

@@ -28,6 +28,8 @@ from llvmsig import parse_sig, TypeParseError  # noqa: E402
 
 BIN = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin")
 ALIVE = os.environ.get("PTXTV_ALIVE", "/home/user/alive2/build/alive-tv")
+WALL_TIMEOUT = int(os.environ.get("PTXTV_WALL_TIMEOUT", "0"))
+LLC_FLAGS = {}   # pid -> llc flags of the file being processed
 
 
 def run(cmd, inp=None, timeout=120):
@@ -61,39 +63,49 @@ def run_lines(text):
 
 
 def llc_args(text):
-    """Pick the first plain `llc ... nvptx64 ...` RUN line; return its args."""
+    """Pick the first plain `llc` RUN line targeting nvptx64; return its args."""
+    tm = re.search(r'^target triple\s*=\s*"([^"]*)"', text, re.M)
+    file_triple = tm.group(1) if tm else ""
     for rl in run_lines(text):
         if "%if" in rl or "sed " in rl or "not llc" in rl or \
-                "not --crash" in rl:
+                "not --crash" in rl or "llvm-mc" in rl:
             continue
         for seg in rl.split("|"):
             seg = seg.strip()
-            if not seg.startswith("llc "):
-                continue
-            if "nvptx64" not in seg:
+            if not seg.startswith("llc ") and seg != "llc":
                 continue
             toks = shlex.split(seg)[1:]
+            arch = [t for t in toks if re.match(r"-+(march|mtriple)=", t)]
+            if arch:
+                if not any("nvptx64" in t for t in arch):
+                    continue
+            elif not file_triple.startswith("nvptx64"):
+                continue
             out = []
             skip = False
-            for i, t in enumerate(toks):
+            for t in toks:
                 if skip:
                     skip = False
                     continue
                 if t in ("<", "%s"):
                     continue
-                if t == "-o":
-                    skip = True
+                if t in ("-o", ">", "2>&1", "2>"):
+                    skip = t != "2>&1"
                     continue
-                if t.startswith("-o") and len(t) > 2 and t != "-opaque-pointers":
+                if t.startswith("-o") and len(t) > 2:
+                    continue
+                if re.match(r"-+(debug|print|stop-|start-|view|time)", t):
                     continue
                 if "%" in t:
                     out = None
                     break
-                if t.startswith("-filetype") or t.startswith("--filetype"):
+                if re.match(r"-+filetype", t) and t.split("=")[-1] != "asm":
                     out = None
                     break
                 out.append(t)
             if out is not None:
+                if not arch:
+                    out.append("-mtriple=" + file_triple)
                 return out
     return None
 
@@ -109,6 +121,16 @@ def flatten_address_spaces(text):
     address space and cvta is the identity.  addrspacecast becomes a no-op
     bitcast; overloaded intrinsic names are re-mangled for p0.
     """
+    # A cast between two different specific (non-generic) address spaces has
+    # no defined result on NVPTX (the backend emits an undefined register).
+    def cast(m):
+        a, b = m.group(2), m.group(4)
+        if a != "0" and b != "0" and a != b:
+            return "%s = freeze ptr addrspace(%s) poison" % (m.group(1), b)
+        return m.group(0)
+    text = re.sub(r"(%[\w.$-]+) = addrspacecast ptr addrspace\((\d+)\) (%[\w.$-]+) "
+                  r"to ptr addrspace\((\d+)\)", cast, text)
+    text = re.sub(r",\s*addrspace\(\d+\)", "", text)   # alloca ..., addrspace(N)
     text = re.sub(r"\s*addrspace\(\d+\)", "", text)
     text = re.sub(r"\baddrspacecast\b", "bitcast", text)
     # bitcast ptr -> ptr instructions are no-ops; keep them (they verify).
@@ -145,7 +167,7 @@ def prepare_source(path, workdir):
         with open(tmp, "w") as f:
             f.write(out)
         rc, out, err = run([BIN + "/opt", "-S",
-                            "-passes=always-inline,globaldce,mem2reg", tmp, "-o", "-"])
+                            "-passes=always-inline,globaldce,sroa,mem2reg", tmp, "-o", "-"])
         if rc:
             raise RuntimeError("intrinsic expansion failed: " + err[-300:])
     lines = []
@@ -156,6 +178,8 @@ def prepare_source(path, workdir):
                 l = l.replace(" immarg", "")
         lines.append(l)
     text = flatten_address_spaces("\n".join(lines))
+    # volatile has no meaning under single-thread semantics (Alive2 rejects it)
+    text = re.sub(r"\b(load|store) volatile\b", r"\1", text)
     # Metadata that carries hints only (or assumptions, whose removal makes
     # the source more defined) and that Alive2 cannot parse.
     text = re.sub(r",\s*!(mem\.cache_hint|nontemporal|invariant\.load|tbaa|tbaa\.struct|"
@@ -234,6 +258,8 @@ def replace_define(text, name, new_fn):
 
 def classify(out, err, rc):
     o = out + err
+    if "doesn't type check" in o:
+        return "alive-error"
     if "Transformation seems to be correct" in o:
         return "correct"
     if "Transformation doesn't verify" in o:
@@ -261,14 +287,88 @@ def function_ptx(ptx, name):
     return ptx[m.start():e if e > 0 else len(ptx)]
 
 
-def known_false_alarm(ptx, name, alive_out):
+def param_oob(ptx, name):
+    """Static check: param-space accesses beyond the declared .param size.
+
+    Returns a list of "sym+off (N bytes) > size" strings.  This is decided
+    from the PTX alone and does not depend on the lifter or Alive2.
+    """
+    funcs = ptx_lift.parse_module(ptx)
+    f = funcs.get(name)
+    if f is None:
+        return []
+    sizes = {p.name: p.size for p in f.params + f.ret}
+    out = []
+    try:
+        items = ptx_lift.parse_body(f.body)
+    except ptx_lift.Unsupported:
+        return []
+    scopes = [dict(sizes)]
+    for it in items:
+        if it[0] == "open":
+            scopes.append({})
+        elif it[0] == "close":
+            scopes.pop()
+        elif it[0] == "stmt" and it[1].startswith(".param"):
+            pp = ptx_lift.PParam(it[1])
+            scopes[-1][pp.name] = pp.size
+        elif it[0] == "stmt":
+            m = re.match(r"(?:@!?%\w+\s+)?(ld|st)\.param[\w:]*((?:\.[\w:]+)*)\s+(.*)", it[1])
+            if not m:
+                continue
+            mods = m.group(2).split(".")
+            vec = 1
+            for md in mods:
+                if md in ("v2", "v4", "v8"):
+                    vec = int(md[1:])
+            ts = [md for md in mods if md in ptx_lift.TBITS]
+            if not ts:
+                continue
+            nbytes = max(ptx_lift.TBITS[ts[0]] // 8, 1) * vec
+            am = re.search(r"\[\s*([\w$]+)\s*(?:\+\s*(\d+))?\s*\]", m.group(3))
+            if not am:
+                continue
+            sym, off = am.group(1), int(am.group(2) or 0)
+            size = None
+            for sc in reversed(scopes):
+                if sym in sc:
+                    size = sc[sym]
+                    break
+            if size is not None and off + nbytes > size:
+                out.append("%s %s+%d (%d bytes) > %d" % (m.group(1), sym, off, nbytes, size))
+    return out
+
+
+APPROX_FLAGS = re.compile(r"-nvptx-prec-(divf32|sqrtf32)=[01]\b|-enable-unsafe-fp-math|"
+                          r"-fp-contract=fast|-nvptx-fma-level=2|--?enable-no-nans-fp-math|"
+                          r"-denormal-fp-math")
+
+
+def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     """Recognise mismatches caused by modelling limits, not backend bugs."""
     body = function_ptx(ptx, name)
+    # Approximation / contraction explicitly permitted by llc flags or by
+    # fast-math flags/attributes in the source.
+    if APPROX_FLAGS.search(llc_flags) or re.search(
+            r"\b(afn|arcp|contract|reassoc|fast)\b|\"unsafe-fp-math\"=\"true\"|"
+            r"\"no-nans-fp-math\"=\"true\"|\"approx-func-fp-math\"=\"true\"", src_text):
+        if re.search(r"\.(approx|full)\b|\bfma\.|\bmad\.|\bex2|\blg2|\brsqrt|\bftz\b", body):
+            return "approximation-permitted-by-flags"
     # Sub-word atomics are expanded (AtomicExpand) into a CAS loop on the
     # aligned 32-bit word containing the value, which may extend past the
     # end of the object.  Hardware cannot fault inside an aligned word, but
     # Alive2's object bounds make the extra bytes out of bounds.
-    if "partword" in body:
+    # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
+    # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
+    if "rsqrt.approx" in body and "sqrt.approx" in src_text:
+        return "rsqrt-approx-opt-default-on"
+    # Both results are NaNs that differ only in sign/payload/quiet bit.
+    vals = re.findall(r"(Source|Target) value: [^\n]*?\((\w+)\)\s*$", alive_out, re.M)
+    if vals and all(v[1] in ("QNaN", "SNaN") for v in vals) and len(vals) >= 2:
+        return "nan-payload"
+    if "partword" in body or (
+            re.search(r"and\.b64\s+%rd\d+, %rd\d+, -4;", body) and
+            re.search(r"atom\.[\w.:]*cas\.b32", body)):
         return "partword-atomic-word-access"
     return None
 
@@ -292,6 +392,9 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         return res
     except Exception as e:  # lifter bug
         res.update(status="lift-crash", detail=(repr(e) + traceback.format_exc()[-400:]))
+        return res
+    if re.search(r"\bcall [^\n]*\basm\b", ext):
+        res.update(status="src-inline-asm")
         return res
     ext_defines = [l for l in ext.split("\n") if l.startswith("define ")]
     dl = [l for l in ext_defines if re.search(r"@%s\(" % re.escape(fname), l)]
@@ -318,14 +421,19 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
                             "--disable-undef-input", "--smt-to=%d" % smt_to,
                             "--func=" + fname.strip('"')],
-                           timeout=max(120, smt_to // 1000 * 6))
+                           timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
     except subprocess.TimeoutExpired:
         res.update(status="timeout", detail="wall clock")
         return res
     st = classify(out, err, rc)
     if st == "mismatch":
-        known = known_false_alarm(ptx, ptxn, out + err)
-        if known:
+        oob = param_oob(ptx, ptxn)
+        known = known_false_alarm(ptx, ptxn, out + err, ext, LLC_FLAGS.get(os.getpid(), ""))
+        if oob:
+            # real defect class: param accesses outside the declared size
+            res["param_oob"] = oob[:6]
+            st = "mismatch-param-oob"
+        elif known:
             st = "mismatch-known"
             res["known"] = known
     res["status"] = st
@@ -347,6 +455,7 @@ def process_file(path, args):
     if largs is None:
         return [dict(base, status="no-llc-run")]
     workdir = tempfile.mkdtemp(prefix="ptxtv_", dir=args.workdir)
+    LLC_FLAGS[os.getpid()] = " ".join(largs)
     try:
         rc, ptx, err = run([BIN + "/llc"] + largs + [path, "-o", "-"], timeout=300)
     except subprocess.TimeoutExpired:

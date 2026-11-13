@@ -126,3 +126,11 @@ def is_sub_byte(t):
     if t.kind == "vec":
         return bits(t.elem) % 8 != 0
     return False
+
+
+def has_sub_byte(t):
+    if t.kind == "struct":
+        return any(has_sub_byte(e) for e in t.elems)
+    if t.kind == "arr":
+        return has_sub_byte(t.elem)
+    return is_sub_byte(t)

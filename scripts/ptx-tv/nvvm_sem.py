@@ -16,10 +16,10 @@ from llvmsig import parse_sig, split_top
 TSUF = {"f": "f32", "d": "f64", "f16": "f16", "f16x2": "f16x2",
         "bf16": "bf16", "bf16x2": "bf16x2"}
 OVL = {"f32": "f32", "f64": "f64", "f16": "f16", "bf16": "bf16",
-       "v2f16": "f16x2", "v2bf16": "bf16x2"}
+       "v2f16": "f16x2", "v2bf16": "bf16x2", "v2f32": "f32x2"}
 RND_IMM = {0: "rz", 1: "rn", 2: "rp", 3: "rm"}
 
-LLTY_BITS = {"float": 32, "double": 64, "half": 16, "bfloat": 16,
+LLTY_BITS = {"float": 32, "double": 64, "half": 16, "bfloat": 16, "<2 x float>": 64,
              "<2 x half>": 32, "<2 x bfloat>": 32, "i16": 16, "i32": 32,
              "i64": 64}
 
@@ -139,8 +139,22 @@ def mapping(name, args):
     m = re.fullmatch(r"idp2a\.([su])\.([su])", n)
     if m and 2 in imms:
         hi = imms[2] in ("true", "1", "-1")
-        return ("dp2a.%s.%s32.%s32 %%d, %%a0, %%a1, %%a2" % (("hi" if hi else "lo"),) + m.groups(),
+        return ("dp2a.%s.%s32.%s32 %%d, %%a0, %%a1, %%a2" % ((("hi" if hi else "lo"),) + m.groups()),
                 [0, 1, 3])
+    m = re.fullmatch(r"flo\.([su])\.i(32|64)", n)
+    if m and 1 in imms:
+        sh = ".shiftamt" if imms[1] in ("true", "1", "-1") else ""
+        return ("bfind%s.%s%s %%d, %%a0" % (sh, m.group(1), m.group(2)), [0])
+    m = re.fullmatch(r"fsh([lr])\.clamp\.i32", n)
+    if m:
+        # llvm.nvvm.fshX.clamp(hi, lo, amt) -> shf.X.clamp d, lo, hi, amt
+        return ("shf.%s.clamp.b32 %%d, %%a1, %%a0, %%a2" % m.group(1), [0, 1, 2])
+    m = re.fullmatch(r"([sz])ext\.(wrap|clamp)", n)
+    if m:
+        return ("szext.%s.%s32 %%d, %%a0, %%a1" % (m.group(2), "s" if m.group(1) == "s" else "u"), [0, 1])
+    m = re.fullmatch(r"bmsk\.(wrap|clamp)", n)
+    if m:
+        return ("bmsk.%s.b32 %%d, %%a0, %%a1" % m.group(1), [0, 1])
     m = re.fullmatch(r"prmt(\.(f4e|b4e|rc8|ecl|ecr|rc16))?", n)
     if m:
         mode = ("." + m.group(2)) if m.group(2) else ""
@@ -254,6 +268,16 @@ def expand(text, lifter_mod):
             line = line[:m.start()] + "@" + defs[key][0] + line[j:]
             out_lines.append(line)
             continue
+        # ldu/ldg: a plain load of the result type with the given alignment
+        lm = re.fullmatch(r"ld[ug]\.global\.[ifp]\.[\w.]+", name)
+        if lm and len(args) == 2 and re.fullmatch(r"\d+", args[1][1]):
+            cm = re.search(r"call\s+((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)
+            res = re.match(r"\s*(%[\w.$-]+)\s*=", line)
+            if cm and res:
+                out_lines.append("  %s = load %s, %s %s, align %s" % (
+                    res.group(1), cm.group(1), args[0][0], args[0][1], args[1][1]))
+                removed = True
+                continue
         mp = mapping(name, args)
         cm = re.search(r"call\s+(?:(?:fast|nnan|ninf|nsz|arcp|contract|afn|reassoc)\s+)*"
                        r"((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)
