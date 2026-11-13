@@ -305,8 +305,13 @@ def indirect_call_sigs(module_text, fname):
     for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+|@[\w.$\"-]+)\((.*)\)", m.group(0)):
         if cm.group(2).startswith("@llvm.") or cm.group(2).startswith("@nvvm."):
             continue
-        ret = re.sub(r"\b(fast|nnan|ninf|nsz|arcp|contract|afn|reassoc|tail|noundef|zeroext|signext)\b", "",
-                     cm.group(1)).strip().split()
+        head = cm.group(1)
+        fnty_vararg = False
+        if "(" in head:      # explicit function type: call RET (T1, ...) @f(...)
+            fnty_vararg = "..." in head[head.index("("):]
+            head = head[:head.index("(")]
+        ret = re.sub(r"\b(fast|nnan|ninf|nsz|arcp|contract|afn|reassoc|tail|musttail|notail|noundef|zeroext|signext)\b", "",
+                     head).strip().split()
         if not ret:
             continue
         try:
@@ -317,7 +322,7 @@ def indirect_call_sigs(module_text, fname):
             a.attrs = "byval(%s)" % a.byval_type() if a.byval_type() else ""
             a.name = None
         sg.callee = cm.group(2)[1:] if cm.group(2).startswith("@") else None
-        sg.vararg = sg.vararg or "..." in cm.group(1)
+        sg.vararg = sg.vararg or fnty_vararg
         out.append(sg)
     return out
 
@@ -456,7 +461,7 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     res = {"function": fname}
     fdir = os.path.join(workdir, "f_" + re.sub(r"[^\w]", "_", fname)[:80])
     os.makedirs(fdir, exist_ok=True)
-    rc, ext, err = run([BIN + "/llvm-extract", "-S", "--func=" + fname.strip('"'),
+    rc, ext, err = run([BIN + "/llvm-extract", "-S", "--keep-const-init", "--func=" + fname.strip('"'),
                         src_path, "-o", "-"])
     if rc:
         res.update(status="extract-failed", detail=err[-300:])

@@ -2262,6 +2262,8 @@ class Lifter:
             if fname is None or fname not in self.decls:
                 raise Unsupported("unknown callee " + callee)
             csig = self.decls[fname]
+            if csig.vararg:
+                return self.vararg_call(fname, csig, rets, args)
         cargs = self.sized_args(csig.args)
         if csig.vararg or len(args) != len(cargs):
             raise Unsupported("call arity")
@@ -2294,6 +2296,45 @@ class Lifter:
         r = self.op(call)
         if len(rets) != 1:
             raise Unsupported("call without retval param")
+        slot, pp = self.lookup(rets[0])
+        from llvmsig import Arg
+        self.store_value(csig.ret, r, Arg(csig.ret, csig.ret_attrs, None), slot, pp, True)
+
+    def vararg_call(self, fname, csig, rets, args):
+        """Call to a variadic function: NVPTX passes the variable arguments in
+        a buffer (natural alignment, in order) whose address is the last
+        parameter.  The variable arguments' types come from the source call."""
+        fixed = self.sized_args(csig.args)
+        if len(args) != len(fixed) + 1:
+            raise Unsupported("vararg call arity")
+        sites = [x for x in self.indirect_sigs if getattr(x, "callee", None) == fname
+                 and len(x.args) > len(csig.args)]
+        kinds = {tuple(a.ty for a in x.args) for x in sites}
+        if len(kinds) != 1:
+            raise Unsupported("vararg call with ambiguous source types")
+        site = sites[0]
+        vtys = [a.ty for a in site.args[len(csig.args):]]
+        vals = []
+        for a, carg in zip(args, fixed):
+            slot, pp = self.lookup(a)
+            if carg.ty.startswith("ptr"):
+                v = self.ptr_from_slot(carg.ty, slot)
+            else:
+                v = self.load_value(carg.ty, slot, pp)
+            vals.append("%s %s %s" % (carg.ty, carg.attrs, v))
+        bslot, _ = self.lookup(args[-1])
+        buf = self.ptr_from_slot("ptr", bslot)
+        st = layout.parse("{ %s }" % ", ".join(vtys), self.typedefs)
+        for t, off in zip(vtys, layout.offsets(st)):
+            p = self.gep(buf, off)
+            vals.append("%s %s" % (t, self.load_mem(layout.parse(t, self.typedefs), p, 0)))
+        fty = "%s (%s)" % (csig.ret, ", ".join([a.ty for a in csig.args] + ["..."]))
+        self.callees.append(fname)
+        call = "call %s @%s(%s)" % (fty, fname, ", ".join(vals))
+        if csig.ret == "void":
+            self.emit(call)
+            return
+        r = self.op(call)
         slot, pp = self.lookup(rets[0])
         from llvmsig import Arg
         self.store_value(csig.ret, r, Arg(csig.ret, csig.ret_attrs, None), slot, pp, True)
