@@ -45,13 +45,22 @@ def ptx_key(opcode):
 
 
 INTR = re.compile(r"(ff|f16x2|bf16x2|f32x4|e\dm\dx2|ue8m0x2|ue5m3x2|s2f6x2)\.to\."
-                  r"(f16x2|bf16x2|e\dm\dx[24]|ue8m0x2|ue5m3x2|s2f6x2)((?:\.\w+)*)")
+                  r"(f16x2|bf16x2|f16|bf16|e\dm\dx[24]|ue8m0x2|ue5m3x2|s2f6x2)((?:\.\w+)*)")
 
 
 def intrinsic_key(name, args):
     """(key, kept_arg_indices) for an NVVM narrow-conversion intrinsic."""
     m = INTR.fullmatch(name)
     tf = re.fullmatch(r"f2tf32((?:\.\w+)*)", name)
+    # f32 -> f16/bf16 conversions are modelled exactly, except the .pzo
+    # (trailing i1 flag set) and stochastic-rounding (.rs) variants
+    hm = re.fullmatch(r"ff2(f16x2|bf16x2)((?:\.\w+)*)|f2(f16|bf16)((?:\.\w+)*)", name)
+    if hm:
+        flag = args and args[-1][0] == "i1" and args[-1][1] in ("true", "1")
+        rest = hm.group(2) if hm.group(1) else hm.group(4)
+        if not (flag or ".rs" in rest + "."):
+            return None
+        m = re.fullmatch(r"(ff)\.to\.(\w+)((?:\.\w+)*)", "ff.to.%s%s" % (hm.group(1) or hm.group(3), rest))
     if m:
         src, dst, rest = m.group(1), m.group(2), m.group(3)
         src = "f32" if src == "ff" else src

@@ -88,12 +88,23 @@ single-thread semantics:
   by an inlined function whose body is the lifted instruction. This checks
   instruction selection and the surrounding code, not the instruction model
   itself.
+* Narrow floating-point conversions (FP8 `e4m3`/`e5m2`, FP6 `e2m3`/`e3m2`/
+  `s2f6`, FP4 `e2m1`, `ue8m0`, `ue5m3`, `tf32`, and the `.pzo`, `.rs` and
+  `.scaled::*` variants) are uninterpreted functions keyed by destination
+  type, source type and modifier set (`narrowcvt.py`); the PTX `cvt` and the
+  NVVM intrinsic map to the same key, operands in instruction order. This
+  checks instruction selection, modifiers, operand order and packing, not
+  the narrow formats' numerics. The key ignores `.satfinite` where PTX
+  requires it (FP8/FP6/FP4 destinations) and rounding on exact
+  up-conversions.
 * Any modifier the lifter does not know makes the instruction unsupported,
   so nothing is silently ignored.
 
 Assumptions taken from the open-source backend rather than an independent
 source (a bug there would not be caught): the lane order of packed
-`setp.f16x2 p|q` (p = low half) and the `prmt` mode table.
+`setp.f16x2 p|q` (p = low half), the `prmt` mode table, and that an `e2m1x2`
+value and a single `ue8m0` scale (`.scale.n1`) occupy the low 8 bits of the
+intrinsics' `i16` operands/results.
 
 ## Known false-alarm classes (labelled automatically)
 

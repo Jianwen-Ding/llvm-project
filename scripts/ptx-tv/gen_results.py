@@ -38,7 +38,10 @@ def main(path, out, title, config):
     L.append("")
     oob = [r for r in fn if r["status"] == "mismatch-param-oob"]
     if oob:
-        L.append("## Counterexamples with out-of-bounds `.param` accesses (finding 1)")
+        L.append("## Counterexamples with out-of-bounds `.param` accesses")
+        L.append("")
+        L.append("All are finding 1 (sub-byte vectors) except `param-vectorize-device.ll` "
+                 "`callee_St4x*`, the lower-severity over-read into alignment padding.")
         L.append("")
         for r in sorted(oob, key=lambda r: (r["file"], r["function"])):
             L.append("* `%s` `%s`: %s" % (r["file"], r["function"], "; ".join(r.get("param_oob", [])[:2])))

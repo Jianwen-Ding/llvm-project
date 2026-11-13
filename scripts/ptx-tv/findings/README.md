@@ -1,6 +1,10 @@
 # ptx-tv findings
 
-Defects in LLVM's NVPTX backend found by ptx-tv (lifting llc's PTX back to
+Defects in LLVM's NVPTX backend found by ptx-tv. This directory only
+documents them; no backend code has been changed. The "fix direction"
+notes are suggestions for whoever fixes them.
+
+Defects found by ptx-tv (lifting llc's PTX back to
 LLVM IR and checking refinement with Alive2), each with a reproducer in this
 directory. Reproducers are ordinary lit-style tests: the RUN line's llc
 output passes the CHECK lines, i.e. they pin down the current (incorrect)
@@ -98,12 +102,45 @@ same technique (or a sticky bit) fixes the integer paths.
 Severity: medium (silently wrong results, one ulp, for integers with more
 than 24 significant bits).
 
+## 4. `llvm.minimum`/`llvm.maximum` return an unflushed subnormal under `preservesign`
+
+Reproducer: `minimum-maximum-ftz.ll` (found in `math-intrins.ll`
+`minimum_float_ftz`)
+
+With `denormal_fpenv(float: preservesign)` inputs must be treated as zero.
+The lowering of `llvm.minimum.f32`/`llvm.maximum.f32` orders signed zeros by
+checking `setp.eq.ftz.f32 p, a, b` and, if equal, selecting one of the
+*original* operands:
+
+```
+setp.eq.b32      %p1, %r1, -2147483648;   // a == -0.0 ?
+selp.f32         %r3, %r1, %r2, %p1;      // a or b, unflushed
+setp.nan.ftz.f32 %p2, %r1, %r2;
+min.ftz.f32      %r4, %r1, %r2;
+selp.f32         %r5, 0f7FC00000, %r4, %p2;
+setp.eq.ftz.f32  %p3, %r1, %r2;           // a subnormal equals 0 here
+selp.f32         %r6, %r3, %r5, %p3;      // ... and is returned as is
+```
+
+`minimum(+0.0, 0x00000001)` returns `0x00000001` (1e-45) and
+`maximum(+0.0, 0x00000008)` returns `0x00000008`; with flushed inputs the
+result must be a zero. The default (`ieee`) lowering is correct.
+
+Severity: low (subnormal inputs, flush-to-zero functions only).
+
+Fix direction: select from flushed operands (or from the `min.ftz` result
+with its sign fixed) in the equal case.
+
 ## Lower-severity observations
 
 * `param-vectorize-device.ll` `callee_St4x3` / `callee_St4x7`: a 12-byte
   `byval` struct declared `.param .align 16 .b8 [12]` is read with
   `ld.param.v4.b32`, 4 bytes past the declared size (inside the alignment
   padding; the extra lane is discarded). The test's CHECK lines expect this.
+* `bf16-instructions.ll` `test_maxnum_v2` (no native bf16 max): `maxnum` of
+  `<2 x bfloat>` is done in f32 and rounded back, so signaling-NaN inputs
+  come back with a different NaN bit pattern. LangRef allows NaN results of
+  `maxnum` to vary, so this is only a note.
 * `rsqrt-opt.ll`: `1.0 / llvm.nvvm.sqrt.approx.f(x)` becomes
   `rsqrt.approx.f32` without fast-math flags (`-nvptx-rsqrt-approx-opt`,
   default on). Intentional, but it replaces an exactly rounded division.
@@ -125,20 +162,21 @@ than 24 significant bits).
 
 ## Unresolved
 
-* `math-intrins.ll` `maximumnum_float` (and presumably the other
-  `minimumnum`/`maximumnum` tests): lowered to `max.f32`/`min.f32`. Correct
-  only if PTX `min`/`max` order -0.0 below +0.0; the lifter does not assume
-  that (it models them like `maxnum`), so this stays open.
+* `llvm.minimumnum`/`llvm.maximumnum` lowered to plain `min.f32`/`max.f32`
+  (`math-intrins.ll` `minimumnum_float`, `maximumnum_float`; `fmax3.ll`
+  `test_fminimumnum3`, `test_fmaximumnum3`, the three-input forms). The
+  counterexamples are `min(+0.0, -0.0)` (must be -0.0) and signaling-NaN
+  inputs (must return the other operand). Correct only if PTX `min`/`max`
+  order -0.0 below +0.0 and treat signaling NaNs as missing; the lifter does
+  not assume either (it models them like `maxnum`), so this stays open.
 
 ## Test-suite run
 
-`RESULTS.md` has the numbers from the final pass (generated from
-`results.jsonl` by `gen_results.py`). In short: 2111 functions sampled from
-620 test files; 949 proved correct, 5 counterexamples of finding 1 (plus 1
-padding over-read), 2 of
-findings 2/3, 1 unresolved, 40 in known modelling classes, 648 not lifted
-(mostly asynchronous/tensor-core instructions: tcgen05, cp.async.bulk,
-mbarrier, sparse (de)compression), 407 solver timeouts or inconclusive.
-The other instances of findings 1 and 2b were found by the static scan and
-by targeted runs (`subbyte-vector-params.ll`, `fabs-fneg-ftz.ll`,
-`math-intrins.ll` `abs_float_ftz`).
+`RESULTS.md` has the numbers (generated from `results.jsonl` by
+`gen_results.py`). Two passes were combined: up to 6 functions per test file,
+then up to 8 more per file not checked before, all re-checked with the final
+lifter. In short: 3323 functions from 620 test files; 1727 proved correct;
+15 counterexamples of finding 1 (plus 1 padding over-read); 4 of findings
+2/2b/3/4; 4 unresolved (min/max signed zeros) and 1 NaN-bits note; 81 in
+known modelling classes; 736 not lifted (mostly asynchronous/tensor-core
+instructions); 648 solver timeouts or inconclusive.
