@@ -804,3 +804,26 @@ gpu.module @binary_search {
     gpu.return
   }
 }
+
+// -----
+
+// math.exp and math.log of f64: fdlibm's algorithms in double operations
+// (the AIR emulation of doubles has no exp or log).
+gpu.module @exp_log_f64 {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK-NOT: llvm.intr.exp
+    // CHECK: llvm.intr.roundeven
+    // CHECK: llvm.fdiv
+    // CHECK: llvm.shl
+    // CHECK-NOT: llvm.intr.log
+    // CHECK: llvm.fdiv
+    // CHECK: llvm.sitofp
+    %e = math.exp %v : f64
+    %l = math.log %e : f64
+    memref.store %l, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
