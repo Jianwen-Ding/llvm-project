@@ -168,28 +168,28 @@
   "waits": 1
  },
  "cuda_attn_decode.ll:attn_decode:agx-g13g": {
-  "bytes": 2254,
-  "cycles": 29591.6,
-  "gprs": 33,
-  "groups": 48,
-  "instructions": 337,
+  "bytes": 2678,
+  "cycles": 27052.9,
+  "gprs": 37,
+  "groups": 44,
+  "instructions": 402,
   "launch_inputs": true,
   "tg_bytes": 2080,
-  "tput": 2535.1,
+  "tput": 2368.1,
   "uniform_halves": 26,
-  "waits": 4
+  "waits": 6
  },
  "cuda_attn_decode.ll:attn_decode:agx-g14c": {
-  "bytes": 2254,
-  "cycles": 29591.6,
-  "gprs": 33,
-  "groups": 48,
-  "instructions": 337,
+  "bytes": 2678,
+  "cycles": 27052.9,
+  "gprs": 37,
+  "groups": 44,
+  "instructions": 402,
   "launch_inputs": true,
   "tg_bytes": 2080,
-  "tput": 2535.1,
+  "tput": 2368.1,
   "uniform_halves": 26,
-  "waits": 4
+  "waits": 6
  },
  "cuda_bitonic_smem.ll:bitonic_smem:agx-g13g": {
   "bytes": 3732,

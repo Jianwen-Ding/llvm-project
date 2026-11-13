@@ -629,8 +629,10 @@ scalar. An innermost single-block loop whose half (or 16-bit integer)
 accesses of a kernel argument's buffer are only known aligned to their
 element, but would be at 4 bytes for a 4-byte aligned buffer, runs as two
 copies: one for buffers whose addresses are multiples of 4 (a test of the
-arguments, uniform), its accesses merged into wide ones, and the loop as it
-was (``AGXAlignmentVersioning``, ``-agx-alignment-versioning``).
+arguments, uniform; a pointer argument, or an integer one the address is a
+sum of, as the PTX front end computes them), its accesses merged into wide
+ones, and the loop as it was (``AGXAlignmentVersioning``,
+``-agx-alignment-versioning``).
 
 Threadgroup and private addresses that PTX computes in integers (``inttoptr``
 of an integer expression) are first written as a constant offset from the

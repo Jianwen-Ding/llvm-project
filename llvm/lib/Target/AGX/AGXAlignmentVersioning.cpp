@@ -94,6 +94,68 @@ FunctionPass *llvm::createAGXAlignmentVersioningPass() {
   return new AGXAlignmentVersioning();
 }
 
+/// Whether V is a kernel argument, or casts of one (the PTX front end's
+/// addrspacecast (inttoptr %arg)): the same for every thread.
+static bool isArgumentValue(const Value *V) {
+  for (unsigned Depth = 0; Depth < 4; ++Depth) {
+    if (isa<Argument>(V))
+      return true;
+    auto *C = dyn_cast<CastInst>(V);
+    if (!C || !(isa<IntToPtrInst>(C) || isa<PtrToIntInst>(C) ||
+                isa<AddrSpaceCastInst>(C) || isa<BitCastInst>(C)))
+      return false;
+    V = C->getOperand(0);
+  }
+  return false;
+}
+
+/// A term of the integer address S that is a kernel argument value (or its
+/// ptrtoint), and that value: S itself, a term of a sum, or of a
+/// recurrence's start.
+static std::pair<const SCEV *, Value *> argumentTerm(const SCEV *S) {
+  if (auto *U = dyn_cast<SCEVUnknown>(S))
+    if (isArgumentValue(U->getValue()))
+      return {U, U->getValue()};
+  if (auto *P = dyn_cast<SCEVPtrToAddrExpr>(S))
+    if (auto *U = dyn_cast<SCEVUnknown>(P->getOperand()))
+      if (isArgumentValue(U->getValue()))
+        return {P, U->getValue()};
+  if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+    return argumentTerm(AR->getStart());
+  if (auto *A = dyn_cast<SCEVAddExpr>(S))
+    for (const SCEV *Op : A->operands())
+      if (auto T = argumentTerm(Op); T.first)
+        return T;
+  return {nullptr, nullptr};
+}
+
+/// The kernel argument value Ptr is an offset from, and the offset: a
+/// pointer argument (MLIR's memrefs), or one in the integer sum the pointer
+/// is (inttoptr, as the PTX front end computes addresses).
+static std::pair<Value *, const SCEV *> baseAndOffset(Value *Ptr,
+                                                      ScalarEvolution &SE) {
+  const SCEV *S = SE.getSCEV(Ptr);
+  auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(S));
+  if (!Base)
+    return {nullptr, nullptr};
+  const SCEV *Off = SE.getMinusSCEV(S, Base);
+  if (isa<SCEVCouldNotCompute>(Off))
+    return {nullptr, nullptr};
+  if (isArgumentValue(Base->getValue()))
+    return {Base->getValue(), Off};
+  auto *ITP = dyn_cast<IntToPtrInst>(Base->getValue());
+  if (!ITP || !ITP->getSrcTy()->isIntegerTy(64))
+    return {nullptr, nullptr};
+  const SCEV *Int = SE.getSCEV(ITP->getOperand(0));
+  auto [Term, V] = argumentTerm(Int);
+  if (!Term)
+    return {nullptr, nullptr};
+  const SCEV *IntOff = SE.getMinusSCEV(Int, Term);
+  if (isa<SCEVCouldNotCompute>(IntOff) || Off->getType() != IntOff->getType())
+    return {nullptr, nullptr};
+  return {V, SE.getAddExpr(IntOff, Off)};
+}
+
 /// The device accesses of L whose alignment a 4-byte aligned kernel argument
 /// base would raise, and those bases.
 static void findRaises(Loop &L, ScalarEvolution &SE,
@@ -122,18 +184,14 @@ static void findRaises(Loop &L, ScalarEvolution &SE,
     // sign extension copies out first (dot_i8: 29 -> 33 GPRs, tput +6%).
     if (getLoadStoreType(&I)->getScalarSizeInBits() < 16)
       continue;
-    const SCEV *S = SE.getSCEV(Ptr);
-    auto *Base = dyn_cast<SCEVUnknown>(SE.getPointerBase(S));
-    if (!Base || !isa<Argument>(Base->getValue()))
-      continue;
-    const SCEV *Off = SE.getMinusSCEV(S, Base);
-    if (isa<SCEVCouldNotCompute>(Off))
+    auto [Base, Off] = baseAndOffset(Ptr, SE);
+    if (!Base)
       continue;
     Align New(uint64_t(1) << std::min(SE.getMinTrailingZeros(Off), 2u));
     if (New <= Old)
       continue;
     Raises.push_back({&I, New});
-    Bases.insert(Base->getValue());
+    Bases.insert(Base);
   }
 }
 
@@ -144,6 +202,10 @@ static bool versionLoop(Loop &L, Function &F, LoopInfo &LI, DominatorTree &DT,
   findRaises(L, SE, Raises, Bases);
   if (Raises.size() < AlignmentVersioningMin)
     return false;
+  for (Value *Base : Bases)
+    if (auto *BI = dyn_cast<Instruction>(Base);
+        BI && !DT.dominates(BI, L.getLoopPreheader()->getTerminator()))
+      return false;
 
   // Values of the loop used after it go through its exit block's phis.
   formLCSSA(L, DT, &LI, &SE);
@@ -170,7 +232,10 @@ static bool versionLoop(Loop &L, Function &F, LoopInfo &LI, DominatorTree &DT,
   IRBuilder<> B(Check->getTerminator());
   Value *Cond = nullptr;
   for (Value *Base : Bases) {
-    Value *Low = B.CreateAnd(B.CreatePtrToInt(Base, B.getInt64Ty()), 3);
+    Value *Int = Base->getType()->isPointerTy()
+                     ? B.CreatePtrToInt(Base, B.getInt64Ty())
+                     : Base;
+    Value *Low = B.CreateAnd(Int, 3);
     Value *Ok = B.CreateICmpEQ(Low, B.getInt64(0), Base->getName() + ".al4");
     Cond = Cond ? B.CreateAnd(Cond, Ok) : Ok;
   }
@@ -198,12 +263,20 @@ bool AGXAlignmentVersioning::runOnFunction(Function &F) {
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   // Innermost single-block loops in simplified form with one exit.
   SmallVector<Loop *, 4> Loops;
-  for (Loop *L : LI.getLoopsInPreorder())
-    if (L->isInnermost() && L->getNumBlocks() == 1 &&
-        L->isLoopSimplifyForm() && L->getExitBlock() &&
-        L->getExitingBlock() && L->hasDedicatedExits())
-      Loops.push_back(L);
   bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    if (!L->isInnermost() || L->getNumBlocks() != 1 ||
+        !L->getLoopPreheader() || !L->getLoopLatch() || !L->getExitBlock() ||
+        !L->getExitingBlock())
+      continue;
+    // (an exit block shared with the path around the loop gets one of its
+    // own, for the copies' values to meet in)
+    if (!L->hasDedicatedExits())
+      Changed |= formDedicatedExitBlocks(L, &DT, &LI, nullptr,
+                                         /*PreserveLCSSA=*/false);
+    if (L->isLoopSimplifyForm() && L->getExitBlock())
+      Loops.push_back(L);
+  }
   for (Loop *L : Loops)
     Changed |= versionLoop(*L, F, LI, DT, SE);
   return Changed;
