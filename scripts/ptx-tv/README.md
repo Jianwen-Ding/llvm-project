@@ -104,6 +104,20 @@ single-thread semantics:
 * Fences (including `fence.proxy.*`) and prefetches are no-ops; the source's
   fence/prefetch intrinsics are removed accordingly. `fma.rn.oob` is
   uninterpreted.
+* Probe-derived opaque instructions (`probe.py`) for intrinsic families the
+  lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
+  (de)compression, applypriority, st.bulk, texture/surface, ...): each such
+  call is compiled alone (immediate arguments kept, others as parameters)
+  with the same llc flags; the single instruction it becomes is traced
+  operand by operand back to argument bytes and result bytes. Both the
+  source call and the matching instruction in the real code become one
+  opaque call named after opcode and operand shape (scalars as i64,
+  addresses as pointers). This checks that the backend emits that
+  instruction with the right values and uses its results correctly in
+  context; it does not check the intrinsic's instruction selection (that is
+  taken from the backend). Results that rely on it carry `"probe": true`.
+  Texture/surface handles are modelled as the reference's address (what PTX
+  uses as the handle).
 * Any modifier the lifter does not know makes the instruction unsupported,
   so nothing is silently ignored.
 

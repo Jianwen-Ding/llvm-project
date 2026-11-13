@@ -179,16 +179,15 @@ with its sign fixed) in the equal case.
 then up to 8 more per file not checked before; everything that was not proved
 correct was re-checked with the final lifter, and part of the solver
 timeouts were re-run with a larger budget. In short: 3323 functions from
-620 test files; 1832 proved correct; 15 counterexamples of finding 1 (plus 1
-padding over-read); 4 of findings 2/2b/3/4; 4 unresolved (min/max signed
-zeros) and 1 NaN-bits note; 81 in known modelling classes; 650 not lifted;
-629 solver timeouts or inconclusive.
+620 test files; 2417 proved correct (584 of them through probe-derived opaque
+instructions for tensor-core/TMA/sparse/texture intrinsics, which check the
+surrounding code but not those instructions' selection); 15 counterexamples
+of finding 1 (plus 1 padding over-read); 4 of findings 2/2b/3/4; 4
+unresolved (min/max signed zeros) and 1 NaN-bits note; 81 in known
+modelling classes; 59 not lifted; 635 solver timeouts or inconclusive.
 
-Not lifted, by design so far: asynchronous and tensor-core instructions
-(`tcgen05.*`, `cp.async.bulk*`/`cp.reduce.async.bulk*` (TMA), sparse
-`spcompress`/`spdecompress`, `st.async`, `multimem.*`, `tensormap.*`,
-cluster launch control), texture/surface instructions, indirect calls whose
-LLVM type cannot be recovered, and variadic calls. Mapping the first group
-needs a per-family correspondence between intrinsic operands and the PTX
-operand lists (often 32-128-element vectors); without it the check would
-only produce noise.
+Not lifted (59): indirect calls whose LLVM type cannot be recovered and
+variadic calls (26), `clusterlaunchcontrol.query_cancel` (128-bit operand),
+`mapa`/`getctarank`, `discard`, `pmevent`, `stacksave`/`stackrestore`,
+`st.async`/`multimem.st.async` variants the probe cannot trace, function-scope
+`.shared` variables, a few calls to undeclared/library functions.

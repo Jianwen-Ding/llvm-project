@@ -1,25 +1,27 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Two passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6 functions per file, then up to 8 further functions per file; non-correct results re-checked with the final lifter, and solver timeouts re-run once with a 30 s per-query / 150 s budget (partially: 182 of 559). Otherwise `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Two passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6 functions per file, then up to 8 further functions per file; non-correct results re-checked with the final lifter, and solver timeouts partially re-run with a 30 s per-query budget. Otherwise `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 620; files with no usable nvptx64 llc RUN line or other file-level failure: 158 (no-llc-run 156, llc-failed 2).
 Functions checked: 3323.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 1832 | 55.1% |
-| `lift-unsupported` | 650 | 19.6% |
-| `timeout` | 535 | 16.1% |
+| `correct` | 2417 | 72.7% |
+| `timeout` | 541 | 16.3% |
 | `inconclusive` | 94 | 2.8% |
 | `mismatch-known` | 81 | 2.4% |
 | `src-inline-asm` | 60 | 1.8% |
+| `lift-unsupported` | 59 | 1.8% |
 | `alive-unsupported` | 27 | 0.8% |
 | `alive-error` | 16 | 0.5% |
 | `mismatch-param-oob` | 16 | 0.5% |
 | `mismatch` | 9 | 0.3% |
 | `extract-failed` | 3 | 0.1% |
 
-Conclusive (proved correct or counterexample): 1938 (58.3%).
+Of the correct results, 584 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
+
+Conclusive (proved correct or counterexample): 2523 (75.9%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -69,8 +71,8 @@ zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
 | `partword-atomic-word-access` | 49 |
 | `approximation-permitted-by-flags` | 15 |
 | `approx-substitution` | 4 |
-| `indirect-call-asm-mode` | 3 |
 | `byval-copy-to-local` | 3 |
+| `indirect-call-asm-mode` | 3 |
 | `dynamic-alloca-size-overflow` | 2 |
 | `aligned-overread-widened-load` | 2 |
 | `nan-payload` | 2 |
@@ -80,31 +82,27 @@ zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
 
 | reason | functions |
 |---|---:|
-| `cp.async` | 155 |
-| `tcgen05.mma` | 151 |
-| `spdecompress.b8` | 56 |
-| `spdecompress.b16` | 47 |
-| `tcgen05.commit` | 22 |
-| `tcgen05.ld` | 18 |
-| `cp.reduce` | 15 |
-| `modifier .async` | 15 |
-| `tcgen05.cp` | 14 |
 | `indirect` | 13 |
-| `tensormap.replace` | 13 |
-| `applypriority.async` | 12 |
-| `tcgen05.st` | 10 |
 | `call` | 8 |
-| `spcompress.b8` | 8 |
-| `multimem.st` | 8 |
-| `tcgen05.alloc` | 8 |
 | `unknown` | 6 |
-| `spcompress.b16` | 6 |
 | `vararg` | 5 |
 | `clusterlaunchcontrol.query_cancel` | 4 |
-| `modifier .bulk` | 4 |
-| `tcgen05.dealloc` | 4 |
-| `tex.1d` | 4 |
-| `suld.b` | 3 |
+| `modifier .async` | 4 |
+| `mapa.u64` | 2 |
+| `directive` | 2 |
+| `non` | 2 |
+| `multimem.st` | 2 |
+| `discard.global` | 1 |
+| `discard` | 1 |
+| `mapa.shared` | 1 |
+| `getctarank.u64` | 1 |
+| `barrier.cluster` | 1 |
+| `pmevent.mask` | 1 |
+| `stacksave.u64` | 1 |
+| `stackrestore.u64` | 1 |
+| `suld.b` | 1 |
+| `tex.1d` | 1 |
+| `modifier .mmio` | 1 |
 
 ## Alive2 could not handle the source
 
