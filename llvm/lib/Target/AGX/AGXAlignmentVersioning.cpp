@@ -36,6 +36,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
@@ -255,6 +256,100 @@ static bool versionLoop(Loop &L, Function &F, LoopInfo &LI, DominatorTree &DT,
   return true;
 }
 
+static cl::opt<unsigned> GuardVersioningMin(
+    "agx-guard-versioning-min", cl::init(4), cl::Hidden,
+    cl::desc("Loop-invariant guards of loads an innermost loop must have to "
+             "get a copy without them where they all hold (0: off)"));
+
+/// A loop whose work is guarded by loop-invariant tests (a convolution's
+/// taps inside the image) waits for each guarded load apart under its own
+/// execution mask. Where every guard holds (the threads inside the image),
+/// a copy of the loop without the guards runs instead, its loads together:
+///   if (g1 && g2 && ...) loop without the tests; else the loop
+/// Both compute the same; the copy runs only where its dropped tests hold.
+static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
+                          DominatorTree &DT, ScalarEvolution &SE) {
+  if (L.getLoopPreheader() && L.getExitBlock() && !L.hasDedicatedExits())
+    formDedicatedExitBlocks(&L, &DT, &LI, nullptr, /*PreserveLCSSA=*/false);
+  BasicBlock *Pre = L.getLoopPreheader();
+  BasicBlock *Exiting = L.getExitingBlock(), *Exit = L.getExitBlock();
+  if (!Pre || !Exiting || !Exit || !L.hasDedicatedExits())
+    return false;
+  struct Guard {
+    CondBrInst *Br;
+    bool ToTrue; // the guarded block is the true successor
+  };
+  SmallVector<Guard, 8> Guards;
+  for (BasicBlock *BB : L.blocks()) {
+    auto *Br = dyn_cast<CondBrInst>(BB->getTerminator());
+    if (!Br || BB == Exiting || !L.isLoopInvariant(Br->getCondition()))
+      continue;
+    if (auto *C = dyn_cast<Instruction>(Br->getCondition());
+        C && !DT.dominates(C, Pre->getTerminator()))
+      continue;
+    for (unsigned K = 0; K < 2; ++K) {
+      BasicBlock *T = Br->getSuccessor(K), *M = Br->getSuccessor(1 - K);
+      if (T->getSinglePredecessor() == BB && T->getSingleSuccessor() == M &&
+          L.contains(T) && any_of(*T, [](Instruction &I) {
+            return isa<LoadInst>(I);
+          })) {
+        Guards.push_back({Br, K == 0});
+        break;
+      }
+    }
+  }
+  if (Guards.size() < GuardVersioningMin)
+    return false;
+  formLCSSA(L, DT, &LI, &SE);
+  Exiting = L.getExitingBlock();
+  Exit = L.getExitBlock();
+  BasicBlock *Check = L.getLoopPreheader();
+  BasicBlock *PH = SplitBlock(Check, Check->getTerminator(), &DT, &LI, nullptr,
+                              Check->getName() + ".guarded");
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 16> NewBlocks;
+  cloneLoopWithPreheader(PH, Check, &L, VMap, ".inside", &LI, &DT, NewBlocks);
+  remapInstructionsInBlocks(NewBlocks, VMap);
+  auto *NewPH = cast<BasicBlock>(VMap[PH]);
+  auto *NewExiting = cast<BasicBlock>(VMap[Exiting]);
+  for (PHINode &P : Exit->phis()) {
+    Value *V = P.getIncomingValueForBlock(Exiting);
+    Value *NV = VMap.lookup(V);
+    P.addIncoming(NV ? NV : V, NewExiting);
+  }
+  IRBuilder<> B(Check->getTerminator());
+  Value *All = nullptr;
+  for (const Guard &G : Guards) {
+    Value *C = G.Br->getCondition();
+    if (!G.ToTrue)
+      C = B.CreateNot(C);
+    All = All ? B.CreateAnd(All, C) : C;
+  }
+  // The same for the whole SIMD-group: the copy only where every active
+  // thread may run it, so that no SIMD-group runs both loops (one with a
+  // thread at the border runs the original alone).
+  All = B.CreateICmpEQ(
+      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {All}),
+      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {B.getTrue()}));
+  Instruction *Old = Check->getTerminator();
+  B.CreateCondBr(All, NewPH, PH);
+  Old->eraseFromParent();
+  // The copy enters every guarded block.
+  for (const Guard &G : Guards) {
+    auto *Br = cast<CondBrInst>(VMap[G.Br]);
+    BasicBlock *BB = Br->getParent();
+    BasicBlock *T = Br->getSuccessor(G.ToTrue ? 0 : 1);
+    BasicBlock *M = Br->getSuccessor(G.ToTrue ? 1 : 0);
+    for (PHINode &P : M->phis())
+      P.removeIncomingValue(BB, /*DeletePHIIfEmpty=*/false);
+    IRBuilder<>(Br).CreateBr(T);
+    Br->eraseFromParent();
+  }
+  DT.recalculate(F);
+  SE.forgetLoop(&L);
+  return true;
+}
+
 bool AGXAlignmentVersioning::runOnFunction(Function &F) {
   if (!EnableAlignmentVersioning || skipFunction(F))
     return false;
@@ -279,5 +374,13 @@ bool AGXAlignmentVersioning::runOnFunction(Function &F) {
   }
   for (Loop *L : Loops)
     Changed |= versionLoop(*L, F, LI, DT, SE);
+  if (GuardVersioningMin) {
+    SmallVector<Loop *, 4> Inner;
+    for (Loop *L : LI.getLoopsInPreorder())
+      if (L->isInnermost() && L->getNumBlocks() > 1)
+        Inner.push_back(L);
+    for (Loop *L : Inner)
+      Changed |= versionGuards(*L, F, LI, DT, SE);
+  }
   return Changed;
 }

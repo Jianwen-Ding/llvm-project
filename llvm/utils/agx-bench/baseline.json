@@ -264,28 +264,28 @@
   "waits": 2
  },
  "cuda_conv3x3.ll:conv3x3:agx-g13g": {
-  "bytes": 1206,
-  "cycles": 47401.4,
-  "gprs": 39,
-  "groups": 40,
-  "instructions": 179,
+  "bytes": 1760,
+  "cycles": 18846.5,
+  "gprs": 55,
+  "groups": 24,
+  "instructions": 257,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 2518.6,
+  "tput": 1348.3,
   "uniform_halves": 24,
-  "waits": 9
+  "waits": 13
  },
  "cuda_conv3x3.ll:conv3x3:agx-g14c": {
-  "bytes": 1206,
-  "cycles": 47401.4,
-  "gprs": 39,
-  "groups": 40,
-  "instructions": 179,
+  "bytes": 1760,
+  "cycles": 18846.5,
+  "gprs": 55,
+  "groups": 24,
+  "instructions": 257,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 2518.6,
+  "tput": 1348.3,
   "uniform_halves": 24,
-  "waits": 9
+  "waits": 13
  },
  "cuda_ddot.ll:ddot:agx-g13g": {
   "bytes": 31716,

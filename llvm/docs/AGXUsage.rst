@@ -636,7 +636,11 @@ copies: one for buffers whose addresses are multiples of 4 (a test of the
 arguments, uniform; a pointer argument, or an integer one the address is a
 sum of, as the PTX front end computes them), its accesses merged into wide
 ones, and the loop as it was (``AGXAlignmentVersioning``,
-``-agx-alignment-versioning``).
+``-agx-alignment-versioning``). The same pass gives an innermost loop with
+at least four loop-invariant guards of loads (a stencil's taps inside the
+image) a copy without them, which a SIMD-group runs when every active thread
+passes all the guards (a ballot), its loads then issuing together
+(``-agx-guard-versioning-min``).
 
 Threadgroup and private addresses that PTX computes in integers (``inttoptr``
 of an integer expression) are first written as a constant offset from the
