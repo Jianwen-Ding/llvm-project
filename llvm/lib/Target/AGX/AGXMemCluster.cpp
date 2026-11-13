@@ -169,6 +169,17 @@ static cl::opt<unsigned> AGXPostRAClusterWait(
              "next access of a memory cluster rather than schedule another "
              "instruction in between (0: off)"));
 
+static cl::opt<unsigned> AGXPostRATGLoadUse(
+    "agx-postra-tg-load-use", cl::Hidden, cl::init(48),
+    cl::desc("After register allocation, wait up to this many cycles for the "
+             "first reader of a threadgroup load rather than schedule an "
+             "unrelated instruction in between (0: off)"));
+
+static cl::opt<unsigned> AGXPostRATGLoadLongLatency(
+    "agx-postra-tg-load-long-latency", cl::Hidden, cl::init(5),
+    cl::desc("The first reader of a threadgroup load does not wait for or go "
+             "ahead of an instruction of at least this latency"));
+
 namespace {
 
 /// The generic post-RA strategy schedules a ready instruction ahead of the next
@@ -176,11 +187,61 @@ namespace {
 /// On AGX, an ALU instruction between two memory accesses costs more than such
 /// a stall (see AGXMemClusterMutation): keep the cluster first, waiting for
 /// its next access if it is a few cycles from ready.
+///
+/// Likewise after a threadgroup load: an ALU instruction issued before the
+/// load's result is read defers its completion (AGX Performance Simulator,
+/// measured on M2 Max: the load completes its latency after the last ALU
+/// instruction), so the generic filling of the load's latency with unrelated
+/// work makes it later. Its first reader goes next where it is (or soon
+/// becomes) ready.
 class AGXPostRASchedStrategy : public PostGenericScheduler {
+  /// The last threadgroup load scheduled whose result is not read yet.
+  SUnit *TGLoad = nullptr;
+
+  static bool isLong(const SUnit *SU) {
+    return SU->Latency >= AGXPostRATGLoadLongLatency;
+  }
+
+  bool readsTGLoad(const SUnit *SU) const {
+    return TGLoad && any_of(SU->Preds, [&](const SDep &D) {
+             return D.getKind() == SDep::Data && D.getSUnit() == TGLoad;
+           });
+  }
+
 public:
   using PostGenericScheduler::PostGenericScheduler;
 
+  void initialize(ScheduleDAGMI *Dag) override {
+    PostGenericScheduler::initialize(Dag);
+    TGLoad = nullptr;
+  }
+
+  void schedNode(SUnit *SU, bool IsTopNode) override {
+    PostGenericScheduler::schedNode(SU, IsTopNode);
+    if (!AGXPostRATGLoadUse || !IsTopNode)
+      return;
+    if (memKind(*SU->getInstr()) == LocalLoad)
+      TGLoad = SU;
+    else if (readsTGLoad(SU))
+      TGLoad = nullptr;
+  }
+
   SUnit *pickNode(bool &IsTopNode) override {
+    if (AGXPostRATGLoadUse && RegionPolicy.OnlyTopDown && TGLoad) {
+      unsigned Limit = Top.getCurrCycle() + AGXPostRATGLoadUse;
+      while (Top.getCurrCycle() < Limit) {
+        Top.releasePending();
+        if (any_of(Top.Available, [&](SUnit *SU) {
+              return (readsTGLoad(SU) || isLong(SU)) && !Top.checkHazard(SU);
+            }))
+          break;
+        if (none_of(Top.Pending, [&](SUnit *SU) {
+              return readsTGLoad(SU) && SU->TopReadyCycle <= Limit;
+            }))
+          break;
+        Top.bumpCycle(Top.getCurrCycle() + 1);
+      }
+    }
     if (AGXPostRAClusterWait && RegionPolicy.OnlyTopDown &&
         TopClusterID != InvalidClusterId) {
       auto InCluster = [&](SUnit *SU) {
@@ -205,6 +266,11 @@ public:
 
 protected:
   bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override {
+    if (AGXPostRATGLoadUse && TGLoad && Cand.isValid() && Cand.AtTop &&
+        TryCand.AtTop && !isLong(Cand.SU) && !isLong(TryCand.SU) &&
+        tryGreater(readsTGLoad(TryCand.SU), readsTGLoad(Cand.SU), TryCand,
+                   Cand, Stall))
+      return TryCand.Reason != NoCand;
     if (AGXPostRAClusterWait && Cand.isValid()) {
       bool CandNext = isTheSameCluster(Cand.AtTop ? TopClusterID : BotClusterID,
                                        Cand.SU->ParentClusterIdx);

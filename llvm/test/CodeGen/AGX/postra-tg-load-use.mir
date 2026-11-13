@@ -1,0 +1,30 @@
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=postmisched -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=postmisched -agx-postra-tg-load-use=0 %s -o - | FileCheck %s --check-prefix=OFF
+
+# An ALU instruction issued before a threadgroup load's result is read defers
+# the load's completion: the reader of the load goes first, not the
+# independent and filling the load's latency (ddot's double compare).
+# CHECK-LABEL: name: reader_next
+# CHECK:       LOCAL_LOAD_64
+# CHECK-NEXT:  $r26 = BITOP_I32 8, 0, {{.*}}$r25
+# CHECK-NEXT:  $r27 = BITOP_I32 8, 0, {{.*}}$r21
+# OFF-LABEL:   name: reader_next
+# OFF:         LOCAL_LOAD_64
+# OFF-NEXT:    $r27 = BITOP_I32 8, 0, {{.*}}$r21
+# OFF-NEXT:    $r26 = BITOP_I32 8, 0, {{.*}}$r25
+
+---
+name:            reader_next
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $r7, $r20, $r21, $r22, $u4_u5
+
+    renamable $r24_r25 = LOCAL_LOAD_64 2, 3, killed renamable $r22l, 0 :: (load (s64), addrspace 3)
+    renamable $r26 = BITOP_I32 8, 0, renamable $r25, 0, renamable $r7, implicit renamable $r24_r25
+    renamable $r27 = BITOP_I32 8, 0, renamable $r21, 0, renamable $r7
+    renamable $r22 = ICMPSEL_I32 2, 0, killed renamable $r26, 0, killed renamable $r27, 0, 1, 0, 0
+    renamable $r23 = ICMPSEL_I32 2, 0, renamable $r24, 0, renamable $r20, 0, killed renamable $r22, 0, 0
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r23, $u4_u5, killed renamable $r21, 1, 1 :: (store (s32), addrspace 1)
+    AGX_STOP
+...
