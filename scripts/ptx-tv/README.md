@@ -118,6 +118,13 @@ single-thread semantics:
   taken from the backend). Results that rely on it carry `"probe": true`.
   Texture/surface handles are modelled as the reference's address (what PTX
   uses as the handle).
+* Calls through a prototype to a known function (`mov.b64 %rd, f` then
+  `call ..., %rd, ..., prototype`) are lifted as direct calls with the
+  source's call-site type; other indirect calls use the source signature
+  that matches the PTX argument count and return.
+* `PTXTV_ALIVE_EXTRA` passes extra (weakening) flags to Alive2, e.g.
+  `--disable-poison-input` for functions whose full check times out; results
+  record the flags in `alive_extra`.
 * Any modifier the lifter does not know makes the instruction unsupported,
   so nothing is silently ignored.
 

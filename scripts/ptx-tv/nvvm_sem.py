@@ -414,6 +414,10 @@ def expand(text, lifter_mod, llc_args=None):
                 out_lines.append(line)
                 continue
         mp = mapping(name, args)
+        # llvm.nvvm.sqrt.f: correctly rounded unless -nvptx-prec-sqrtf32=0
+        if name == "sqrt.f" and llc_args is not None:
+            approx = any(re.fullmatch(r"-+nvptx-prec-sqrtf32=0", a) for a in llc_args)
+            mp = ("sqrt.%s.f32 %%d, %%a0" % ("approx" if approx else "rn"), [0])
         cm = re.search(r"call\s+(?:(?:fast|nnan|ninf|nsz|arcp|contract|afn|reassoc)\s+)*"
                        r"((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)
         if not mp or not cm:

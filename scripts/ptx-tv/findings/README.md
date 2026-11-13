@@ -177,17 +177,20 @@ with its sign fixed) in the equal case.
 `RESULTS.md` has the numbers (generated from `results.jsonl` by
 `gen_results.py`). Two passes were combined: up to 6 functions per test file,
 then up to 8 more per file not checked before; everything that was not proved
-correct was re-checked with the final lifter, and part of the solver
-timeouts were re-run with a larger budget. In short: 3323 functions from
-620 test files; 2417 proved correct (584 of them through probe-derived opaque
-instructions for tensor-core/TMA/sparse/texture intrinsics, which check the
-surrounding code but not those instructions' selection); 15 counterexamples
-of finding 1 (plus 1 padding over-read); 4 of findings 2/2b/3/4; 4
-unresolved (min/max signed zeros) and 1 NaN-bits note; 81 in known
-modelling classes; 59 not lifted; 635 solver timeouts or inconclusive.
+correct was re-checked with the final lifter, and solver timeouts were
+re-run with a larger budget and the weaker `--disable-poison-input` check
+(tagged in the results). In short: 3323 functions from 620 test files; 2457
+proved correct (584 through probe-derived opaque instructions, 20 only with
+the weaker check); 15 counterexamples of finding 1 (plus 1 padding
+over-read); 4 of findings 2/2b/3/4; 4 unresolved (min/max signed zeros) and
+2 NaN-bits notes; 84 in known modelling classes; 36 not lifted; 610 solver
+timeouts or inconclusive.
 
-Not lifted (59): indirect calls whose LLVM type cannot be recovered and
-variadic calls (26), `clusterlaunchcontrol.query_cancel` (128-bit operand),
-`mapa`/`getctarank`, `discard`, `pmevent`, `stacksave`/`stackrestore`,
-`st.async`/`multimem.st.async` variants the probe cannot trace, function-scope
-`.shared` variables, a few calls to undeclared/library functions.
+Not lifted (36): variadic calls and calls whose LLVM type cannot be
+recovered (passed through `undef`, or ambiguous), two kernels with non-void
+LLVM return types, `stacksave`/`stackrestore`, `st.async`/`multimem.st.async`
+variants the probe cannot trace, function-scope `.shared` variables, a few
+calls to undeclared/library functions.
+
+The remaining timeouts are float-heavy functions: neither a 6x larger solver
+budget nor the weaker check resolves more than a few percent of them.

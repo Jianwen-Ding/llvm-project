@@ -34,6 +34,11 @@ def main(path, out, title, config):
         L.append("| `%s` | %d | %.1f%% |" % (k, v, 100.0 * v / n))
     concl = st["correct"] + st["mismatch"] + st["mismatch-known"] + st["mismatch-param-oob"]
     nprobe = sum(1 for r in fn if r["status"] == "correct" and r.get("probe"))
+    nweak = sum(1 for r in fn if r["status"] == "correct" and r.get("alive_extra"))
+    L.append("")
+    L.append("%d of the correct results were obtained only with a weaker check "
+             "(`--disable-poison-input`: inputs assumed not to be poison) after the "
+             "full check timed out." % nweak)
     L.append("")
     L.append("Of the correct results, %d rely on probe-derived opaque instructions "
              "(probe.py): they check the surrounding code and operand plumbing, not "
