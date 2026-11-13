@@ -40,6 +40,7 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -852,6 +853,11 @@ static cl::opt<bool> AGXMergeDownCounters(
 /// i' = i0 + s c0 exactly (mod 2^32: s is invertible, and c reaches zero at
 /// the same iteration): the test on i', and c goes. An even s = 2^m odd
 /// where the loop runs fewer than 2^(32 - m) times.
+static cl::opt<bool> AGXDeadAfterNarrowing(
+    "agx-dead-after-narrowing", cl::init(true), cl::Hidden,
+    cl::desc("Delete what narrowing a loop's inductions left dead before the "
+             "rewrites that count uses"));
+
 static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
@@ -963,8 +969,24 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
     for (PHINode &Phi : L->getHeader()->phis())
       if (Phi.getType()->isIntegerTy(64))
         Phis.push_back(&Phi);
+    bool Narrowed = false;
     for (PHINode *Phi : Phis)
-      Changed |= narrow(*Phi, *L, SE);
+      Narrowed |= narrow(*Phi, *L, SE);
+    // The extensions of a narrowed value that its old 64-bit uses left
+    // (dead, but uses that the one-use tests below would count).
+    if (Narrowed && AGXDeadAfterNarrowing) {
+      SmallVector<WeakTrackingVH, 8> Dead;
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (isInstructionTriviallyDead(&I))
+            Dead.push_back(&I);
+      for (WeakTrackingVH &V : Dead)
+        if (auto *I = dyn_cast_or_null<Instruction>(V)) {
+          SE.forgetValue(I);
+          RecursivelyDeleteTriviallyDeadInstructions(I);
+        }
+    }
+    Changed |= Narrowed;
     if (AGXElementIndices && L->isInnermost()) {
       SmallVector<PHINode *, 4> Narrow;
       for (PHINode &Phi : L->getHeader()->phis())
