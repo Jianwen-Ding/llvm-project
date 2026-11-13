@@ -20,17 +20,17 @@ define agx_kernel void @tile(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 ; CHECK-NEXT:  // %bb.0: // %entry
 ; CHECK-NEXT:    mov_imm r0l, 0
 ; CHECK-NEXT:    get_sr r1, sr48 (thread_position_in_threadgroup.x)
-; CHECK-NEXT:    mov_imm r2, 256
-; CHECK-NEXT:    mov_imm r3, 1023
+; CHECK-NEXT:    mov_imm r3, 256
+; CHECK-NEXT:    mov_imm r4, 1023
+; CHECK-NEXT:    and r2, r1, 15
 ; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
 ; CHECK-NEXT:  .LBB0_1: // %loop
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
-; CHECK-NEXT:    bfeil r4, 0, r1, 4
-; CHECK-NEXT:    and r5, r1, 15
-; CHECK-NEXT:    device_store 0, i32, x, r4, u0_u1, r1, unsigned
-; CHECK-NEXT:    device_store 0, i32, x, r5, u2_u3, r1, unsigned
-; CHECK-NEXT:    iadd r1, r1, r2
-; CHECK-NEXT:    while_icmp r0l, slte, r1, r3, 1
+; CHECK-NEXT:    bfeil r5, 0, r1, 4
+; CHECK-NEXT:    device_store 0, i32, x, r5, u0_u1, r1, unsigned
+; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, unsigned
+; CHECK-NEXT:    iadd r1, r1, r3
+; CHECK-NEXT:    while_icmp r0l, slte, r1, r4, 1
 ; CHECK-NEXT:    jmp_exec_any .LBB0_1
 ; CHECK-NEXT:  // %bb.2: // %done
 ; CHECK-NEXT:    pop_exec r0l, 1

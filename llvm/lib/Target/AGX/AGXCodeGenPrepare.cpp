@@ -43,7 +43,9 @@
 #include "llvm/ADT/GenericUniformityImpl.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -512,6 +514,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool simdScans(Function &F, const AGXSubtarget &ST);
   bool mergeLoopExits(Function &F);
   bool forwardOwnSlots(Function &F);
+  bool strideDivisions(Function &F);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
   bool flushHalfDenormals(Function &F);
   bool flushFloatMinMax(Function &F);
@@ -2059,6 +2062,89 @@ bool AGXCodeGenPrepare::forwardOwnSlots(Function &F) {
       Changed = true;
     }
   }
+  return Changed;
+}
+
+static cl::opt<bool> AGXStrideRemainders(
+    "agx-stride-remainders", cl::init(true), cl::Hidden,
+    cl::desc("Remainders by 2^k of an induction stepped by a multiple of 2^k "
+             "as the loop-invariant remainder of its start"));
+
+/// A loop over a tile by the threadgroup (for (l = tid; l < n; l += 256):
+/// column l % 16) takes the remainder by 2^k of an induction X = {S, +, t}
+/// whose step 2^k divides. That remainder (X & (2^k - 1), X - (X & -2^k),
+/// urem X, 2^k) is S's in every iteration, whatever the wrap-around (the
+/// step only adds multiples of 2^k): it is computed once, before the loop.
+/// (The quotient as an induction of its own, {S >> k, +, t >> k}, cost
+/// sgemm_reg4x4 six registers and tput: L15-E249.)
+bool AGXCodeGenPrepare::strideDivisions(Function &F) {
+  using namespace PatternMatch;
+  if (!AGXStrideRemainders)
+    return false;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  if (LI.empty())
+    return false;
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  struct Rewrite {
+    Instruction *I;
+    unsigned K;
+    const SCEVAddRecExpr *AR;
+  };
+  SmallVector<Rewrite, 8> Work;
+  for (Instruction &I : instructions(F)) {
+    if (!I.getType()->isIntegerTy() || !LI.getLoopFor(I.getParent()))
+      continue;
+    Value *X, *Y;
+    const APInt *C;
+    unsigned W = I.getType()->getIntegerBitWidth(), K;
+    if (match(&I, m_And(m_Value(X), m_APInt(C))) && C->isMask())
+      K = C->countr_one();
+    else if (match(&I, m_URem(m_Value(X), m_APInt(C))) && C->isPowerOf2())
+      K = C->logBase2();
+    else if (match(&I, m_Sub(m_Value(X), m_And(m_Value(Y), m_APInt(C)))) &&
+             C->isNegatedPowerOf2() && SE.isSCEVable(X->getType()) &&
+             SE.getSCEV(X) == SE.getSCEV(Y))
+      K = C->countr_zero();
+    else
+      continue;
+    if (!K || K >= W || !SE.isSCEVable(X->getType()))
+      continue;
+    auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(X));
+    if (!AR || !AR->isAffine() || !AR->getLoop()->contains(&I))
+      continue;
+    // (a loop entered from a branch gets the preheader loop-simplify gives)
+    Loop *L = const_cast<Loop *>(AR->getLoop());
+    if (!L->getLoopPreheader() &&
+        !InsertPreheaderForLoop(L, &DT, &LI, nullptr, false))
+      continue;
+    auto *T = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+    if (!T || T->getAPInt().isZero() || T->getAPInt().countr_zero() < K)
+      continue;
+    Work.push_back({&I, K, AR});
+  }
+  if (Work.empty())
+    return false;
+  SCEVExpander Exp(SE, "agx.stride");
+  bool Changed = false;
+  for (const Rewrite &R : Work) {
+    Instruction *Pre = R.AR->getLoop()->getLoopPreheader()->getTerminator();
+    if (!Exp.isSafeToExpandAt(R.AR->getStart(), Pre))
+      continue;
+    Type *Ty = R.I->getType();
+    Value *S = Exp.expandCodeFor(R.AR->getStart(), Ty, Pre);
+    Value *New = IRBuilder<>(Pre).CreateAnd(
+        S, APInt::getLowBitsSet(Ty->getIntegerBitWidth(), R.K));
+    R.I->replaceAllUsesWith(New);
+    New->takeName(R.I);
+    Changed = true;
+  }
+  for (const Rewrite &R : Work)
+    if (R.I->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(R.I);
   return Changed;
 }
 
@@ -3716,6 +3802,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= simdScans(F, ST);
   Changed |= mergeLoopExits(F);
   Changed |= forwardOwnSlots(F);
+  Changed |= strideDivisions(F);
   Changed |= lowerMatrixFMA(F, ST);
   if (ST.hasQuadShuffleIndexMerge())
     Changed |= lowerDivergentShuffles(F, TTI);
