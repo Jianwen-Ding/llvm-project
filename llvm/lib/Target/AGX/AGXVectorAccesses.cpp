@@ -54,6 +54,11 @@ static cl::opt<bool> AGXNeighbourAlignment(
     cl::desc("Raise access alignments to what accesses of the same base that "
              "run with them prove"));
 
+static cl::opt<bool> AGXWideLanesAs32(
+    "agx-wide-lanes-as-32", cl::init(true), cl::Hidden,
+    cl::desc("Load and store vectors of two 64-bit lanes as four 32-bit "
+             "lanes"));
+
 static cl::opt<bool> AGXSplitPermutedStores(
     "agx-split-permuted-stores", cl::init(true), cl::Hidden,
     cl::desc("Split vector stores whose lanes would need register copies"));
@@ -294,6 +299,45 @@ static bool raiseAlignments(BasicBlock &BB) {
   return Changed;
 }
 
+/// A load or store of <2 x i64> or <2 x double> (the vectorizer's merge of
+/// two 64-bit accesses, a struct copied as two i64) as <4 x i32>: the 32-bit
+/// lane vectors of up to 16 bytes are one access at 4-byte alignment
+/// (AGXISelLowering lowerVectorLoad / lowerVectorStore); a 64-bit lane
+/// vector is not a legal type, and type legalization split it in two.
+static bool wideLanesAs32(Instruction &I) {
+  auto *LI = dyn_cast<LoadInst>(&I);
+  auto *SI = dyn_cast<StoreInst>(&I);
+  Type *T = LI ? LI->getType() : SI->getValueOperand()->getType();
+  auto *VT = dyn_cast<FixedVectorType>(T);
+  if (!VT || VT->getNumElements() != 2 ||
+      VT->getElementType()->getScalarSizeInBits() != 64 ||
+      !(VT->getElementType()->isIntegerTy() ||
+        VT->getElementType()->isDoubleTy()))
+    return false;
+  if ((LI ? LI->getAlign() : SI->getAlign()) < Align(4) ||
+      (LI ? LI->isVolatile() || !LI->isSimple()
+          : SI->isVolatile() || !SI->isSimple()))
+    return false;
+  unsigned AS = LI ? LI->getPointerAddressSpace() : SI->getPointerAddressSpace();
+  if (AS != AGX::DEVICE_ADDRESS)
+    return false;
+  IRBuilder<> B(&I);
+  auto *V4 = FixedVectorType::get(B.getInt32Ty(), 4);
+  if (LI) {
+    LoadInst *N = B.CreateAlignedLoad(V4, LI->getPointerOperand(),
+                                      LI->getAlign(), LI->getName());
+    N->copyMetadata(*LI);
+    LI->replaceAllUsesWith(B.CreateBitCast(N, VT));
+  } else {
+    StoreInst *N = B.CreateAlignedStore(
+        B.CreateBitCast(SI->getValueOperand(), V4), SI->getPointerOperand(),
+        SI->getAlign());
+    N->copyMetadata(*SI);
+  }
+  I.eraseFromParent();
+  return true;
+}
+
 bool AGXVectorAccesses::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -312,6 +356,15 @@ bool AGXVectorAccesses::runOnFunction(Function &F) {
       Changed |= narrowLoad(*cast<LoadInst>(I));
     else if (!BeforeVectorizer && AGXSplitPermutedStores)
       Changed |= splitStore(*cast<StoreInst>(I));
+  }
+  if (!BeforeVectorizer && AGXWideLanesAs32) {
+    SmallVector<Instruction *, 16> Wide;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        if (isa<LoadInst>(I) || isa<StoreInst>(I))
+          Wide.push_back(&I);
+    for (Instruction *I : Wide)
+      Changed |= wideLanesAs32(*I);
   }
   return Changed;
 }

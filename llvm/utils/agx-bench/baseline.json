@@ -456,28 +456,28 @@
   "waits": 0
  },
  "cuda_nbody.ll:nbody:agx-g13g": {
-  "bytes": 744,
-  "cycles": 38004.6,
-  "gprs": 40,
+  "bytes": 698,
+  "cycles": 37958.6,
+  "gprs": 39,
   "groups": 40,
-  "instructions": 119,
+  "instructions": 112,
   "launch_inputs": true,
   "tg_bytes": 4096,
-  "tput": 3435.9,
+  "tput": 3440.6,
   "uniform_halves": 18,
-  "waits": 3
+  "waits": 2
  },
  "cuda_nbody.ll:nbody:agx-g14c": {
-  "bytes": 744,
-  "cycles": 38004.6,
-  "gprs": 40,
+  "bytes": 698,
+  "cycles": 37958.6,
+  "gprs": 39,
   "groups": 40,
-  "instructions": 119,
+  "instructions": 112,
   "launch_inputs": true,
   "tg_bytes": 4096,
-  "tput": 3435.9,
+  "tput": 3440.6,
   "uniform_halves": 18,
-  "waits": 3
+  "waits": 2
  },
  "cuda_permute4d.ll:permute4d:agx-g13g": {
   "bytes": 13188,

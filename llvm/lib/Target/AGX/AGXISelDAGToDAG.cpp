@@ -561,6 +561,26 @@ bool AGXDAGToDAGISel::SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods) {
 /// (sext / zext of an i16), or a 32-bit such value extended the same way.
 bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
   unsigned Opc = N.getOpcode();
+  // The low 16 bits of an extended 32-bit value, sign or zero extended in
+  // place (a lane of a vector of 64-bit lanes loaded as 32-bit lanes): the
+  // 32-bit value's low half.
+  bool InReg = Opc == ISD::SIGN_EXTEND_INREG &&
+               cast<VTSDNode>(N.getOperand(1))->getVT() == MVT::i16;
+  bool Mask = Opc == ISD::AND && isa<ConstantSDNode>(N.getOperand(1)) &&
+              N.getConstantOperandVal(1) == 0xffff;
+  if (InReg || Mask) {
+    SDValue E = N.getOperand(0);
+    unsigned EOpc = E.getOpcode();
+    if ((EOpc != ISD::ANY_EXTEND && EOpc != ISD::ZERO_EXTEND &&
+         EOpc != ISD::SIGN_EXTEND) ||
+        E.getOperand(0).getValueType() != MVT::i32)
+      return false;
+    SDLoc DL(N);
+    Src = CurDAG->getTargetExtractSubreg(AGX::lo16, DL, MVT::i16,
+                                         E.getOperand(0));
+    Mods = getI32Imm(InReg ? AGX::SRC_MOD_SX : 0, DL);
+    return true;
+  }
   // A pair with a zero high word: the low word zero-extended.
   if (Opc == ISD::BUILD_PAIR && isNullConstant(N.getOperand(1)))
     Opc = ISD::ZERO_EXTEND;
