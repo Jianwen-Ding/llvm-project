@@ -32,6 +32,8 @@ BIN = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin")
 ALIVE = os.environ.get("PTXTV_ALIVE", "/home/user/alive2/build/alive-tv")
 WALL_TIMEOUT = int(os.environ.get("PTXTV_WALL_TIMEOUT", "0"))
 LLC_FLAGS = {}   # pid -> llc flags of the file being processed
+# extra (weakening) Alive2 flags, e.g. --disable-poison-input; recorded per result
+ALIVE_EXTRA = os.environ.get("PTXTV_ALIVE_EXTRA", "").split()
 SKIP = {}        # file -> functions to skip (--skip-from)
 PROBE_LLC = {}   # pid -> llc args used for intrinsic probes
 probe_mod = None
@@ -300,7 +302,9 @@ def indirect_call_sigs(module_text, fname):
     if not m:
         return []
     out = []
-    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+)\((.*)\)", m.group(0)):
+    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+|@[\w.$\"-]+)\((.*)\)", m.group(0)):
+        if cm.group(2).startswith("@llvm.") or cm.group(2).startswith("@nvvm."):
+            continue
         ret = re.sub(r"\b(fast|nnan|ninf|nsz|arcp|contract|afn|reassoc|tail|noundef|zeroext|signext)\b", "",
                      cm.group(1)).strip().split()
         if not ret:
@@ -312,6 +316,8 @@ def indirect_call_sigs(module_text, fname):
         for a in sg.args:   # call-site operands, not parameter attributes
             a.attrs = "byval(%s)" % a.byval_type() if a.byval_type() else ""
             a.name = None
+        sg.callee = cm.group(2)[1:] if cm.group(2).startswith("@") else None
+        sg.vararg = sg.vararg or "..." in cm.group(1)
         out.append(sg)
     return out
 
@@ -491,13 +497,15 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         return res
     try:
         rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
-                            "--disable-undef-input", "--smt-to=%d" % smt_to,
+                            "--disable-undef-input", "--smt-to=%d" % smt_to] + ALIVE_EXTRA + [
                             "--func=" + fname.strip('"')],
                            timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
     except subprocess.TimeoutExpired:
         res.update(status="timeout", detail="wall clock")
         return res
     st = classify(out, err, rc)
+    if ALIVE_EXTRA:
+        res["alive_extra"] = " ".join(ALIVE_EXTRA)
     if L.used_probe:
         res["probe"] = True   # relies on a probe-derived opaque instruction
     if st == "mismatch":

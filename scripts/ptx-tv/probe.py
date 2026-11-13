@@ -35,10 +35,11 @@ FAMILIES = re.compile(r"(tcgen05|cp\.async\.bulk|cp\.reduce|spcompress|spdecompr
                       r"st\.async|multimem|tensormap|clusterlaunchcontrol|griddepcontrol|"
                       r"ldmatrix|stmatrix|wmma|mma|wgmma|cp\.async|red\.async|"
                       r"stacksave|stackrestore|applypriority|tex|suld|sust|txq|suq|st\.bulk|"
-                      r"tld4)\b")
+                      r"tld4|mapa|getctarank|discard|pm\.event|barrier\.cluster)\b")
 PTX_FAMILIES = re.compile(r"^(tcgen05|cp|spcompress|spdecompress|st|multimem|tensormap|"
                           r"clusterlaunchcontrol|griddepcontrol|ldmatrix|stmatrix|wmma|mma|"
-                          r"wgmma|red|applypriority|tex|suld|sust|txq|suq|tld4)$")
+                          r"wgmma|red|applypriority|tex|suld|sust|txq|suq|tld4|mapa|"
+                          r"getctarank|discard|pmevent|barrier)$")
 COPY_OPS = {"mov", "cvta"}
 LLC = None
 _cache = {}
@@ -149,6 +150,7 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
     src = {}          # reg -> ("arg", argindex, byteoff, bits)
     target = None
     results = {}      # reg -> retval byte offset
+    sel = {}          # int reg -> predicate it was selected from
     regw = {}
     for it in items:
         if it[0] != "stmt":
@@ -179,6 +181,15 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
             for q, d in enumerate(dsts):
                 src[d] = ("arg", pidx[m.group(1)], int(m.group(2) or 0) + q * eb // 8, eb)
             continue
+        # mov.b128 d, {lo, hi}: two contiguous pieces of the same argument
+        if base == "mov" and len(ops) == 2 and ops[1].strip().startswith("{") and \
+                not ops[0].strip().startswith("{"):
+            parts = [x.strip() for x in split_top(ops[1].strip()[1:-1])]
+            ss = [src.get(x) for x in parts]
+            if all(ss) and len({x[1] for x in ss}) == 1 and all(
+                    ss[q][2] == ss[0][2] + sum(x[3] for x in ss[:q]) // 8 for q in range(len(ss))):
+                src[ops[0].strip()] = ("arg", ss[0][1], ss[0][2], sum(x[3] for x in ss))
+                continue
         if base in COPY_OPS and len(ops) == 2 and ops[1].strip() in src:
             src[ops[0].strip()] = src[ops[1].strip()]
             continue
@@ -200,11 +211,17 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
             ts = [x for x in mods if x in ptx_lift.TBITS]
             eb = ptx_lift.TBITS[ts[0]]
             for q, v in enumerate(vals):
+                v = sel.get(v, v)
                 if v in results or target is None:
                     return None
                 results[v] = (int(m.group(1) or 0) + q * eb // 8, eb)
             continue
         if base == "ret":
+            continue
+        # predicate result turned into an integer: selp.bN r, 1|-1, 0, p
+        if target is not None and base == "selp" and len(ops) == 4 and \
+                ops[1].strip() in ("1", "-1") and ops[2].strip() == "0":
+            sel[ops[0].strip()] = ops[3].strip()
             continue
         if target is not None:
             return None   # more than one real instruction
@@ -326,7 +343,7 @@ def helper_body(fname, mp, ret, args, typedefs):
                 v2 = tmp()
                 L.append("  %s = zext i%d %s to i64" % (v2, bits, v))
                 v = v2
-            cargs.append("i64 " + v)
+            cargs.append("i%d %s" % (max(bits, 64), v))
     nd = len(mp.dsts)
     rty = "void" if nd == 0 else "{ %s }" % ", ".join(["i64"] * nd)
     if rty == "void":
@@ -346,8 +363,11 @@ def helper_body(fname, mp, ret, args, typedefs):
             off, sbits, rbits = d
             e = tmp()
             L.append("  %s = extractvalue %s %s, %d" % (e, rty, r, q))
-            t2 = tmp()
-            L.append("  %s = trunc i64 %s to i%d" % (t2, e, sbits))
+            if sbits < 64:
+                t2 = tmp()
+                L.append("  %s = trunc i64 %s to i%d" % (t2, e, sbits))
+            else:
+                t2 = e
             p = tmp()
             L.append("  %s = getelementptr i8, ptr %s, i64 %d" % (p, rs, off))
             L.append("  store i%d %s, ptr %s, align 1" % (sbits, t2, p))

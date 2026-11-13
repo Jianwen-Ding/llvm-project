@@ -1999,13 +1999,14 @@ class Lifter:
                     raise Unsupported("generic op pointer type")
                 vals.append(p)
             else:
+                cw = int(carg.ty[1:]) if re.fullmatch(r"i\d+", carg.ty) else 64
                 if text in self.regs:
                     w = self.regs[text]
                     v = self.read_reg(text, w)
-                    v = self.resize(v, w, 64, False)
+                    v = self.resize(v, w, cw, False)
                 else:
-                    v = self.get(text, 64)
-                vals.append("i64 " + v)
+                    v = self.get(text, cw)
+                vals.append("i%d %s" % (cw, v))
         if nd == 0:
             self.emit("call void @%s(%s)" % (name, ", ".join(vals)))
             return
@@ -2230,18 +2231,30 @@ class Lifter:
             if len(ops) > 1 and ops[1].startswith("(") else []
         indirect = callee.startswith("%")
         if indirect:
-            sigs = {(x.ret, tuple(a.ty for a in x.args), x.vararg): x for x in self.indirect_sigs}
+            key = self.base_of.get(callee)
+            target = None
+            if key is not None and key[0] == "sym" and callee in self.exact and \
+                    key[1] in self.name_map:
+                target = self.name_map[key[1]]     # mov %rd, func: a known function
+            cands = [x for x in self.indirect_sigs
+                     if getattr(x, "callee", None) == target and len(self.sized_args(x.args)) == len(args)
+                     and (x.ret == "void" or self.zero_sized(x.ret)) == (not rets)]
+            sigs = {(x.ret, tuple(a.ty for a in x.args), x.vararg): x for x in cands}
             if len(sigs) != 1:
                 raise Unsupported("indirect call with ambiguous source signature")
             csig = next(iter(sigs.values()))
-            fv = self.get(callee, 64)
-            key = self.base_of.get(callee)
-            if key is not None and callee in self.exact:
-                b = self.base_ptr(key)
-                fp = "%s %s" % b if b else None
+            if csig.vararg:
+                raise Unsupported("vararg")
+            if target is not None:
+                fname = "@" + target
             else:
-                fp = self.rebase(key, fv) if key is not None else None
-            fname = fp.rsplit(" ", 1)[1] if fp else self.op("inttoptr i64 %s to ptr" % fv)
+                fv = self.get(callee, 64)
+                if key is not None and callee in self.exact:
+                    b = self.base_ptr(key)
+                    fp = "%s %s" % b if b else None
+                else:
+                    fp = self.rebase(key, fv) if key is not None else None
+                fname = fp.rsplit(" ", 1)[1] if fp else self.op("inttoptr i64 %s to ptr" % fv)
         else:
             if len(ops) > 2:
                 raise Unsupported("call with prototype")
@@ -2268,6 +2281,8 @@ class Lifter:
             vals = [next(it) if a in cargs else "%s zeroinitializer" % a.ty for a in csig.args]
         self.callees.append(fname)
         call = "call %s %s(%s)" % (csig.ret, fname if indirect else "@" + fname, ", ".join(vals))
+        if indirect and fname.startswith("@"):
+            self.callees.append(fname[1:])
         if csig.ret == "void":
             if rets:
                 raise Unsupported("void call with retval")
