@@ -112,12 +112,56 @@ FunctionPass *llvm::createAGXISelDag(AGXTargetMachine &TM) {
   return new AGXDAGToDAGISelLegacy(TM);
 }
 
+static cl::opt<bool> FreezeAsUse(
+    "agx-freeze-as-use",
+    cl::desc("select a freeze of an instruction's result as the result "
+             "itself, not a copy"),
+    cl::init(true), cl::Hidden);
+
 void AGXDAGToDAGISel::Select(SDNode *N) {
   if (N->isMachineOpcode()) {
     N->setNodeId(-1);
     return;
   }
   switch (N->getOpcode()) {
+  case ISD::FREEZE: {
+    // A freeze is a COPY (SelectionDAGISel), which keeps MachineCSE from
+    // merging selects of the value and of its bitcast. The result of a
+    // SIMD-group operation (convergent: a shuffle, ballot, reduction or
+    // scan) or of a load is one fixed value in its register, never folded
+    // into or rematerialized at its users: freeze it by using it. Not for
+    // nodes that patterns fold into each user (a compare into a select),
+    // which would read an undef operand again at each, nor for an undef or
+    // a register from another block (an IMPLICIT_DEF).
+    SDValue V = N->getOperand(0);
+    while (V.getOpcode() == ISD::BITCAST)
+      V = V.getOperand(0);
+    bool Fixed = V.getOpcode() == ISD::LOAD;
+    if (V.getOpcode() == ISD::INTRINSIC_WO_CHAIN)
+      switch (V.getConstantOperandVal(0)) {
+      case Intrinsic::agx_simd_shuffle:
+      case Intrinsic::agx_simd_shuffle_xor:
+      case Intrinsic::agx_simd_shuffle_up:
+      case Intrinsic::agx_simd_shuffle_down:
+      case Intrinsic::agx_quad_shuffle:
+      case Intrinsic::agx_quad_shuffle_xor:
+      case Intrinsic::agx_quad_shuffle_up:
+      case Intrinsic::agx_quad_shuffle_down:
+      case Intrinsic::agx_simd_ballot:
+      case Intrinsic::agx_quad_ballot:
+      case Intrinsic::agx_simd_reduce:
+      case Intrinsic::agx_simd_prefix:
+      case Intrinsic::agx_quad_reduce:
+      case Intrinsic::agx_quad_prefix:
+        Fixed = true;
+      }
+    if (FreezeAsUse && Fixed) {
+      ReplaceUses(SDValue(N, 0), N->getOperand(0));
+      CurDAG->RemoveDeadNode(N);
+      return;
+    }
+    break;
+  }
   case AGXISD::CALL: {
     SDLoc DL(N);
     // Mesa's push_exec r0l, 2 is if_fcmp r0l, eq, 0.0, 0.0, 2.

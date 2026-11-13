@@ -7,7 +7,10 @@
 ; block of its own, into an empty block; the default SimplifyCFG does not merge
 ; them (three instructions to speculate). AGXCodeGenPrepare merges the
 ; branches and the SimplifyCFG before structurization makes the phis selects:
-; no if, no mask operations, no moves.
+; no if, no mask operations, no moves. The || is then `select lt, 1, (and eq,
+; lt)`, combined into `or lt, (freeze (and eq, lt))`: the freeze is pushed into
+; the compares (AGXISelLowering) and is no copy of the shuffle (AGXISelDAGToDAG),
+; so the or is the last compare-select, without an `and 1`.
 ; NOFOLD: if_icmp
 
 declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)
@@ -16,7 +19,7 @@ declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @step(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-LABEL: step:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 8 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 7 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0: // %entry
@@ -28,10 +31,8 @@ define agx_kernel void @step(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    simd_shuffle_xor r5, r3, 1
 ; CHECK-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
-; CHECK-NEXT:    fcmpsel lt, r7, r3, r5, 1, 0
 ; CHECK-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
-; CHECK-NEXT:    or r6, r7, r6
-; CHECK-NEXT:    and r6, r6, 1
+; CHECK-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
 ; CHECK-NEXT:    icmpsel ueq, r3, r6, 0, r3, r5
 ; CHECK-NEXT:    icmpsel ueq, r2, r6, 0, r2, r4
 ; CHECK-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed

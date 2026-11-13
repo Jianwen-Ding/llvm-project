@@ -114,7 +114,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
-                       ISD::MULHS, ISD::ADD});
+                       ISD::MULHS, ISD::ADD, ISD::FREEZE});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1783,6 +1783,12 @@ static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
   return DAG.getNode(ISD::SUB, DL, MVT::i32, F, C(128));
 }
 
+static cl::opt<bool> FreezeTruthLogic(
+    "agx-freeze-truth-logic",
+    cl::desc("push a freeze of an and / or / xor / select of truth values "
+             "into its operands"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> SelectOfSelect(
     "agx-select-of-select",
     cl::desc("a select on an or / and of truth values as two nested "
@@ -2068,6 +2074,27 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
         DAG.getConstant(0, DL, C.getOperand(0).getValueType()), ISD::SETLT);
     return DAG.getSelect(DL, N->getValueType(0), Lt, N->getOperand(2),
                          N->getOperand(1));
+  }
+  case ISD::FREEZE: {
+    // freeze (and a, b) -> and (freeze a), (freeze b), likewise or, xor and
+    // select, for i1: the generic combine pushes a freeze only into an
+    // operation with one operand that may be poison (or a compare), and
+    // `select c, true, d` -> `or c, freeze d` leaves a frozen and of two
+    // compares, whose known bits (0 or 1) are lost. Each operand is frozen
+    // here, without replacing its other uses; the compares then take the
+    // freezes into their own operands.
+    SDValue V = N->getOperand(0);
+    if (!FreezeTruthLogic || V.getValueType() != MVT::i1 || !V.hasOneUse())
+      return SDValue();
+    unsigned Opc = V.getOpcode();
+    if (Opc != ISD::AND && Opc != ISD::OR && Opc != ISD::XOR &&
+        Opc != ISD::SELECT)
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    SmallVector<SDValue, 3> Ops;
+    for (SDValue Op : V->op_values())
+      Ops.push_back(DAG.getFreeze(Op));
+    return DAG.getNode(Opc, SDLoc(N), MVT::i1, Ops);
   }
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
