@@ -175,22 +175,31 @@ with its sign fixed) in the equal case.
 ## Test-suite run
 
 `RESULTS.md` has the numbers (generated from `results.jsonl` by
-`gen_results.py`). Two passes were combined: up to 6 functions per test file,
-then up to 8 more per file not checked before; everything that was not proved
-correct was re-checked with the final lifter, and solver timeouts were
-re-run with a larger budget and the weaker `--disable-poison-input` check
-(tagged in the results). In short: 3323 functions from 620 test files; 2457
-proved correct (584 through probe-derived opaque instructions, 20 only with
-the weaker check); 15 counterexamples of finding 1 (plus 1 padding
-over-read); 4 of findings 2/2b/3/4; 4 unresolved (min/max signed zeros) and
-2 NaN-bits notes; 84 in known modelling classes; 36 not lifted; 610 solver
-timeouts or inconclusive.
+`gen_results.py`). Three passes were combined (up to 6, 8 and 10 further
+functions per test file, so files with up to 24 functions are fully
+covered); everything not proved correct was re-checked with the final
+lifter, and earlier solver timeouts were re-run with a larger budget and the
+weaker `--disable-poison-input` check (tagged). In short: 4170 functions from
+620 test files; 3101 proved correct (663 through probe-derived opaque
+instructions, 20 only with the weaker check); 30 counterexamples with
+out-of-bounds `.param` accesses (finding 1, plus the padding over-reads);
+findings 2/2b/3/4; 5 unresolved (min/max signed zeros) and 1 NaN-bits note;
+128 in known modelling classes; 31 not lifted; 738 solver timeouts or
+inconclusive.
 
-Not lifted (36): variadic calls and calls whose LLVM type cannot be
-recovered (passed through `undef`, or ambiguous), two kernels with non-void
-LLVM return types, `stacksave`/`stackrestore`, `st.async`/`multimem.st.async`
-variants the probe cannot trace, function-scope `.shared` variables, a few
-calls to undeclared/library functions.
+Not lifted: variadic *callees* (they read their arguments through
+`va_arg`, which Alive2 models abstractly; variadic *calls* are lifted),
+calls through `undef`, two kernels with non-void LLVM return types,
+`stacksave`/`stackrestore`, `st.async`/`st.mmio`/`multimem.st.async`
+variants, function-scope `.shared` variables, a few calls to
+undeclared/library functions.
 
 The remaining timeouts are float-heavy functions: neither a 6x larger solver
 budget nor the weaker check resolves more than a few percent of them.
+
+## Observations not counted as defects
+
+* `intrinsic-old.ll` `test_gridid`: `llvm.nvvm.read.ptx.sreg.gridid` is a
+  32-bit intrinsic and is lowered to `mov.u32 %r, %gridid`; the PTX ISA
+  documents `%gridid` as 64-bit (since PTX 3.0). Not checkable without the
+  vendor toolchain; noted only.

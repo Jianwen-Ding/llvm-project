@@ -458,7 +458,7 @@ class Lifter:
         # lanemask.ge) unless the intrinsic overrides its name
         if not (nm.endswith("_smem_size") or nm.startswith("reserved_smem_offset")):
             nm = nm.replace("_", ".")
-        ty = 64 if nm in ("clock64", "globaltimer", "gridid") else 32
+        ty = 64 if nm in ("clock64", "globaltimer") else 32  # gridid: i32 in LLVM
         fname = "nvvm.read.ptx.sreg." + nm
         attrs = "memory(none)" if base in SREG_PURE else \
             "memory(inaccessiblemem: readwrite)"
