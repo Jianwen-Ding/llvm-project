@@ -39,7 +39,7 @@ using namespace llvm;
 #define DEBUG_TYPE "agx-cold-regions"
 
 static cl::opt<bool> EnableColdRegions(
-    "agx-cold-regions", cl::init(true), cl::Hidden,
+    "agx-move-cold-regions", cl::init(true), cl::Hidden,
     cl::desc("Move if-bodies entered with an unlikely edge to the end of the "
              "function, so that skipping them is a jump not taken"));
 

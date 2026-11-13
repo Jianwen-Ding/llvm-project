@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-cold-regions=false < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-move-cold-regions=false < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -mattr=+ieee-fp32 < %s | FileCheck %s --check-prefix=OFF
 
 ; An if-body entered with an unlikely edge (here double precision's general
