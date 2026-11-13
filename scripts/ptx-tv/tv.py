@@ -195,6 +195,9 @@ def prepare_source(path, workdir):
     # noalias on parameters is unsupported by Alive2; dropping an assumption
     # makes the source more defined (cannot hide a defect)
     text = re.sub(r"(define [^\n]*)", lambda m: re.sub(r"\bnoalias\b\s*", "", m.group(1)), text)
+    # Unnamed globals (@0, @1, ...) are printed as __unnamed_<N+1> in PTX;
+    # give them those names so functions can be extracted and matched.
+    text = re.sub(r"@(\d+)\b(?!\s*=\s*!)", lambda m: "@__unnamed_%d" % (int(m.group(1)) + 1), text)
     # A kernel's return value is not observable (.entry has no return
     # parameter): return poison from non-void kernels, as the lifted code does.
     def kernel_ret(m):
@@ -241,6 +244,14 @@ def module_symbols(text):
                 rest = m.group(2)
                 am = re.search(r"\baddrspace\((\d+)\)", rest.split("global")[0].split("constant")[0])
                 globals_[m.group(1)] = "ptr addrspace(%s)" % am.group(1) if am and am.group(1) != "0" else "ptr"
+    # function aliases: @b = ... alias <ty>, ptr @a  -> callable like @a
+    for m in re.finditer(r'^@("[^"]*"|[-a-zA-Z$._0-9]+)\s*=[^\n]*\balias\b[^\n]*@("[^"]*"|[-a-zA-Z$._0-9]+)\s*$',
+                         text, re.M):
+        if m.group(2) in decls and m.group(1) not in decls:
+            import copy
+            sg = copy.copy(decls[m.group(2)])
+            sg.name = m.group(1)
+            decls[m.group(1)] = sg
     return defines, decls, globals_, typedefs
 
 
