@@ -43,6 +43,11 @@
 #include "llvm/ADT/GenericUniformityImpl.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Transforms/Utils/SSAUpdater.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CycleAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -506,6 +511,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool foldLaneIdentities(Function &F);
   bool simdScans(Function &F, const AGXSubtarget &ST);
   bool mergeLoopExits(Function &F);
+  bool forwardOwnSlots(Function &F);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
   bool flushHalfDenormals(Function &F);
   bool flushFloatMinMax(Function &F);
@@ -1922,6 +1928,136 @@ bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
       P.replaceIncomingBlockWith(T, X);
     T->eraseFromParent();
     Changed = true;
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXForwardOwnSlots(
+    "agx-forward-own-slots", cl::init(true), cl::Hidden,
+    cl::desc("Loads of a thread's own slot of threadgroup memory that only "
+             "its thread writes as the value it last stored there"));
+
+/// Whether S is a thread's index in its threadgroup, unique to it: the
+/// linear index, or the x position in a threadgroup known to be one row
+/// ("agx-threads-per-threadgroup"="X,1,1"), maybe extended.
+static bool isUniqueThreadIndex(const SCEV *S, const Function &F) {
+  while (auto *C = dyn_cast<SCEVCastExpr>(S))
+    S = C->getOperand();
+  auto *U = dyn_cast<SCEVUnknown>(S);
+  auto *II = U ? dyn_cast<IntrinsicInst>(U->getValue()) : nullptr;
+  if (!II)
+    return false;
+  if (II->getIntrinsicID() == Intrinsic::agx_thread_index_in_threadgroup)
+    return true;
+  if (II->getIntrinsicID() != Intrinsic::agx_thread_position_in_threadgroup_x)
+    return false;
+  Attribute A = F.getFnAttribute("agx-threads-per-threadgroup");
+  if (!A.isStringAttribute())
+    return false;
+  SmallVector<StringRef, 3> Parts;
+  A.getValueAsString().split(Parts, ',');
+  return Parts.size() == 3 && Parts[1] == "1" && Parts[2] == "1";
+}
+
+/// A threadgroup array (internal, undefined at the start) whose every write
+/// is a plain store at G + size * tid, tid unique to each thread (a tree
+/// reduction's sh[tid] = v; barrier; sh[tid] = sh[tid] + sh[tid + s]): no
+/// other thread ever writes a thread's own slot, so its loads of that slot
+/// read what it last stored there (or the undefined start), whatever the
+/// barriers between. Those loads become that value (SSAUpdater's phis);
+/// the stores stay, for the other threads that read them.
+bool AGXCodeGenPrepare::forwardOwnSlots(Function &F) {
+  if (!AGXForwardOwnSlots)
+    return false;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  bool Changed = false;
+  for (GlobalVariable &G : F.getParent()->globals()) {
+    if (G.getAddressSpace() != AGX::THREADGROUP_ADDRESS ||
+        !G.hasLocalLinkage() || !G.hasInitializer() ||
+        !isa<UndefValue>(G.getInitializer()))
+      continue;
+    // Every use: addresses, simple loads and stores, in this function.
+    SmallVector<LoadInst *, 8> Loads;
+    SmallVector<StoreInst *, 8> Stores;
+    SmallVector<Value *, 16> Work{&G};
+    SmallPtrSet<Value *, 16> Seen;
+    bool Ok = true;
+    while (!Work.empty() && Ok) {
+      Value *V = Work.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (User *U : V->users()) {
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I) {
+          if (isa<ConstantExpr>(U))
+            Work.push_back(U);
+          else
+            Ok = false;
+          continue;
+        }
+        if (I->getFunction() != &F) {
+          Ok = false;
+        } else if (auto *Ld = dyn_cast<LoadInst>(I)) {
+          Ok &= Ld->isSimple();
+          Loads.push_back(Ld);
+        } else if (auto *St = dyn_cast<StoreInst>(I)) {
+          Ok &= St->isSimple() && St->getPointerOperand() == V;
+          Stores.push_back(St);
+        } else if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I)) {
+          Work.push_back(I);
+        } else {
+          Ok = false;
+        }
+      }
+    }
+    if (!Ok || Stores.empty())
+      continue;
+    // One own slot: every store at G + size * tid.
+    const SCEV *Own = SE.getSCEV(Stores.front()->getPointerOperand());
+    Type *Ty = Stores.front()->getValueOperand()->getType();
+    uint64_t Size = F.getDataLayout().getTypeStoreSize(Ty);
+    for (StoreInst *St : Stores)
+      if (SE.getSCEV(St->getPointerOperand()) != Own ||
+          St->getValueOperand()->getType() != Ty)
+        Ok = false;
+    const SCEV *Off = SE.getMinusSCEV(Own, SE.getSCEV(&G));
+    auto *M = dyn_cast<SCEVMulExpr>(Off);
+    auto *K = M && M->getNumOperands() == 2
+                  ? dyn_cast<SCEVConstant>(M->getOperand(0))
+                  : nullptr;
+    if (!Ok || !K || K->getAPInt() != Size ||
+        !isUniqueThreadIndex(M->getOperand(1), F))
+      continue;
+    SSAUpdater SSA;
+    SSA.Initialize(Ty, G.getName().str() + ".own");
+    for (StoreInst *St : Stores) {
+      BasicBlock *BB = St->getParent();
+      // (the last store of each block)
+      StoreInst *Last = St;
+      for (StoreInst *O : Stores)
+        if (O->getParent() == BB && Last->comesBefore(O))
+          Last = O;
+      SSA.AddAvailableValue(BB, Last->getValueOperand());
+    }
+    for (LoadInst *Ld : Loads) {
+      if (Ld->getType() != Ty || SE.getSCEV(Ld->getPointerOperand()) != Own)
+        continue;
+      Value *V = nullptr;
+      for (StoreInst *St : Stores)
+        if (St->getParent() == Ld->getParent() && St->comesBefore(Ld) &&
+            (!V || cast<StoreInst>(V)->comesBefore(St)))
+          V = St;
+      V = V ? cast<StoreInst>(V)->getValueOperand()
+            : SSA.GetValueInMiddleOfBlock(Ld->getParent());
+      Ld->replaceAllUsesWith(V);
+      Ld->eraseFromParent();
+      Changed = true;
+    }
   }
   return Changed;
 }
@@ -3579,6 +3715,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= foldLaneIdentities(F);
   Changed |= simdScans(F, ST);
   Changed |= mergeLoopExits(F);
+  Changed |= forwardOwnSlots(F);
   Changed |= lowerMatrixFMA(F, ST);
   if (ST.hasQuadShuffleIndexMerge())
     Changed |= lowerDivergentShuffles(F, TTI);
