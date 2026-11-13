@@ -126,6 +126,11 @@ static cl::opt<unsigned> AGXThreadgroupUnroll(
              "unrolled by, so that its loads can be merged (0: as far as "
              "contiguous loads become 16-byte ones, 1: no unrolling)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollNarrow(
+    "agx-device-unroll-narrow", cl::init(16), cl::Hidden,
+    cl::desc("The factor of agx-device-unroll for loops whose device loads "
+             "are all of one or two bytes (0: the same)"));
+
 static cl::opt<unsigned> AGXDeviceUnroll(
     "agx-device-unroll", cl::init(4), cl::Hidden,
     cl::desc("Iterations a single-block loop that loads device memory, of a "
@@ -323,6 +328,19 @@ void AGXTTIImpl::getUnrollingPreferences(
         return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
       });
     });
+    // Loads of one or two bytes (half, int8 rows): 16 where it divides the
+    // trip count, each iteration's work being small (L15-E234; 32 loses
+    // latency and occupancy).
+    bool Narrow = DeviceLoads && all_of(L->blocks(), [&](const BasicBlock *BB) {
+      return all_of(*BB, [&](const Instruction &I) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        return !LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
+               DL.getTypeStoreSize(LI->getType()) <= 2;
+      });
+    });
+    if (Narrow && AGXDeviceUnrollNarrow && Trips >= AGXDeviceUnrollNarrow &&
+        Trips % AGXDeviceUnrollNarrow == 0)
+      F = AGXDeviceUnrollNarrow;
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
       UP.Partial = true;
       UP.MaxCount = F;
