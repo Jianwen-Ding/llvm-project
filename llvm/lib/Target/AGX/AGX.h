@@ -55,6 +55,7 @@ FunctionPass *createAGXAnnotateControlFlowPass();
 FunctionPass *createAGXSinkAddressesPass();
 FunctionPass *createAGXThreadgroupAddressesPass();
 FunctionPass *createAGXHoistGuardedLoadsPass();
+FunctionPass *createAGXAlignmentVersioningPass();
 FunctionPass *createAGXNarrowInductionsPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
@@ -105,6 +106,7 @@ void initializeAGXAnnotateControlFlowPass(PassRegistry &);
 void initializeAGXSinkAddressesPass(PassRegistry &);
 void initializeAGXThreadgroupAddressesPass(PassRegistry &);
 void initializeAGXHoistGuardedLoadsPass(PassRegistry &);
+void initializeAGXAlignmentVersioningPass(PassRegistry &);
 void initializeAGXNarrowInductionsPass(PassRegistry &);
 void initializeAGXSpecialRegisterRangesPassPass(PassRegistry &);
 void initializeAGXVectorAccessesPass(PassRegistry &);

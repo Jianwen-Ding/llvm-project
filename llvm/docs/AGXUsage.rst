@@ -625,7 +625,12 @@ threadgroup memory are one ``xy`` / ``xyz`` / ``xyzw`` access at any 4-byte
 alignment, which the M2 Max handles exactly at every offset, across 64-byte
 lines and pages (ptx-re-blockers B33). The vectorizer runs after checked mode,
 so the checks see the accesses the source wrote. Vector arithmetic is still
-scalar.
+scalar. An innermost single-block loop whose half (or 16-bit integer)
+accesses of a kernel argument's buffer are only known aligned to their
+element, but would be at 4 bytes for a 4-byte aligned buffer, runs as two
+copies: one for buffers whose addresses are multiples of 4 (a test of the
+arguments, uniform), its accesses merged into wide ones, and the loop as it
+was (``AGXAlignmentVersioning``, ``-agx-alignment-versioning``).
 
 Threadgroup and private addresses that PTX computes in integers (``inttoptr``
 of an integer expression) are first written as a constant offset from the
