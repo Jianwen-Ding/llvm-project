@@ -54,6 +54,9 @@ def mapping(name, args):
             return None
         rnd = RND_IMM.get(int(imms[2]))
         return ("%s.%s%s%s.%s %%d, %%a0, %%a1" % (op, rnd, ftz or "", sat or "", OVL[ovl]), [0, 1])
+    m = re.fullmatch(r"fma\.rn\.oob(\.relu)?\.(\w+)", n)
+    if m and m.group(2) in OVL:
+        return ("fma.rn.oob%s.%s %%d, %%a0, %%a1, %%a2" % (m.group(1) or "", OVL[m.group(2)]), [0, 1, 2])
     m = re.fullmatch(r"fma(\.ftz)?(\.sat|\.relu)?\.(\w+)", n)
     if m and 3 in imms:
         ftz, var, ovl = m.groups()
@@ -239,7 +242,8 @@ def expand(text, lifter_mod):
             ty = re.sub(r"\b(noundef|immarg|signext|zeroext|inreg)\b", "", ty).strip()
             args.append((ty, val))
         # memory barriers: no-ops under single-thread semantics (as in tgt)
-        if re.fullmatch(r"membar\.\w+|fence\.[\w.]+", name) \
+        if re.fullmatch(r"membar\.\w+|fence\.[\w.]+|prefetch\.[\w.]+|prefetchu\.[\w.]+|"
+                        r"applypriority\.[\w.]+", name) \
                 and not re.match(r"\s*%", line):
             removed = True
             continue

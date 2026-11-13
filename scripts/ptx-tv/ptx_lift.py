@@ -901,7 +901,7 @@ class Lifter:
         "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
         "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
         "number", "notanumber", "normal", "subnormal", "u32", "s32",
-        "u64", "satfinite", "xorsign", "red", "popc", "inc", "dec", "m8n8", "trans",
+        "u64", "satfinite", "xorsign", "oob", "red", "popc", "inc", "dec", "m8n8", "trans",
     }
 
     def instr(self, base, mods, ops, opcode):
@@ -912,6 +912,8 @@ class Lifter:
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
+        if base in ("fence", "membar", "prefetch", "prefetchu"):
+            return h(mods, ops, opcode)   # no-ops whatever the modifiers
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
                 raise Unsupported("modifier .%s in %s" % (m, opcode))
@@ -1711,7 +1713,8 @@ class Lifter:
 
     def i_fma(self, mods, ops, opc):
         if "oob" in mods:
-            raise Unsupported(opc)
+            # .oob: special handling of "out-of-bounds" NaN inputs; uninterpreted
+            return self.uninterp(mods, ops, opc, 3)
         self.ffma(mods, ops, opc)
 
     def fdiv(self, mods, ops, opc):
