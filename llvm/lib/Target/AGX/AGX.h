@@ -56,6 +56,7 @@ FunctionPass *createAGXAnnotateControlFlowPass();
 FunctionPass *createAGXSinkAddressesPass();
 FunctionPass *createAGXThreadgroupAddressesPass();
 FunctionPass *createAGXHoistGuardedLoadsPass();
+FunctionPass *createAGXAlignmentVersioningPass();
 FunctionPass *createAGXNarrowInductionsPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
@@ -86,6 +87,7 @@ FunctionPass *createAGXHoistFromElseFlowPass();
 FunctionPass *createAGXSinkRematPass();
 FunctionPass *createAGXLowerControlFlowPass();
 FunctionPass *createAGXInsertWaitsPass();
+FunctionPass *createAGXColdRegionsPass();
 
 // Machine scheduler: keeps runs of memory accesses of one kind together.
 std::unique_ptr<ScheduleDAGMutation> createAGXMemClusterMutation();
@@ -106,6 +108,7 @@ void initializeAGXAnnotateControlFlowPass(PassRegistry &);
 void initializeAGXSinkAddressesPass(PassRegistry &);
 void initializeAGXThreadgroupAddressesPass(PassRegistry &);
 void initializeAGXHoistGuardedLoadsPass(PassRegistry &);
+void initializeAGXAlignmentVersioningPass(PassRegistry &);
 void initializeAGXNarrowInductionsPass(PassRegistry &);
 void initializeAGXSpecialRegisterRangesPassPass(PassRegistry &);
 void initializeAGXVectorAccessesPass(PassRegistry &);
@@ -119,6 +122,7 @@ void initializeAGXHoistFromElseFlowPass(PassRegistry &);
 void initializeAGXSinkRematPass(PassRegistry &);
 void initializeAGXLowerControlFlowPass(PassRegistry &);
 void initializeAGXInsertWaitsPass(PassRegistry &);
+void initializeAGXColdRegionsPass(PassRegistry &);
 void initializeAGXAsmPrinterPass(PassRegistry &);
 
 class TargetMachine;

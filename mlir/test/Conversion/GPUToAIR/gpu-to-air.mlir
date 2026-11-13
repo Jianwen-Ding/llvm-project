@@ -735,3 +735,123 @@ gpu.module @erfc_isinf_ipowi {
     gpu.return
   }
 }
+
+// -----
+
+// A binary search over index (lo from 0, hi any index, while lo < hi, a load
+// of a static 2^20-element memref at mid = (lo + hi) >> 1 every iteration):
+// its values stay below 2^31 (or the first load is out of bounds), so the
+// loop runs in i32.
+gpu.module @binary_search {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%keys: memref<1048576xi32, 1>, %sorted: memref<1048576xi32, 1>, %n: index, %m: index) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %key = memref.load %keys[%c0] : memref<1048576xi32, 1>
+    // CHECK: llvm.icmp "ult" %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.add %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.lshr %{{.*}}, %{{.*}} : i32
+    %r:2 = scf.while (%lo = %c0, %hi = %n) : (index, index) -> (index, index) {
+      %go = arith.cmpi ult, %lo, %hi : index
+      scf.condition(%go) %lo, %hi : index, index
+    } do {
+    ^bb0(%l: index, %h: index):
+      %s = arith.addi %l, %h : index
+      %mid = arith.shrui %s, %c1 : index
+      %v = memref.load %sorted[%mid] : memref<1048576xi32, 1>
+      %lt = arith.cmpi slt, %v, %key : i32
+      %m1 = arith.addi %mid, %c1 : index
+      %nl = arith.select %lt, %m1, %l : index
+      %nh = arith.select %lt, %h, %mid : index
+      scf.yield %nl, %nh : index, index
+    }
+    // lo from an argument: not narrowed (lo + hi may wrap).
+    // CHECK: llvm.icmp "ult" %{{.*}}, %{{.*}} : i64
+    %q:2 = scf.while (%lo = %m, %hi = %n) : (index, index) -> (index, index) {
+      %go = arith.cmpi ult, %lo, %hi : index
+      scf.condition(%go) %lo, %hi : index, index
+    } do {
+    ^bb0(%l: index, %h: index):
+      %s = arith.addi %l, %h : index
+      %mid = arith.shrui %s, %c1 : index
+      %v = memref.load %sorted[%mid] : memref<1048576xi32, 1>
+      %lt = arith.cmpi slt, %v, %key : i32
+      %m1 = arith.addi %mid, %c1 : index
+      %nl = arith.select %lt, %m1, %l : index
+      %nh = arith.select %lt, %h, %mid : index
+      scf.yield %nl, %nh : index, index
+    }
+    // a signed test: not narrowed
+    // CHECK: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+    %u:2 = scf.while (%lo = %c0, %hi = %n) : (index, index) -> (index, index) {
+      %go = arith.cmpi slt, %lo, %hi : index
+      scf.condition(%go) %lo, %hi : index, index
+    } do {
+    ^bb0(%l: index, %h: index):
+      %s = arith.addi %l, %h : index
+      %mid = arith.shrui %s, %c1 : index
+      %v = memref.load %sorted[%mid] : memref<1048576xi32, 1>
+      %lt = arith.cmpi slt, %v, %key : i32
+      %m1 = arith.addi %mid, %c1 : index
+      %nl = arith.select %lt, %m1, %l : index
+      %nh = arith.select %lt, %h, %mid : index
+      scf.yield %nl, %nh : index, index
+    }
+    %p0 = arith.addi %r#0, %q#0 : index
+    %p = arith.addi %p0, %u#1 : index
+    %pi = arith.index_cast %p : index to i32
+    memref.store %pi, %keys[%c0] : memref<1048576xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// math.exp and math.log of f64: fdlibm's algorithms in double operations
+// (the AIR emulation of doubles has no exp or log).
+gpu.module @exp_log_f64 {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK-NOT: llvm.intr.exp
+    // CHECK: llvm.intr.roundeven
+    // CHECK: llvm.fdiv
+    // CHECK: llvm.shl
+    // CHECK-NOT: llvm.intr.log
+    // CHECK: llvm.fdiv
+    // CHECK: llvm.sitofp
+    %e = math.exp %v : f64
+    %l = math.log %e : f64
+    memref.store %l, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// The other f64 exponentials, logarithms and hyperbolic functions build on
+// the f64 exp, log and expm1 above (no llvm.intr call is left for them).
+gpu.module @more_f64_functions {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK-NOT: llvm.intr.exp
+    // CHECK-NOT: llvm.intr.log
+    // CHECK-NOT: llvm.intr.cosh
+    // CHECK-NOT: llvm.intr.sinh
+    // CHECK-NOT: llvm.intr.tanh
+    // CHECK: llvm.return
+    %e1 = math.expm1 %v : f64
+    %e2 = math.log1p %e1 : f64
+    %e3 = math.exp2 %e2 : f64
+    %e4 = math.log2 %e3 : f64
+    %e5 = math.log10 %e4 : f64
+    %e6 = math.cosh %e5 : f64
+    %e7 = math.sinh %e6 : f64
+    %e8 = math.tanh %e7 : f64
+    memref.store %e8, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}

@@ -596,16 +596,18 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
 template <typename OpTy>
 static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   auto type = dyn_cast<FloatType>(op.getType());
-  if (!type || !(type.isF16() || type.isBF16() || type.isF32()))
+  if (!type || !(type.isF16() || type.isBF16() || type.isF32() || type.isF64()))
     return failure();
   Location loc = op.getLoc();
-  Type f32 = rewriter.getF32Type();
+  // f16 and bf16 in f32; f64 in f64 (its exp and log: rewriteExpF64 /
+  // rewriteLogF64)
+  Type f32 = type.isF64() ? Type(type) : Type(rewriter.getF32Type());
   Value x = op.getOperand();
-  if (!type.isF32())
+  if (!type.isF32() && !type.isF64())
     x = arith::ExtFOp::create(rewriter, loc, f32, x);
   auto c = [&](float v) {
     return arith::ConstantOp::create(rewriter, loc, f32,
-                                     rewriter.getF32FloatAttr(v));
+                                     rewriter.getFloatAttr(f32, v));
   };
   auto eq = [&](Value a, Value b) {
     return arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ, a, b);
@@ -633,7 +635,7 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
         arith::SubFOp::create(rewriter, loc, u, one));
     r = sel(small, sel(eq(u, one), x, q), lu);
   }
-  if (!type.isF32())
+  if (!type.isF32() && !type.isF64())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
   rewriter.replaceOp(op, r);
   return success();
@@ -792,6 +794,286 @@ static LogicalResult rewriteErfc(math::ErfcOp op, PatternRewriter &rewriter) {
                               c(0.0f), r);
   r = arith::SelectOp::create(b, cmp(arith::CmpFPredicate::OLT, x, c(0.0f)),
                               arith::SubFOp::create(b, two, r), r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// math.exp of f64 (no double precision exp on the GPU; the AIR emulation
+/// of doubles has arithmetic only): fdlibm's e_exp.c in double operations,
+/// which the emulation computes. k = roundeven(x / ln 2), r = x - k ln2hi -
+/// k ln2lo (k ln2hi exact: ln2hi has 11 trailing zero bits), c = r - r^2
+/// P(r^2), exp(r) = 1 - ((lo - r c / (2 - c)) - hi), within 1 ulp; then
+/// times 2^k as two powers of two (each normal; the product rounds once
+/// where it is denormal). x is clamped to [-746, 710] first (by compares
+/// that keep a NaN), beyond which the result is 0 or infinite anyway.
+static LogicalResult rewriteExpF64(math::ExpOp op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) {
+    return arith::ConstantIntOp::create(b, i64, v);
+  };
+  auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
+  auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
+  auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
+  auto fma = [&](Value x, Value y, Value z) {
+    return math::FmaOp::create(b, x, y, z);
+  };
+  auto sel = [&](Value cnd, Value x, Value y) {
+    return arith::SelectOp::create(b, cnd, x, y);
+  };
+  Value x = op.getOperand();
+  x = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::OGT, x, c(710.0)),
+          c(710.0), x);
+  x = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, x, c(-746.0)),
+          c(-746.0), x);
+  Value k = math::RoundEvenOp::create(b, mul(x, c(1.44269504088896338700e+00)));
+  Value hi = sub(x, mul(k, c(6.93147180369123816490e-01)));
+  Value lo = mul(k, c(1.90821492927058770002e-10));
+  Value r = sub(hi, lo);
+  Value t = mul(r, r);
+  Value p = c(4.13813679705723846039e-08);
+  for (double coef : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
+                      -2.77777777770155933842e-03, 1.66666666666666019037e-01})
+    p = fma(t, p, c(coef));
+  Value cc = sub(r, mul(t, p));
+  Value y = sub(c(1.0), sub(sub(lo, arith::DivFOp::create(
+                                       b, mul(r, cc), sub(c(2.0), cc))),
+                            hi));
+  // 2^k = 2^k1 2^k2, k1 = k >> 1 (k within [-1077, 1025])
+  Value ki = arith::FPToSIOp::create(b, i64, k);
+  Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
+  Value k2 = arith::SubIOp::create(b, ki, k1);
+  auto pow2 = [&](Value e) {
+    return arith::BitcastOp::create(
+        b, f64,
+        arith::ShLIOp::create(b, arith::AddIOp::create(b, e, ci(1023)), ci(52)));
+  };
+  rewriter.replaceOp(op, mul(mul(y, pow2(k1)), pow2(k2)));
+  return success();
+}
+
+/// math.log of f64: fdlibm's e_log.c in double and integer operations
+/// (within 1 ulp): x (a denormal scaled by 2^54) is 2^k (1 + f) with 1 + f
+/// in [sqrt(2)/2, sqrt(2)), s = f / (2 + f), R a polynomial in s^2, and
+/// log x = k ln2hi - ((f^2 / 2 - (s (f^2 / 2 + R) + k ln2lo)) - f), or the
+/// form without f^2 / 2 that fdlibm takes near the interval's ends (both
+/// computed, one selected); +0 / -0 give -inf, negative values NaN, +inf
+/// itself, NaN NaN.
+static LogicalResult rewriteLogF64(math::LogOp op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
+  auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
+  auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
+  auto fma = [&](Value x, Value y, Value z) {
+    return math::FmaOp::create(b, x, y, z);
+  };
+  auto sel = [&](Value cnd, Value x, Value y) {
+    return arith::SelectOp::create(b, cnd, x, y);
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value x, Value y) {
+    return arith::CmpIOp::create(b, p, x, y);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value x, Value y) {
+    return arith::CmpFOp::create(b, p, x, y);
+  };
+  auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v); };
+  Value x = op.getOperand();
+  // denormals scaled by 2^54
+  Value tiny = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p-1022));
+  Value x2 = sel(tiny, mul(x, c(0x1p54)), x);
+  Value k0 = sel(tiny, ci(-54), ci(0));
+  Value bx = bits(x2);
+  Value hx = arith::ShRUIOp::create(b, bx, ci(32));
+  Value k = arith::AddIOp::create(
+      b, k0, arith::SubIOp::create(b, arith::ShRUIOp::create(b, hx, ci(20)),
+                                   ci(1023)));
+  hx = arith::AndIOp::create(b, hx, ci(0xfffff));
+  Value i = arith::AndIOp::create(
+      b, arith::AddIOp::create(b, hx, ci(0x95f64)), ci(0x100000));
+  Value newHi = arith::OrIOp::create(
+      b, hx, arith::XOrIOp::create(b, i, ci(0x3ff00000)));
+  Value x3 = arith::BitcastOp::create(
+      b, f64,
+      arith::OrIOp::create(b, arith::ShLIOp::create(b, newHi, ci(32)),
+                           arith::AndIOp::create(b, bx, ci(0xffffffff))));
+  k = arith::AddIOp::create(b, k, arith::ShRUIOp::create(b, i, ci(20)));
+  Value f = sub(x3, c(1.0));
+  Value sv = arith::DivFOp::create(b, f, add(c(2.0), f));
+  Value z = mul(sv, sv), w = mul(z, z);
+  Value t1 = mul(w, fma(w, fma(w, c(1.531383769920937332e-01),
+                               c(2.222219843214978396e-01)),
+                        c(3.999999999940941908e-01)));
+  Value t2 = mul(z, fma(w, fma(w, fma(w, c(1.479819860511658591e-01),
+                                      c(1.818357216161805012e-01)),
+                               c(2.857142874366239149e-01)),
+                        c(6.666666666666735130e-01)));
+  Value r = add(t2, t1);
+  Value dk = arith::SIToFPOp::create(b, f64, k);
+  Value hiPart = mul(dk, c(6.93147180369123816490e-01));
+  Value loPart = mul(dk, c(1.90821492927058770002e-10));
+  Value hfsq = mul(mul(c(0.5), f), f);
+  Value a = sub(hiPart, sub(sub(hfsq, add(mul(sv, add(hfsq, r)), loPart)), f));
+  Value bb = sub(hiPart, sub(sub(mul(sv, sub(f, r)), loPart), f));
+  Value ij = arith::OrIOp::create(
+      b, arith::SubIOp::create(b, hx, ci(0x6147a)),
+      arith::SubIOp::create(b, ci(0x6b851), hx));
+  Value res = sel(icmp(arith::CmpIPredicate::sgt, ij, ci(0)), a, bb);
+  // specials
+  Value inf = c(std::numeric_limits<double>::infinity());
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, x, inf), inf, res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(0.0)),
+            c(-std::numeric_limits<double>::infinity()), res);
+  res = sel(fcmp(arith::CmpFPredicate::ULT, x, c(0.0)),
+            c(std::numeric_limits<double>::quiet_NaN()), res);
+  rewriter.replaceOp(op, res);
+  return success();
+}
+
+/// exp2, log2, log10, cosh, sinh and tanh of f64 from the f64 exp, log and
+/// expm1 above (each rewritten in turn), in fdlibm's forms:
+///   exp2 x = exp(r ln 2) 2^k, k = roundeven(x), r = x - k (exact), r ln 2
+///     with its rounding error recovered by an fma (k applied as two powers
+///     of two; x clamped to [-1080, 1030] keeping a NaN);
+///   log2 x = k + log(m) log2(e), log10 x = k log10(2) + log(m) log10(e),
+///     x = 2^k m with m in [sqrt(2)/2, sqrt(2)) (exact for powers of two);
+///   cosh x = (e + 1/e) / 2, e = exp(|x|) (exp(|x| / 2)^2 / 2 from 709);
+///   sinh x = h (2t - t^2 / (t + 1)) (|x| < 1) or h (t + t / (t + 1))
+///     (|x| < 22), t = expm1(|x|), h = +-1/2; then h exp(|x|) (exp(|x| /
+///     2)^2 h 2 from 709);
+///   tanh x = 1 - 2 / (t + 2) from |x| = 1, t / (t + 2) below, t =
+///     expm1(2|x|); a - a^3/3 + 2a^5/15 below 2^-9, 1 from 22, with x's sign.
+template <typename OpTy>
+static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
+  auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
+  auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
+  auto div = [&](Value x, Value y) { return arith::DivFOp::create(b, x, y); };
+  auto fma = [&](Value x, Value y, Value z) {
+    return math::FmaOp::create(b, x, y, z);
+  };
+  auto sel = [&](Value cnd, Value x, Value y) {
+    return arith::SelectOp::create(b, cnd, x, y);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value x, Value y) {
+    return arith::CmpFOp::create(b, p, x, y);
+  };
+  auto pow2 = [&](Value e) {
+    return arith::BitcastOp::create(
+        b, f64,
+        arith::ShLIOp::create(b, arith::AddIOp::create(b, e, ci(1023)), ci(52)));
+  };
+  Value x = op.getOperand();
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::Exp2Op>) {
+    x = sel(fcmp(arith::CmpFPredicate::OGT, x, c(1030.0)), c(1030.0), x);
+    x = sel(fcmp(arith::CmpFPredicate::OLT, x, c(-1080.0)), c(-1080.0), x);
+    Value k = math::RoundEvenOp::create(b, x);
+    Value rr = sub(x, k);
+    Value ln2 = c(0x1.62e42fefa39efp-1);
+    Value hi = mul(rr, ln2);
+    // r ln 2 - hi: fma's exact remainder plus r times ln 2's own error
+    Value lo = add(fma(rr, ln2, arith::NegFOp::create(b, hi)),
+                   mul(rr, c(2.319046813846299558e-17)));
+    Value e = math::ExpOp::create(b, hi);
+    e = fma(e, lo, e);
+    Value ki = arith::FPToSIOp::create(b, i64, k);
+    Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
+    r = mul(mul(e, pow2(k1)), pow2(arith::SubIOp::create(b, ki, k1)));
+  } else if constexpr (std::is_same_v<OpTy, math::Log2Op> ||
+                       std::is_same_v<OpTy, math::Log10Op>) {
+    Value tiny = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p-1022));
+    Value x2 = sel(tiny, mul(x, c(0x1p54)), x);
+    Value bx = arith::BitcastOp::create(b, i64, x2);
+    Value k = arith::SubIOp::create(
+        b, arith::ShRUIOp::create(b, bx, ci(52)), ci(1023));
+    k = arith::AddIOp::create(b, k, sel(tiny, ci(-54), ci(0)));
+    Value m = arith::BitcastOp::create(
+        b, f64,
+        arith::OrIOp::create(b, arith::AndIOp::create(b, bx, ci(0xfffffffffffffLL)),
+                             ci(0x3ff0000000000000LL)));
+    Value big = fcmp(arith::CmpFPredicate::OGT, m, c(1.4142135623730951));
+    m = sel(big, mul(m, c(0.5)), m);
+    k = arith::AddIOp::create(b, k, sel(big, ci(1), ci(0)));
+    Value dk = arith::SIToFPOp::create(b, f64, k);
+    Value lm = math::LogOp::create(b, m);
+    if constexpr (std::is_same_v<OpTy, math::Log2Op>)
+      r = fma(lm, c(1.4426950408889634), dk);
+    else
+      r = add(mul(dk, c(0.30102999566398120)),
+              fma(lm, c(0.43429448190325182),
+                  mul(dk, c(-2.8037281277851704e-18))));
+    Value inf = c(std::numeric_limits<double>::infinity());
+    r = sel(fcmp(arith::CmpFPredicate::OEQ, x, inf), inf, r);
+    r = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(0.0)),
+            c(-std::numeric_limits<double>::infinity()), r);
+    r = sel(fcmp(arith::CmpFPredicate::ULT, x, c(0.0)),
+            c(std::numeric_limits<double>::quiet_NaN()), r);
+  } else if constexpr (std::is_same_v<OpTy, math::CoshOp>) {
+    Value a = math::AbsFOp::create(b, x);
+    Value e = math::ExpOp::create(b, a);
+    Value near = add(mul(c(0.5), e), div(c(0.5), e));
+    // from 709 (where e^|x| overflows): e^(|x|/2) squared, halved; |x| - ln 2
+    // would round |x|'s last bits away (up to 500 ulp)
+    Value w = math::ExpOp::create(b, mul(c(0.5), a));
+    Value far = mul(mul(c(0.5), w), w);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), near, far);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  } else if constexpr (std::is_same_v<OpTy, math::SinhOp>) {
+    Value a = math::AbsFOp::create(b, x);
+    Value h = math::CopySignOp::create(b, c(0.5), x);
+    Value t = math::ExpM1Op::create(b, a);
+    Value tp1 = add(t, c(1.0));
+    Value small = mul(h, sub(mul(c(2.0), t), div(mul(t, t), tp1)));
+    Value mid = mul(h, add(t, div(t, tp1)));
+    Value large = mul(h, math::ExpOp::create(b, a));
+    Value w = math::ExpOp::create(b, mul(c(0.5), a));
+    Value huge = mul(mul(mul(h, c(2.0)), w), mul(c(0.5), w));
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(1.0)), small,
+            sel(fcmp(arith::CmpFPredicate::OLT, a, c(22.0)), mid,
+                sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), large, huge)));
+    // tiny x: x itself (also -0)
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  } else {
+    static_assert(std::is_same_v<OpTy, math::TanhOp>);
+    Value a = math::AbsFOp::create(b, x);
+    Value t1 = math::ExpM1Op::create(b, mul(c(2.0), a));
+    Value z1 = sub(c(1.0), div(c(2.0), add(t1, c(2.0))));
+    // below 1: t / (t + 2) with t = e^2a - 1 > 0, whose relative error
+    // passes on scaled by 2 / (t + 2) <= 1 (fdlibm's e^-2a - 1 form scales
+    // it by up to 1.8)
+    Value z2 = div(t1, add(t1, c(2.0)));
+    Value z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(1.0)), z1, z2);
+    // below 2^-9: a - a^3/3 + 2a^5/15 (next term 2^-58 relative), as expm1's
+    // error would otherwise reach 3 ulp there
+    Value a2 = mul(a, a);
+    Value series = fma(mul(a, a2), fma(a2, c(2.0 / 15.0), c(-1.0 / 3.0)), a);
+    z = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-9)), series, z);
+    z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(22.0)), c(1.0), z);
+    r = math::CopySignOp::create(b, z, x);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-55)), x, r);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  }
   rewriter.replaceOp(op, r);
   return success();
 }
@@ -1394,6 +1676,142 @@ static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
   return bound;
 }
 
+/// A binary search's scf.while over index (lo, hi), lo from 0, continuing
+/// while lo < hi (unsigned: a signed test of a hi0 negative as an index would
+/// end the original loop at once with hi0, not its truncation), whose body loads a static 1-D memref of S <= 2^30 elements
+/// at mid = (lo + hi) >> 1 and yields lo, hi, mid or mid + 1 (or selects of
+/// them), in i32. Each yielded value is at most max(lo, hi, S); in the first
+/// iteration mid = hi0 >> 1 is below S (a load out of bounds is undefined),
+/// so hi0 < 2 S and every value stays below 2^31 and every lo + hi below
+/// 2^32: the i32 values are the index ones. A hi0 of 2^32 or more makes the
+/// first load out of bounds (or, truncated to 0, ends the loop at once, which
+/// is then as good), and with hi0 = 0 neither loop runs.
+static bool narrowBinarySearch(scf::WhileOp w, IRRewriter &rewriter) {
+  if (w.getNumOperands() != 2 || w.getNumResults() != 2)
+    return false;
+  for (Type t : w.getOperandTypes())
+    if (!t.isIndex())
+      return false;
+  if (!matchPattern(w.getInits()[0], m_Zero()))
+    return false;
+  Block &before = w.getBefore().front();
+  Block &after = w.getAfter().front();
+  auto cond = dyn_cast<scf::ConditionOp>(before.getTerminator());
+  if (!cond || before.getOperations().size() != 2 ||
+      cond.getArgs().size() != 2 || cond.getArgs()[0] != before.getArgument(0) ||
+      cond.getArgs()[1] != before.getArgument(1))
+    return false;
+  auto cmp = cond.getCondition().getDefiningOp<arith::CmpIOp>();
+  if (!cmp || cmp.getLhs() != before.getArgument(0) ||
+      cmp.getRhs() != before.getArgument(1) ||
+      cmp.getPredicate() != arith::CmpIPredicate::ult)
+    return false;
+  Value lo = after.getArgument(0), hi = after.getArgument(1);
+  // mid = (lo + hi) >> 1, loaded at before anything that could leave the
+  // body (only ops without regions or calls before the load)
+  Value mid, midInc;
+  arith::AddIOp sum;
+  arith::ShRUIOp half;
+  bool loaded = false;
+  for (Operation &op : after.without_terminator()) {
+    if (op.getNumRegions() || isa<CallOpInterface>(op))
+      break;
+    if (auto a = dyn_cast<arith::AddIOp>(op);
+        a && !sum &&
+        ((a.getLhs() == lo && a.getRhs() == hi) ||
+         (a.getLhs() == hi && a.getRhs() == lo)))
+      sum = a;
+    else if (auto sh = dyn_cast<arith::ShRUIOp>(op);
+             sh && sum && sh.getLhs() == sum.getResult() &&
+             matchPattern(sh.getRhs(), m_One()))
+      half = sh, mid = sh.getResult();
+    else if (auto load = dyn_cast<memref::LoadOp>(op);
+             load && mid && load.getIndices().size() == 1 &&
+             load.getIndices()[0] == mid) {
+      MemRefType t = load.getMemRefType();
+      if (t.getRank() == 1 && !t.isDynamicDim(0) &&
+          t.getDimSize(0) <= (int64_t(1) << 30))
+        loaded = true;
+    } else if (auto a = dyn_cast<arith::AddIOp>(op);
+               a && mid && a.getLhs() == mid &&
+               matchPattern(a.getRhs(), m_One()))
+      midInc = a.getResult();
+  }
+  if (!loaded)
+    return false;
+  auto yield = cast<scf::YieldOp>(after.getTerminator());
+  // the yielded values: lo, hi, mid, mid + 1, or selects of them
+  std::function<bool(Value, unsigned)> bounded = [&](Value v, unsigned d) {
+    if (v == lo || v == hi || v == mid || (midInc && v == midInc))
+      return true;
+    auto sel = v.getDefiningOp<arith::SelectOp>();
+    return sel && d < 4 && sel->getBlock() == &after &&
+           bounded(sel.getTrueValue(), d + 1) &&
+           bounded(sel.getFalseValue(), d + 1);
+  };
+  for (Value v : yield.getResults())
+    if (!bounded(v, 0))
+      return false;
+
+  Location loc = w.getLoc();
+  Type i32 = rewriter.getI32Type();
+  rewriter.setInsertionPoint(w);
+  Value init0 = arith::ConstantIntOp::create(rewriter, loc, i32, 0);
+  Value init1 = arith::IndexCastOp::create(rewriter, loc, i32, w.getInits()[1]);
+  auto beforeBuilder = [&](OpBuilder &b, Location l, ValueRange args) {
+    Value go = arith::CmpIOp::create(b, l, cmp.getPredicate(), args[0], args[1]);
+    scf::ConditionOp::create(b, l, go, args);
+  };
+  auto afterBuilder = [&](OpBuilder &b, Location l, ValueRange args) {
+    Value lo32 = args[0], hi32 = args[1];
+    Type idx = b.getIndexType();
+    Value sum32 = arith::AddIOp::create(b, l, lo32, hi32);
+    Value one = arith::ConstantIntOp::create(b, l, i32, 1);
+    Value mid32 = arith::ShRUIOp::create(b, l, sum32, one);
+    Value midInc32 = arith::AddIOp::create(b, l, mid32, one);
+    IRMapping map;
+    map.map(lo, arith::IndexCastUIOp::create(b, l, idx, lo32));
+    map.map(hi, arith::IndexCastUIOp::create(b, l, idx, hi32));
+    map.map(mid, arith::IndexCastUIOp::create(b, l, idx, mid32));
+    if (midInc)
+      map.map(midInc, arith::IndexCastUIOp::create(b, l, idx, midInc32));
+    for (Operation &op : after.without_terminator()) {
+      if (&op == sum.getOperation() || &op == half.getOperation() ||
+          (midInc && op.getNumResults() == 1 && op.getResult(0) == midInc))
+        continue;
+      b.clone(op, map);
+    }
+    std::function<Value(Value)> narrowed = [&](Value v) -> Value {
+      if (v == lo)
+        return lo32;
+      if (v == hi)
+        return hi32;
+      if (v == mid)
+        return mid32;
+      if (midInc && v == midInc)
+        return midInc32;
+      auto sel = v.getDefiningOp<arith::SelectOp>();
+      return arith::SelectOp::create(b, l, map.lookup(sel.getCondition()),
+                                     narrowed(sel.getTrueValue()),
+                                     narrowed(sel.getFalseValue()));
+    };
+    SmallVector<Value> ys;
+    for (Value v : yield.getResults())
+      ys.push_back(narrowed(v));
+    scf::YieldOp::create(b, l, ys);
+  };
+  auto nw = scf::WhileOp::create(rewriter, loc, TypeRange{i32, i32},
+                                 ValueRange{init0, init1}, beforeBuilder,
+                                 afterBuilder);
+  rewriter.setInsertionPointAfter(nw);
+  SmallVector<Value> results;
+  for (Value r : nw.getResults())
+    results.push_back(arith::IndexCastUIOp::create(rewriter, loc,
+                                                   rewriter.getIndexType(), r));
+  rewriter.replaceOp(w, results);
+  return true;
+}
+
 /// An scf.for over index whose offsets o = iv - lb are below a bound B <=
 /// 2^31 (loopOffsetBound) is a loop over o in i32, unsigned: from 0 to
 /// umin(ub - lb, B) (0 for ub <= lb) by umin(step, B), with iv = lb + o.
@@ -1403,6 +1821,13 @@ static std::optional<uint64_t> loopOffsetBound(scf::ForOp loop) {
 /// too. The offsets, below B + B <= 2^32, do not wrap. Index arithmetic of
 /// the iv that narrow-indices computes in i32 becomes lb + o in i32.
 static void narrowLoops(gpu::GPUModuleOp m) {
+  {
+    SmallVector<scf::WhileOp> whiles;
+    m.walk([&](scf::WhileOp w) { whiles.push_back(w); });
+    IRRewriter rewriter(m.getContext());
+    for (scf::WhileOp w : whiles)
+      narrowBinarySearch(w, rewriter);
+  }
   SmallVector<scf::ForOp> loops;
   m.walk([&](scf::ForOp loop) {
     if (loop.getInductionVar().getType().isIndex() && !loop.getUnsignedCmp())
@@ -1653,6 +2078,14 @@ struct LowerGpuOpsToAIROpsPass final
           },
           /*benefit=*/2);
       patterns.add(rewriteIsInf);
+      patterns.add(rewriteExpF64);
+      patterns.add(rewriteLogF64);
+      patterns.add(rewriteF64Function<math::Exp2Op>);
+      patterns.add(rewriteF64Function<math::Log2Op>);
+      patterns.add(rewriteF64Function<math::Log10Op>);
+      patterns.add(rewriteF64Function<math::CoshOp>);
+      patterns.add(rewriteF64Function<math::SinhOp>);
+      patterns.add(rewriteF64Function<math::TanhOp>);
       patterns.add(rewriteIPowI);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }

@@ -78,6 +78,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXSinkAddressesPass(PR);
   initializeAGXThreadgroupAddressesPass(PR);
   initializeAGXHoistGuardedLoadsPass(PR);
+  initializeAGXAlignmentVersioningPass(PR);
   initializeAGXNarrowInductionsPass(PR);
   initializeAGXSpecialRegisterRangesPassPass(PR);
   initializeAGXVectorAccessesPass(PR);
@@ -91,6 +92,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXSinkRematPass(PR);
   initializeAGXLowerControlFlowPass(PR);
   initializeAGXInsertWaitsPass(PR);
+  initializeAGXColdRegionsPass(PR);
   initializeAGXAsmPrinterPass(PR);
 }
 
@@ -515,6 +517,9 @@ void AGXPassConfig::addIRPasses() {
     // Loads that all-pairs loops skip for one element issue together.
     addPass(createAGXHoistGuardedLoadsPass());
     addPass(createAGXThreadgroupAddressesPass());
+    // Loops over buffers only known aligned to 1- or 2-byte elements: a
+    // copy for 4-byte aligned bases, whose accesses the vectorizer merges.
+    addPass(createAGXAlignmentVersioningPass());
     addPass(createAGXVectorAccessesPass(/*BeforeVectorizer=*/true));
     addPass(createLoadStoreVectorizerPass());
     addPass(createAGXVectorAccessesPass(/*BeforeVectorizer=*/false));
@@ -543,13 +548,15 @@ static cl::opt<unsigned> AGXPreISelSimplifyCFG(
              "threshold (0: not run)"));
 
 bool AGXPassConfig::addPreISel() {
+  // The special registers' bounds after loop strength reduction, which
+  // would form 64-bit offsets from the bounded indices (EXPERIMENTS.md
+  // L14-E1), but before AGXNarrowInductions, which proves counters from
+  // thread positions non-negative with them (L15-E224).
+  addPass(createAGXSpecialRegisterRangesPass());
   // After loop strength reduction, which makes 64-bit counters of PTX's
   // 64-bit address arithmetic.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createAGXNarrowInductionsPass());
-  // After loop strength reduction, which would form 64-bit offsets from
-  // the bounded indices (EXPERIMENTS.md L14-E1).
-  addPass(createAGXSpecialRegisterRangesPass());
   // The phis of an if's empty side (left by AGXCodeGenPrepare's merging of
   // || and && conditions) become selects, as SimplifyCFG folds two-entry
   // phis: an if is execution mask operations, which cost more than the
@@ -612,4 +619,6 @@ void AGXPassConfig::addPostRegAlloc() {
 void AGXPassConfig::addPreEmitPass() {
   addPass(createAGXLowerControlFlowPass());
   addPass(createAGXInsertWaitsPass());
+  // Rarely entered if-bodies out of line (after the waits: paths unchanged).
+  addPass(createAGXColdRegionsPass());
 }

@@ -31,6 +31,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -39,11 +40,17 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "agx-narrow-inductions"
+
+static cl::opt<bool> AGXNonNegativeCasts(
+    "agx-non-negative-casts", cl::init(true), cl::Hidden,
+    cl::desc("Signed extensions, divisions and arithmetic shifts of values "
+             "SCEV proves non-negative as the unsigned ones"));
 
 static cl::opt<bool> AGXNarrowInductionsOpt(
     "agx-narrow-ivs", cl::init(true), cl::Hidden,
@@ -846,6 +853,11 @@ static cl::opt<bool> AGXMergeDownCounters(
 /// i' = i0 + s c0 exactly (mod 2^32: s is invertible, and c reaches zero at
 /// the same iteration): the test on i', and c goes. An even s = 2^m odd
 /// where the loop runs fewer than 2^(32 - m) times.
+static cl::opt<bool> AGXDeadAfterNarrowing(
+    "agx-dead-after-narrowing", cl::init(true), cl::Hidden,
+    cl::desc("Delete what narrowing a loop's inductions left dead before the "
+             "rewrites that count uses"));
+
 static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
@@ -912,13 +924,69 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   bool Changed = false;
+  // Signed operations of values SCEV proves non-negative (a loop counter
+  // from a thread position, say) as unsigned ones: a sign extension as a
+  // zero extension (whose 64-bit uses need no high word: a multiplication of
+  // it is one instruction fewer, and no asr of the sign), a signed division
+  // or arithmetic shift right as the unsigned / logical one.
+  if (AGXNonNegativeCasts) {
+    SmallVector<Instruction *, 8> Work;
+    for (Instruction &I : instructions(F))
+      if (isa<SExtInst>(I) ||
+          ((I.getOpcode() == Instruction::AShr ||
+            I.getOpcode() == Instruction::SDiv) &&
+           I.getType()->isIntegerTy()))
+        Work.push_back(&I);
+    for (Instruction *I : Work) {
+      Value *X = I->getOperand(0);
+      if (!SE.isSCEVable(X->getType()) || !SE.isKnownNonNegative(SE.getSCEV(X)))
+        continue;
+      Instruction *R;
+      if (isa<SExtInst>(I)) {
+        R = new ZExtInst(X, I->getType(), "", I->getIterator());
+        R->setNonNeg(true);
+      } else if (I->getOpcode() == Instruction::AShr) {
+        R = BinaryOperator::CreateLShr(X, I->getOperand(1), "", I->getIterator());
+        R->setIsExact(I->isExact());
+      } else {
+        // x / d for x >= 0 is udiv only where d > 0 too
+        Value *D = I->getOperand(1);
+        if (!SE.isKnownPositive(SE.getSCEV(D)))
+          continue;
+        R = BinaryOperator::CreateUDiv(X, D, "", I->getIterator());
+        R->setIsExact(I->isExact());
+      }
+      R->takeName(I);
+      R->setDebugLoc(I->getDebugLoc());
+      I->replaceAllUsesWith(R);
+      SE.forgetValue(I);
+      I->eraseFromParent();
+      Changed = true;
+    }
+  }
   for (Loop *L : LI.getLoopsInPreorder()) {
     SmallVector<PHINode *, 4> Phis;
     for (PHINode &Phi : L->getHeader()->phis())
       if (Phi.getType()->isIntegerTy(64))
         Phis.push_back(&Phi);
+    bool Narrowed = false;
     for (PHINode *Phi : Phis)
-      Changed |= narrow(*Phi, *L, SE);
+      Narrowed |= narrow(*Phi, *L, SE);
+    // The extensions of a narrowed value that its old 64-bit uses left
+    // (dead, but uses that the one-use tests below would count).
+    if (Narrowed && AGXDeadAfterNarrowing) {
+      SmallVector<WeakTrackingVH, 8> Dead;
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (isInstructionTriviallyDead(&I))
+            Dead.push_back(&I);
+      for (WeakTrackingVH &V : Dead)
+        if (auto *I = dyn_cast_or_null<Instruction>(V)) {
+          SE.forgetValue(I);
+          RecursivelyDeleteTriviallyDeadInstructions(I);
+        }
+    }
+    Changed |= Narrowed;
     if (AGXElementIndices && L->isInnermost()) {
       SmallVector<PHINode *, 4> Narrow;
       for (PHINode &Phi : L->getHeader()->phis())

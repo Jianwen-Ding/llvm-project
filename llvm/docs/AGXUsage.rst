@@ -385,7 +385,9 @@ attributes lower the register use, spilling the rest to the stack:
   N threads fit. With N at most 128 the threadgroup is one aligned block of 4
   SIMD-groups, and on chips with ``block_barrier`` (G14, not ``agx-strict``)
   its threadgroup barriers become block barriers, without the workgroup
-  fences around them (the block barrier orders the block's memory).
+  fences around them (the block barrier orders the block's memory). The
+  threadgroup's positions and sizes are taken to be at most N, and its
+  SIMD-group index below N / 32 (``-agx-threadgroup-ranges``).
 * ``"agx-max-gprs"="N"`` (PTX ``.maxnreg``): at most N 32-bit registers, and
   no fewer than 16.
 
@@ -623,7 +625,12 @@ threadgroup memory are one ``xy`` / ``xyz`` / ``xyzw`` access at any 4-byte
 alignment, which the M2 Max handles exactly at every offset, across 64-byte
 lines and pages (ptx-re-blockers B33). The vectorizer runs after checked mode,
 so the checks see the accesses the source wrote. Vector arithmetic is still
-scalar.
+scalar. An innermost single-block loop whose half (or 16-bit integer)
+accesses of a kernel argument's buffer are only known aligned to their
+element, but would be at 4 bytes for a 4-byte aligned buffer, runs as two
+copies: one for buffers whose addresses are multiples of 4 (a test of the
+arguments, uniform), its accesses merged into wide ones, and the loop as it
+was (``AGXAlignmentVersioning``, ``-agx-alignment-versioning``).
 
 Threadgroup and private addresses that PTX computes in integers (``inttoptr``
 of an integer expression) are first written as a constant offset from the
@@ -944,8 +951,9 @@ exact ``fmod``, one bit of the quotient an iteration (8 instructions
 for each binade between the operands); ``powi`` is compiler-rt's
 ``__powidf2`` (a multiplication for each bit of the exponent and a squaring
 for each but the last, each rounded; the reciprocal for a negative
-exponent). Vector arithmetic and the
-transcendental functions on ``double`` are diagnosed as unsupported. The code is large: in
+exponent); ``llvm.exp`` and ``llvm.log`` are fdlibm's algorithms in double
+operations (within 1 ulp). Vector arithmetic and the other transcendental
+functions on ``double`` are diagnosed as unsupported. The code is large: in
 instructions per operation, about 215 for an addition or a multiplication,
 430 for a fused multiply-add, 290 for a division or a square root, 100 for a
 conversion and 30 for a comparison.

@@ -1195,6 +1195,11 @@ static Value *expandLaunchDivRem32(BinaryOperator &BO, unsigned Arg,
   return B.CreateSelect(Zero, B.getInt32(-1), Res);
 }
 
+static cl::opt<bool> AGXDiv64FitsLikely(
+    "agx-div64-fits-likely", cl::init(true), cl::Hidden,
+    cl::desc("Mark the outermost test that a 64-bit division's operands fit "
+             "in 32 bits as likely"));
+
 static cl::opt<bool> AGXNewtonDiv64(
     "agx-newton-div64", cl::init(true), cl::Hidden,
     cl::desc("Expand 64-bit division and remainder with a reciprocal estimate "
@@ -1409,6 +1414,47 @@ bool AGXCodeGenPrepare::expandDivisions(Function &F) {
                     BO->getOpcode() == Instruction::SDiv ||
                         BO->getOpcode() == Instruction::SRem});
   bool Newton = AGXNewtonDiv64 && Sites.size() <= AGXNewtonDiv64Max;
+  // The long case of a 64-bit division under a test that its operands fit
+  // in 32 bits (a front end's (a | b) < 2^32, or the bypass's (a | b) &
+  // ~0xffffffff == 0) is the rare one: the outermost such test on the
+  // division's chain of single predecessors is marked likely to fit, so that
+  // AGXColdRegions moves the long case out of line (a skip not taken). Where
+  // the operands rarely fit, one more taken jump is little beside the long
+  // division. (Not an inner test: under an outer one that failed, the inner
+  // one's fast case is not the common one.)
+  if (AGXDiv64FitsLikely)
+    for (BinaryOperator *BO : Wide) {
+      if (!BO->getType()->isIntegerTy(64))
+        continue;
+      using namespace PatternMatch;
+      auto FitsTest = [](Value *C) {
+        return match(C, m_SpecificICmp(ICmpInst::ICMP_ULT, m_Or(m_Value(), m_Value()),
+                                       m_SpecificInt(uint64_t(1) << 32))) ||
+               match(C, m_SpecificICmp(
+                            ICmpInst::ICMP_EQ,
+                            m_And(m_Value(), m_SpecificInt(0xffffffff00000000ULL)),
+                            m_Zero()));
+      };
+      CondBrInst *Outer = nullptr;
+      bool OuterFitsSide = false;
+      BasicBlock *Cur = BO->getParent();
+      for (unsigned Depth = 0; Depth < 4; ++Depth) {
+        BasicBlock *Pred = Cur->getSinglePredecessor();
+        if (!Pred)
+          break;
+        if (auto *Br = dyn_cast<CondBrInst>(Pred->getTerminator());
+            Br && FitsTest(Br->getCondition()) &&
+            Br->getSuccessor(0) != Br->getSuccessor(1)) {
+          Outer = Br;
+          OuterFitsSide = Br->getSuccessor(0) == Cur;
+        }
+        Cur = Pred;
+      }
+      // the division on the side where the operands do not fit
+      if (Outer && !OuterFitsSide && !Outer->hasMetadata(LLVMContext::MD_prof))
+        Outer->setMetadata(LLVMContext::MD_prof,
+                           MDBuilder(BO->getContext()).createLikelyBranchWeights());
+    }
   for (BinaryOperator *BO : Wide) {
     bool IsRem = BO->getOpcode() == Instruction::URem ||
                  BO->getOpcode() == Instruction::SRem;
