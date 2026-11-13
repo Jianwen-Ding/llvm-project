@@ -64,6 +64,10 @@ static void diagnose(SelectionDAG &DAG, const SDLoc &DL, const Twine &Msg) {
       DiagnosticInfoUnsupported(F, Msg, DL.getDebugLoc()));
 }
 
+static cl::opt<bool> AGXWordShifts128(
+    "agx-word-shifts-128", cl::init(true), cl::Hidden,
+    cl::desc("Variable 128-bit shifts on the 32-bit words"));
+
 AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                                      const AGXSubtarget &ST)
     : TargetLowering(TM, ST), ST(ST) {
@@ -143,6 +147,9 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                        VT == MVT::i64 ? Expand : Legal);
   }
   setOperationAction({ISD::MULHU, ISD::MULHS}, MVT::i32, Legal);
+  // Variable 128-bit shifts on the 32-bit words (ReplaceNodeResults).
+  if (AGXWordShifts128)
+    setOperationAction({ISD::SHL, ISD::SRL, ISD::SRA}, MVT::i128, Custom);
   // Both halves of a 32 x 32 -> 64-bit product from one multiply (the
   // expansions of 64-bit multiplications would otherwise take the low half
   // from a second, 32-bit one).
@@ -1003,9 +1010,76 @@ static cl::opt<bool> AGXElementAlignedVectors(
              "element's alignment (not measured on hardware; 32-bit elements "
              "at 4 bytes are: ptx-re-blockers B33)"));
 
+/// A 128-bit shift by a variable amount n (below 128: more is poison) on the
+/// 32-bit words: the words moved by 64 where n's bit 6 is set, then by 32
+/// where bit 5 is, then each result word a funnel shift (extr) of two
+/// neighbours by n mod 32 (the type legalizer's expansion through 64-bit
+/// halves takes about 23 instructions, this about 15).
+static SDValue lowerShift128(SDNode *N, SelectionDAG &DAG) {
+  SDLoc DL(N);
+  unsigned Opc = N->getOpcode();
+  SDValue X = N->getOperand(0);
+  SDValue Amt = DAG.getZExtOrTrunc(N->getOperand(1), DL, MVT::i32);
+  auto C32 = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i32); };
+  SDValue W[4];
+  for (unsigned I = 0; I < 4; ++I)
+    W[I] = DAG.getNode(ISD::TRUNCATE, DL, MVT::i32,
+                       DAG.getNode(ISD::SRL, DL, MVT::i128, X,
+                                   DAG.getConstant(32 * I, DL, MVT::i32)));
+  SDValue Fill = Opc == ISD::SRA
+                     ? DAG.getNode(ISD::SRA, DL, MVT::i32, W[3], C32(31))
+                     : C32(0);
+  auto Bit = [&](unsigned B) {
+    return DAG.getSetCC(DL, MVT::i32,
+                        DAG.getNode(ISD::AND, DL, MVT::i32, Amt, C32(B)),
+                        C32(0), ISD::SETNE);
+  };
+  auto Sel = [&](SDValue C, SDValue T, SDValue F) {
+    return DAG.getSelect(DL, MVT::i32, C, T, F);
+  };
+  // word moves by 64 and 32 places (K words), filled with Fill
+  auto Move = [&](SDValue C, unsigned K) {
+    SDValue V[4];
+    for (int I = 0; I < 4; ++I) {
+      int From = Opc == ISD::SHL ? I - int(K) : I + int(K);
+      SDValue Moved = From >= 0 && From < 4 ? W[From] : Fill;
+      V[I] = Sel(C, Moved, W[I]);
+    }
+    for (int I = 0; I < 4; ++I)
+      W[I] = V[I];
+  };
+  // (n below 128: bit 6 is n >= 64, which the select's compare takes)
+  Move(DAG.getSetCC(DL, MVT::i32, Amt, C32(64), ISD::SETUGE), 2);
+  Move(Bit(32), 1);
+  // (the funnel shifts take n mod 32 themselves: one and for all)
+  SDValue S = DAG.getNode(ISD::AND, DL, MVT::i32, Amt, C32(31));
+  SDValue R[4];
+  if (Opc == ISD::SHL) {
+    for (int I = 3; I > 0; --I)
+      R[I] = DAG.getNode(ISD::FSHL, DL, MVT::i32, W[I], W[I - 1], Amt);
+    R[0] = DAG.getNode(ISD::SHL, DL, MVT::i32, W[0], S);
+  } else {
+    for (int I = 0; I < 3; ++I)
+      R[I] = DAG.getNode(ISD::FSHR, DL, MVT::i32, W[I + 1], W[I], Amt);
+    R[3] = DAG.getNode(Opc, DL, MVT::i32, W[3], S);
+  }
+  auto Pair = [&](SDValue Lo, SDValue Hi) {
+    return DAG.getNode(ISD::BUILD_PAIR, DL, MVT::i64, Lo, Hi);
+  };
+  return DAG.getNode(ISD::BUILD_PAIR, DL, MVT::i128, Pair(R[0], R[1]),
+                     Pair(R[2], R[3]));
+}
+
 void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
                                            SmallVectorImpl<SDValue> &Results,
                                            SelectionDAG &DAG) const {
+  if ((N->getOpcode() == ISD::SHL || N->getOpcode() == ISD::SRL ||
+       N->getOpcode() == ISD::SRA) &&
+      N->getValueType(0) == MVT::i128 &&
+      !isa<ConstantSDNode>(N->getOperand(1))) {
+    Results.push_back(lowerShift128(N, DAG));
+    return;
+  }
   // llvm.agx.texture.sample: one i32 result per channel.
   if (N->getOpcode() == ISD::INTRINSIC_W_CHAIN &&
       N->getConstantOperandVal(1) == Intrinsic::agx_texture_sample) {
