@@ -493,6 +493,14 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     if rc:
         res.update(status="extract-failed", detail=err[-300:])
         return res
+    # Initializers of constant globals holding i1 values cannot be read
+    # bytewise in Alive2's assembly mode (sub-byte memory); drop them there.
+    if re.search(r"^@[^\n]*\bconstant\b[^\n]*\bi1\b", ext, re.M):
+        rc, ext, err = run([BIN + "/llvm-extract", "-S", "--func=" + fname.strip('"'),
+                            src_path, "-o", "-"])
+        if rc:
+            res.update(status="extract-failed", detail=err[-300:])
+            return res
     ptxn = ptx_name(fname)
     try:
         L = ptx_lift.lift_function(ptx, sig, name_map, decls, globals_, ptxn,
