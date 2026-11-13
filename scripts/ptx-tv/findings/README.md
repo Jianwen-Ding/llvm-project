@@ -61,6 +61,21 @@ scalar `and.b16 ..., 0x7fff` would be correct on every target.
 
 Severity: low (only signaling-NaN inputs are affected).
 
+### 2b. `fabs`/`fneg` flush subnormals under `preservesign`
+
+Reproducer: `fabs-fneg-ftz.ll`
+
+The same LangRef rule ("`fneg`, `llvm.fabs`, and `llvm.copysign` ... act
+directly on the underlying bit representation and never change anything
+except possibly for the sign bit") is violated for f32 when the function has
+`denormal_fpenv(float: preservesign)`: the backend selects `abs.ftz.f32` and
+`neg.ftz.f32`, which flush a subnormal input, so `fabs(0x00000001)` is `+0.0`
+and `fneg(0x00000001)` is `-0.0`. `copysign` is lowered to `copysign.f32`
+(no `.ftz`) and is correct. (Test: `math-intrins.ll` `abs_float_ftz`.)
+LangRef's `denormal_fpenv` text speaks of "floating-point operations"
+flushing inputs, so one could argue about the intent, but the NaN section
+explicitly excludes these three operations from floating-point math.
+
 ## 3. Integer to bf16 conversion rounds twice before sm_90
 
 Reproducer: `int-to-bf16-double-rounding.ll`
@@ -108,6 +123,22 @@ than 24 significant bits).
   (the source is UB): `forward-ld-param.ll` `test_ld_param_const`,
   `lower-byval-args.ll` `memcpy_from_param{,_noalign}`.
 
+## Unresolved
+
+* `math-intrins.ll` `maximumnum_float` (and presumably the other
+  `minimumnum`/`maximumnum` tests): lowered to `max.f32`/`min.f32`. Correct
+  only if PTX `min`/`max` order -0.0 below +0.0; the lifter does not assume
+  that (it models them like `maxnum`), so this stays open.
+
 ## Test-suite run
 
-See `RESULTS.md` (generated from the final pass) for the coverage numbers.
+`RESULTS.md` has the numbers from the final pass (generated from
+`results.jsonl` by `gen_results.py`). In short: 2111 functions sampled from
+620 test files; 949 proved correct, 5 counterexamples of finding 1 (plus 1
+padding over-read), 2 of
+findings 2/3, 1 unresolved, 40 in known modelling classes, 648 not lifted
+(mostly asynchronous/tensor-core instructions: tcgen05, cp.async.bulk,
+mbarrier, sparse (de)compression), 407 solver timeouts or inconclusive.
+The other instances of findings 1 and 2b were found by the static scan and
+by targeted runs (`subbyte-vector-params.ll`, `fabs-fneg-ftz.ll`,
+`math-intrins.ll` `abs_float_ftz`).

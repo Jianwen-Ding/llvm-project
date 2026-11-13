@@ -450,7 +450,10 @@ class Lifter:
             nm = "%s.%s" % (m.group(1), m.group(2))
         else:
             base = nm = s[1:]
-        nm = nm.replace("_", ".")  # TableGen intrinsic naming: lanemask_ge -> lanemask.ge
+        # TableGen intrinsic naming turns _ into . (lanemask_ge ->
+        # lanemask.ge) unless the intrinsic overrides its name
+        if not (nm.endswith("_smem_size") or nm.startswith("reserved_smem_offset")):
+            nm = nm.replace("_", ".")
         ty = 64 if nm in ("clock64", "globaltimer", "gridid") else 32
         fname = "nvvm.read.ptx.sreg." + nm
         attrs = "memory(none)" if base in SREG_PURE else \

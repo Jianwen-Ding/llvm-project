@@ -152,9 +152,16 @@ def prepare_source(path, workdir):
     """Strip debug info and rename llvm.nvvm.* intrinsics to plain functions."""
     # Atomics are given single-thread semantics (as in the lifted code),
     # which Alive2 can reason about: lower them to plain loads and stores.
+    # llc parses the module with the target's datalayout (overriding the
+    # file's), which fixes the alignment of accesses written without one:
+    # do the same here.
+    raw = re.sub(r"^target datalayout\s*=.*$", "", open(path).read(), flags=re.M)
+    nodl = os.path.join(workdir, "nodl.ll")
+    with open(nodl, "w") as f:
+        f.write(raw)
     rc, out, err = run([BIN + "/opt", "-S", "-mtriple=nvptx64-nvidia-cuda",
                         "-strip-debug", "-passes=lower-atomic",
-                        path, "-o", "-"])
+                        nodl, "-o", "-"])
     if rc:
         raise RuntimeError("opt failed: " + err[-300:])
     # NVVM intrinsics that name one PTX instruction get that instruction's
@@ -410,6 +417,11 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     if re.search(r"atom\.[\w.:]*cas\.b128", body) and re.search(r"\bload (atomic )?i128\b", src_text) \
             and "cmpxchg" not in src_text:
         return "cas-based-atomic-load"
+    # Loads of 3-element vectors widened to the next aligned power of two
+    # (e.g. ld.b64 for a 6-byte <3 x half>): reads past the object but stay
+    # inside the aligned granule, which cannot fault.
+    if re.search(r"load <3 x ", src_text) and re.search(r"\bld\.[\w.:]*b(32|64)\b", body):
+        return "aligned-overread-widened-load"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
     if "rsqrt.approx" in body and "sqrt.approx" in src_text:
