@@ -76,6 +76,9 @@ public:
   bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM, Type *Ty,
                              unsigned AS,
                              Instruction *I = nullptr) const override;
+  bool isLoadBitCastBeneficial(EVT LoadVT, EVT BitcastVT,
+                               const SelectionDAG &DAG,
+                               const MachineMemOperand &MMO) const override;
   bool allowsMisalignedMemoryAccesses(EVT VT, unsigned AS, Align Alignment,
                                       MachineMemOperand::Flags Flags,
                                       unsigned *Fast) const override;

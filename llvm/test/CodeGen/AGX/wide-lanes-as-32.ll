@@ -5,7 +5,10 @@
 ; A 16-byte struct copied as two i64 (the PTX front end's copy of a float4):
 ; the load/store vectorizer makes <2 x i64> accesses, which type legalization
 ; split in two again (each with its 64-bit address). As <4 x i32> they are one
-; access each. agx-tv verifies the machine code.
+; access each. agx-tv verifies the machine code. A bfloat vector was split
+; into 16-bit loads (@bf4: four, and a store of the packed lanes); as <2 x i32>
+; it is one access, and isLoadBitCastBeneficial keeps the DAG from folding the
+; bitcast back into a <4 x bfloat> load.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @copy16(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
@@ -68,5 +71,64 @@ define agx_kernel void @copy16(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
   %lo = load i64, ptr addrspace(1) %ps, align 8
   store i64 %lo, ptr addrspace(1) %pd, align 8
   store i64 %hi, ptr addrspace(1) %pd8, align 8
+  ret void
+}
+
+define agx_kernel void @bf4(ptr addrspace(1) %s, ptr addrspace(1) %d) {
+; CHECK-LABEL: bf4:
+; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // threadgroup memory: 0 bytes
+; CHECK-NEXT:    // stack size: 0 bytes
+; CHECK-NEXT:  // %bb.0:
+; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; CHECK-NEXT:    device_load 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 1
+; CHECK-NEXT:    wait 0
+; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u2_u3, r1, signed, lsl 1
+; CHECK-NEXT:    stop
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+; CHECK-NEXT:    trap
+;
+; OFF-LABEL: bf4:
+; OFF:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
+; OFF-NEXT:    // general purpose registers: 9 x 32-bit (up to 1024 threads per threadgroup)
+; OFF-NEXT:    // threadgroup memory: 0 bytes
+; OFF-NEXT:    // stack size: 0 bytes
+; OFF-NEXT:  // %bb.0:
+; OFF-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
+; OFF-NEXT:    bitop 0101, r2, u0, 0
+; OFF-NEXT:    bitop 0101, r3, u1, 0
+; OFF-NEXT:    device_load 0, i16, x, r6, u0_u1, r1, signed, lsl 2
+; OFF-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 3
+; OFF-NEXT:    device_load 1, i16, x, r4, r2_r3, 2, signed
+; OFF-NEXT:    device_load 1, i16, x, r5, r2_r3, 3, signed
+; OFF-NEXT:    device_load 1, i16, x, r2, r2_r3, 1, signed
+; OFF-NEXT:    wait 0
+; OFF-NEXT:    bitop 0101, r7l, r6l, 0
+; OFF-NEXT:    wait 1
+; OFF-NEXT:    bitop 0101, r8l, r4l, 0
+; OFF-NEXT:    bitop 0101, r8h, r5l, 0
+; OFF-NEXT:    bitop 0101, r7h, r2l, 0
+; OFF-NEXT:    device_store 0, i32, xy, r7_r8, u2_u3, r1, signed, lsl 1
+; OFF-NEXT:    stop
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+; OFF-NEXT:    trap
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %ps = getelementptr <4 x bfloat>, ptr addrspace(1) %s, i32 %i
+  %pd = getelementptr <4 x bfloat>, ptr addrspace(1) %d, i32 %i
+  %v = load <4 x bfloat>, ptr addrspace(1) %ps, align 4
+  store <4 x bfloat> %v, ptr addrspace(1) %pd, align 4
   ret void
 }

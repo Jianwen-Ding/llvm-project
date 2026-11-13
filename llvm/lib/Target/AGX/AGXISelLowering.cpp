@@ -2008,6 +2008,19 @@ static SDValue performOffsetIndexCombine(SDNode *N,
   return SDValue();
 }
 
+/// A load or store of 32-bit lanes (one access up to 16 bytes, see
+/// lowerVectorLoad) stays one: not a vector of other lanes, which type
+/// legalization would split (AGXVectorAccesses made <8 x half> and <2 x i64>
+/// accesses <4 x i32> for that).
+bool AGXTargetLowering::isLoadBitCastBeneficial(
+    EVT LoadVT, EVT BitcastVT, const SelectionDAG &DAG,
+    const MachineMemOperand &MMO) const {
+  if (LoadVT.isVector() && LoadVT.getScalarSizeInBits() == 32 &&
+      BitcastVT.isVector() && BitcastVT.getScalarSizeInBits() != 32)
+    return false;
+  return TargetLowering::isLoadBitCastBeneficial(LoadVT, BitcastVT, DAG, MMO);
+}
+
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
