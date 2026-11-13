@@ -31,6 +31,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -44,6 +45,11 @@ using namespace llvm;
 using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "agx-narrow-inductions"
+
+static cl::opt<bool> AGXNonNegativeCasts(
+    "agx-non-negative-casts", cl::init(true), cl::Hidden,
+    cl::desc("Signed extensions, divisions and arithmetic shifts of values "
+             "SCEV proves non-negative as the unsigned ones"));
 
 static cl::opt<bool> AGXNarrowInductionsOpt(
     "agx-narrow-ivs", cl::init(true), cl::Hidden,
@@ -912,6 +918,46 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   bool Changed = false;
+  // Signed operations of values SCEV proves non-negative (a loop counter
+  // from a thread position, say) as unsigned ones: a sign extension as a
+  // zero extension (whose 64-bit uses need no high word: a multiplication of
+  // it is one instruction fewer, and no asr of the sign), a signed division
+  // or arithmetic shift right as the unsigned / logical one.
+  if (AGXNonNegativeCasts) {
+    SmallVector<Instruction *, 8> Work;
+    for (Instruction &I : instructions(F))
+      if (isa<SExtInst>(I) ||
+          ((I.getOpcode() == Instruction::AShr ||
+            I.getOpcode() == Instruction::SDiv) &&
+           I.getType()->isIntegerTy()))
+        Work.push_back(&I);
+    for (Instruction *I : Work) {
+      Value *X = I->getOperand(0);
+      if (!SE.isSCEVable(X->getType()) || !SE.isKnownNonNegative(SE.getSCEV(X)))
+        continue;
+      Instruction *R;
+      if (isa<SExtInst>(I)) {
+        R = new ZExtInst(X, I->getType(), "", I->getIterator());
+        R->setNonNeg(true);
+      } else if (I->getOpcode() == Instruction::AShr) {
+        R = BinaryOperator::CreateLShr(X, I->getOperand(1), "", I->getIterator());
+        R->setIsExact(I->isExact());
+      } else {
+        // x / d for x >= 0 is udiv only where d > 0 too
+        Value *D = I->getOperand(1);
+        if (!SE.isKnownPositive(SE.getSCEV(D)))
+          continue;
+        R = BinaryOperator::CreateUDiv(X, D, "", I->getIterator());
+        R->setIsExact(I->isExact());
+      }
+      R->takeName(I);
+      R->setDebugLoc(I->getDebugLoc());
+      I->replaceAllUsesWith(R);
+      SE.forgetValue(I);
+      I->eraseFromParent();
+      Changed = true;
+    }
+  }
   for (Loop *L : LI.getLoopsInPreorder()) {
     SmallVector<PHINode *, 4> Phis;
     for (PHINode &Phi : L->getHeader()->phis())

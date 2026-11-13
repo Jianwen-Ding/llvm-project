@@ -532,13 +532,15 @@ static cl::opt<unsigned> AGXPreISelSimplifyCFG(
              "threshold (0: not run)"));
 
 bool AGXPassConfig::addPreISel() {
+  // The special registers' bounds after loop strength reduction, which
+  // would form 64-bit offsets from the bounded indices (EXPERIMENTS.md
+  // L14-E1), but before AGXNarrowInductions, which proves counters from
+  // thread positions non-negative with them (L15-E224).
+  addPass(createAGXSpecialRegisterRangesPass());
   // After loop strength reduction, which makes 64-bit counters of PTX's
   // 64-bit address arithmetic.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createAGXNarrowInductionsPass());
-  // After loop strength reduction, which would form 64-bit offsets from
-  // the bounded indices (EXPERIMENTS.md L14-E1).
-  addPass(createAGXSpecialRegisterRangesPass());
   // The phis of an if's empty side (left by AGXCodeGenPrepare's merging of
   // || and && conditions) become selects, as SimplifyCFG folds two-entry
   // phis: an if is execution mask operations, which cost more than the
