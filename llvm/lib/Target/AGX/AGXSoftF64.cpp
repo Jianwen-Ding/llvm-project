@@ -1645,6 +1645,87 @@ static void expandPowI(IntrinsicInst &II) {
   II.eraseFromParent();
 }
 
+/// llvm.exp / llvm.log of a double as fdlibm's e_exp.c / e_log.c in double
+/// and integer operations, which the lowering below takes (as
+/// convert-gpu-to-air does for math.exp / math.log of f64): within 1 ulp.
+static Value *expandExpF64(IRBuilder<> &B, Value *X) {
+  Type *F = B.getDoubleTy(), *I = B.getInt64Ty();
+  auto C = [&](double V) { return ConstantFP::get(F, V); };
+  auto CI = [&](int64_t V) { return ConstantInt::get(I, V); };
+  X = B.CreateSelect(B.CreateFCmpOGT(X, C(710.0)), C(710.0), X);
+  X = B.CreateSelect(B.CreateFCmpOLT(X, C(-746.0)), C(-746.0), X);
+  Value *K = B.CreateUnaryIntrinsic(Intrinsic::roundeven,
+                                   B.CreateFMul(X, C(1.44269504088896338700e+00)));
+  Value *Hi = B.CreateFSub(X, B.CreateFMul(K, C(6.93147180369123816490e-01)));
+  Value *Lo = B.CreateFMul(K, C(1.90821492927058770002e-10));
+  Value *R = B.CreateFSub(Hi, Lo);
+  Value *T = B.CreateFMul(R, R);
+  Value *P = C(4.13813679705723846039e-08);
+  for (double Coef : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
+                      -2.77777777770155933842e-03, 1.66666666666666019037e-01})
+    P = B.CreateIntrinsic(Intrinsic::fma, {F}, {T, P, C(Coef)});
+  Value *CC = B.CreateFSub(R, B.CreateFMul(T, P));
+  Value *Y = B.CreateFSub(
+      C(1.0), B.CreateFSub(B.CreateFSub(Lo, B.CreateFDiv(B.CreateFMul(R, CC),
+                                                         B.CreateFSub(C(2.0), CC))),
+                           Hi));
+  Value *KI = B.CreateFPToSI(K, I);
+  Value *K1 = B.CreateAShr(KI, CI(1));
+  Value *K2 = B.CreateSub(KI, K1);
+  auto Pow2 = [&](Value *E) {
+    return B.CreateBitCast(B.CreateShl(B.CreateAdd(E, CI(1023)), CI(52)), F);
+  };
+  return B.CreateFMul(B.CreateFMul(Y, Pow2(K1)), Pow2(K2));
+}
+
+static Value *expandLogF64(IRBuilder<> &B, Value *X) {
+  Type *F = B.getDoubleTy(), *I = B.getInt64Ty();
+  auto C = [&](double V) { return ConstantFP::get(F, V); };
+  auto CI = [&](int64_t V) { return ConstantInt::get(I, V); };
+  auto Fma = [&](Value *A, Value *Bv, Value *Cv) {
+    return B.CreateIntrinsic(Intrinsic::fma, {F}, {A, Bv, Cv});
+  };
+  Value *Tiny = B.CreateFCmpOLT(X, C(0x1p-1022));
+  Value *X2 = B.CreateSelect(Tiny, B.CreateFMul(X, C(0x1p54)), X);
+  Value *K = B.CreateSelect(Tiny, CI(-54), CI(0));
+  Value *BX = B.CreateBitCast(X2, I);
+  Value *HX = B.CreateLShr(BX, CI(32));
+  K = B.CreateAdd(K, B.CreateSub(B.CreateLShr(HX, CI(20)), CI(1023)));
+  HX = B.CreateAnd(HX, CI(0xfffff));
+  Value *Iv = B.CreateAnd(B.CreateAdd(HX, CI(0x95f64)), CI(0x100000));
+  Value *NewHi = B.CreateOr(HX, B.CreateXor(Iv, CI(0x3ff00000)));
+  Value *X3 = B.CreateBitCast(
+      B.CreateOr(B.CreateShl(NewHi, CI(32)), B.CreateAnd(BX, CI(0xffffffff))), F);
+  K = B.CreateAdd(K, B.CreateLShr(Iv, CI(20)));
+  Value *Fv = B.CreateFSub(X3, C(1.0));
+  Value *S = B.CreateFDiv(Fv, B.CreateFAdd(C(2.0), Fv));
+  Value *Z = B.CreateFMul(S, S), *W = B.CreateFMul(Z, Z);
+  Value *T1 = B.CreateFMul(W, Fma(W, Fma(W, C(1.531383769920937332e-01),
+                                        C(2.222219843214978396e-01)),
+                                 C(3.999999999940941908e-01)));
+  Value *T2 = B.CreateFMul(
+      Z, Fma(W, Fma(W, Fma(W, C(1.479819860511658591e-01), C(1.818357216161805012e-01)),
+                    C(2.857142874366239149e-01)),
+             C(6.666666666666735130e-01)));
+  Value *R = B.CreateFAdd(T2, T1);
+  Value *DK = B.CreateSIToFP(K, F);
+  Value *HiP = B.CreateFMul(DK, C(6.93147180369123816490e-01));
+  Value *LoP = B.CreateFMul(DK, C(1.90821492927058770002e-10));
+  Value *Hfsq = B.CreateFMul(B.CreateFMul(C(0.5), Fv), Fv);
+  Value *A = B.CreateFSub(
+      HiP, B.CreateFSub(B.CreateFSub(Hfsq, B.CreateFAdd(B.CreateFMul(S, B.CreateFAdd(Hfsq, R)), LoP)),
+                        Fv));
+  Value *Bv = B.CreateFSub(
+      HiP, B.CreateFSub(B.CreateFSub(B.CreateFMul(S, B.CreateFSub(Fv, R)), LoP), Fv));
+  Value *IJ = B.CreateOr(B.CreateSub(HX, CI(0x6147a)), B.CreateSub(CI(0x6b851), HX));
+  Value *Res = B.CreateSelect(B.CreateICmpSGT(IJ, CI(0)), A, Bv);
+  Value *Inf = ConstantFP::getInfinity(F);
+  Res = B.CreateSelect(B.CreateFCmpOEQ(X, Inf), Inf, Res);
+  Res = B.CreateSelect(B.CreateFCmpOEQ(X, C(0.0)), ConstantFP::getInfinity(F, true), Res);
+  Res = B.CreateSelect(B.CreateFCmpULT(X, C(0.0)), ConstantFP::getQNaN(F), Res);
+  return Res;
+}
+
 bool AGXSoftF64::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -1709,6 +1790,22 @@ bool AGXSoftF64::runOnFunction(Function &F) {
         X);
     Value *R = B.CreateInsertValue(
         B.CreateInsertValue(PoisonValue::get(II->getType()), Frac, 0), Int, 1);
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
+  SmallVector<IntrinsicInst *, 2> ExpLogs;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && (II->getIntrinsicID() == Intrinsic::exp ||
+               II->getIntrinsicID() == Intrinsic::log) &&
+        isDouble(II))
+      ExpLogs.push_back(II);
+  for (IntrinsicInst *II : ExpLogs) {
+    IRBuilder<> B(II);
+    Value *R = II->getIntrinsicID() == Intrinsic::exp
+                  ? expandExpF64(B, II->getArgOperand(0))
+                  : expandLogF64(B, II->getArgOperand(0));
     R->takeName(II);
     II->replaceAllUsesWith(R);
     II->eraseFromParent();

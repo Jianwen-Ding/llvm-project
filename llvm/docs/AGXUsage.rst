@@ -944,8 +944,9 @@ exact ``fmod``, one bit of the quotient an iteration (8 instructions
 for each binade between the operands); ``powi`` is compiler-rt's
 ``__powidf2`` (a multiplication for each bit of the exponent and a squaring
 for each but the last, each rounded; the reciprocal for a negative
-exponent). Vector arithmetic and the
-transcendental functions on ``double`` are diagnosed as unsupported. The code is large: in
+exponent); ``llvm.exp`` and ``llvm.log`` are fdlibm's algorithms in double
+operations (within 1 ulp). Vector arithmetic and the other transcendental
+functions on ``double`` are diagnosed as unsupported. The code is large: in
 instructions per operation, about 215 for an addition or a multiplication,
 430 for a fused multiply-add, 290 for a division or a square root, 100 for a
 conversion and 30 for a comparison.
