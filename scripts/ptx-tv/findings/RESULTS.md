@@ -1,14 +1,14 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4167.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3104 | 74.5% |
-| `timeout` | 659 | 15.8% |
+| `correct` | 3123 | 74.9% |
+| `timeout` | 640 | 15.4% |
 | `mismatch-known` | 124 | 3.0% |
 | `inconclusive` | 100 | 2.4% |
 | `src-inline-asm` | 74 | 1.8% |
@@ -22,7 +22,7 @@ Functions checked: 4167.
 
 Of the correct results, 668 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
 
-Conclusive (proved correct or counterexample): 3269 (78.4%).
+Conclusive (proved correct or counterexample): 3288 (78.9%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 

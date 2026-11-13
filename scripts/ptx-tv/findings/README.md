@@ -196,12 +196,12 @@ functions per test file, so files with up to 24 functions are fully
 covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
-`--disable-poison-input` check (tagged). In short: 4167 functions from 620
-test files; 3104 proved correct (668 through probe-derived opaque instructions,
+`--disable-poison-input` check (tagged). In short: 4167 functions from 619
+test files; 3123 proved correct (668 through probe-derived opaque instructions,
 20 only with the weaker check); 30 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 124 in
-known modelling classes; 11 not lifted; 759 solver timeouts or inconclusive.
+known modelling classes; 11 not lifted; 740 solver timeouts or inconclusive.
 
 Not lifted (11): the two finding-5 kernels (invalid PTX), calls through
 `undef` or with ambiguous types, `stacksave`/`stackrestore` (unsupported by
@@ -212,7 +212,10 @@ ExpandVariadics (which the backend runs; the pass itself is trusted).
 The remaining timeouts: about three quarters involve floating point; the
 rest are 64-bit division and vector atomics expanded into CAS loops. A 24x
 larger per-query budget resolved 7 of 81 integer ones tried; a 2x budget
-with the weaker check resolved 20 of about 360.
+with the weaker check resolved 20 of about 360. Some proofs are
+sensitive to machine load: a regression re-run under load turned 28
+previously correct functions into timeouts; 19 of them were proved again
+with a 30 s per-query budget (recorded as `smt_to`), 9 remain timeouts.
 
 ## Observations not counted as defects
 
