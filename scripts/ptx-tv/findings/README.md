@@ -194,24 +194,26 @@ kernels in the verifier).
 `gen_results.py`). Three passes were combined (up to 6, 8 and 10 further
 functions per test file, so files with up to 24 functions are fully
 covered); everything not proved correct was re-checked with the final
-lifter, and earlier solver timeouts were re-run with a larger budget and the
-weaker `--disable-poison-input` check (tagged). In short: 4170 functions from
-620 test files; 3101 proved correct (663 through probe-derived opaque
+lifter, and timeouts were re-run with larger budgets and, separately, the
+weaker `--disable-poison-input` check (tagged). In short: 4167 functions from
+620 test files; 3119 proved correct (668 through probe-derived opaque
 instructions, 20 only with the weaker check); 30 counterexamples with
 out-of-bounds `.param` accesses (finding 1, plus the padding over-reads);
-findings 2/2b/3/4; 5 unresolved (min/max signed zeros) and 1 NaN-bits note;
-128 in known modelling classes; 31 not lifted; 738 solver timeouts or
+findings 2/2b/3/4/5; 5 unresolved (min/max signed zeros) and 1 NaN-bits
+note; 128 in known modelling classes; 19 not lifted; 730 solver timeouts or
 inconclusive.
 
-Not lifted: variadic *callees* (they read their arguments through
-`va_arg`, which Alive2 models abstractly; variadic *calls* are lifted),
-calls through `undef`, two kernels with non-void LLVM return types,
-`stacksave`/`stackrestore`, `st.async`/`st.mmio`/`multimem.st.async`
-variants, function-scope `.shared` variables, a few calls to
-undeclared/library functions.
+Not lifted (19): variadic *callees* (they read their arguments through
+`va_arg`, which Alive2 models abstractly; variadic *calls* are lifted), the
+two finding-5 kernels (invalid PTX), calls through `undef` or whose type is
+ambiguous, `stacksave`/`stackrestore` (unsupported by Alive2 in the source
+anyway), the non-CUDA texture/surface forms, and calls to library functions
+the source does not declare.
 
-The remaining timeouts are float-heavy functions: neither a 6x larger solver
-budget nor the weaker check resolves more than a few percent of them.
+The remaining timeouts: about three quarters involve floating point; the
+rest are 64-bit division and vector atomics expanded into CAS loops. A 24x
+larger per-query budget resolved 7 of 81 integer ones tried; a 2x budget
+with the weaker check resolved 20 of about 360.
 
 ## Observations not counted as defects
 

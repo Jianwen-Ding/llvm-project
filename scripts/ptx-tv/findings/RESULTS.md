@@ -1,29 +1,28 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file (files with fewer functions are fully covered); non-correct results re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; earlier timeouts re-run with `--smt-to=10000` and the weaker `--disable-poison-input` (tagged). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file (files with fewer functions are fully covered); non-correct results re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts re-run with `--smt-to=10000` and the weaker `--disable-poison-input` (tagged), and integer-only timeouts partially (81 of 215) with `--smt-to=120000`. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
-Test files: 620; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
-Functions checked: 4170.
+Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
+Functions checked: 4167.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3101 | 74.4% |
-| `timeout` | 641 | 15.4% |
+| `correct` | 3119 | 74.9% |
+| `timeout` | 633 | 15.2% |
 | `mismatch-known` | 128 | 3.1% |
 | `inconclusive` | 97 | 2.3% |
 | `src-inline-asm` | 74 | 1.8% |
 | `alive-unsupported` | 37 | 0.9% |
-| `lift-unsupported` | 31 | 0.7% |
 | `mismatch-param-oob` | 30 | 0.7% |
-| `alive-error` | 17 | 0.4% |
+| `alive-error` | 19 | 0.5% |
+| `lift-unsupported` | 19 | 0.5% |
 | `mismatch` | 11 | 0.3% |
-| `extract-failed` | 3 | 0.1% |
 
 20 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
 
-Of the correct results, 663 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
+Of the correct results, 668 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
 
-Conclusive (proved correct or counterexample): 3270 (78.4%).
+Conclusive (proved correct or counterexample): 3288 (78.9%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -69,7 +68,9 @@ Triage (see `README.md`): `bf16-instructions.ll` `test_uitofp_i32`,
 `minimumnum_float`/`maximumnum_float`/`maximumnum_double` and `fmax3.ll`
 `test_fminimumnum3`/`test_fmaximumnum3`: unresolved (PTX min/max signed
 zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
-`maxnum`).
+`maxnum`). Finding 5 (`lower-args-gridconstant.ll` kernels storing to an
+undeclared `func_retval0`) is reported as `lift-unsupported`, since the PTX
+is invalid.
 
 * `bf16-instructions.ll` `test_maxnum_v2`
 * `bf16-instructions.ll` `test_uitofp_i32`
@@ -102,13 +103,9 @@ zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
 | reason | functions |
 |---|---:|
 | `vararg` | 7 |
-| `unknown` | 6 |
 | `indirect` | 3 |
-| `modifier .async` | 3 |
-| `directive` | 2 |
-| `non` | 2 |
-| `multimem.st` | 2 |
-| `modifier .mmio` | 2 |
+| `unknown` | 3 |
+| `kernel` | 2 |
 | `suld.b` | 1 |
 | `stacksave.u64` | 1 |
 | `stackrestore.u64` | 1 |
@@ -120,5 +117,6 @@ zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
 * 8: ERROR: The target program doesn't reach a return instruction.
 * 6: ERROR: SMT Error: invalid extract application
 * 3: ERROR: The source program doesn't reach a return instruction.
+* 2: ERROR: SMT Error: smt tactic failed to show goal to be sat/unsat memout
 * 1: ERROR: Unsupported attribute: alignstack(32)
 
