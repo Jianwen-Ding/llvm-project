@@ -8,7 +8,10 @@
 //
 // The thread and threadgroup indices have known bounds: a threadgroup has at
 // most 1024 threads, a SIMD-group 32, and grid positions and sizes are below
-// 2^31 (CUDA's limits, within which CUDA launches stay). This pass gives the
+// 2^31 (CUDA's limits, within which CUDA launches stay); a kernel promising
+// at most N threads a threadgroup ("agx-max-threads-per-threadgroup", from
+// PTX's .maxntid or MLIR's known_block_size) has its threadgroup positions
+// below N and its SIMD-group index below N / 32. This pass gives the
 // special register reads range return attributes just before instruction
 // selection, which turns them into AssertZext nodes: signed divisions and
 // remainders of indices by powers of two then select as shifts and masks.
@@ -39,6 +42,11 @@ static cl::opt<bool> AGXSpecialRegisterRanges(
     "agx-sr-ranges", cl::init(true), cl::Hidden,
     cl::desc("Bound the thread and threadgroup indices before instruction "
              "selection"));
+
+static cl::opt<bool> AGXThreadgroupRanges(
+    "agx-threadgroup-ranges", cl::init(true), cl::Hidden,
+    cl::desc("Bound the threadgroup's special registers by the kernel's "
+             "agx-max-threads-per-threadgroup"));
 
 static cl::opt<cl::boolOrDefault> AGXKnownGridRanges(
     "agx-known-grid-ranges", cl::Hidden,
@@ -93,6 +101,28 @@ static std::optional<std::pair<uint64_t, uint64_t>> bounds(Intrinsic::ID ID) {
   case Intrinsic::agx_threadgroups_per_grid_y:
   case Intrinsic::agx_threadgroups_per_grid_z:
     return std::pair(1, 0x80000000);
+  default:
+    return std::nullopt;
+  }
+}
+
+/// The tighter bounds of the threadgroup's registers when the launch
+/// promises at most N threads a threadgroup ("agx-max-threads-per-threadgroup",
+/// as block barriers rely on): each extent is at most N.
+static std::optional<std::pair<uint64_t, uint64_t>>
+threadgroupBounds(Intrinsic::ID ID, uint64_t N) {
+  switch (ID) {
+  case Intrinsic::agx_thread_position_in_threadgroup_x:
+  case Intrinsic::agx_thread_position_in_threadgroup_y:
+  case Intrinsic::agx_thread_position_in_threadgroup_z:
+  case Intrinsic::agx_thread_index_in_threadgroup:
+    return std::pair(uint64_t(0), N);
+  case Intrinsic::agx_threads_per_threadgroup_x:
+  case Intrinsic::agx_threads_per_threadgroup_y:
+  case Intrinsic::agx_threads_per_threadgroup_z:
+    return std::pair(uint64_t(1), N + 1);
+  case Intrinsic::agx_simdgroup_index_in_threadgroup:
+    return std::pair(uint64_t(0), divideCeil(N, 32));
   default:
     return std::nullopt;
   }
@@ -155,11 +185,20 @@ bool AGX::addSpecialRegisterRanges(Function &F,
     FindFunctionBackedges(F, Edges);
     GridRanges = Edges.empty();
   }
+  uint64_t MaxThreads = 0;
+  if (AGXThreadgroupRanges)
+    MaxThreads =
+        F.getFnAttributeAsParsedInteger("agx-max-threads-per-threadgroup", 0);
+  if (MaxThreads > 1024)
+    MaxThreads = 0;
   for (Instruction &I : instructions(F)) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
     if (!II || !II->getType()->isIntegerTy(32))
       continue;
     auto B = bounds(II->getIntrinsicID());
+    if (B && MaxThreads)
+      if (auto T = threadgroupBounds(II->getIntrinsicID(), MaxThreads))
+        B = T;
     if (GridRanges)
       if (auto G = gridBounds(F, II->getIntrinsicID()))
         if (!B || G->second - G->first < B->second - B->first)
