@@ -36,6 +36,7 @@ import sys
 
 from llvmsig import parse_sig, int_bits, split_top
 import layout
+import narrowcvt
 
 
 class Unsupported(Exception):
@@ -899,13 +900,15 @@ class Lifter:
         "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
         "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
         "number", "notanumber", "normal", "subnormal", "u32", "s32",
-        "u64", "satfinite", "xorsign",
+        "u64", "satfinite", "xorsign", "red", "popc", "inc", "dec", "m8n8", "trans",
     }
 
     def instr(self, base, mods, ops, opcode):
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
+        if base == "cvt" and narrowcvt.is_narrow(mods, mods):
+            return self.cvt_narrow(opcode, ops)
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
                 raise Unsupported("modifier .%s in %s" % (m, opcode))
@@ -1911,10 +1914,32 @@ class Lifter:
         v = self.post(v, df, mods)
         self.writef(ops[0], v, dt)
 
+    def cvt_narrow(self, opcode, ops):
+        """Narrow-format conversion as an uninterpreted function (narrowcvt)."""
+        k = narrowcvt.ptx_key(opcode)
+        if k is None:
+            raise Unsupported(opcode)
+        d = ops[0].strip()
+        if d not in self.regs:
+            raise Unsupported("narrow cvt destination " + d)
+        w = self.regs[d]
+        args, tys = [], []
+        for o in ops[1:]:
+            o = o.strip()
+            if o not in self.regs:
+                raise Unsupported("narrow cvt operand " + o)
+            ow = self.regs[o]
+            args.append("i%d %s" % (ow, self.read_reg(o, ow)))
+            tys.append("i%d" % ow)
+        self.declare(k, "declare i%d @%s(%s) nounwind willreturn memory(none)" % (w, k, ", ".join(tys)))
+        self.write(d, self.op("call i%d @%s(%s)" % (w, k, ", ".join(args))), w)
+
     def cvt_ff(self, v, sf, df, frnd, mods):
         order = {"half": 1, "bfloat": 1, "float": 2, "double": 3}
         if sf in ("half", "bfloat") and df in ("half", "bfloat"):
-            raise Unsupported("cvt f16<->bf16")
+            # both convert exactly to f32, so this rounds once
+            v = self.op("fpext %s %s to float" % (sf, v))
+            return self.cvt_ff(v, "float", df, frnd, mods)
         if order[df] > order[sf]:
             return self.op("fpext %s %s to %s" % (sf, v, df))
         rm = frnd[0] if frnd else None
@@ -2188,6 +2213,8 @@ class Lifter:
             self.ucall("void", "bar.warp.sync", ["i32 " + self.get(ops[0], 32)])
             return
         kind = mods[0] if mods else "sync"
+        if kind == "red":
+            return self.barrier_red(mods, ops, opc, al)
         if kind not in ("sync", "arrive"):
             raise Unsupported(opc)
         a = self.get(ops[0], 32)
@@ -2198,6 +2225,38 @@ class Lifter:
         else:
             b = self.get(ops[1], 32)
             self.ucall("void", "barrier.cta.%s%s.count" % (kind, al), ["i32 " + a, "i32 " + b])
+
+    def barrier_red(self, mods, ops, opc, al):
+        # bar.red.{and,or}.pred d, a{, b}, {!}c   /  bar.red.popc.u32 d, a{, b}, {!}c
+        op = [m for m in mods if m in ("and", "or", "popc")]
+        if not op:
+            raise Unsupported(opc)
+        op = op[0]
+        a = self.get(ops[1], 32)
+        args = ["i32 " + a]
+        if len(ops) == 4:
+            args.append("i32 " + self.get(ops[2], 32))
+        args.append("i1 " + self.pred_operand(ops[-1]))
+        name = "barrier.cta.red.%s%s.%s" % (op, al, "count" if len(ops) == 4 else "all")
+        if op == "popc":
+            self.write(ops[0], self.ucall("i32", name, args), 32)
+        else:
+            self.write(ops[0], self.ucall("i1", name, args), 1)
+
+    def i_movmatrix(self, mods, ops, opc):
+        # movmatrix.sync.aligned.m8n8.trans.b16 d, a  (cross-lane data movement)
+        name = "movmatrix." + ".".join(mods)
+        self.write(ops[0], self.ucall("i32", name, ["i32 " + self.get(ops[1], 32)]), 32)
+
+    def i_fns(self, mods, ops, opc):
+        args = ["i32 " + self.get(o, 32) for o in ops[1:4]]
+        self.write(ops[0], self.ucall("i32", "fns", args, "nounwind willreturn memory(none)"), 32)
+
+    def i_setmaxnreg(self, mods, ops, opc):
+        kind = [m for m in mods if m in ("inc", "dec")]
+        if not kind:
+            raise Unsupported(opc)
+        self.ucall("void", "setmaxnreg.%s.sync.aligned.u32" % kind[0], ["i32 " + self.get(ops[0], 32)])
 
     def i_shfl(self, mods, ops, opc):
         sync = "sync" in mods
@@ -2236,6 +2295,15 @@ class Lifter:
     def i_redux(self, mods, ops, opc):
         t = self.types_of(mods)[0]
         kind = [m for m in mods if m in ("add", "min", "max", "and", "or", "xor")]
+        if t == "f32" and kind and kind[0] in ("min", "max"):
+            name = "redux.sync.f" + kind[0] + (".abs" if "abs" in mods else "") + \
+                (".NaN" if "NaN" in mods else "")
+            a = self.getf(ops[1], "f32")
+            fname = "nvvm." + name
+            self.declare(fname, "declare float @%s(float, i32) nounwind" % fname)
+            r = self.op("call float @%s(float %s, i32 %s)" % (fname, a, self.get(ops[2], 32)))
+            self.writef(ops[0], r, "f32")
+            return
         if not kind or t not in ("u32", "s32", "b32"):
             raise Unsupported(opc)
         k = kind[0]

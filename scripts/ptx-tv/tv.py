@@ -30,6 +30,7 @@ BIN = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin")
 ALIVE = os.environ.get("PTXTV_ALIVE", "/home/user/alive2/build/alive-tv")
 WALL_TIMEOUT = int(os.environ.get("PTXTV_WALL_TIMEOUT", "0"))
 LLC_FLAGS = {}   # pid -> llc flags of the file being processed
+SKIP = {}        # file -> functions to skip (--skip-from)
 
 
 def run(cmd, inp=None, timeout=120):
@@ -538,12 +539,18 @@ def process_file(path, args):
         return [dict(base, status="source-prep-failed", detail=str(e)[:300])]
     name_map = build_name_map(defines, decls, globals_)
     names = list(defines)
+    skip_here = SKIP.get(base["file"], set())
+    if skip_here:
+        names = [n for n in names if n not in skip_here]
     if args.max_funcs and len(names) > args.max_funcs:
         import random
         rnd = random.Random(hash(path) & 0xffff)
         names = sorted(rnd.sample(names, args.max_funcs), key=names.index)
+    skip = SKIP.get(base["file"], set())
     for n in names:
         if args.func and n not in args.func:
+            continue
+        if n in skip:
             continue
         line, sig = defines[n]
         try:
@@ -571,6 +578,8 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--root", default=None)
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--skip-from", default=None,
+                    help="skip functions already present in this results file")
     ap.add_argument("--resume", action="store_true",
                     help="skip files already present in --out")
     args = ap.parse_args()
@@ -583,6 +592,11 @@ def main():
                 pass
         args.files = [f for f in args.files
                       if (os.path.relpath(f, args.root) if args.root else f) not in done]
+    if args.skip_from:
+        for l in open(args.skip_from):
+            r = json.loads(l)
+            if "function" in r:
+                SKIP.setdefault(r["file"], set()).add(r["function"])
     out = sys.stdout if args.out == "-" else open(args.out, "a")
     if args.j <= 1:
         for f in args.files:

@@ -12,6 +12,11 @@ Intrinsics with no entry here are left as uninterpreted calls.
 import re
 
 from llvmsig import parse_sig, split_top
+import narrowcvt
+
+INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
+          "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
+          "i64": "i64", "double": "i64"}
 
 TSUF = {"f": "f32", "d": "f64", "f16": "f16", "f16x2": "f16x2",
         "bf16": "bf16", "bf16x2": "bf16x2"}
@@ -118,6 +123,9 @@ def mapping(name, args):
     if m and imms.get(1, "false") in ("false", "0"):
         t, rnd, relu, sf = m.groups()
         return ("cvt.%s%s%s.%s.f32 %%d, %%a0" % (rnd, relu or "", sf or "", t), [0])
+    m = re.fullmatch(r"bf2h\.rn(\.ftz)?", n)
+    if m:
+        return ("cvt.rn%s.f16.bf16 %%d, %%a0" % (m.group(1) or ""), [0])
     m = re.fullmatch(r"f2h\.rn(\.ftz)?", n)
     if m:
         return ("cvt.rn%s.f16.f32 %%d, %%a0" % (m.group(1) or ""), [0])
@@ -278,6 +286,50 @@ def expand(text, lifter_mod):
                 out_lines.append("  %s = load %s, %s %s, align %s" % (
                     res.group(1), cm.group(1), args[0][0], args[0][1], args[1][1]))
                 removed = True
+                continue
+        nk = narrowcvt.intrinsic_key(name, args)
+        if nk:
+            cm = re.search(r"call\s+((?:<[^>]*>)|\S+)\s+@llvm\.nvvm\.", line)
+            ret = cm.group(1) if cm else None
+            kname, keep, argw, retw = nk
+            kept = [args[i] for i in keep]
+            itys = [INT_OF.get(t) for t, _ in kept]
+            rty = INT_OF.get(ret)
+            if ret and rty and None not in itys:
+                key = ("narrow", name, ret, tuple(t for t, _ in kept))
+                if key not in defs:
+                    fname = "ptxtv_sem_%d" % len(defs)
+                    params = ", ".join("%s %%x%d" % (t, i) for i, (t, _) in enumerate(kept))
+                    body = ["define internal %s @%s(%s) alwaysinline {" % (ret, fname, params)]
+                    cargs, ctys = [], []
+                    for i, ((t, _), it) in enumerate(zip(kept, itys)):
+                        v = "%%x%d" % i
+                        if t != it:
+                            body.append("  %%c%d = bitcast %s %%x%d to %s" % (i, t, i, it))
+                            v = "%%c%d" % i
+                        if argw[i]:
+                            body.append("  %%w%d = trunc %s %s to i%d" % (i, it, v, argw[i]))
+                            v, it = "%%w%d" % i, "i%d" % argw[i]
+                        cargs.append("%s %s" % (it, v))
+                        ctys.append(it)
+                    itys = ctys
+                    if retw:
+                        body.append("  %%r8 = call i%d @%s(%s)" % (retw, kname, ", ".join(cargs)))
+                        body.append("  %%r = zext i%d %%r8 to %s" % (retw, rty))
+                    else:
+                        body.append("  %%r = call %s @%s(%s)" % (rty, kname, ", ".join(cargs)))
+                    if rty == ret:
+                        body.append("  ret %s %%r" % ret)
+                    else:
+                        body.append("  %%rv = bitcast %s %%r to %s" % (rty, ret))
+                        body.append("  ret %s %%rv" % ret)
+                    body.append("}")
+                    decl = "declare %s @%s(%s) nounwind willreturn memory(none)" % (
+                        "i%d" % retw if retw else rty, kname, ", ".join(itys))
+                    defs[key] = (fname, "\n".join(body), {kname: decl})
+                line = line[:m.start()] + "@" + defs[key][0] + "(" + \
+                    ", ".join("%s %s" % a for a in kept) + line[k:]
+                out_lines.append(line)
                 continue
         mp = mapping(name, args)
         cm = re.search(r"call\s+(?:(?:fast|nnan|ninf|nsz|arcp|contract|afn|reassoc)\s+)*"
