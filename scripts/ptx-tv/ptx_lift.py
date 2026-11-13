@@ -79,6 +79,10 @@ class PParam:
         if self.align is None or self.ptr:
             self.align = max(self.size if not m else 1, 1) if not self.ptr else 8
         self.scalar_bits = None if m else ebits
+        # texture/sampler/surface reference parameters hold an opaque handle
+        self.handle = any(t in toks for t in (".texref", ".samplerref", ".surfref"))
+        if self.handle:
+            self.size, self.align, self.scalar_bits = 8, 8, 64
 
 
 class PFunc:
@@ -271,6 +275,7 @@ class Lifter:
         self.typedefs = typedefs or {}
         self.indirect_sigs = indirect_sigs or []
         self.used_probe = False
+        self.handle_params = {}      # .texref/.samplerref param -> LLVM arg
         self.pf = pfunc
         self.sig = sig
         self.name_map = name_map     # PTX symbol -> LLVM global/function name
@@ -283,6 +288,7 @@ class Lifter:
         self.slots_used = set()
         self.base_of = {}            # 64-bit reg -> base object key
         self.exact = set()           # regs equal to their base address
+        self.const_off = {}          # regs equal to base + constant
         self.slot_base = {}          # param slot -> base key of stored ptr
         self.jump_tables = {}        # label -> [target labels]
         self.last_label = None
@@ -512,6 +518,13 @@ class Lifter:
         if off:
             a = self.op("add i64 %s, %d" % (a, off))
         key = self.base_of.get(base)
+        if key is not None and base in self.const_off:
+            b = self.base_ptr(key)
+            if b is not None:
+                total = self.const_off[base] + off
+                if total == 0:
+                    return "%s %s" % b
+                return "%s %s" % (b[0], self.op("getelementptr i8, %s %s, i64 %d" % (b[0], b[1], total)))
         if key is not None:
             if base in self.exact and not off:
                 b = self.base_ptr(key)
@@ -594,6 +607,27 @@ class Lifter:
             if d not in widths or parts[0] in NO_DEF_OPS:
                 continue
             defs.append((parts[0], parts[1:], d, ops[1:]))
+        # registers whose value is used as an address (or call target),
+        # directly or through add/sub/mov/cvta/and
+        addr_used = set()
+        for it in items:
+            if it[0] != "stmt" or it[1].startswith("."):
+                continue
+            for m in re.finditer(r"\[\s*(%[\w$]+)", it[1]):
+                addr_used.add(m.group(1))
+            mc = re.match(r"(?:@!?%\w+\s+)?call[\w.]*\s+(?:\([^)]*\)\s*,\s*)?(%[\w$]+)", it[1])
+            if mc:
+                addr_used.add(mc.group(1))
+        changed = True
+        while changed:
+            changed = False
+            for b, mods, d, srcs in defs:
+                if d in addr_used and b in ("add", "sub", "mov", "cvta", "and"):
+                    for x in srcs:
+                        x = x.strip()
+                        if x in widths and x not in addr_used:
+                            addr_used.add(x)
+                            changed = True
         base = {r: set() for r in widths}
         NONE = ("none", None)
 
@@ -622,9 +656,13 @@ class Lifter:
                         new = {NONE}
                 elif b == "sub" and len(srcs) == 2 and "cc" not in mods and ob(srcs[1]) == {NONE}:
                     new = ob(srcs[0])
+                elif b == "and" and len(srcs) == 2 and (self.imm(srcs[1]) or 0) < 0:
+                    # clearing low address bits (alignment) stays in the object
+                    new = ob(srcs[0])
                 elif b == "alloca":
                     new = {("dyn", d)}
                 elif b in ("ld", "ldu") and "param" not in mods and len(srcs) == 1 \
+                        and d in addr_used \
                         and any(m in ("b64", "u64", "s64") for m in mods) \
                         and not any(m in ("v2", "v4", "v8") for m in mods):
                     # a loaded 64-bit value may be a pointer: keep its provenance
@@ -655,6 +693,32 @@ class Lifter:
                     exact.discard(d)
                     changed = True
         self.exact = exact
+        # registers holding base + a constant: only defined by an exact base
+        # register (offset 0) or add/sub of an immediate to such a register
+        defs_of = {}
+        for b, mods, d, srcs in defs:
+            defs_of.setdefault(d, []).append((b, mods, srcs))
+        offs = {r: 0 for r in exact}
+        changed = True
+        while changed:
+            changed = False
+            for d, dl in defs_of.items():
+                if d in offs or d not in self.base_of or len(dl) != 1:
+                    continue
+                b, mods, srcs = dl[0]
+                if b in ("add", "sub") and len(srcs) == 2 and "cc" not in mods:
+                    a, c = srcs[0].strip(), srcs[1].strip()
+                    ia, ic = self.imm(a), self.imm(c)
+                    if a in offs and ic is not None:
+                        offs[d] = offs[a] + (ic if b == "add" else -ic)
+                        changed = True
+                    elif b == "add" and c in offs and ia is not None:
+                        offs[d] = offs[c] + ia
+                        changed = True
+                elif b in ("mov", "cvta") and len(srcs) == 1 and srcs[0].strip() in offs:
+                    offs[d] = offs[srcs[0].strip()]
+                    changed = True
+        self.const_off = offs
 
     # ---- function body -----------------------------------------------------
     def lift(self):
@@ -677,6 +741,8 @@ class Lifter:
                 self.scopes[0][pp.name] = (arg.name, pp)
                 continue
             slot = "%%param.%d" % k
+            if pp.handle:
+                self.handle_params[pp.name] = "%s %s" % (arg.ty, arg.name)
             self.allocas.append("%s = alloca [%d x i8], align %d" %
                                 (slot, pp.size, pp.align))
             self.scopes[0][pp.name] = (slot, pp)
@@ -1999,6 +2065,9 @@ class Lifter:
             raise Unsupported("generic op arity")
         vals = []
         for (kind, text), carg in zip(args, csig.args):
+            if text.strip() in self.handle_params and carg.ty == "i64":
+                vals.append(self.handle_params[text.strip()])
+                continue
             if kind == "addr" and carg.ty == "i64":
                 base = text.split("+")[0].strip()
                 if base not in self.regs and "+" not in text and base in self.name_map:

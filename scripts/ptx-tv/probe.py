@@ -148,6 +148,10 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
     if len(f.params) != len(params):
         return None
     src = {}          # reg -> ("arg", argindex, byteoff, bits)
+    # parameters named directly as operands (e.g. texture handles in
+    # texmode_independent)
+    for i, pp in enumerate(f.params):
+        src[pp.name] = ("arg", params[i][0], 0, pp.size * 8)
     target = None
     results = {}      # reg -> retval byte offset
     sel = {}          # int reg -> predicate it was selected from
@@ -283,6 +287,8 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
             s = src[text]
             if s[0] != "arg":
                 return None
+            if args[s[1]][0].startswith("ptr") and text in pidx:
+                return None   # a pointer parameter named as a value: its slot address
             mp.ops.append(("piece", s[1], s[2], min(regw.get(text, s[3]), s[3]) if s[3] == 1 else regw.get(text, s[3])))
         else:
             v = ptx_lift.Lifter.imm(None, text)

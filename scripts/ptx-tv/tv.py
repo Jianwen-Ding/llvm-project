@@ -166,9 +166,18 @@ def prepare_source(path, workdir):
     nodl = os.path.join(workdir, "nodl.ll")
     with open(nodl, "w") as f:
         f.write(raw)
+    # Variadic function definitions: NVPTX lowers them with LLVM's
+    # ExpandVariadics (the variable arguments become an explicit buffer
+    # pointer); apply the same pass so the callee can be compared.  The pass
+    # itself is trusted.
+    passes = "lower-atomic"
+    extra = []
+    if re.search(r"^define [^\n]*\.\.\.\)", raw, re.M):
+        passes = "expand-variadics,lower-atomic"
+        extra = ["-expand-variadics-override=lowering"]
     rc, out, err = run([BIN + "/opt", "-S", "-mtriple=nvptx64-nvidia-cuda",
-                        "-strip-debug", "-passes=lower-atomic",
-                        nodl, "-o", "-"])
+                        "-strip-debug", "-passes=" + passes] + extra +
+                       [nodl, "-o", "-"])
     if rc:
         raise RuntimeError("opt failed: " + err[-300:])
     # NVVM intrinsics that name one PTX instruction get that instruction's
