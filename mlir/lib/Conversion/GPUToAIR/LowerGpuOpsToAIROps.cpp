@@ -2203,6 +2203,14 @@ struct LowerGpuOpsToAIROpsPass final
         passthrough.push_back(ArrayAttr::get(
             ctx, {StringAttr::get(ctx, "agx-max-threads-per-threadgroup"),
                   StringAttr::get(ctx, std::to_string(threads))}));
+        // and each extent (the AGX backend bounds the threadgroup's
+        // positions and sizes by it)
+        std::string dims;
+        for (int32_t d : size.asArrayRef())
+          dims += (dims.empty() ? "" : ",") + std::to_string(d);
+        passthrough.push_back(ArrayAttr::get(
+            ctx, {StringAttr::get(ctx, "agx-threads-per-threadgroup"),
+                  StringAttr::get(ctx, dims)}));
       }
       // The grid's extents when known (the launch promises them): the AGX
       // backend bounds the position special registers by them just before

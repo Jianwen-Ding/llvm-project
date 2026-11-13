@@ -388,6 +388,10 @@ attributes lower the register use, spilling the rest to the stack:
   fences around them (the block barrier orders the block's memory). The
   threadgroup's positions and sizes are taken to be at most N, and its
   SIMD-group index below N / 32 (``-agx-threadgroup-ranges``).
+* ``"agx-threads-per-threadgroup"="X,Y,Z"`` (MLIR's ``known_block_size``):
+  the launch's exact threadgroup shape; each thread position is below its
+  extent and each threadgroup size is that extent
+  (``-agx-threadgroup-shape-ranges``).
 * ``"agx-max-gprs"="N"`` (PTX ``.maxnreg``): at most N 32-bit registers, and
   no fewer than 16.
 

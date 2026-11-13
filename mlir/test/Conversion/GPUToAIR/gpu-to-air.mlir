@@ -130,12 +130,12 @@ gpu.module @default_space {
 
 // -----
 
-// A known threadgroup size is an AGX hint on the kernel; the threadgroup
-// size and SIMD-group count are constants then, and the thread positions
-// and SIMD-group index are bounded by it.
+// A known threadgroup size is an AGX hint on the kernel (its thread count
+// and its shape); the threadgroup size and SIMD-group count are constants
+// then, and the thread positions and SIMD-group index are bounded by it.
 gpu.module @block_size {
   // CHECK-LABEL: llvm.func @k(
-  // CHECK-SAME: passthrough = ["air-kernel", ["agx-max-threads-per-threadgroup", "128"]]
+  // CHECK-SAME: passthrough = ["air-kernel", ["agx-max-threads-per-threadgroup", "128"], ["agx-threads-per-threadgroup", "64,2,1"]]
   gpu.func @k(%out: memref<8xindex, 1>) kernel attributes {known_block_size = array<i32: 64, 2, 1>} {
     // CHECK-NOT: @air.threads_per_threadgroup
     // CHECK: llvm.mlir.constant(2 : i64) : i64

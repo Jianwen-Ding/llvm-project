@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-threadgroup-ranges=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-threadgroup-ranges=0 -agx-threadgroup-shape-ranges=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; A threadgroup of at most N threads ("agx-max-threads-per-threadgroup", a
 ; promise of the launch) has its positions below N and its SIMD-group index
@@ -44,5 +44,19 @@ define agx_kernel void @unknown(ptr addrspace(1) %o) {
   ret void
 }
 
+; A known shape (MLIR's known_block_size): x below 16 in a 16 x 16 group.
+; CHECK-LABEL: shape:
+; CHECK-NOT: and
+; CHECK: stop
+; OFF-LABEL: shape:
+; OFF: and
+define agx_kernel void @shape(ptr addrspace(1) %o) #2 {
+  %t = call i32 @llvm.agx.thread.position.in.threadgroup.x()
+  %m = and i32 %t, 15
+  store i32 %m, ptr addrspace(1) %o, align 4
+  ret void
+}
+
 attributes #0 = { "agx-max-threads-per-threadgroup"="256" }
 attributes #1 = { "agx-max-threads-per-threadgroup"="128" }
+attributes #2 = { "agx-max-threads-per-threadgroup"="256" "agx-threads-per-threadgroup"="16,16,1" }
