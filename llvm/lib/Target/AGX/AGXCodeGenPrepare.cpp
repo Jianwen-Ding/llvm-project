@@ -505,6 +505,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool lowerDivergentShuffles(Function &F, const TargetTransformInfo &TTI);
   bool foldLaneIdentities(Function &F);
   bool simdScans(Function &F, const AGXSubtarget &ST);
+  bool mergeLoopExits(Function &F);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
   bool flushHalfDenormals(Function &F);
   bool flushFloatMinMax(Function &F);
@@ -1847,6 +1848,82 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
     RecursivelyDeleteTriviallyDeadInstructions(End);
   }
   return !Scans.empty();
+}
+
+static cl::opt<unsigned> AGXMergeLoopExits(
+    "agx-merge-loop-exits", cl::init(16), cl::Hidden,
+    cl::desc("Largest latch of side-effect-free instructions a two-block loop "
+             "exiting from both blocks runs in its header, one exit (0: off)"));
+
+/// A loop of two blocks that exits from both (Mandelbrot's escape test in
+/// the header, its iteration count in the latch):
+///   H: ...; br e1, XH, T      T: (arithmetic); br e2, XT, H
+/// is structurized as an if inside the loop, with flags for which exit was
+/// taken, every iteration. Where T has no side effects and is small, it
+/// runs in H, the loop has one exit on e1 | e2, and a block after it goes
+/// to XH where e1 held, else to XT: T's work is wasted only on the last
+/// iteration of the threads that leave by e1.
+bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
+  if (!AGXMergeLoopExits)
+    return false;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  SmallVector<Loop *, 4> Loops;
+  for (Loop *L : LI.getLoopsInPreorder())
+    if (L->isInnermost() && L->getNumBlocks() == 2)
+      Loops.push_back(L);
+  bool Changed = false;
+  for (Loop *L : Loops) {
+    BasicBlock *H = L->getHeader(), *T = L->getLoopLatch();
+    if (!T || T == H || T->getSinglePredecessor() != H)
+      continue;
+    auto *BH = dyn_cast<CondBrInst>(H->getTerminator());
+    auto *BT = dyn_cast<CondBrInst>(T->getTerminator());
+    if (!BH || !BT)
+      continue;
+    bool HToT = BH->getSuccessor(0) == T;
+    BasicBlock *XH = BH->getSuccessor(HToT ? 1 : 0);
+    bool TToH = BT->getSuccessor(0) == H;
+    BasicBlock *XT = BT->getSuccessor(TToH ? 1 : 0);
+    if (BH->getSuccessor(HToT ? 0 : 1) != T ||
+        BT->getSuccessor(TToH ? 0 : 1) != H || L->contains(XH) ||
+        L->contains(XT) || XH == XT)
+      continue;
+    unsigned N = 0;
+    bool Ok = true;
+    for (Instruction &I : *T) {
+      if (I.isTerminator())
+        continue;
+      if (isa<PHINode>(I) || ++N > AGXMergeLoopExits ||
+          !isSafeToSpeculativelyExecute(&I))
+        Ok = false;
+    }
+    if (!Ok)
+      continue;
+    for (Instruction &I : make_early_inc_range(*T))
+      if (!I.isTerminator())
+        I.moveBefore(BH->getIterator());
+    IRBuilder<> B(BH);
+    Value *E1 = BH->getCondition(), *E2 = BT->getCondition();
+    if (HToT)
+      E1 = B.CreateNot(E1);
+    if (TToH)
+      E2 = B.CreateNot(E2);
+    BasicBlock *X = BasicBlock::Create(F.getContext(), H->getName() + ".exit",
+                                       &F, XH);
+    B.CreateCondBr(B.CreateOr(E1, E2), X, H);
+    IRBuilder<>(X).CreateCondBr(E1, XH, XT);
+    BH->eraseFromParent();
+    for (PHINode &P : H->phis())
+      P.replaceIncomingBlockWith(T, H);
+    for (PHINode &P : XH->phis())
+      P.replaceIncomingBlockWith(H, X);
+    for (PHINode &P : XT->phis())
+      P.replaceIncomingBlockWith(T, X);
+    T->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
 }
 
 bool AGXCodeGenPrepare::foldLaneIdentities(Function &F) {
@@ -3501,6 +3578,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   Changed |= simdScans(F, ST);
+  Changed |= mergeLoopExits(F);
   Changed |= lowerMatrixFMA(F, ST);
   if (ST.hasQuadShuffleIndexMerge())
     Changed |= lowerDivergentShuffles(F, TTI);
