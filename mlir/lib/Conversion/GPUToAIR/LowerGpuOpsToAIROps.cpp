@@ -596,16 +596,18 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
 template <typename OpTy>
 static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   auto type = dyn_cast<FloatType>(op.getType());
-  if (!type || !(type.isF16() || type.isBF16() || type.isF32()))
+  if (!type || !(type.isF16() || type.isBF16() || type.isF32() || type.isF64()))
     return failure();
   Location loc = op.getLoc();
-  Type f32 = rewriter.getF32Type();
+  // f16 and bf16 in f32; f64 in f64 (its exp and log: rewriteExpF64 /
+  // rewriteLogF64)
+  Type f32 = type.isF64() ? Type(type) : Type(rewriter.getF32Type());
   Value x = op.getOperand();
-  if (!type.isF32())
+  if (!type.isF32() && !type.isF64())
     x = arith::ExtFOp::create(rewriter, loc, f32, x);
   auto c = [&](float v) {
     return arith::ConstantOp::create(rewriter, loc, f32,
-                                     rewriter.getF32FloatAttr(v));
+                                     rewriter.getFloatAttr(f32, v));
   };
   auto eq = [&](Value a, Value b) {
     return arith::CmpFOp::create(rewriter, loc, arith::CmpFPredicate::OEQ, a, b);
@@ -633,7 +635,7 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
         arith::SubFOp::create(rewriter, loc, u, one));
     r = sel(small, sel(eq(u, one), x, q), lu);
   }
-  if (!type.isF32())
+  if (!type.isF32() && !type.isF64())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
   rewriter.replaceOp(op, r);
   return success();
@@ -936,6 +938,143 @@ static LogicalResult rewriteLogF64(math::LogOp op, PatternRewriter &rewriter) {
   res = sel(fcmp(arith::CmpFPredicate::ULT, x, c(0.0)),
             c(std::numeric_limits<double>::quiet_NaN()), res);
   rewriter.replaceOp(op, res);
+  return success();
+}
+
+/// exp2, log2, log10, cosh, sinh and tanh of f64 from the f64 exp, log and
+/// expm1 above (each rewritten in turn), in fdlibm's forms:
+///   exp2 x = exp(r ln 2) 2^k, k = roundeven(x), r = x - k (exact), r ln 2
+///     with its rounding error recovered by an fma (k applied as two powers
+///     of two; x clamped to [-1080, 1030] keeping a NaN);
+///   log2 x = k + log(m) log2(e), log10 x = k log10(2) + log(m) log10(e),
+///     x = 2^k m with m in [sqrt(2)/2, sqrt(2)) (exact for powers of two);
+///   cosh x = (e + 1/e) / 2, e = exp(|x|) (exp(|x| / 2)^2 / 2 from 709);
+///   sinh x = h (2t - t^2 / (t + 1)) (|x| < 1) or h (t + t / (t + 1))
+///     (|x| < 22), t = expm1(|x|), h = +-1/2; then h exp(|x|) (exp(|x| /
+///     2)^2 h 2 from 709);
+///   tanh x = 1 - 2 / (t + 2) from |x| = 1, t / (t + 2) below, t =
+///     expm1(2|x|); a - a^3/3 + 2a^5/15 below 2^-9, 1 from 22, with x's sign.
+template <typename OpTy>
+static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
+  auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
+  auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
+  auto div = [&](Value x, Value y) { return arith::DivFOp::create(b, x, y); };
+  auto fma = [&](Value x, Value y, Value z) {
+    return math::FmaOp::create(b, x, y, z);
+  };
+  auto sel = [&](Value cnd, Value x, Value y) {
+    return arith::SelectOp::create(b, cnd, x, y);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value x, Value y) {
+    return arith::CmpFOp::create(b, p, x, y);
+  };
+  auto pow2 = [&](Value e) {
+    return arith::BitcastOp::create(
+        b, f64,
+        arith::ShLIOp::create(b, arith::AddIOp::create(b, e, ci(1023)), ci(52)));
+  };
+  Value x = op.getOperand();
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::Exp2Op>) {
+    x = sel(fcmp(arith::CmpFPredicate::OGT, x, c(1030.0)), c(1030.0), x);
+    x = sel(fcmp(arith::CmpFPredicate::OLT, x, c(-1080.0)), c(-1080.0), x);
+    Value k = math::RoundEvenOp::create(b, x);
+    Value rr = sub(x, k);
+    Value ln2 = c(0x1.62e42fefa39efp-1);
+    Value hi = mul(rr, ln2);
+    // r ln 2 - hi: fma's exact remainder plus r times ln 2's own error
+    Value lo = add(fma(rr, ln2, arith::NegFOp::create(b, hi)),
+                   mul(rr, c(2.319046813846299558e-17)));
+    Value e = math::ExpOp::create(b, hi);
+    e = fma(e, lo, e);
+    Value ki = arith::FPToSIOp::create(b, i64, k);
+    Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
+    r = mul(mul(e, pow2(k1)), pow2(arith::SubIOp::create(b, ki, k1)));
+  } else if constexpr (std::is_same_v<OpTy, math::Log2Op> ||
+                       std::is_same_v<OpTy, math::Log10Op>) {
+    Value tiny = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p-1022));
+    Value x2 = sel(tiny, mul(x, c(0x1p54)), x);
+    Value bx = arith::BitcastOp::create(b, i64, x2);
+    Value k = arith::SubIOp::create(
+        b, arith::ShRUIOp::create(b, bx, ci(52)), ci(1023));
+    k = arith::AddIOp::create(b, k, sel(tiny, ci(-54), ci(0)));
+    Value m = arith::BitcastOp::create(
+        b, f64,
+        arith::OrIOp::create(b, arith::AndIOp::create(b, bx, ci(0xfffffffffffffLL)),
+                             ci(0x3ff0000000000000LL)));
+    Value big = fcmp(arith::CmpFPredicate::OGT, m, c(1.4142135623730951));
+    m = sel(big, mul(m, c(0.5)), m);
+    k = arith::AddIOp::create(b, k, sel(big, ci(1), ci(0)));
+    Value dk = arith::SIToFPOp::create(b, f64, k);
+    Value lm = math::LogOp::create(b, m);
+    if constexpr (std::is_same_v<OpTy, math::Log2Op>)
+      r = fma(lm, c(1.4426950408889634), dk);
+    else
+      r = add(mul(dk, c(0.30102999566398120)),
+              fma(lm, c(0.43429448190325182),
+                  mul(dk, c(-2.8037281277851704e-18))));
+    Value inf = c(std::numeric_limits<double>::infinity());
+    r = sel(fcmp(arith::CmpFPredicate::OEQ, x, inf), inf, r);
+    r = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(0.0)),
+            c(-std::numeric_limits<double>::infinity()), r);
+    r = sel(fcmp(arith::CmpFPredicate::ULT, x, c(0.0)),
+            c(std::numeric_limits<double>::quiet_NaN()), r);
+  } else if constexpr (std::is_same_v<OpTy, math::CoshOp>) {
+    Value a = math::AbsFOp::create(b, x);
+    Value e = math::ExpOp::create(b, a);
+    Value near = add(mul(c(0.5), e), div(c(0.5), e));
+    // from 709 (where e^|x| overflows): e^(|x|/2) squared, halved; |x| - ln 2
+    // would round |x|'s last bits away (up to 500 ulp)
+    Value w = math::ExpOp::create(b, mul(c(0.5), a));
+    Value far = mul(mul(c(0.5), w), w);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), near, far);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  } else if constexpr (std::is_same_v<OpTy, math::SinhOp>) {
+    Value a = math::AbsFOp::create(b, x);
+    Value h = math::CopySignOp::create(b, c(0.5), x);
+    Value t = math::ExpM1Op::create(b, a);
+    Value tp1 = add(t, c(1.0));
+    Value small = mul(h, sub(mul(c(2.0), t), div(mul(t, t), tp1)));
+    Value mid = mul(h, add(t, div(t, tp1)));
+    Value large = mul(h, math::ExpOp::create(b, a));
+    Value w = math::ExpOp::create(b, mul(c(0.5), a));
+    Value huge = mul(mul(mul(h, c(2.0)), w), mul(c(0.5), w));
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(1.0)), small,
+            sel(fcmp(arith::CmpFPredicate::OLT, a, c(22.0)), mid,
+                sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), large, huge)));
+    // tiny x: x itself (also -0)
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  } else {
+    static_assert(std::is_same_v<OpTy, math::TanhOp>);
+    Value a = math::AbsFOp::create(b, x);
+    Value t1 = math::ExpM1Op::create(b, mul(c(2.0), a));
+    Value z1 = sub(c(1.0), div(c(2.0), add(t1, c(2.0))));
+    // below 1: t / (t + 2) with t = e^2a - 1 > 0, whose relative error
+    // passes on scaled by 2 / (t + 2) <= 1 (fdlibm's e^-2a - 1 form scales
+    // it by up to 1.8)
+    Value z2 = div(t1, add(t1, c(2.0)));
+    Value z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(1.0)), z1, z2);
+    // below 2^-9: a - a^3/3 + 2a^5/15 (next term 2^-58 relative), as expm1's
+    // error would otherwise reach 3 ulp there
+    Value a2 = mul(a, a);
+    Value series = fma(mul(a, a2), fma(a2, c(2.0 / 15.0), c(-1.0 / 3.0)), a);
+    z = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-9)), series, z);
+    z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(22.0)), c(1.0), z);
+    r = math::CopySignOp::create(b, z, x);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-55)), x, r);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  }
+  rewriter.replaceOp(op, r);
   return success();
 }
 
@@ -1941,6 +2080,12 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteIsInf);
       patterns.add(rewriteExpF64);
       patterns.add(rewriteLogF64);
+      patterns.add(rewriteF64Function<math::Exp2Op>);
+      patterns.add(rewriteF64Function<math::Log2Op>);
+      patterns.add(rewriteF64Function<math::Log10Op>);
+      patterns.add(rewriteF64Function<math::CoshOp>);
+      patterns.add(rewriteF64Function<math::SinhOp>);
+      patterns.add(rewriteF64Function<math::TanhOp>);
       patterns.add(rewriteIPowI);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }

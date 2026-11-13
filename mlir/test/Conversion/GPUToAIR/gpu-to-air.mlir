@@ -827,3 +827,31 @@ gpu.module @exp_log_f64 {
     gpu.return
   }
 }
+
+// -----
+
+// The other f64 exponentials, logarithms and hyperbolic functions build on
+// the f64 exp, log and expm1 above (no llvm.intr call is left for them).
+gpu.module @more_f64_functions {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK-NOT: llvm.intr.exp
+    // CHECK-NOT: llvm.intr.log
+    // CHECK-NOT: llvm.intr.cosh
+    // CHECK-NOT: llvm.intr.sinh
+    // CHECK-NOT: llvm.intr.tanh
+    // CHECK: llvm.return
+    %e1 = math.expm1 %v : f64
+    %e2 = math.log1p %e1 : f64
+    %e3 = math.exp2 %e2 : f64
+    %e4 = math.log2 %e3 : f64
+    %e5 = math.log10 %e4 : f64
+    %e6 = math.cosh %e5 : f64
+    %e7 = math.sinh %e6 : f64
+    %e8 = math.tanh %e7 : f64
+    memref.store %e8, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
