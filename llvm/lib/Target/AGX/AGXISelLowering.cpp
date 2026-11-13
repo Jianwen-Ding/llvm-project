@@ -1783,6 +1783,11 @@ static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
   return DAG.getNode(ISD::SUB, DL, MVT::i32, F, C(128));
 }
 
+static cl::opt<bool> BranchLowBitXor(
+    "agx-branch-low-bit-xor",
+    cl::desc("a branch on (a ^ x) & 1, a boolean, as a != (x & 1)"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> FreezeTruthLogic(
     "agx-freeze-truth-logic",
     cl::desc("push a freeze of an and / or / xor / select of truth values "
@@ -2420,6 +2425,26 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       if (!isa<ConstantSDNode>(B) && IsBool(A) && IsBool(B))
         return Branch(DAG.getSetCC(DL, MVT::i32, A, B, ISD::SETNE));
       return SDValue();
+    }
+    // On (a ^ x) & 1 for a boolean a: on a != (x & 1), a compare the
+    // branch takes, and x & 1 often computed already (bitonic's direction
+    // bit, i1 trunc of the thread index), instead of an xor, an and and a
+    // compare with zero.
+    if (BranchLowBitXor && Cond.getOpcode() == ISD::AND && Cond.hasOneUse() &&
+        isOneConstant(Cond.getOperand(1)) &&
+        Cond.getOperand(0).getOpcode() == ISD::XOR &&
+        Cond.getOperand(0).hasOneUse() && Cond.getValueType() == MVT::i32) {
+      SDValue X = Cond.getOperand(0);
+      for (unsigned I = 0; I < 2; ++I) {
+        SDValue A = X.getOperand(I), B = X.getOperand(1 - I);
+        if (!IsBool(A) || isa<ConstantSDNode>(B))
+          continue;
+        return Branch(DAG.getSetCC(
+            DL, MVT::i32, A,
+            DAG.getNode(ISD::AND, DL, MVT::i32, B,
+                        DAG.getConstant(1, DL, MVT::i32)),
+            ISD::SETNE));
+      }
     }
     if (Cond.getOpcode() == ISD::SETCC && Cond.hasOneUse() &&
         isNullConstant(Cond.getOperand(1)) &&
