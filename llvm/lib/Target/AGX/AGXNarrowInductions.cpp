@@ -27,6 +27,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
+#include "Utils/AGXBaseInfo.h"
+#include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
@@ -917,6 +921,199 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
   return false;
 }
 
+static cl::opt<unsigned> LoopIndexBases(
+    "agx-loop-index-bases", cl::init(4), cl::Hidden,
+    cl::desc("Device accesses of a loop's block at B[zext(X + C)] for this "
+             "many distinct constants C != 0 or more share B + zext(X), the "
+             "C as immediate indices (0: never)"));
+
+/// A bound (inclusive) on the unsigned value of S over its loop's
+/// iterations: constants, the thread and threadgroup positions (the
+/// threadgroup's shape or 1024, the known grid or 2^31), their sums,
+/// products and zero extensions, and add recurrences up to the loop's
+/// constant maximum trip count.
+static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
+                                       const Function &F, unsigned Depth = 0) {
+  if (Depth > 8)
+    return std::nullopt;
+  auto Fits = [](APInt V) -> std::optional<APInt> {
+    return V.getActiveBits() <= 63 ? std::optional<APInt>(V) : std::nullopt;
+  };
+  if (auto *C = dyn_cast<SCEVConstant>(S))
+    return C->getAPInt().isNegative() ? std::nullopt
+                                      : Fits(C->getAPInt().zext(128));
+  if (auto *Z = dyn_cast<SCEVZeroExtendExpr>(S))
+    return upperBound(Z->getOperand(), SE, F, Depth + 1);
+  if (auto *U = dyn_cast<SCEVUnknown>(S)) {
+    auto *II = dyn_cast<IntrinsicInst>(U->getValue());
+    if (!II)
+      return std::nullopt;
+    Intrinsic::ID ID = II->getIntrinsicID();
+    if (std::optional<uint64_t> E = AGX::knownGridExtent(F, ID))
+      return APInt(128, *E - 1);
+    switch (ID) {
+    case Intrinsic::agx_thread_position_in_threadgroup_x:
+    case Intrinsic::agx_thread_position_in_threadgroup_y:
+    case Intrinsic::agx_thread_position_in_threadgroup_z:
+    case Intrinsic::agx_thread_index_in_threadgroup:
+      return APInt(128, 1023);
+    case Intrinsic::agx_threadgroup_position_in_grid_x:
+    case Intrinsic::agx_threadgroup_position_in_grid_y:
+    case Intrinsic::agx_threadgroup_position_in_grid_z:
+      return APInt(128, 0x7ffffffe);
+    default:
+      return std::nullopt;
+    }
+  }
+  if (auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    auto *T = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+    auto *N = dyn_cast<SCEVConstant>(
+        SE.getConstantMaxBackedgeTakenCount(AR->getLoop()));
+    std::optional<APInt> B = upperBound(AR->getStart(), SE, F, Depth + 1);
+    if (!AR->isAffine() || !T || T->getAPInt().isNegative() || !N || !B)
+      return std::nullopt;
+    return Fits(*B + T->getAPInt().zext(128) * N->getAPInt().zext(128));
+  }
+  bool Add = isa<SCEVAddExpr>(S), Mul = isa<SCEVMulExpr>(S);
+  if (!Add && !Mul)
+    return std::nullopt;
+  APInt R(128, Add ? 0 : 1);
+  for (const SCEV *Op : cast<SCEVNAryExpr>(S)->operands()) {
+    std::optional<APInt> B = upperBound(Op, SE, F, Depth + 1);
+    if (!B)
+      return std::nullopt;
+    R = Add ? R + *B : R * *B;
+    if (R.getActiveBits() > 63)
+      return std::nullopt;
+  }
+  return R;
+}
+
+/// A lower bound on S's value where upperBound bounds it (so no step of it
+/// wraps): constants, positions (0), sums, products, zero extensions, and
+/// the start of a non-decreasing recurrence.
+static std::optional<APInt> lowerBound(const SCEV *S, ScalarEvolution &SE,
+                                       unsigned Depth = 0) {
+  if (Depth > 8)
+    return std::nullopt;
+  if (auto *C = dyn_cast<SCEVConstant>(S))
+    return C->getAPInt().isNegative()
+               ? std::nullopt
+               : std::optional<APInt>(C->getAPInt().zext(128));
+  if (auto *Z = dyn_cast<SCEVZeroExtendExpr>(S))
+    return lowerBound(Z->getOperand(), SE, Depth + 1);
+  if (isa<SCEVUnknown>(S))
+    return APInt(128, 0);
+  if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+    return lowerBound(AR->getStart(), SE, Depth + 1);
+  bool Add = isa<SCEVAddExpr>(S), Mul = isa<SCEVMulExpr>(S);
+  if (!Add && !Mul)
+    return std::nullopt;
+  APInt R(128, Add ? 0 : 1);
+  for (const SCEV *Op : cast<SCEVNAryExpr>(S)->operands()) {
+    std::optional<APInt> B = lowerBound(Op, SE, Depth + 1);
+    if (!B)
+      return std::nullopt;
+    R = Add ? R + *B : R * *B;
+  }
+  return R;
+}
+
+/// In a loop, device accesses at B[zext(X + C_k)] (an unrolled column walk:
+/// x[i + 512 k]) each take a 32-bit addition for their index and a register
+/// for each C_k; B + zext(X), one 64-bit addition an iteration (its uniform
+/// base's copy hoisted), with the C_k as immediate indices, where X + C_k
+/// provably does not wrap (upperBound). Before the structurizer, which
+/// leaves SCEV no trip count. L15-E230 found the straight-line version no
+/// better: there the copy is paid where the additions were.
+static bool shareLoopIndexBases(Function &F, LoopInfo &LI,
+                                ScalarEvolution &SE) {
+  if (!LoopIndexBases || LI.empty())
+    return false;
+  const DataLayout &DL = F.getDataLayout();
+  struct Member {
+    GetElementPtrInst *GEP;
+    int64_t C;
+  };
+  using Key = std::tuple<BasicBlock *, Value *, Value *, Type *>;
+  MapVector<Key, SmallVector<Member, 8>> Groups;
+  for (Instruction &I : instructions(F)) {
+    if (!LI.getLoopFor(I.getParent()))
+      continue;
+    Value *Ptr = getLoadStorePointerOperand(&I);
+    if (!Ptr || Ptr->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+      continue;
+    Type *Ty = getLoadStoreType(&I);
+    auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+    if (!Ty->isSized() || !GEP || GEP->getNumIndices() != 1 ||
+        GEP->getParent() != I.getParent())
+      continue;
+    auto *Z = dyn_cast<ZExtInst>(GEP->getOperand(1));
+    if (!Z || !Z->getSrcTy()->isIntegerTy(32) || !Z->getDestTy()->isIntegerTy(64))
+      continue;
+    Value *N = Z->getOperand(0), *X = N;
+    int64_t C = 0;
+    const APInt *CA;
+    using namespace PatternMatch;
+    if (match(N, m_Add(m_Value(X), m_APInt(CA))) ||
+        match(N, m_DisjointOr(m_Value(X), m_APInt(CA)))) {
+      C = CA->getSExtValue();
+      // X + C wraps for no X: below 2^32 above, and at least -C below (the
+      // bounds hold as the upper one keeps X's own sums from wrapping).
+      const SCEV *SX = SE.getSCEV(X);
+      std::optional<APInt> B = upperBound(SX, SE, F);
+      if (!B || (*B + std::max<int64_t>(C, 0)).ugt(APInt(128, 0xffffffffu)))
+        continue;
+      if (C < 0) {
+        std::optional<APInt> Lo = lowerBound(SX, SE);
+        if (!Lo || Lo->ult(APInt(128, uint64_t(-C))))
+          continue;
+      }
+    }
+    Type *Elt = GEP->getSourceElementType();
+    uint64_t Size = DL.getTypeAllocSize(Elt);
+    unsigned EltBits = Ty->isPointerTy() ? 64 : Ty->getScalarSizeInBits();
+    if (!isPowerOf2_32(EltBits) || EltBits < 8)
+      continue;
+    int64_t Unit = std::min(EltBits, 32u) / 8, Bytes = C * int64_t(Size);
+    if (Bytes % Unit || !isInt<16>(Bytes / Unit))
+      continue;
+    Groups[{GEP->getParent(), GEP->getPointerOperand(), X, Elt}].push_back(
+        {GEP, C});
+  }
+  bool Changed = false;
+  SmallVector<WeakTrackingVH, 16> Dead;
+  for (auto &[K, Members] : Groups) {
+    SmallSet<int64_t, 8> Cs;
+    for (const Member &M : Members)
+      if (M.C)
+        Cs.insert(M.C);
+    if (Cs.size() < LoopIndexBases)
+      continue;
+    auto [BB, Base, X, Elt] = K;
+    Instruction *First = Members.front().GEP;
+    for (const Member &M : Members)
+      if (M.GEP->comesBefore(First))
+        First = M.GEP;
+    IRBuilder<> B(First);
+    Value *P = B.CreateGEP(Elt, Base, B.CreateZExt(X, B.getInt64Ty()),
+                           "loop.base");
+    uint64_t Size = DL.getTypeAllocSize(Elt);
+    for (const Member &M : Members) {
+      Value *New = P;
+      if (M.C) {
+        IRBuilder<> MB(M.GEP);
+        New = MB.CreateGEP(MB.getInt8Ty(), P, MB.getInt64(M.C * int64_t(Size)));
+      }
+      M.GEP->replaceAllUsesWith(New);
+      Dead.push_back(M.GEP);
+    }
+    Changed = true;
+  }
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+  return Changed;
+}
+
 bool AGXNarrowInductions::runOnFunction(Function &F) {
   if (!AGXNarrowInductionsOpt || skipFunction(F))
     return false;
@@ -1023,6 +1220,7 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
         Changed |= splitOffsets(*Phi, *L, SE, DT);
     }
   }
+  Changed |= shareLoopIndexBases(F, LI, SE);
   if (!AGXSplitWideCounters)
     return Changed;
   // Innermost loops only: each split adds blocks that the other loops'
