@@ -48,7 +48,9 @@ class Unsupported(Exception):
 
 def strip_comments(text):
     text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"//[^\n]*", "", text)
+    # debug directives are not terminated by ';'
+    return re.sub(r"^\s*\.(loc|file|section)\b[^\n]*$", "", text, flags=re.M)
 
 
 class PParam:
@@ -437,12 +439,18 @@ class Lifter:
         raise Unsupported("operand " + s)
 
     def sreg(self, s, bits):
+        if s == "%is_explicit_cluster":
+            self.declare("nvvm.is_explicit_cluster",
+                         "declare i1 @nvvm.is_explicit_cluster() nounwind willreturn memory(none)")
+            v = self.op("call i1 @nvvm.is_explicit_cluster()")
+            return self.resize(v, 1, bits, False)
         m = SREG_RE.fullmatch(s)
         if m:
             base = m.group(1)
             nm = "%s.%s" % (m.group(1), m.group(2))
         else:
             base = nm = s[1:]
+        nm = nm.replace("_", ".")  # TableGen intrinsic naming: lanemask_ge -> lanemask.ge
         ty = 64 if nm in ("clock64", "globaltimer", "gridid") else 32
         fname = "nvvm.read.ptx.sreg." + nm
         attrs = "memory(none)" if base in SREG_PURE else \
@@ -645,8 +653,10 @@ class Lifter:
             raise Unsupported("param count mismatch %d vs %d" %
                               (len(pf.params), len(args)))
         for k, (pp, arg) in enumerate(zip(pf.params, args)):
-            if arg.byval_type():
-                # the .param of a byval argument *is* the callee's copy
+            if arg.byval_type() and re.search(
+                    r"(?<![\[\w$])%s(?![\w$])(?!\s*\+?\s*\d*\s*\])" % re.escape(pp.name), pf.body):
+                # the address of the .param is taken: it *is* the callee's
+                # byval copy, so keep the source's object identity
                 self.scopes[0][pp.name] = (arg.name, pp)
                 continue
             slot = "%%param.%d" % k
@@ -1600,10 +1610,58 @@ class Lifter:
         v = self.getf(op, at)
         return self.op("fpext %s %s to %s" % (FPTY[at], v, FPTY[t]))
 
+    WIDTH = {"f16": 1, "bf16": 1, "f16x2": 1, "bf16x2": 1, "f32": 2, "f32x2": 2}
+
+    def fbin_down(self, mods, ops, opc, llop, t, st):
+        """add/sub/mul.rnd.<narrow>.<wide> d, a, b: one rounding to `t`.
+
+        Computed in double, then rounded to `t`: exact for directed rounding
+        (directed roundings compose) and for rn multiplication (the f32
+        product is exact in double).  Packed forms are done lane by lane.
+        """
+        rm = self.rounding(mods)
+        if rm == "rn" and llop != "fmul":
+            raise Unsupported("rn down-converting " + opc)
+        vec = t.endswith("x2")
+        sfty = FPTY[st]
+        a, b = self.getf(ops[1], st), self.getf(ops[2], st)
+        fty = FPTY[t]
+        efty = fty.split(" x ")[1][:-1] if vec else fty
+        esty = sfty.split(" x ")[1][:-1] if vec else sfty
+        lanes = []
+        for k in (range(2) if vec else [None]):
+            x = self.op("extractelement %s %s, i32 %d" % (sfty, a, k)) if vec else a
+            y = self.op("extractelement %s %s, i32 %d" % (sfty, b, k)) if vec else b
+            x = self.op("fpext %s %s to double" % (esty, x))
+            y = self.op("fpext %s %s to double" % (esty, y))
+            if llop == "fmul":
+                r = self.op("fmul double %s, %s" % (x, y))
+            else:
+                name = "llvm.experimental.constrained.%s.f64" % llop
+                self.declare(name, "declare double @%s(double, double, metadata, metadata)" % name)
+                r = self.op('call double @%s(double %s, double %s, metadata !"%s", metadata !"fpexcept.ignore") strictfp'
+                            % (name, x, y, MODES[rm]))
+            if rm == "rn":
+                v = self.op("fptrunc double %s to %s" % (r, efty))
+            else:
+                name = "llvm.experimental.constrained.fptrunc.%s.f64" % FP_SCALAR[efty]
+                self.declare(name, "declare %s @%s(double, metadata, metadata)" % (efty, name))
+                v = self.op('call %s @%s(double %s, metadata !"%s", metadata !"fpexcept.ignore") strictfp'
+                            % (efty, name, r, MODES[rm]))
+            lanes.append(v)
+        if vec:
+            v = self.op("insertelement %s poison, %s %s, i32 0" % (fty, efty, lanes[0]))
+            v = self.op("insertelement %s %s, %s %s, i32 1" % (fty, v, efty, lanes[1]))
+        else:
+            v = lanes[0]
+        self.writef(ops[0], self.post(v, fty, mods), t)
+
     def fbin(self, mods, ops, opc, llop):
         ts = self.types_of(mods)
         t = ts[0]
         at = ts[1] if len(ts) > 1 else t   # add.rn.f32.f16 d, a(f16), b(f32)
+        if len(ts) > 1 and self.WIDTH.get(t, 0) < self.WIDTH.get(at, 0):
+            return self.fbin_down(mods, ops, opc, llop, t, at)
         fty = FPTY[t]
         ftz = "ftz" in mods
         a = self.ftz_in(self.mixed_operand(ops[1], t, at), fty, ftz)

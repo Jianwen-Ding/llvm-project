@@ -178,6 +178,9 @@ def prepare_source(path, workdir):
                 l = l.replace(" immarg", "")
         lines.append(l)
     text = flatten_address_spaces("\n".join(lines))
+    # noalias on parameters is unsupported by Alive2; dropping an assumption
+    # makes the source more defined (cannot hide a defect)
+    text = re.sub(r"(define [^\n]*)", lambda m: re.sub(r"\bnoalias\b\s*", "", m.group(1)), text)
     # volatile has no meaning under single-thread semantics (Alive2 rejects it)
     text = re.sub(r"\b(load|store) volatile\b", r"\1", text)
     # Metadata that carries hints only (or assumptions, whose removal makes
@@ -397,6 +400,16 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # out or fails), so these are not verified.
     if ".callprototype" in body and re.search(r"call[\w.]*\s+(\([^)]*\),\s*)?%rd\d+", body):
         return "indirect-call-asm-mode"
+    # One approximate operation replaced by another (e.g. div.full(1, x) ->
+    # rcp.approx): both sides are uninterpreted approximations, so they can
+    # never be related; the PTX ISA error bounds have to be compared by hand.
+    if re.search(r"@ptx\.\w+\.(approx|full)", src_text) and re.search(r"\.(approx|full)\b", body):
+        return "approx-substitution"
+    # Atomic (volatile) 128-bit load implemented as cas(0, 0): needs the
+    # memory to be writable, which the source load does not require.
+    if re.search(r"atom\.[\w.:]*cas\.b128", body) and re.search(r"\bload (atomic )?i128\b", src_text) \
+            and "cmpxchg" not in src_text:
+        return "cas-based-atomic-load"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
     if "rsqrt.approx" in body and "sqrt.approx" in src_text:
@@ -410,7 +423,7 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
             return "nan-payload"
     if "partword" in body or (
             re.search(r"and\.b64\s+%rd\d+, %rd\d+, -4;", body) and
-            re.search(r"atom\.[\w.:]*cas\.b32", body)):
+            re.search(r"atom\.[\w.:]*\.b32", body)):
         return "partword-atomic-word-access"
     return None
 
