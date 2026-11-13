@@ -90,6 +90,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXSinkRematPass(PR);
   initializeAGXLowerControlFlowPass(PR);
   initializeAGXInsertWaitsPass(PR);
+  initializeAGXColdRegionsPass(PR);
   initializeAGXAsmPrinterPass(PR);
 }
 
@@ -588,4 +589,6 @@ void AGXPassConfig::addMachineSSAOptimization() {
 void AGXPassConfig::addPreEmitPass() {
   addPass(createAGXLowerControlFlowPass());
   addPass(createAGXInsertWaitsPass());
+  // Rarely entered if-bodies out of line (after the waits: paths unchanged).
+  addPass(createAGXColdRegionsPass());
 }

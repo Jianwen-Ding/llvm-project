@@ -43,6 +43,7 @@ add_llvm_target(AGXCodeGen
   AGXISelDAGToDAG.cpp
   AGXISelLowering.cpp
   AGXInsertWaits.cpp
+  AGXColdRegions.cpp
   AGXInstrInfo.cpp
   AGXLowerControlFlow.cpp
   AGXCheckedAccesses.cpp
