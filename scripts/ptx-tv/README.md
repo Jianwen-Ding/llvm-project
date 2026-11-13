@@ -108,6 +108,9 @@ source (a bug there would not be caught): the lane order of packed
 * `nan-payload`: both results are NaN and differ only in sign or payload
   (not applied when the source uses `fabs`/`fneg`/`copysign`).
 * `dynamic-alloca-size-overflow`: needs allocation sizes near 2^63.
+* `indirect-call-asm-mode`: indirect calls through a pointer loaded from
+  memory; Alive2's assembly mode fails or times out even on an unchanged
+  call, so indirect calls are effectively unverified.
 
 Aligned over-reads (for example `ld.b64` of a 6-byte `<3 x half>`) also show
 up as mismatches; they are hardware-safe and are triaged by hand.

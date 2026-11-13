@@ -279,6 +279,28 @@ def classify(out, err, rc):
     return "alive-other"
 
 
+def indirect_call_sigs(module_text, fname):
+    """LLVM signatures of the indirect calls in function `fname`."""
+    m = re.search(r"^define [^\n]*@%s\(.*?^}" % re.escape(fname), module_text, re.M | re.S)
+    if not m:
+        return []
+    out = []
+    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+)\((.*)\)", m.group(0)):
+        ret = re.sub(r"\b(fast|nnan|ninf|nsz|arcp|contract|afn|reassoc|tail|noundef|zeroext|signext)\b", "",
+                     cm.group(1)).strip().split()
+        if not ret:
+            continue
+        try:
+            sg = parse_sig("declare %s @f(%s)" % (ret[-1], cm.group(3)))
+        except (TypeParseError, ValueError):
+            continue
+        for a in sg.args:   # call-site operands, not parameter attributes
+            a.attrs = "byval(%s)" % a.byval_type() if a.byval_type() else ""
+            a.name = None
+        out.append(sg)
+    return out
+
+
 def function_ptx(ptx, name):
     m = re.search(r"\.(?:func|entry)[^\n]*?\b%s\(" % re.escape(name), ptx)
     if not m:
@@ -370,6 +392,11 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # of that size succeed.
     if re.search(r"\balloca\.u(32|64)\b", body) and re.search(r"alloca [^,\n]+, i\d+ %", src_text):
         return "dynamic-alloca-size-overflow"
+    # Indirect call through a function pointer loaded from memory: Alive2's
+    # assembly mode cannot relate such calls (even an unchanged call times
+    # out or fails), so these are not verified.
+    if ".callprototype" in body and re.search(r"call[\w.]*\s+(\([^)]*\),\s*)?%rd\d+", body):
+        return "indirect-call-asm-mode"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
     if "rsqrt.approx" in body and "sqrt.approx" in src_text:
@@ -401,7 +428,7 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     ptxn = ptx_name(fname)
     try:
         L = ptx_lift.lift_function(ptx, sig, name_map, decls, globals_, ptxn,
-                                   typedefs)
+                                   typedefs, indirect_call_sigs(ext, fname))
     except ptx_lift.Unsupported as e:
         res.update(status="lift-unsupported", detail=str(e)[:200])
         return res

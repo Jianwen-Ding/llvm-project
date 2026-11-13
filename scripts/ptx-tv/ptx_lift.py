@@ -251,9 +251,17 @@ SREG_PURE = {"tid", "ntid", "ctaid", "nctaid", "laneid", "warpsize",
              "is_explicit_cluster", "nsmid", "nwarpid"}
 
 
+# instructions whose first operand is not a destination register
+NO_DEF_OPS = {"st", "red", "call", "bra", "brx", "ret", "exit", "bar",
+              "barrier", "membar", "fence", "prefetch", "prefetchu", "trap",
+              "nanosleep", "stackrestore", "cp", "applypriority", "pmevent"}
+
+
 class Lifter:
-    def __init__(self, pfunc, sig, name_map, decls, globals_, typedefs=None):
+    def __init__(self, pfunc, sig, name_map, decls, globals_, typedefs=None,
+                 indirect_sigs=None):
         self.typedefs = typedefs or {}
+        self.indirect_sigs = indirect_sigs or []
         self.pf = pfunc
         self.sig = sig
         self.name_map = name_map     # PTX symbol -> LLVM global/function name
@@ -265,6 +273,7 @@ class Lifter:
         self.reg_shadow = []         # per scope: shadowed registers
         self.slots_used = set()
         self.base_of = {}            # 64-bit reg -> base object key
+        self.exact = set()           # regs equal to their base address
         self.slot_base = {}          # param slot -> base key of stored ptr
         self.jump_tables = {}        # label -> [target labels]
         self.last_label = None
@@ -480,6 +489,10 @@ class Lifter:
             a = self.op("add i64 %s, %d" % (a, off))
         key = self.base_of.get(base)
         if key is not None:
+            if base in self.exact and not off:
+                b = self.base_ptr(key)
+                if b is not None:
+                    return "%s %s" % b
             r = self.rebase(key, a)
             if r is not None:
                 return r
@@ -500,7 +513,7 @@ class Lifter:
     def base_ptr(self, key):
         kind, v = key
         if kind == "arg":
-            a = self.sig.args[v]
+            a = self.sized_args(self.sig.args)[v]
             return a.ty, a.name
         if kind == "dyn":
             return "ptr", self.op("load ptr, ptr %s" % self.dyn_slot(v))
@@ -527,7 +540,7 @@ class Lifter:
         symbol, or a pointer argument read with ld.param).
         """
         ptr_args = {}
-        for k, (pp, arg) in enumerate(zip(self.pf.params, self.sig.args)):
+        for k, (pp, arg) in enumerate(zip(self.pf.params, self.sized_args(self.sig.args))):
             if arg.ty.startswith("ptr") and not arg.byval_type():
                 ptr_args[pp.name] = k
         widths = {}
@@ -552,9 +565,9 @@ class Lifter:
             if not ops:
                 continue
             d = ops[0].strip()
-            if d not in widths:
-                continue
             parts = opc.split(".")
+            if d not in widths or parts[0] in NO_DEF_OPS:
+                continue
             defs.append((parts[0], parts[1:], d, ops[1:]))
         base = {r: set() for r in widths}
         NONE = ("none", None)
@@ -586,6 +599,11 @@ class Lifter:
                     new = ob(srcs[0])
                 elif b == "alloca":
                     new = {("dyn", d)}
+                elif b in ("ld", "ldu") and "param" not in mods and len(srcs) == 1 \
+                        and any(m in ("b64", "u64", "s64") for m in mods) \
+                        and not any(m in ("v2", "v4", "v8") for m in mods):
+                    # a loaded 64-bit value may be a pointer: keep its provenance
+                    new = {("dyn", d)}
                 elif b == "ld" and "param" in mods and len(srcs) == 1:
                     m = re.fullmatch(r"\[\s*([\w$]+)\s*\]", srcs[0].strip())
                     new = {("arg", ptr_args[m.group(1)])} if m and m.group(1) in ptr_args else {NONE}
@@ -596,6 +614,22 @@ class Lifter:
                     changed = True
         self.base_of = {r: next(iter(v)) for r, v in base.items()
                         if len(v) == 1 and NONE not in v}
+        # registers that always hold exactly the base address (offset 0)
+        exact = {r for r in self.base_of}
+        changed = True
+        while changed:
+            changed = False
+            for b, mods, d, srcs in defs:
+                if d not in exact:
+                    continue
+                ok = b in ("ld", "ldu") or b == "alloca" or \
+                    (b in ("mov", "cvta") and len(srcs) == 1 and
+                     (srcs[0].strip() in exact or
+                      (srcs[0].strip() not in widths and self.imm(srcs[0]) is None)))
+                if not ok:
+                    exact.discard(d)
+                    changed = True
+        self.exact = exact
 
     # ---- function body -----------------------------------------------------
     def lift(self):
@@ -606,10 +640,11 @@ class Lifter:
         # parameters
         if sig.vararg:
             raise Unsupported("vararg")
-        if len(pf.params) != len(sig.args):
+        args = self.sized_args(sig.args)
+        if len(pf.params) != len(args):
             raise Unsupported("param count mismatch %d vs %d" %
-                              (len(pf.params), len(sig.args)))
-        for k, (pp, arg) in enumerate(zip(pf.params, sig.args)):
+                              (len(pf.params), len(args)))
+        for k, (pp, arg) in enumerate(zip(pf.params, args)):
             if arg.byval_type():
                 # the .param of a byval argument *is* the callee's copy
                 self.scopes[0][pp.name] = (arg.name, pp)
@@ -627,7 +662,7 @@ class Lifter:
                                 (rp.size, rp.align))
             self.scopes[0][rp.name] = ("%retval", rp)
             self.retparam = rp
-        elif sig.ret != "void":
+        elif sig.ret != "void" and not self.zero_sized(sig.ret):
             raise Unsupported("non-void function without retval param")
         self.emit("br label %start")
         self.new_block("start")
@@ -660,6 +695,27 @@ class Lifter:
         if not self.terminated():
             self.emit("unreachable")
         entry[1] = ["  " + a for a in self.allocas] + entry[1]
+
+    def zero_sized(self, ty):
+        if ty.startswith("ptr") or ty == "void":
+            return False
+        try:
+            return layout.alloc_size(layout.parse(ty, self.typedefs)) == 0
+        except ValueError:
+            return False
+
+    def sized_args(self, args):
+        """Arguments that get a PTX parameter (zero-sized types get none)."""
+        out = []
+        for a in args:
+            if not a.ty.startswith("ptr"):
+                try:
+                    if layout.alloc_size(layout.parse(a.ty, self.typedefs)) == 0:
+                        continue
+                except ValueError:
+                    pass
+            out.append(a)
+        return out
 
     def label(self, l):
         return "L." + l.replace("$", "_")
@@ -768,6 +824,8 @@ class Lifter:
                                 (slot, pp.size, pp.align))
             self.scopes[-1][pp.name] = (slot, pp)
             return
+        if s.startswith(".callprototype"):
+            return  # the LLVM type of indirect calls comes from the source
         if s.startswith(".branchtargets"):
             self.jump_tables[self.last_label] = [x.strip() for x in s[len(".branchtargets"):].split(",")]
             return
@@ -828,7 +886,7 @@ class Lifter:
         "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
         "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
         "number", "notanumber", "normal", "subnormal", "u32", "s32",
-        "u64",
+        "u64", "satfinite", "xorsign",
     }
 
     def instr(self, base, mods, ops, opcode):
@@ -859,6 +917,8 @@ class Lifter:
     def i_ret(self, mods, ops, opc):
         if self.sig.ret == "void":
             self.emit("ret void")
+        elif self.zero_sized(self.sig.ret):
+            self.emit("ret %s zeroinitializer" % self.sig.ret)
         elif self.sig.ret.startswith("ptr"):
             v = self.ptr_from_slot(self.sig.ret, "%retval")
             self.emit("ret %s %s" % (self.sig.ret, v))
@@ -1506,7 +1566,24 @@ class Lifter:
         r = self.op("select %s %s, %s %s, %s %s" % (ct, neg, fty, fconst(fty, 0.0), fty, v))
         return self.op("select %s %s, %s %s, %s %s" % (ct, isn, fty, v, fty, r))
 
+    MAX_FINITE = {"half": 65504.0, "bfloat": 3.3895313892515355e38,
+                  "float": 3.4028234663852886e38}
+
+    def satfinite(self, v, fty):
+        """.satfinite: +-Inf results become +-MAX_NORM; NaN stays NaN."""
+        e = fty.split(" x ")[1][:-1] if fty.startswith("<") else fty
+        if e not in self.MAX_FINITE:
+            raise Unsupported("satfinite for " + fty)
+        ct = "<%s x i1>" % fty[1:].split(" x ")[0] if fty.startswith("<") else "i1"
+        a = self.call_intr(fty, "llvm.fabs.%s" % intname(fty), ["%s %s" % (fty, v)])
+        inf = self.op("fcmp oeq %s %s, %s" % (fty, a, fconst(fty, float("inf"))))
+        mx = self.call_intr(fty, "llvm.copysign.%s" % intname(fty),
+                            ["%s %s" % (fty, fconst(fty, self.MAX_FINITE[e])), "%s %s" % (fty, v)])
+        return self.op("select %s %s, %s %s, %s %s" % (ct, inf, fty, mx, fty, v))
+
     def post(self, v, fty, mods):
+        if "satfinite" in mods:
+            v = self.satfinite(v, fty)
         v = self.ftz_out(v, fty, "ftz" in mods)
         if "sat" in mods:
             v = self.sat(v, fty)
@@ -1518,7 +1595,7 @@ class Lifter:
         """Operand of PTX type `at` converted exactly to type `t` (mixed precision)."""
         if at == t:
             return self.getf(op, t)
-        if t.endswith("x2") or at.endswith("x2"):
+        if t.endswith("x2") != at.endswith("x2"):
             raise Unsupported("packed mixed precision")
         v = self.getf(op, at)
         return self.op("fpext %s %s to %s" % (FPTY[at], v, FPTY[t]))
@@ -1601,11 +1678,29 @@ class Lifter:
     def fminmax(self, mods, ops, opc, is_min):
         t = self.types_of(mods)[0]
         fty = FPTY[t]
-        if "xorsign" in mods:
-            raise Unsupported(opc)
         fn = ("minimum" if is_min else "maximum") if "NaN" in mods else \
             ("minnum" if is_min else "maxnum")
         args = [self.ftz_in(self.getf(o, t), fty, "ftz" in mods) for o in ops[1:]]
+        if "xorsign" in mods:
+            # min/max.xorsign.abs: |a| op |b| with sign bit sign(a) ^ sign(b)
+            if len(args) != 2 or "abs" not in mods:
+                raise Unsupported(opc)
+            bits = TBITS[t]
+            it = "i%d" % bits if not fty.startswith("<") else "<2 x i%d>" % (bits // 2)
+            eb = bits if not fty.startswith("<") else bits // 2
+            ai = self.op("bitcast %s %s to %s" % (fty, args[0], it))
+            bi = self.op("bitcast %s %s to %s" % (fty, args[1], it))
+            sg = self.op("xor %s %s, %s" % (it, ai, bi))
+            sm = splat(it, str(-(1 << (eb - 1)))) if it.startswith("<") else str(-(1 << (eb - 1)))
+            sg = self.op("and %s %s, %s" % (it, sg, sm))
+            ab = [self.call_intr(fty, "llvm.fabs.%s" % intname(fty), ["%s %s" % (fty, x)]) for x in args]
+            r = self.call_intr(fty, "llvm.%s.%s" % (fn, intname(fty)), ["%s %s" % (fty, ab[0]), "%s %s" % (fty, ab[1])])
+            ri = self.op("bitcast %s %s to %s" % (fty, r, it))
+            nm = splat(it, str((1 << (eb - 1)) - 1)) if it.startswith("<") else str((1 << (eb - 1)) - 1)
+            ri = self.op("and %s %s, %s" % (it, ri, nm))
+            ri = self.op("or %s %s, %s" % (it, ri, sg))
+            self.writef(ops[0], self.op("bitcast %s %s to %s" % (it, ri, fty)), t)
+            return
         if "abs" in mods:  # min.abs / max.abs: operate on |inputs|
             args = [self.call_intr(fty, "llvm.fabs.%s" % intname(fty), ["%s %s" % (fty, x)])
                     for x in args]
@@ -1693,6 +1788,8 @@ class Lifter:
             et = dt[:-2]
             hi = self.cvt_ff(self.ftz_in(self.getf(ops[1], at), "float", ftz), "float", FPTY[et], frnd, mods)
             lo = self.cvt_ff(self.ftz_in(self.getf(ops[2], at), "float", ftz), "float", FPTY[et], frnd, mods)
+            hi = self.post(hi, FPTY[et], [m for m in mods if m in ("satfinite", "relu")])
+            lo = self.post(lo, FPTY[et], [m for m in mods if m in ("satfinite", "relu")])
             hi = self.op("bitcast %s %s to i16" % (FPTY[et], hi))
             lo = self.op("bitcast %s %s to i16" % (FPTY[et], lo))
             hi = self.op("zext i16 %s to i32" % hi)
@@ -1813,7 +1910,15 @@ class Lifter:
         if len(dsts) != vec:
             raise Unsupported("vector arity " + opc)
         total = eb * vec
-        v = self.op("load i%d, %s, align %d" % (total, p, total // 8))
+        d0 = dsts[0].strip()
+        if vec == 1 and eb == 64 and self.base_of.get(d0) == ("dyn", d0):
+            # load as a pointer (keeping provenance); its integer value is
+            # the address (Alive2's assembly mode makes this exact)
+            pv = self.op("load ptr, %s, align 8" % p)
+            self.emit("store ptr %s, ptr %s" % (pv, self.dyn_slot(d0)))
+            v = self.op("ptrtoint ptr %s to i64" % pv)
+        else:
+            v = self.op("load i%d, %s, align %d" % (total, p, total // 8))
         for k, d in enumerate(dsts):
             if d == "_":
                 continue
@@ -1929,16 +2034,32 @@ class Lifter:
         callee = ops[0].strip()
         args = [x.strip() for x in ops[1][1:-1].split(",") if x.strip()] \
             if len(ops) > 1 and ops[1].startswith("(") else []
-        if len(ops) > 2 or callee.startswith("%"):
-            raise Unsupported("indirect call")
-        fname = self.name_map.get(callee)
-        if fname is None or fname not in self.decls:
-            raise Unsupported("unknown callee " + callee)
-        csig = self.decls[fname]
-        if csig.vararg or len(args) != len(csig.args):
+        indirect = callee.startswith("%")
+        if indirect:
+            sigs = {(x.ret, tuple(a.ty for a in x.args), x.vararg): x for x in self.indirect_sigs}
+            if len(sigs) != 1:
+                raise Unsupported("indirect call with ambiguous source signature")
+            csig = next(iter(sigs.values()))
+            fv = self.get(callee, 64)
+            key = self.base_of.get(callee)
+            if key is not None and callee in self.exact:
+                b = self.base_ptr(key)
+                fp = "%s %s" % b if b else None
+            else:
+                fp = self.rebase(key, fv) if key is not None else None
+            fname = fp.rsplit(" ", 1)[1] if fp else self.op("inttoptr i64 %s to ptr" % fv)
+        else:
+            if len(ops) > 2:
+                raise Unsupported("call with prototype")
+            fname = self.name_map.get(callee)
+            if fname is None or fname not in self.decls:
+                raise Unsupported("unknown callee " + callee)
+            csig = self.decls[fname]
+        cargs = self.sized_args(csig.args)
+        if csig.vararg or len(args) != len(cargs):
             raise Unsupported("call arity")
         vals = []
-        for a, carg in zip(args, csig.args):
+        for a, carg in zip(args, cargs):
             slot, pp = self.lookup(a)
             if carg.byval_type():
                 vals.append("%s %s %s" % (carg.ty, carg.attrs, slot))
@@ -1948,12 +2069,18 @@ class Lifter:
             else:
                 v = self.load_value(carg.ty, slot, pp)
             vals.append("%s %s %s" % (carg.ty, carg.attrs, v))
+        if len(cargs) != len(csig.args):
+            it = iter(vals)
+            vals = [next(it) if a in cargs else "%s zeroinitializer" % a.ty for a in csig.args]
         self.callees.append(fname)
-        call = "call %s @%s(%s)" % (csig.ret, fname, ", ".join(vals))
+        call = "call %s %s(%s)" % (csig.ret, fname if indirect else "@" + fname, ", ".join(vals))
         if csig.ret == "void":
             if rets:
                 raise Unsupported("void call with retval")
             self.emit(call)
+            return
+        if not rets and self.zero_sized(csig.ret):
+            self.op(call)
             return
         r = self.op(call)
         if len(rets) != 1:
@@ -2170,11 +2297,11 @@ class Lifter:
 
 
 def lift_function(ptx_text, sig, name_map, decls, globals_, ptx_name,
-                  typedefs=None):
+                  typedefs=None, indirect_sigs=None):
     funcs = parse_module(ptx_text)
     if ptx_name not in funcs:
         raise Unsupported("function not found in PTX: " + ptx_name)
-    L = Lifter(funcs[ptx_name], sig, name_map, decls, globals_, typedefs)
+    L = Lifter(funcs[ptx_name], sig, name_map, decls, globals_, typedefs, indirect_sigs)
     try:
         L.lift()
     except ValueError as e:  # layout of an unsupported LLVM type

@@ -109,14 +109,15 @@ def mapping(name, args):
         u, w, dst, rnd = m.groups()
         st = ("u" if u else "s") + ("32" if w == "i" else "64")
         return ("cvt.%s.%s.%s %%d, %%a0" % (rnd, TSUF[dst], st), [0])
-    m = re.fullmatch(r"ff2(f16x2|bf16x2)\.(rn|rz)(\.relu)?", n)
-    if m:
-        t, rnd, relu = m.groups()
-        return ("cvt.%s%s.%s.f32 %%d, %%a0, %%a1" % (rnd, relu or "", t), [0, 1])
-    m = re.fullmatch(r"f2(f16|bf16)\.(rn|rz)(\.relu)?", n)
-    if m:
-        t, rnd, relu = m.groups()
-        return ("cvt.%s%s.%s.f32 %%d, %%a0" % (rnd, relu or "", t), [0])
+    # trailing i1 immediate (default 0) selects the unmodelled .pzo variant
+    m = re.fullmatch(r"ff2(f16x2|bf16x2)\.(rn|rz)(\.relu)?(\.satfinite)?", n)
+    if m and imms.get(2, "false") in ("false", "0"):
+        t, rnd, relu, sf = m.groups()
+        return ("cvt.%s%s%s.%s.f32 %%d, %%a0, %%a1" % (rnd, relu or "", sf or "", t), [0, 1])
+    m = re.fullmatch(r"f2(f16|bf16)\.(rn|rz)(\.relu)?(\.satfinite)?", n)
+    if m and imms.get(1, "false") in ("false", "0"):
+        t, rnd, relu, sf = m.groups()
+        return ("cvt.%s%s%s.%s.f32 %%d, %%a0" % (rnd, relu or "", sf or "", t), [0])
     m = re.fullmatch(r"f2h\.rn(\.ftz)?", n)
     if m:
         return ("cvt.rn%s.f16.f32 %%d, %%a0" % (m.group(1) or ""), [0])
