@@ -1,16 +1,16 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Two passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6 functions per file, then up to 8 further functions per file, all re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s wall clock per function. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Two passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6 functions per file, then up to 8 further functions per file; non-correct results re-checked with the final lifter, and solver timeouts re-run once with a 30 s per-query / 150 s budget (partially: 182 of 559). Otherwise `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 620; files with no usable nvptx64 llc RUN line or other file-level failure: 158 (no-llc-run 156, llc-failed 2).
 Functions checked: 3323.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 1727 | 52.0% |
-| `lift-unsupported` | 736 | 22.1% |
-| `timeout` | 559 | 16.8% |
-| `inconclusive` | 89 | 2.7% |
+| `correct` | 1832 | 55.1% |
+| `lift-unsupported` | 650 | 19.6% |
+| `timeout` | 535 | 16.1% |
+| `inconclusive` | 94 | 2.8% |
 | `mismatch-known` | 81 | 2.4% |
 | `src-inline-asm` | 60 | 1.8% |
 | `alive-unsupported` | 27 | 0.8% |
@@ -19,7 +19,7 @@ Functions checked: 3323.
 | `mismatch` | 9 | 0.3% |
 | `extract-failed` | 3 | 0.1% |
 
-Conclusive (proved correct or counterexample): 1833 (55.2%).
+Conclusive (proved correct or counterexample): 1938 (58.3%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -90,21 +90,21 @@ zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
 | `modifier .async` | 15 |
 | `tcgen05.cp` | 14 |
 | `indirect` | 13 |
-| `modifier .tensormap` | 13 |
 | `tensormap.replace` | 13 |
 | `applypriority.async` | 12 |
-| `mbarrier.arrive` | 12 |
 | `tcgen05.st` | 10 |
-| `narrow` | 9 |
-| `modifier .proxy` | 9 |
 | `call` | 8 |
-| `modifier .oob` | 8 |
 | `spcompress.b8` | 8 |
 | `multimem.st` | 8 |
 | `tcgen05.alloc` | 8 |
 | `unknown` | 6 |
-| `mbarrier.test_wait` | 6 |
-| `mbarrier.try_wait` | 6 |
+| `spcompress.b16` | 6 |
+| `vararg` | 5 |
+| `clusterlaunchcontrol.query_cancel` | 4 |
+| `modifier .bulk` | 4 |
+| `tcgen05.dealloc` | 4 |
+| `tex.1d` | 4 |
+| `suld.b` | 3 |
 
 ## Alive2 could not handle the source
 

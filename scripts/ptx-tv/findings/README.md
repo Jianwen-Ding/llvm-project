@@ -137,10 +137,12 @@ with its sign fixed) in the equal case.
   `byval` struct declared `.param .align 16 .b8 [12]` is read with
   `ld.param.v4.b32`, 4 bytes past the declared size (inside the alignment
   padding; the extra lane is discarded). The test's CHECK lines expect this.
-* `bf16-instructions.ll` `test_maxnum_v2` (no native bf16 max): `maxnum` of
-  `<2 x bfloat>` is done in f32 and rounded back, so signaling-NaN inputs
-  come back with a different NaN bit pattern. LangRef allows NaN results of
-  `maxnum` to vary, so this is only a note.
+* `bf16-instructions.ll` `test_maxnum_v2` (no native bf16 max), and the same
+  in `atomicrmw-elementwise-sm60.ll` `fmin_acq_rel_v2bf16_global_cta` (found
+  with the larger solver budget): `minnum`/`maxnum` of `<2 x bfloat>` is
+  done in f32 and rounded back, so signaling-NaN inputs come back with a
+  different NaN bit pattern. LangRef allows NaN results of `minnum`/`maxnum`
+  to vary, so this is only a note.
 * `rsqrt-opt.ll`: `1.0 / llvm.nvvm.sqrt.approx.f(x)` becomes
   `rsqrt.approx.f32` without fast-math flags (`-nvptx-rsqrt-approx-opt`,
   default on). Intentional, but it replaces an exactly rounded division.
@@ -174,9 +176,19 @@ with its sign fixed) in the equal case.
 
 `RESULTS.md` has the numbers (generated from `results.jsonl` by
 `gen_results.py`). Two passes were combined: up to 6 functions per test file,
-then up to 8 more per file not checked before, all re-checked with the final
-lifter. In short: 3323 functions from 620 test files; 1727 proved correct;
-15 counterexamples of finding 1 (plus 1 padding over-read); 4 of findings
-2/2b/3/4; 4 unresolved (min/max signed zeros) and 1 NaN-bits note; 81 in
-known modelling classes; 736 not lifted (mostly asynchronous/tensor-core
-instructions); 648 solver timeouts or inconclusive.
+then up to 8 more per file not checked before; everything that was not proved
+correct was re-checked with the final lifter, and part of the solver
+timeouts were re-run with a larger budget. In short: 3323 functions from
+620 test files; 1832 proved correct; 15 counterexamples of finding 1 (plus 1
+padding over-read); 4 of findings 2/2b/3/4; 4 unresolved (min/max signed
+zeros) and 1 NaN-bits note; 81 in known modelling classes; 650 not lifted;
+629 solver timeouts or inconclusive.
+
+Not lifted, by design so far: asynchronous and tensor-core instructions
+(`tcgen05.*`, `cp.async.bulk*`/`cp.reduce.async.bulk*` (TMA), sparse
+`spcompress`/`spdecompress`, `st.async`, `multimem.*`, `tensormap.*`,
+cluster launch control), texture/surface instructions, indirect calls whose
+LLVM type cannot be recovered, and variadic calls. Mapping the first group
+needs a per-family correspondence between intrinsic operands and the PTX
+operand lists (often 32-128-element vectors); without it the check would
+only produce noise.

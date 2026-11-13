@@ -97,6 +97,13 @@ single-thread semantics:
   the narrow formats' numerics. The key ignores `.satfinite` where PTX
   requires it (FP8/FP6/FP4 destinations) and rounding on exact
   up-conversions.
+* `mbarrier.*` operations are uninterpreted calls whose names are normalised
+  from the PTX opcode and the NVVM intrinsic (`mbar.py`); defaults that one
+  side spells out (scope `.cta`, the default semantics of each operation,
+  layout `v0`) are dropped.
+* Fences (including `fence.proxy.*`) and prefetches are no-ops; the source's
+  fence/prefetch intrinsics are removed accordingly. `fma.rn.oob` is
+  uninterpreted.
 * Any modifier the lifter does not know makes the instruction unsupported,
   so nothing is silently ignored.
 
