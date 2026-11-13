@@ -155,6 +155,10 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
 
 } // namespace
 
+bool llvm::isAGXDeviceLoad(const MachineInstr &MI) {
+  return memKind(MI) == DeviceLoad;
+}
+
 std::unique_ptr<ScheduleDAGMutation> llvm::createAGXMemClusterMutation() {
   return std::make_unique<AGXMemClusterMutation>();
 }

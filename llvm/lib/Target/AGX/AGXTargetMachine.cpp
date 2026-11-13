@@ -244,6 +244,12 @@ static cl::opt<bool> AGXSchedKeepOccupancy(
     cl::desc("Keep a region's original order where scheduling it would lower "
              "the threads its register pressure lets reside"));
 
+static cl::opt<bool> AGXSchedCoreOccupancy(
+    "agx-sched-core-occupancy", cl::init(true), cl::Hidden,
+    cl::desc("Also keep the original order of a region with fewer than 4 "
+             "device loads where its schedule would cut the SIMD-groups its "
+             "registers let reside on a core by 1.8 times or more"));
+
 namespace {
 /// Picks the region's instructions in their order before the first
 /// scheduling (top-down; that order is a topological one of the DAG).
@@ -323,8 +329,26 @@ public:
     LLVM_DEBUG(dbgs() << "agx-occupancy region " << BB->getName() << " "
                       << Index.size() << " instrs: halves " << Before << " -> "
                       << After << "\n");
-    if (After <= Before || AGXSubtarget::maxThreadsForHalves(After) >=
-                               AGXSubtarget::maxThreadsForHalves(Before))
+    // The original order where the new one lowers the threads a threadgroup
+    // may have, or, for a region of few device loads (whose clustered loads
+    // E187 and the like rely on), cuts the SIMD-groups resident on a
+    // core (min(96, 2 floor(3328 / (2 halves))), AGX Performance Simulator
+    // dispatch, registers allocated by 8 halves) by 1.8 times or more: a tiled
+    // matrix product's threadgroup loads, all hoisted ahead of their fmas,
+    // doubled its registers for a latency the resident groups hide anyway
+    // (L15-E239).
+    auto CoreGroups = [](unsigned H) {
+      H = alignTo(std::max(16u, H), 8);
+      return std::min(96u, 2 * (3328 / (2 * H)));
+    };
+    unsigned DeviceLoads = 0;
+    for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
+      DeviceLoads += isAGXDeviceLoad(MI);
+    bool Threads = AGXSubtarget::maxThreadsForHalves(After) <
+                   AGXSubtarget::maxThreadsForHalves(Before);
+    bool Core = AGXSchedCoreOccupancy && DeviceLoads < 4 &&
+                9 * CoreGroups(After) < 5 * CoreGroups(Before);
+    if (After <= Before || (!Threads && !Core))
       return;
     // the original order again, through the scheduler's own moves
     std::unique_ptr<MachineSchedStrategy> Original =

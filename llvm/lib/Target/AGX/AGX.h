@@ -89,6 +89,8 @@ FunctionPass *createAGXColdRegionsPass();
 
 // Machine scheduler: keeps runs of memory accesses of one kind together.
 std::unique_ptr<ScheduleDAGMutation> createAGXMemClusterMutation();
+/// Whether MI is a device load (one of AGXMemCluster's kinds).
+bool isAGXDeviceLoad(const MachineInstr &MI);
 /// The post-RA machine scheduler: AGXMemClusterMutation, and cluster members
 /// kept together ahead of latency stalls.
 ScheduleDAGMI *createAGXPostRAScheduler(MachineSchedContext *C);
