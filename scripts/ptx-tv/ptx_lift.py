@@ -1982,6 +1982,13 @@ class Lifter:
         for (kind, text), carg in zip(args, csig.args):
             if kind == "addr" and carg.ty == "i64":
                 base = text.split("+")[0].strip()
+                if base not in self.regs and "+" not in text and base in self.name_map:
+                    # a texture/surface reference named directly: its handle is
+                    # what the source obtains with texsurf.handle on the global
+                    # (texsurf.handle(@g) is modelled as the address of @g,
+                    # which is what PTX uses as the handle: mov.u64 %rd, g)
+                    vals.append("i64 " + self.symbol_addr(base))
+                    continue
                 if base not in self.regs or "+" in text:
                     raise Unsupported("generic op narrow address")
                 w = self.regs[base]
@@ -2462,6 +2469,10 @@ class Lifter:
 
     def i_isspacep(self, mods, ops, opc):
         space = [m for m in mods if m in ("global", "shared", "local", "const", "param")]
+        if "shared::cluster" in mods:
+            space = ["shared.cluster"]
+        elif "shared::cta" in mods:
+            space = ["shared"]
         if not space:
             raise Unsupported(opc)
         a = self.get(ops[1], 64)

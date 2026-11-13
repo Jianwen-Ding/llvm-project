@@ -34,10 +34,11 @@ import layout
 FAMILIES = re.compile(r"(tcgen05|cp\.async\.bulk|cp\.reduce|spcompress|spdecompress|"
                       r"st\.async|multimem|tensormap|clusterlaunchcontrol|griddepcontrol|"
                       r"ldmatrix|stmatrix|wmma|mma|wgmma|cp\.async|red\.async|"
-                      r"stacksave|stackrestore)\b")
+                      r"stacksave|stackrestore|applypriority|tex|suld|sust|txq|suq|st\.bulk|"
+                      r"tld4)\b")
 PTX_FAMILIES = re.compile(r"^(tcgen05|cp|spcompress|spdecompress|st|multimem|tensormap|"
                           r"clusterlaunchcontrol|griddepcontrol|ldmatrix|stmatrix|wmma|mma|"
-                          r"wgmma|red)$")
+                          r"wgmma|red|applypriority|tex|suld|sust|txq|suq|tld4)$")
 COPY_OPS = {"mov", "cvta"}
 LLC = None
 _cache = {}
@@ -243,8 +244,12 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
             if "+" in text:
                 return None
             s = src.get(text)
-            if not s or not args[s[1]][0].startswith("ptr"):
+            if not s:
                 return None
+            if not args[s[1]][0].startswith("ptr"):
+                # integer handle in address position (texture/surface objects)
+                mp.ops.append(("piece", s[1], s[2], regw.get(text, s[3])))
+                continue
             if regw.get(text, 64) < 64:
                 # 32-bit address (e.g. tensor memory): passed as its integer bits
                 mp.ops.append(("piece", s[1], s[2], regw[text]))

@@ -261,8 +261,7 @@ def expand(text, lifter_mod, llc_args=None):
             ty = re.sub(r"\b(noundef|immarg|signext|zeroext|inreg)\b", "", ty).strip()
             args.append((ty, val))
         # memory barriers: no-ops under single-thread semantics (as in tgt)
-        if re.fullmatch(r"membar\.\w+|fence\.[\w.]+|prefetch\.[\w.]+|prefetchu\.[\w.]+|"
-                        r"applypriority\.[\w.]+", name) \
+        if re.fullmatch(r"membar\.\w+|fence\.[\w.]+|prefetch\.[\w.]+|prefetchu\.[\w.]+", name) \
                 and not re.match(r"\s*%", line):
             removed = True
             continue
@@ -311,6 +310,14 @@ def expand(text, lifter_mod, llc_args=None):
             if cm and res:
                 out_lines.append("  %s = load %s, %s %s, align %s" % (
                     res.group(1), cm.group(1), args[0][0], args[0][1], args[1][1]))
+                removed = True
+                continue
+        # texsurf.handle(.internal)(@g): in PTX the handle of a texture/surface
+        # reference is the symbol itself (mov.u64 %rd, g)
+        if re.fullmatch(r"texsurf\.handle(\.internal)?(\.p\d+)?", name) and len(args) == 1:
+            res = re.match(r"\s*(%[\w.$-]+)\s*=", line)
+            if res:
+                out_lines.append("  %s = ptrtoint %s %s to i64" % (res.group(1), args[0][0], args[0][1]))
                 removed = True
                 continue
         mk = mbar.intrinsic_key(name, args)
