@@ -320,6 +320,13 @@ def expand(text, lifter_mod, llc_args=None):
                 out_lines.append("  %s = ptrtoint %s %s to i64" % (res.group(1), args[0][0], args[0][1]))
                 removed = True
                 continue
+        # %warpsize is the constant WARP_SZ = 32 (which the backend emits)
+        if name == "read.ptx.sreg.warpsize":
+            res = re.match(r"\s*(%[\w.$-]+)\s*=", line)
+            if res:
+                out_lines.append("  %s = add i32 32, 0" % res.group(1))
+                removed = True
+                continue
         mk = mbar.intrinsic_key(name, args)
         if mk:
             mk, keep = mk

@@ -131,6 +131,22 @@ Severity: low (subnormal inputs, flush-to-zero functions only).
 Fix direction: select from flushed operands (or from the `min.ftz` result
 with its sign fixed) in the equal case.
 
+## 5. Kernels with a non-void return type store to an undeclared `func_retval0`
+
+Reproducer: `kernel-nonvoid-return.ll` (found in `lower-args-gridconstant.ll`
+`grid_const_ptrtoint`, `grid_const_partial_escapemem`; `entry_retval_scan.py`
+finds no others in the suite)
+
+A `ptx_kernel` function whose LLVM return type is not `void` becomes a
+`.entry` with no return parameter, but its `ret` is still lowered to
+`st.param.b32 [func_retval0], ...`. `func_retval0` is not declared in a
+`.entry`, so the PTX names an undefined symbol (invalid PTX). The tests'
+CHECK lines encode this output.
+
+Severity: low (kernels returning values are unusual; the value is not
+observable). Fix direction: drop the store for kernels (or reject non-void
+kernels in the verifier).
+
 ## Lower-severity observations
 
 * `param-vectorize-device.ll` `callee_St4x3` / `callee_St4x7`: a 12-byte

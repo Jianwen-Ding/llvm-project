@@ -247,7 +247,10 @@ SREG_PLAIN = {"laneid", "warpid", "nwarpid", "smid", "nsmid", "gridid",
               "globaltimer_lo", "globaltimer_hi", "warpsize",
               "cluster_ctarank", "cluster_nctarank", "is_explicit_cluster",
               "dynamic_smem_size", "total_smem_size", "aggr_smem_size",
-              "current_graph_exec", "pm0", "pm1", "pm2", "pm3", "pm4",
+              "current_graph_exec", "reserved_smem_offset_begin",
+              "reserved_smem_offset_end", "reserved_smem_offset_cap",
+              "reserved_smem_offset_0", "reserved_smem_offset_1",
+              "pm0", "pm1", "pm2", "pm3", "pm4",
               "pm5", "pm6", "pm7"}
 SREG_PURE = {"tid", "ntid", "ctaid", "nctaid", "laneid", "warpsize",
              "nclusterid", "clusterid", "cluster_ctaid", "cluster_nctaid",
@@ -407,6 +410,10 @@ class Lifter:
             v -= 1 << bits
         return str(v)
 
+    def check_entry_retval(self, sym):
+        if sym == "func_retval0" and self.pf.kind == "entry" and not self.pf.ret:
+            raise Unsupported("kernel stores to undeclared func_retval0 (finding 5)")
+
     def symbol_addr(self, sym):
         """i64 address of a PTX symbol (param, global, function, depot)."""
         for sc in reversed(self.scopes):
@@ -434,6 +441,8 @@ class Lifter:
         v = self.imm(s)
         if v is not None:
             return self.const(v, bits)
+        if s == "WARP_SZ":          # PTX constant: the warp size, 32
+            return self.const(32, bits)
         m = re.fullmatch(r"([\w$.]+)(?:\+(-?\d+))?", s)
         if m:
             a = self.symbol_addr(m.group(1))
@@ -515,6 +524,7 @@ class Lifter:
 
     def sym_ptr(self, sym):
         """(pointer type, pointer value) of a PTX symbol."""
+        self.check_entry_retval(sym)
         for sc in reversed(self.scopes):
             if sym in sc:
                 return "ptr", sc[sym][0]
@@ -679,7 +689,7 @@ class Lifter:
                                 (rp.size, rp.align))
             self.scopes[0][rp.name] = ("%retval", rp)
             self.retparam = rp
-        elif sig.ret != "void" and not self.zero_sized(sig.ret):
+        elif sig.ret != "void" and not self.zero_sized(sig.ret) and pf.kind != "entry":
             raise Unsupported("non-void function without retval param")
         self.emit("br label %start")
         self.new_block("start")
@@ -851,6 +861,12 @@ class Lifter:
                                 (slot, pp.size, pp.align))
             self.scopes[-1][pp.name] = (slot, pp)
             return
+        if s.startswith(".shared"):
+            # a module-scope shared global the backend demoted into the function
+            m = re.search(r"([\w$]+)(\[\d+\])?\s*$", s)
+            if m and m.group(1) in self.name_map:
+                return
+            raise Unsupported("function-scope .shared")
         if s.startswith(".callprototype"):
             return  # the LLVM type of indirect calls comes from the source
         if s.startswith(".branchtargets"):
@@ -913,7 +929,7 @@ class Lifter:
         "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
         "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
         "number", "notanumber", "normal", "subnormal", "u32", "s32",
-        "u64", "satfinite", "xorsign", "oob", "red", "popc", "inc", "dec", "m8n8", "trans",
+        "u64", "satfinite", "xorsign", "oob", "mmio", "red", "popc", "inc", "dec", "m8n8", "trans",
     }
 
     def instr(self, base, mods, ops, opcode):
@@ -956,6 +972,9 @@ class Lifter:
             self.emit("ret void")
         elif self.zero_sized(self.sig.ret):
             self.emit("ret %s zeroinitializer" % self.sig.ret)
+        elif self.pf.kind == "entry":
+            # a kernel's return value is not observable (.entry has no retval)
+            self.emit("ret %s poison" % self.sig.ret)
         elif self.sig.ret.startswith("ptr"):
             v = self.ptr_from_slot(self.sig.ret, "%retval")
             self.emit("ret %s %s" % (self.sig.ret, v))
@@ -2091,7 +2110,9 @@ class Lifter:
         return t[0], vec, space[0] if space else "generic"
 
     def check_mem_mods(self, mods, opc):
-        bad = [m for m in mods if m in ("mmio", "async", "bulk", "multimem", "tensor")
+        # .mmio only orders the access for memory-mapped I/O: a plain access
+        # under single-thread semantics
+        bad = [m for m in mods if m in ("async", "bulk", "multimem", "tensor")
                or m.startswith("unified") or m.startswith("mbarrier")]
         if bad:
             raise Unsupported(opc)

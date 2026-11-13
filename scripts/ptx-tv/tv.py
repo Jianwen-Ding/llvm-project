@@ -195,6 +195,13 @@ def prepare_source(path, workdir):
     # noalias on parameters is unsupported by Alive2; dropping an assumption
     # makes the source more defined (cannot hide a defect)
     text = re.sub(r"(define [^\n]*)", lambda m: re.sub(r"\bnoalias\b\s*", "", m.group(1)), text)
+    # A kernel's return value is not observable (.entry has no return
+    # parameter): return poison from non-void kernels, as the lifted code does.
+    def kernel_ret(m):
+        body = m.group(0)
+        return re.sub(r"^(\s*)ret (?!void)(.+?) (%[\w.$-]+|-?\d+|true|false|[\w.]+)$",
+                      lambda r: "%sret %s poison" % (r.group(1), r.group(2)), body, flags=re.M)
+    text = re.sub(r"^define [^\n]*ptx_kernel (?!void)[^\n]*\{.*?^\}", kernel_ret, text, flags=re.M | re.S)
     # volatile has no meaning under single-thread semantics (Alive2 rejects it)
     text = re.sub(r"\b(load|store) volatile\b", r"\1", text)
     # Metadata that carries hints only (or assumptions, whose removal makes

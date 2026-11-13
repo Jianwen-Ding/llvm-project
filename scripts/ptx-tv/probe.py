@@ -190,6 +190,13 @@ def _probe(name, ret, args, decl_line, llc_args, typedefs_text):
                     ss[q][2] == ss[0][2] + sum(x[3] for x in ss[:q]) // 8 for q in range(len(ss))):
                 src[ops[0].strip()] = ("arg", ss[0][1], ss[0][2], sum(x[3] for x in ss))
                 continue
+        # narrowing integer conversion of a traced value: cvt.u8.u16 d, s
+        if base == "cvt" and len(ops) == 2 and ops[1].strip() in src and \
+                len(mods) == 2 and all(re.fullmatch(r"[ub]\d+", m) for m in mods) and \
+                int(mods[0][1:]) <= int(mods[1][1:]):
+            s0 = src[ops[1].strip()]
+            src[ops[0].strip()] = ("arg", s0[1], s0[2], int(mods[0][1:]))
+            continue
         if base in COPY_OPS and len(ops) == 2 and ops[1].strip() in src:
             src[ops[0].strip()] = src[ops[1].strip()]
             continue
