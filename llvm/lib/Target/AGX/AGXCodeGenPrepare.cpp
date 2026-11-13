@@ -504,6 +504,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool lowerConstrainedFP(Function &F);
   bool lowerDivergentShuffles(Function &F, const TargetTransformInfo &TTI);
   bool foldLaneIdentities(Function &F);
+  bool simdScans(Function &F, const AGXSubtarget &ST);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
   bool flushHalfDenormals(Function &F);
   bool flushFloatMinMax(Function &F);
@@ -1757,6 +1758,97 @@ static bool isLaneMovement(const Value *V) {
 /// matrix unit's layout to the PTX fragment layout and the next mma's C back:
 /// a chain of mmas keeps its accumulator in the unit's layout. Each candidate
 /// is checked in all 32 threads.
+static cl::opt<bool> AGXSIMDScans(
+    "agx-simd-scans", cl::init(true), cl::Hidden,
+    cl::desc("A SIMD-group's inclusive integer add scan by shuffles up 1, 2, "
+             "4, 8 and 16 as one simd_prefix plus the value"));
+
+/// Whether select(Cond, shuffled, 0) (ShuffleOnTrue; else the arms swapped)
+/// keeps the shuffled value exactly in the lanes D and above.
+static bool keepsLanesFrom(Value *Cond, bool ShuffleOnTrue, uint64_t D) {
+  using namespace PatternMatch;
+  CmpPredicate P;
+  Value *L;
+  const APInt *C;
+  if (!match(Cond, m_ICmp(P, m_Value(L), m_APInt(C))) ||
+      !match(L, m_Intrinsic<Intrinsic::agx_thread_index_in_simdgroup>()))
+    return false;
+  ICmpInst::Predicate Pr =
+      ShuffleOnTrue ? ICmpInst::Predicate(P) : ICmpInst::getInversePredicate(P);
+  uint64_t K = C->getZExtValue();
+  switch (Pr) {
+  case ICmpInst::ICMP_UGT:
+    return K + 1 == D;
+  case ICmpInst::ICMP_UGE:
+    return K == D;
+  case ICmpInst::ICMP_NE:
+    return D == 1 && K == 0;
+  default:
+    return false;
+  }
+}
+
+/// The Hillis-Steele inclusive add scan of a SIMD-group's 32 lanes,
+///   x' = x + (lane >= d ? shuffle_up(x, d) : 0), d = 1, 2, 4, 8, 16,
+/// is the hardware's exclusive simd_prefix of x0 plus x0: 2 instructions
+/// for 15. Integer addition wraps the same in any order, so the values are
+/// the same; a shuffle from an inactive lane is undefined (Metal, CUDA,
+/// MLIR's gpu.shuffle), so where some lanes are inactive the prefix of the
+/// active ones is one of the original's results.
+bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
+  using namespace PatternMatch;
+  if (!AGXSIMDScans || !ST.hasSIMDReduce())
+    return false;
+  SmallVector<std::pair<Instruction *, Value *>, 4> Scans;
+  for (Instruction &I : instructions(F)) {
+    if (I.getOpcode() != Instruction::Add || !I.getType()->isIntegerTy(32))
+      continue;
+    Value *X = &I;
+    bool Ok = true;
+    for (uint64_t D : {16, 8, 4, 2, 1}) {
+      auto *A = dyn_cast<BinaryOperator>(X);
+      if (!A || A->getOpcode() != Instruction::Add) {
+        Ok = false;
+        break;
+      }
+      bool Found = false;
+      for (unsigned K = 0; K < 2 && !Found; ++K) {
+        Value *Prev = A->getOperand(K);
+        auto *Sel = dyn_cast<SelectInst>(A->getOperand(1 - K));
+        if (!Sel)
+          continue;
+        for (bool OnTrue : {true, false}) {
+          Value *Sh = OnTrue ? Sel->getTrueValue() : Sel->getFalseValue();
+          Value *Zero = OnTrue ? Sel->getFalseValue() : Sel->getTrueValue();
+          if (match(Zero, m_Zero()) &&
+              match(Sh, m_Intrinsic<Intrinsic::agx_simd_shuffle_up>(
+                            m_Specific(Prev), m_SpecificInt(D))) &&
+              keepsLanesFrom(Sel->getCondition(), OnTrue, D)) {
+            X = Prev;
+            Found = true;
+            break;
+          }
+        }
+      }
+      if (!Found) {
+        Ok = false;
+        break;
+      }
+    }
+    if (Ok)
+      Scans.push_back({&I, X});
+  }
+  for (auto [End, V] : Scans) {
+    IRBuilder<> B(End);
+    Value *Prefix = B.CreateIntrinsic(Intrinsic::agx_simd_prefix,
+                                      {V->getType()},
+                                      {V, B.getInt32(AGX::SIMD_IADD)});
+    End->replaceAllUsesWith(B.CreateAdd(Prefix, V));
+    RecursivelyDeleteTriviallyDeadInstructions(End);
+  }
+  return !Scans.empty();
+}
+
 bool AGXCodeGenPrepare::foldLaneIdentities(Function &F) {
   if (!AGXFoldLaneIdentities)
     return false;
@@ -3408,6 +3500,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   bool Changed = diagnoseDoubles(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
+  Changed |= simdScans(F, ST);
   Changed |= lowerMatrixFMA(F, ST);
   if (ST.hasQuadShuffleIndexMerge())
     Changed |= lowerDivergentShuffles(F, TTI);
