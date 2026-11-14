@@ -1084,3 +1084,30 @@ gpu.module @pow2_floor_ceil_div {
     gpu.return
   }
 }
+
+// -----
+
+// A shuffle by the induction variable of a loop with uniform bounds (a
+// broadcast of each lane in turn) is a uniform shuffle of that lane, not a
+// per-thread source lane (L15-E297).
+gpu.module @loop_uniform_shuffle {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c32 = arith.constant 32 : index
+    %w = arith.constant 32 : i32
+    %zero = arith.constant 0.0 : f32
+    // CHECK: %[[L:.*]] = llvm.trunc %{{.*}} : i32 to i16
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %[[L]])
+    // CHECK: llvm.select %{{.*}}, %{{.*}}, %{{.*}} : i1, f32
+    %s = scf.for %k = %c0 to %c32 step %c1 iter_args(%acc = %zero) -> f32 {
+      %ki = arith.index_cast %k : index to i32
+      %b, %ok = gpu.shuffle idx %v, %ki, %w : f32
+      %acc2 = arith.addf %acc, %b : f32
+      scf.yield %acc2 : f32
+    }
+    memref.store %s, %out[%c0] : memref<8xf32, 1>
+    gpu.return
+  }
+}

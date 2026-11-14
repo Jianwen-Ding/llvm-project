@@ -166,13 +166,21 @@ static std::optional<int64_t> constantInt(Value converted, Value original) {
 
 /// Whether \p v (an original, unconverted value) is the same in every thread
 /// of a threadgroup: a constant, a kernel argument, a threadgroup-level id or
-/// size, or pure arith of those (L15-E286).
+/// size, the induction variable of a loop with uniform bounds, or pure arith
+/// of those (L15-E286).
 static bool isThreadgroupUniform(Value v, unsigned depth = 0) {
   if (depth > 8)
     return false;
   if (getConstantIntValue(v))
     return true;
   if (auto arg = dyn_cast<BlockArgument>(v)) {
+    // The induction variable of a loop whose bounds and step are uniform
+    // (every thread runs the same iterations) (L15-E297).
+    if (auto loop = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp()))
+      return arg == loop.getInductionVar() &&
+             isThreadgroupUniform(loop.getLowerBound(), depth + 1) &&
+             isThreadgroupUniform(loop.getUpperBound(), depth + 1) &&
+             isThreadgroupUniform(loop.getStep(), depth + 1);
     auto func = dyn_cast<gpu::GPUFuncOp>(arg.getOwner()->getParentOp());
     return func && arg.getOwner()->isEntryBlock() &&
            arg.getArgNumber() < func.getNumArguments() &&
