@@ -26,6 +26,7 @@ import ptx_lift  # noqa: E402
 import nvvm_sem  # noqa: E402
 import asm_sem  # noqa: E402
 import arbfp  # noqa: E402
+import masked  # noqa: E402
 import probe  # noqa: E402
 probe.LLC = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin") + "/llc"
 from llvmsig import parse_sig, TypeParseError  # noqa: E402
@@ -193,7 +194,8 @@ def prepare_source(path, workdir):
     arb_expanded = arb_expanded or arb_to
     asm_expanded = asm_expanded or arb_expanded
     out, expanded = nvvm_sem.expand(out, ptx_lift, PROBE_LLC.get(os.getpid()))
-    expanded = expanded or asm_expanded
+    out, masked_expanded = masked.expand(out)   # also those created above
+    expanded = expanded or asm_expanded or masked_expanded
     if expanded:
         tmp = os.path.join(workdir, "src.sem.ll")
         with open(tmp, "w") as f:
@@ -507,6 +509,12 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # inside the aligned granule, which cannot fault.
     if re.search(r"load <3 x ", src_text) and re.search(r"\bld\.[\w.:]*b(32|64)\b", body):
         return "aligned-overread-widened-load"
+    # A masked load lowered to a full-width aligned load whose unused bytes
+    # are marked with `.pragma "used_bytes_mask"`: reads disabled lanes (UB
+    # in LLVM terms if they are not dereferenceable), but stays within an
+    # aligned granule, so it cannot fault on the hardware.  Intentional.
+    if 'used_bytes_mask' in body and "Source is more defined than target" in alive_out:
+        return "masked-load-widened"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
     if "rsqrt.approx" in body and "sqrt.approx" in src_text:
@@ -576,6 +584,7 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     have = set(re.findall(r"^declare [^@]*@([\w.$\"-]+)\(", tgt, re.M))
     extra = [d for n, d in L.extra_decls.items() if n not in have]
     tgt += "\n" + "\n".join(extra) + "\n"
+    tgt, tgt_masked = masked.expand(tgt)
     src_f = os.path.join(fdir, "src.ll")
     tgt_raw = os.path.join(fdir, "tgt.raw.ll")
     tgt_f = os.path.join(fdir, "tgt.ll")
@@ -583,7 +592,8 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         f.write(ext)
     with open(tgt_raw, "w") as f:
         f.write(tgt)
-    rc, _, err = run([BIN + "/opt", "-S", "-passes=mem2reg", tgt_raw, "-o", tgt_f])
+    rc, _, err = run([BIN + "/opt", "-S", "-passes=" + (
+        "always-inline,globaldce,mem2reg" if tgt_masked else "mem2reg"), tgt_raw, "-o", tgt_f])
     if rc:
         res.update(status="lift-invalid-ir", detail=err[-400:])
         return res
