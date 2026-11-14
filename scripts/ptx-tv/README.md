@@ -91,7 +91,11 @@ single-thread semantics:
   of the suite (each proved function's PTX, all directed modes on
   floating-point results) finds 112 proved functions with directed
   rounding, each using a single mode (92 `.rz`, 14 `.rp`, 4 `.rm`, 2
-  `.rna`), so none is vacuous.
+  `.rna`), so none is vacuous. Functions that do combine directed modes
+(for example the mixed-precision `*_lanes` tests, which chain `.rz`,
+`.rm` and `.rp`) cannot be checked this way and currently time out; run
+`rounding_audit.py` after merging new results so that such a function is
+never reported as proved.
 * Approximate instructions (`ex2.approx`, `rsqrt.approx`, `div.full`, ...)
   are uninterpreted pure functions; cross-thread operations (`shfl`, `vote`,
   `bar`, `redux`, `match`, `elect`, special registers) are uninterpreted calls
