@@ -543,6 +543,29 @@ def IMSUB_I32 : AGXALUPseudo<IMSUB_g13, (outs GPR32:$dst),
 def : Pat<(i32 (sub (mul AGXIntSrc32:$a, AGXIntSrc32:$b), AGXIntSrc32:$c)),
           (IMSUB_I32 0, $a, 0, $b, 0, $c, 0)>;
 
+// x + (a << s) for s of 5 to 7 (past iadd's 4-place shift), the shift used
+// only there: the shift is a bfi on the multiply / bit-field unit and then
+// an iadd; imadd of a by the 8-bit immediate 2^s (the same unit, 2.95 cycles
+// of latency and 2 of issue as the bfi, coverage/timing) is the whole of it
+// (L15-E318). (a << s) - x likewise with imsub. (A shift with other users
+// stays: its one bfi serves them all.)
+def agx_imadd_shift : ImmLeaf<i32, [{ return Imm >= 5 && Imm <= 7; }]>;
+def AGXPow2Imm : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(uint64_t(1) << N->getZExtValue(), SDLoc(N),
+                                   MVT::i32);
+}]>;
+def agx_shl_oneuse : PatFrag<(ops node:$a, node:$s), (shl node:$a, node:$s), [{
+  return N->hasOneUse();
+}]>;
+let AddedComplexity = 2 in {
+def : Pat<(i32 (add (agx_shl_oneuse AGXIntSrc32:$a, agx_imadd_shift:$s),
+                    AGXIntSrc32:$c)),
+          (IMADD_I32 0, $a, 0, (i32 (AGXPow2Imm $s)), 0, $c, 0)>;
+def : Pat<(i32 (sub (agx_shl_oneuse AGXIntSrc32:$a, agx_imadd_shift:$s),
+                    AGXIntSrc32:$c)),
+          (IMSUB_I32 0, $a, 0, (i32 (AGXPow2Imm $s)), 0, $c, 0)>;
+}
+
 // 32-bit adds, subtracts and multiply-adds of 16-bit values sign or zero
 // extended read the 16-bit registers (with .sx for the sign) instead of
 // extending them first: a 32-bit operation takes 16-bit sources.
