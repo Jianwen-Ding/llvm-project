@@ -1,6 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-reciprocal-above-one=0 < %s | FileCheck %s --check-prefix=OFF
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-reciprocal-sqrt=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-reciprocal-sqrt=0 -agx-reciprocal-converted=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; 1 / (e^x + c), c >= 1: the divisor is at least 1 or a NaN, so the
 ; reciprocal step of the division without its scaling of the divisor's
@@ -54,6 +54,33 @@ define agx_kernel void @half(ptr addrspace(1) %p, float %x) {
 define agx_kernel void @rsqrt(ptr addrspace(1) %p, float %x) {
   %s = call float @llvm.sqrt.f32(float %x)
   %r = fdiv float 1.0, %s
+  store float %r, ptr addrspace(1) %p
+  ret void
+}
+
+; 1 / float(n) for an i32 n, and 1 / a widened half: +-0 or a float of
+; magnitude 2^-24 to 2^32 with a normal reciprocal, as a square root
+; (L15-E295).
+; CHECK-LABEL: inv_int:
+; CHECK: rcp [[Y0:r[0-9]+]], [[D:r[0-9]+]]
+; CHECK-NEXT: fmadd32 [[E:r[0-9]+]], [[D]].neg, [[Y0]], 1.0
+; CHECK-NEXT: fmadd32 [[Y:r[0-9]+]], [[E]], [[Y0]], [[Y0]]
+; CHECK-NEXT: fcmpsel eq, {{r[0-9]+}}, [[E]], [[E]], [[Y]], [[Y0]]
+; OFF-LABEL: inv_int:
+; OFF: bfi {{r[0-9]+}}, {{r[0-9]+}}, 128, 23
+define agx_kernel void @inv_int(ptr addrspace(1) %p, i32 %n) {
+  %f = sitofp i32 %n to float
+  %r = fdiv float 1.0, %f
+  store float %r, ptr addrspace(1) %p
+  ret void
+}
+; CHECK-LABEL: inv_half:
+; CHECK: rcp
+; CHECK-NOT: bfi
+; CHECK: stop
+define agx_kernel void @inv_half(ptr addrspace(1) %p, half %h) {
+  %f = fpext half %h to float
+  %r = fdiv float 1.0, %f
   store float %r, ptr addrspace(1) %p
   ret void
 }

@@ -4466,6 +4466,11 @@ static cl::opt<bool> AGXReciprocalAboveOne(
     cl::desc("1 / (e^x + c), c >= 1, as the reciprocal step without the "
              "division's scaling and NaN select"));
 
+static cl::opt<bool> AGXReciprocalConverted(
+    "agx-reciprocal-converted", cl::init(true), cl::Hidden,
+    cl::desc("1 / (a converted 32-bit integer or widened half) as the "
+             "reciprocal step without the division's scaling"));
+
 static cl::opt<bool> AGXReciprocalSqrt(
     "agx-reciprocal-sqrt", cl::init(true), cl::Hidden,
     cl::desc("1 / sqrt(v) as the reciprocal step without the division's "
@@ -4494,6 +4499,19 @@ static bool reciprocalsAboveOne(Function &F) {
         cast<FPMathOperator>(I).getFastMathFlags().any())
       continue;
     if (AGXReciprocalSqrt && match(D, m_Intrinsic<Intrinsic::sqrt>(m_Value()))) {
+      Divs.push_back({&I, true});
+      continue;
+    }
+    // A converted integer of at most 32 bits or a widened half: +-0 or a
+    // float of magnitude 2^-24 to 2^32 (a half's denormals are normal
+    // floats), whose reciprocal is normal, as a square root's: the same
+    // sequence (L15-E295).
+    Value *Src;
+    if (AGXReciprocalConverted &&
+        (((match(D, m_SIToFP(m_Value(Src))) ||
+           match(D, m_UIToFP(m_Value(Src)))) &&
+          Src->getType()->getScalarSizeInBits() <= 32) ||
+         (match(D, m_FPExt(m_Value(Src))) && Src->getType()->isHalfTy()))) {
       Divs.push_back({&I, true});
       continue;
     }
