@@ -3279,6 +3279,72 @@ static bool sinkMulExtensions(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXConvertedMinMaxNum(
+    "agx-converted-minmax-num", cl::init(true), cl::Hidden,
+    cl::desc("maximum / minimum whose only use is a float-to-integer "
+             "conversion (or another such) as maxnum / minnum"));
+
+/// fptosi / fptoui (maximum(a, b)) is fpto[su]i (maxnum(a, b)), and minimum
+/// likewise, through a chain of single-use maximums and minimums: where no
+/// operand is a NaN they are the same up to a zero's sign, which converts to
+/// 0 either way, and where one is, the maximum's NaN made the conversion
+/// poison. The NaN select of the maximum goes, and satConvertClamps sees the
+/// maxnum / minnum clamps it takes (L15-E281). So does a select of a NaN
+/// constant into the conversion.
+static bool convertedMinMaxNum(Function &F) {
+  if (!AGXConvertedMinMaxNum)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<Instruction *, 8> Work;
+  for (Instruction &I : instructions(F))
+    if (isa<FPToSIInst>(I) || isa<FPToUIInst>(I))
+      Work.push_back(&I);
+  bool Changed = false;
+  while (!Work.empty()) {
+    Instruction *User = Work.pop_back_val();
+    // A select of a NaN constant into the conversion (MLIR's maximumf: a
+    // maxnum and a select of a NaN where an operand is one): the other arm,
+    // the NaN's conversion being poison.
+    if (isa<FPToSIInst>(User) || isa<FPToUIInst>(User)) {
+      const APFloat *K;
+      Value *V;
+      while (true) {
+        Value *X = User->getOperand(0);
+        if (match(X, m_Select(m_Value(), m_APFloat(K), m_Value(V))) &&
+            K->isNaN())
+          ;
+        else if (match(X, m_Select(m_Value(), m_Value(V), m_APFloat(K))) &&
+                 K->isNaN())
+          ;
+        else
+          break;
+        User->setOperand(0, V);
+        RecursivelyDeleteTriviallyDeadInstructions(X);
+        Changed = true;
+      }
+    }
+    for (Use &U : User->operands()) {
+      auto *II = dyn_cast<IntrinsicInst>(U.get());
+      if (!II || !II->hasOneUse())
+        continue;
+      Intrinsic::ID ID = II->getIntrinsicID();
+      if (ID != Intrinsic::maximum && ID != Intrinsic::minimum)
+        continue;
+      IRBuilder<> B(II);
+      B.setFastMathFlags(II->getFastMathFlags());
+      auto *R = cast<Instruction>(B.CreateBinaryIntrinsic(
+          ID == Intrinsic::maximum ? Intrinsic::maxnum : Intrinsic::minnum,
+          II->getArgOperand(0), II->getArgOperand(1)));
+      R->takeName(II);
+      II->replaceAllUsesWith(R);
+      II->eraseFromParent();
+      Work.push_back(R);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSatConvertClamps(
     "agx-sat-convert-clamps", cl::init(true), cl::Hidden,
     cl::desc("a float clamped above at an 8- or 16-bit integer's maximum and "
@@ -3817,6 +3883,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= permuteBytes(F);
   Changed |= loadBFloatsAsWords(F);
   Changed |= foldConditionChains(F, TTI);
+  Changed |= convertedMinMaxNum(F);
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);
   Changed |= storeBytesTogether(F);
