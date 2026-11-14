@@ -767,6 +767,13 @@ def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
 def : Pat<(i16 (and (agx_srl_oneuse AGXIntSrc16:$a, (i16 imm:$s)),
                     agx_field_mask:$m)),
           (BFEIL_I16 0, (i16 0), 0, $a, 0, (i16 imm:$s), (AGXFieldWidth $m))>;
+// By a register amount too: bfeil's register offset is read in 7 bits (an
+// amount from 32 leaves 0, where the IR shift is poison), with the field's
+// width (recorded: coverage alu/bfeil_r14_r6_r7_r8_mask_0x1 ... 0xFFFF):
+// (x >> n) & 1, a bit test, in one instruction (L15-E357).
+def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, i32:$s),
+                    agx_field_mask:$m)),
+          (BFEIL_I32 0, (i32 0), 0, $a, 0, $s, (AGXFieldWidth $m))>;
 // A half that is x >> 16 is x's high half register (a float rounded to
 // bfloat, packed with another), without the shift.
 let AddedComplexity = 2 in

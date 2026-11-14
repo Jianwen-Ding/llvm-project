@@ -25,3 +25,16 @@ define void @m_n15(ptr addrspace(1) %p, i32 %x) {
   store i32 %r, ptr addrspace(1) %p
   ret void
 }
+
+; A bit test by a register amount, (x >> n) & 1: one bfeil with the field's
+; width (L15-E357; the register-offset masked form is recorded on hardware).
+; CHECK-LABEL: bittest:
+; CHECK: bfeil {{r[0-9]+}}, 0, {{[ur][0-9]+}}, {{[ur][0-9]+}}, mask 0x1
+; CHECK-NOT: and
+; CHECK: stop
+define void @bittest(ptr addrspace(1) %p, i32 %x, i32 %n) {
+  %s = lshr i32 %x, %n
+  %r = and i32 %s, 1
+  store i32 %r, ptr addrspace(1) %p
+  ret void
+}
