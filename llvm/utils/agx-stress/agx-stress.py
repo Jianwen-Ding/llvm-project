@@ -10,7 +10,9 @@ buffer with a Python model of the kernel:
   nesting        48 nested divergent ifs;
   tg-48k         48 KiB of threadgroup memory;
   generic        a load through a generic pointer that may name threadgroup or device memory;
-  generic3       the same with private memory as a third choice.
+  generic3       the same with private memory as a third choice;
+  sunk-scan      a SIMD-group add scan by shuffles up whose last add only feeds the last thread's store of the total
+                 (sunk into that branch: the recognized scan must stay with its shuffles, L15-E365).
 
   agx-stress.py --llc build/bin/llc --run path/to/agx_run [--objcopy build/bin/llvm-objcopy] [--only NAME]
 
@@ -182,6 +184,46 @@ define agx_kernel void @k(ptr addrspace(1) %out, ptr addrspace(1) %dev, i32 %sel
                 uniforms=[OUT, 0, IN, 0, sel], expect=expect)
 
 
+def sunk_scan():
+    steps = []
+    v = "%x"
+    for k, d in enumerate([1, 2, 4, 8, 16]):
+        steps.append("""  %%s%d = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %s, i32 %d)
+  %%c%d = icmp uge i32 %%lane, %d
+  %%z%d = select i1 %%c%d, i32 %%s%d, i32 0""" % (k, v, d, k, d, k, k, k))
+        if k < 4:
+            steps.append("  %%v%d = add i32 %s, %%z%d" % (k, v, k))
+            v = "%%v%d" % k
+    ir = """declare i32 @llvm.agx.thread.position.in.threadgroup.x()
+declare i32 @llvm.agx.thread.index.in.simdgroup()
+declare i32 @llvm.agx.simd.shuffle.up.i32(i32, i32)
+define agx_kernel void @k(ptr addrspace(1) %%out) {
+  %%t = call i32 @llvm.agx.thread.position.in.threadgroup.x()
+  %%lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %%h = mul i32 %%t, -1640531535
+  %%x = xor i32 %%h, 12345
+  %%po = getelementptr i32, ptr addrspace(1) %%out, i32 %%t
+%s
+  %%last = icmp eq i32 %%lane, 31
+  br i1 %%last, label %%st, label %%part
+st:
+  %%v4 = add i32 %s, %%z4
+  store i32 %%v4, ptr addrspace(1) %%po
+  ret void
+part:
+  store i32 %s, ptr addrspace(1) %%po
+  ret void
+}""" % ("\n".join(steps), v, v)
+    x = [((t * 2654435761) & M) ^ 12345 for t in range(64)]
+    expect = []
+    for t in range(64):
+        w, lane = t // 32 * 32, t % 32
+        # thread 31 stores the scan of all 32; the others the scan of 16 (four steps)
+        n = 32 if lane == 31 else 16
+        expect.append(sum(x[w + j] for j in range(max(0, lane - n + 1), lane + 1)) & M)
+    return dict(ir=ir, threads=64, wg=64, uniforms=[OUT, 0], expect=expect)
+
+
 CASES = {
     "pressure": lambda: pressure(None),
     "pressure-1024-threads": lambda: pressure('"agx-max-threads-per-threadgroup"="1024"'),
@@ -194,6 +236,7 @@ CASES = {
     "generic3-threadgroup": lambda: generic3(0),
     "generic3-private": lambda: generic3(1),
     "generic3-device": lambda: generic3(2),
+    "sunk-scan": sunk_scan,
 }
 
 
