@@ -1,16 +1,16 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4187.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3257 | 77.8% |
-| `timeout` | 676 | 16.1% |
-| `mismatch-known` | 152 | 3.6% |
-| `inconclusive` | 59 | 1.4% |
+| `correct` | 3266 | 78.0% |
+| `timeout` | 657 | 15.7% |
+| `mismatch-known` | 157 | 3.7% |
+| `inconclusive` | 64 | 1.5% |
 | `mismatch-param-oob` | 33 | 0.8% |
 | `mismatch` | 7 | 0.2% |
 | `lift-unsupported` | 2 | 0.0% |
@@ -24,7 +24,7 @@ Of the correct results, 507 rely on probe-derived opaque instructions (probe.py)
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 3449 (82.4%).
+Conclusive (proved correct or counterexample): 3463 (82.7%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -87,11 +87,11 @@ The `nan-payload` entries of `arbitrary-fp-to-float.ll` are finding 6.
 
 | class | functions |
 |---|---:|
-| `partword-atomic-word-access` | 81 |
-| `approximation-permitted-by-flags` | 21 |
-| `nan-payload` | 21 |
+| `partword-atomic-word-access` | 82 |
+| `nan-payload` | 23 |
+| `approximation-permitted-by-flags` | 22 |
 | `masked-load-widened` | 10 |
-| `indirect-call-asm-mode` | 4 |
+| `indirect-call-asm-mode` | 5 |
 | `approx-substitution` | 4 |
 | `aligned-overread-widened-load` | 3 |
 | `byval-copy-to-local` | 3 |
