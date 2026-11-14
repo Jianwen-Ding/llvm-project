@@ -1125,6 +1125,42 @@ foreach VT = [f16, bf16] in
 def : Pat<(VT (select i32:$c, VT:$x, VT:$y)),
           (ICMPSEL_I32_I16 IC_UEQ, 0, $c, 0, (i32 0), 0, $y, 0, $x)>;
 
+// Select on a boolean whose high 16 bits are known zero (a setcc, or a chain
+// of selects between them and 0 / 1: the and / or of comparisons): the
+// comparison of its low half with 0, the same test. The select then reads
+// at most two 32-bit registers, which issues in one cycle instead of two
+// (agx_cost PORT_BOUND, coverage/timing icmpsel / fcmpsel 16-bit forms;
+// L15-E366). Not relying on the boolean contents: the known bits decide.
+def agx_select_bool16 : PatFrag<(ops node:$c, node:$x, node:$y),
+                                (select node:$c, node:$x, node:$y), [{
+  // Only where the select would read three 32-bit registers: with a
+  // constant arm (an immediate) or one value twice it reads at most two
+  // already, and a 16-bit read of a just-written register is not forwarded.
+  SDValue C = N->getOperand(0), X = N->getOperand(1), Y = N->getOperand(2);
+  auto IsConst = [](SDValue V) {
+    return isa<ConstantSDNode>(V) || isa<ConstantFPSDNode>(V);
+  };
+  return AGXSelectBool16 && C.getValueType() == MVT::i32 &&
+         C.getOpcode() != ISD::ZERO_EXTEND && !IsConst(X) && !IsConst(Y) &&
+         X != Y && X.getValueSizeInBits() == 32 &&
+         CurDAG->computeKnownBits(C).countMinLeadingZeros() >= 16;
+}]>;
+let AddedComplexity = 1 in {
+def : Pat<(i32 (agx_select_bool16 i32:$c, AGXIntSrc32:$x, AGXIntSrc32:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+def : Pat<(f32 (agx_select_bool16 i32:$c, f32:$x, f32:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+def : Pat<(i16 (agx_select_bool16 i32:$c, AGXIntSrc16:$x, AGXIntSrc16:$y)),
+          (ICMPSEL_I16 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                       (i16 0), 0, $y, 0, $x)>;
+foreach VT = [f16, bf16] in
+def : Pat<(VT (agx_select_bool16 i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                       (i16 0), 0, $y, 0, $x)>;
+}
+
 // Select on a 16-bit value widened to 32 bits (booleans shared by several
 // i16 operations, which type legalization keeps as i16): the comparison of
 // its 16 bits with 0, without the widening copy.

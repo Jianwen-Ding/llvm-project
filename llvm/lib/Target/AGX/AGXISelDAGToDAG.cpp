@@ -27,6 +27,11 @@ using namespace llvm;
 #define DEBUG_TYPE "agx-isel"
 #define PASS_NAME "AGX DAG->DAG Pattern Instruction Selection"
 
+static cl::opt<bool> AGXSelectBool16(
+    "agx-select-bool16", cl::init(true), cl::Hidden,
+    cl::desc("a select on a 32-bit boolean with high 16 bits known zero "
+             "compares its low half with 0 (one 32-bit register read fewer)"));
+
 namespace {
 
 class AGXDAGToDAGISel : public SelectionDAGISel {

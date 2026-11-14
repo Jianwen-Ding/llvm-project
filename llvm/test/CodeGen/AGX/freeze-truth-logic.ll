@@ -30,8 +30,8 @@ define agx_kernel void @loads(ptr addrspace(1) %v, ptr addrspace(1) %ix, ptr add
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    fcmpsel eq, r6, r4, r5, r6, 0
 ; CHECK-NEXT:    fcmpsel lt, r6, r4, r5, 1, r6
-; CHECK-NEXT:    icmpsel ueq, r4, r6, 0, r4, r5
-; CHECK-NEXT:    icmpsel ueq, r2, r6, 0, r2, r3
+; CHECK-NEXT:    icmpsel ueq, r4, r6l, 0, r4, r5
+; CHECK-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r3
 ; CHECK-NEXT:    device_store 0, i32, x, r4, u0_u1, r1, signed
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed
 ; CHECK-NEXT:    stop
@@ -62,8 +62,8 @@ define agx_kernel void @loads(ptr addrspace(1) %v, ptr addrspace(1) %ix, ptr add
 ; NOPUSH-NEXT:    fcmpsel eq, r6, r2, r5, r6, 0
 ; NOPUSH-NEXT:    or r6, r7, r6
 ; NOPUSH-NEXT:    and r6, r6, 1
-; NOPUSH-NEXT:    icmpsel ueq, r2, r6, 0, r2, r5
-; NOPUSH-NEXT:    icmpsel ueq, r3, r6, 0, r3, r4
+; NOPUSH-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r5
+; NOPUSH-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r4
 ; NOPUSH-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
 ; NOPUSH-NEXT:    device_store 0, i32, x, r3, u2_u3, r1, signed
 ; NOPUSH-NEXT:    stop
@@ -92,8 +92,8 @@ define agx_kernel void @loads(ptr addrspace(1) %v, ptr addrspace(1) %ix, ptr add
 ; COPY-NEXT:    wait 1
 ; COPY-NEXT:    fcmpsel eq, r6, r4, r5, r6, 0
 ; COPY-NEXT:    fcmpsel lt, r6, r4, r5, 1, r6
-; COPY-NEXT:    icmpsel ueq, r4, r6, 0, r4, r5
-; COPY-NEXT:    icmpsel ueq, r2, r6, 0, r2, r3
+; COPY-NEXT:    icmpsel ueq, r4, r6l, 0, r4, r5
+; COPY-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r3
 ; COPY-NEXT:    device_store 0, i32, x, r4, u0_u1, r1, signed
 ; COPY-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed
 ; COPY-NEXT:    stop
@@ -144,8 +144,8 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
 ; CHECK-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
 ; CHECK-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
-; CHECK-NEXT:    icmpsel ueq, r3, r6, 0, r3, r5
-; CHECK-NEXT:    icmpsel ueq, r2, r6, 0, r2, r4
+; CHECK-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
+; CHECK-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
 ; CHECK-NEXT:    iadd r2, r3, r2
 ; CHECK-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed
@@ -177,8 +177,8 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; NOPUSH-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
 ; NOPUSH-NEXT:    or r6, r7, r6
 ; NOPUSH-NEXT:    and r6, r6, 1
-; NOPUSH-NEXT:    icmpsel ueq, r3, r6, 0, r3, r5
-; NOPUSH-NEXT:    icmpsel ueq, r2, r6, 0, r2, r4
+; NOPUSH-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
+; NOPUSH-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
 ; NOPUSH-NEXT:    iadd r2, r3, r2
 ; NOPUSH-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed
 ; NOPUSH-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed
@@ -208,9 +208,9 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; COPY-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
 ; COPY-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
 ; COPY-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
-; COPY-NEXT:    icmpsel ueq, r7, r6, 0, r3, r5
-; COPY-NEXT:    icmpsel ueq, r2, r6, 0, r2, r4
-; COPY-NEXT:    icmpsel ueq, r3, r6, 0, r3, r5
+; COPY-NEXT:    icmpsel ueq, r7, r6l, 0, r3, r5
+; COPY-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
+; COPY-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
 ; COPY-NEXT:    iadd r2, r7, r2
 ; COPY-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed
 ; COPY-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed

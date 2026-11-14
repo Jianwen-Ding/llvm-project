@@ -663,9 +663,9 @@ define void @fadd_descending(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    and r3, r3, 1
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    simd_shuffle_xor r5, r2, 17
-; CHECK-NEXT:    icmpsel ueq, r2, r4, 0, r2, r5
+; CHECK-NEXT:    icmpsel ueq, r2, r4l, 0, r2, r5
 ; CHECK-NEXT:    simd_shuffle_xor r4, r2, 10
-; CHECK-NEXT:    icmpsel ueq, r2, r3, 0, r2, r4
+; CHECK-NEXT:    icmpsel ueq, r2, r3l, 0, r2, r4
 ; CHECK-NEXT:    simd_fadd r2, r2
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
 ; CHECK-NEXT:    stop
