@@ -3315,6 +3315,49 @@ static bool nonNegXorDivisions(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXFloorModulos(
+    "agx-floor-modulos", cl::init(true), cl::Hidden,
+    cl::desc("the floor modulo of srem by a positive constant through the "
+             "unsigned floor division"));
+
+/// r < 0 ? r + c : r for r = srem x, c (c > 0 not a power of two; MLIR's
+/// affine mod): x - c * floor(x / c), the floor quotient s ^ ((x ^ s) / c)
+/// with the non-negative x ^ s divided unsigned (E292), x frozen: the
+/// unsigned magic multiply instead of the signed one's correction, and no
+/// select (L15-E294).
+static bool floorModulos(Function &F) {
+  if (!AGXFloorModulos)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Value *R, *X;
+    const APInt *C, *C2;
+    if (!I.getType()->isIntegerTy(32) ||
+        !match(&I, m_Select(m_SpecificICmp(ICmpInst::ICMP_SLT, m_Value(R),
+                                           m_Zero()),
+                            m_Add(m_Deferred(R), m_APInt(C2)),
+                            m_Deferred(R))) ||
+        !match(R, m_SRem(m_Value(X), m_APInt(C))) || *C != *C2 ||
+        !C->isStrictlyPositive() || C->isPowerOf2())
+      continue;
+    IRBuilder<> B(&I);
+    Value *Xf = B.CreateFreeze(X);
+    Value *S = B.CreateAShr(Xf, 31);
+    Value *Q = B.CreateUDiv(
+        B.CreateAnd(B.CreateXor(Xf, S), APInt::getSignedMaxValue(32)),
+        ConstantInt::get(I.getType(), *C));
+    Value *M = B.CreateSub(
+        Xf, B.CreateMul(B.CreateXor(Q, S), ConstantInt::get(I.getType(), *C)));
+    M->takeName(&I);
+    I.replaceAllUsesWith(M);
+    I.eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(R);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXConvertedMinMaxNum(
     "agx-converted-minmax-num", cl::init(true), cl::Hidden,
     cl::desc("maximum / minimum whose only use is a float-to-integer "
@@ -3920,6 +3963,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= loadBFloatsAsWords(F);
   Changed |= foldConditionChains(F, TTI);
   Changed |= nonNegXorDivisions(F);
+  Changed |= floorModulos(F);
   Changed |= convertedMinMaxNum(F);
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);
