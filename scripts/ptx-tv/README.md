@@ -170,8 +170,11 @@ single-thread semantics:
   and the intrinsic (whose qualifiers are derived as documented in
   `NVPTXUsage.md`). Assumed: elements and indices are packed from bit 0 of
   the first register upwards; an out-of-group index (implementation-specific
-  in the ISA) is taken modulo the group size on both sides. `spcompress` is
-  left opaque: its tie-breaking and NaN selection are implementation-specific.
+  in the ISA) is taken modulo the group size on both sides. `spcompress`,
+  whose selection is implementation-specific, is an uninterpreted call keyed
+  by element size, index size and repeat factor on the 32-bit register
+  bundles (NVPTXUsage's bundle sizes), which checks instruction selection
+  and operand packing but not the selection itself.
 * Inline PTX assembly in the source (`asm_sem.py`) is replaced by an
   inlined function lifted from the template with its operands bound to
   parameters (outputs returned, tied operands and `i`/`n` immediates

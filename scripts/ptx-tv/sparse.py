@@ -86,3 +86,47 @@ def intrinsic_params(name, ret, args):
     if args[0][0] != ("i32" if mr == 1 else "<%d x i32>" % mr):
         return None
     return E, I, X, Y, num
+
+
+# ---- spcompress: keyed model ------------------------------------------------
+# NVPTXUsage: llvm.nvvm.spcompress(DataTy %data, i32 %spdesc, i32 immarg
+# %idx_size, i32 immarg %num_tgt = 4) -> {MDataTy, CDataTy}; data = 2*num
+# registers, cdata = num, mdata = ceil(num * idx_size / elem_size).  The
+# selection (implementation-specific) is not modelled: an uninterpreted
+# call keyed by element size, index size and num, on 32-bit register bundles.
+
+def spc_key(E, I, num):
+    return "ptx.spcompress.b%d.b%d.x%d" % (E, I, num)
+
+
+def spc_regs(E, I, num):
+    return 2 * num, num, (num * I + E - 1) // E
+
+
+def spc_decl(E, I, num):
+    d, c, mr = spc_regs(E, I, num)
+    return "declare { <%d x i32>, <%d x i32> } @%s(<%d x i32>, i32) nounwind willreturn memory(none)" % (
+        mr, c, spc_key(E, I, num), d)
+
+
+def spc_intrinsic(name, ret, args):
+    m = re.fullmatch(r"spcompress\.[\w.]+", name)
+    if not m or len(args) != 4 or args[3][1] != "4" or args[2][1] not in ("2", "4"):
+        return None
+    dm = re.fullmatch(r"<(\d+) x i(8|16)>", args[0][0])
+    if not dm or args[1][0] != "i32":
+        return None
+    K, E, I = int(dm.group(1)), int(dm.group(2)), int(args[2][1])
+    if (K * E) % 64:
+        return None
+    num = K * E // 64
+    if num not in (1, 2, 4, 8, 16, 32, 64):
+        return None
+    return E, I, num
+
+
+def spc_ptx(mods):
+    if len(mods) != 4 or mods[0] not in ("b8", "b16") or mods[1] not in ("b2", "b4") \
+            or mods[2] != "sp::2:4" or not re.fullmatch(r"x\d+", mods[3]):
+        return None
+    return int(mods[0][1:]), int(mods[1][1:]), int(mods[3][1:])

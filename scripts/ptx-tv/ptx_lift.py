@@ -1011,7 +1011,7 @@ class Lifter:
         if h is None:
             raise Unsupported("opcode " + opcode)
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
-                    "spdecompress", "multimem", "applypriority") or \
+                    "spdecompress", "spcompress", "multimem", "applypriority") or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
@@ -2594,6 +2594,29 @@ class Lifter:
         self.declare("ptx.stackrestore", "declare void @ptx.stackrestore(ptr) nounwind")
         p = self.address("[%s]" % ops[0].strip(), "local")
         self.emit("call void @ptx.stackrestore(%s)" % p)
+
+    def i_spcompress(self, mods, ops, opc):
+        """spcompress (keyed, sparse.spc_*): {mdata}, {cdata}, {data}, spdesc."""
+        import sparse
+        k = sparse.spc_ptx(mods)
+        if k is None or len(ops) != 4:
+            raise Unsupported("opcode " + opc)
+        E, I, num = k
+        d, c, mr = sparse.spc_regs(E, I, num)
+        md, cd, dd = (self.vec_ops(o) for o in ops[:3])
+        if not md or not cd or not dd or (len(md), len(cd), len(dd)) != (mr, c, d):
+            raise Unsupported("operands " + opc)
+        name = sparse.spc_key(E, I, num)
+        self.declare(name, sparse.spc_decl(E, I, num))
+        acc = "poison"
+        for i, r in enumerate(dd):
+            acc = self.op("insertelement <%d x i32> %s, i32 %s, i32 %d" % (d, acc, self.get(r, 32), i))
+        st = "{ <%d x i32>, <%d x i32> }" % (mr, c)
+        v = self.op("call %s @%s(<%d x i32> %s, i32 %s)" % (st, name, d, acc, self.get(ops[3].strip(), 32)))
+        for idx, regs, n in ((0, md, mr), (1, cd, c)):
+            vec = self.op("extractvalue %s %s, %d" % (st, v, idx))
+            for i, r in enumerate(regs):
+                self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (n, vec, i)), 32)
 
     def i_ldu(self, mods, ops, opc):
         self.i_ld(mods, ops, opc)

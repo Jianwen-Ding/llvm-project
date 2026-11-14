@@ -534,6 +534,40 @@ def expand(text, lifter_mod, llc_args=None):
                 line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
                 out_lines.append(line)
                 continue
+        if name.startswith("spcompress."):
+            ret = call_ret_type(line, m.start())
+            sc = sparse.spc_intrinsic(name, ret, args) if ret else None
+            rm = re.fullmatch(r"\{\s*(<(\d+) x i32>|i32)\s*,\s*<(\d+) x i(8|16)>\s*\}", ret or "")
+            if sc and rm:
+                E, I, num = sc
+                d, c, mr = sparse.spc_regs(E, I, num)
+                mty = rm.group(1)
+                ok = (mty == "i32" and mr == 1) or (rm.group(2) and int(rm.group(2)) == mr)
+                if ok and int(rm.group(3)) * E == 32 * c:
+                    key_ = ("spcompress", name, ret, tuple(a[1] for a in args[2:]))
+                    if key_ not in defs:
+                        fname = "ptxtv_sem_%d_spc" % len(defs)
+                        kname = sparse.spc_key(E, I, num)
+                        st = "{ <%d x i32>, <%d x i32> }" % (mr, c)
+                        cty = "<%s x i%d>" % (rm.group(3), E)
+                        w = ["define internal %s @%s(%s %%x, i32 %%s, i32 %%i, i32 %%t) alwaysinline {" % (
+                                ret, fname, args[0][0]),
+                             "  %%xi = bitcast %s %%x to <%d x i32>" % (args[0][0], d),
+                             "  %%r = call %s @%s(<%d x i32> %%xi, i32 %%s)" % (st, kname, d),
+                             "  %%m = extractvalue %s %%r, 0" % st,
+                             "  %%c = extractvalue %s %%r, 1" % st]
+                        if mty == "i32":
+                            w.append("  %mo = extractelement <1 x i32> %m, i32 0")
+                        else:
+                            w.append("  %%mo = add <%d x i32> %%m, zeroinitializer" % mr)
+                        w += ["  %%co = bitcast <%d x i32> %%c to %s" % (c, cty),
+                              "  %%o1 = insertvalue %s poison, %s %%mo, 0" % (ret, mty),
+                              "  %%o2 = insertvalue %s %%o1, %s %%co, 1" % (ret, cty),
+                              "  ret %s %%o2" % ret, "}"]
+                        defs[key_] = (fname, "\n".join(w), {kname: sparse.spc_decl(E, I, num)})
+                    line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                    out_lines.append(line)
+                    continue
         if name.startswith("spdecompress."):
             ret = call_ret_type(line, m.start())
             sp = sparse.intrinsic_params(name, ret, args) if ret else None
