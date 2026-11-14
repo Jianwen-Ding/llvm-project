@@ -349,8 +349,16 @@ mismatch.
   with c) and `vset` (all comparisons, secondary operations)
   (`video_scalar`, 232 functions). The pseudo-code does not say which
   signedness the secondary min/max uses; the model takes the destination
-  type's (unsigned for `vset`). Lane selectors, masks, `.dsel` merges,
-  `vshl`/`vshr` and `vmad` are rejected (`lift-unsupported`).
+  type's (unsigned for `vset`).
+* Video operand selectors (`.b0`-`.b3`, `.h0`/`.h1`, extended by the
+  operand's type), destination selectors (merge into c; `.sat` clamps to
+  the field's range), `vshl`/`vshr` (`.clamp`/`.wrap`) (`video_sel`, 348
+  functions), SIMD destination masks (`.h0/.h1/.h10`, `.b0`... : lanes
+  outside the mask from c; `.add` sums only the masked lanes)
+  (`video_mask`, 96 functions), and `vmad` (`.po`, negated operands,
+  `.shr7`/`.shr15`, `.sat`; the scale shift is taken as arithmetic for a
+  signed result, an assumption) (`video_vmad`). Source lane selectors of
+  the SIMD forms are rejected.
 * `set` (`set.cmp{.boolop}.dtype.stype`: all ones, 1.0 or 0) (`set`), and
   `sqrt.rz/.rm/.rp` (LLVM's constrained square root in that mode; the
   `slow_sqrt` references are not decided by Alive2 within 600 s, so that

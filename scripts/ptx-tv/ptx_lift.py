@@ -1014,7 +1014,7 @@ class Lifter:
                     "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
                     "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa",
                     "txq", "suq", "suld", "sust", "tex", "wmma", "mma", "ldmatrix", "stmatrix") or \
-                re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]?", base) or \
+                re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]?|vsh[lr]|vmad", base) or \
                 base in ("createpolicy", "istypeof", "tld4", "sured") or \
                 (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
@@ -1389,19 +1389,41 @@ class Lifter:
             raise Unsupported(opc)
         return self.opaque_keyed("sured", mods, ops, opc, False)
 
+    def video_sel(self, o):
+        """(register, selector or None) of a video operand `%r.b2` / `%r.h1`."""
+        m = re.fullmatch(r"(.+?)\.(b[0-7]{1,4}|h[0-3]{1,2})", o.strip())
+        return (m.group(1), m.group(2)) if m else (o.strip(), None)
+
+    def video_operand(self, o, t):
+        """A scalar video source operand, its selected byte/halfword (or the
+        whole word) extended by its type, as i128."""
+        r, sel = self.video_sel(o)
+        v = self.get(r, 32)
+        ext = "sext" if t == "s32" else "zext"
+        if sel is None:
+            return self.op("%s i32 %s to i128" % (ext, v))
+        if not re.fullmatch(r"b[0-3]|h[01]", sel):
+            raise Unsupported("video selector ." + sel)
+        w = 8 if sel[0] == "b" else 16
+        x = self.op("lshr i32 %s, %d" % (v, w * int(sel[1])))
+        x = self.op("trunc i32 %s to i%d" % (x, w))
+        return self.op("%s i%d %s to i128" % (ext, w, x))
+
     def scalar_video(self, op, mods, ops, opc):
-        """vop.dtype.atype.btype{.sat}{.op2} d, a, b{, c} for vadd, vsub,
-        vabsdiff, vmin, vmax and vset.atype.btype.cmp{.op2} (PTX ISA
-        pseudo-code): a and b extended by their types, the operation done
-        exactly, .sat clamps to the dtype range (otherwise the low 32 bits),
-        then the optional secondary .add (wrapping) / .min / .max with c, in
-        the dtype's signedness (vset: unsigned; an assumption, the
-        pseudo-code does not say).  Default selectors only; no .dsel merge."""
-        if any("." in o.strip().split("%")[-1] for o in ops):
-            raise Unsupported("video operand selector in " + opc)
+        """Scalar video instructions (PTX ISA pseudo-code): vadd, vsub,
+        vabsdiff, vmin, vmax, vshl, vshr .dtype.atype.btype{.sat}, vset
+        .atype.btype.cmp; operands may select a byte (.b0-.b3) or halfword
+        (.h0/.h1), extended by the operand's type (the shift amount of
+        vshl/vshr is unsigned; .clamp limits it to 32, .wrap takes it mod
+        32; vshr shifts arithmetically for a signed a).  The exact result is
+        saturated to the dtype range, or to the selected destination field's
+        (.sat); then either the secondary .add (wrapping) / .min / .max with
+        c (in the dtype's signedness; unsigned for vset: an assumption) or,
+        with a destination selector, merged into c at that field (low bits
+        of the result)."""
         ts = [m for m in mods if m in ("u32", "s32")]
         rest = [m for m in mods if m not in ("u32", "s32")]
-        cmp = None
+        cmp = shmode = None
         if op == "vset":
             if len(ts) != 2:
                 raise Unsupported(opc)
@@ -1415,36 +1437,120 @@ class Lifter:
             if len(ts) != 3:
                 raise Unsupported(opc)
             dt, at, bt = ts
+            if op in ("vshl", "vshr"):
+                sm = [m for m in rest if m in ("clamp", "wrap")]
+                if len(sm) != 1 or bt != "u32":
+                    raise Unsupported(opc)
+                shmode = sm[0]
+                rest.remove(shmode)
         op2 = [m for m in rest if m in ("add", "min", "max")]
+        dreg, dsel = self.video_sel(ops[0])
         if set(rest) - {"sat", "add", "min", "max"} or len(op2) > 1 or \
-                (op == "vset" and "sat" in rest) or len(ops) != (4 if op2 else 3):
+                (op == "vset" and "sat" in rest) or (dsel and op2) or \
+                len(ops) != (4 if op2 or dsel else 3) or \
+                (dsel and not re.fullmatch(r"b[0-3]|h[01]", dsel)):
             raise Unsupported(opc)
-        ext = lambda v, t: self.op("%s i32 %s to i64" % ("sext" if t == "s32" else "zext", v))
-        a, b = ext(self.get(ops[1], 32), at), ext(self.get(ops[2], 32), bt)
+        a, b = self.video_operand(ops[1], at), self.video_operand(ops[2], bt)
         if op == "vadd":
-            t = self.op("add i64 %s, %s" % (a, b))
+            t = self.op("add i128 %s, %s" % (a, b))
         elif op == "vsub":
-            t = self.op("sub i64 %s, %s" % (a, b))
+            t = self.op("sub i128 %s, %s" % (a, b))
         elif op == "vabsdiff":
-            t = self.call_intr("i64", "llvm.abs.i64", ["i64 %s" % self.op("sub i64 %s, %s" % (a, b)), "i1 false"])
+            t = self.call_intr("i128", "llvm.abs.i128", ["i128 %s" % self.op("sub i128 %s, %s" % (a, b)), "i1 false"])
         elif op in ("vmin", "vmax"):
-            t = self.call_intr("i64", "llvm.s%s.i64" % op[1:], ["i64 %s" % a, "i64 %s" % b])
+            t = self.call_intr("i128", "llvm.s%s.i128" % op[1:], ["i128 %s" % a, "i128 %s" % b])
+        elif op in ("vshl", "vshr"):
+            if shmode == "clamp":
+                n = self.call_intr("i128", "llvm.umin.i128", ["i128 %s" % b, "i128 32"])
+            else:
+                n = self.op("and i128 %s, 31" % b)
+            t = self.op("%s i128 %s, %s" % ("shl" if op == "vshl" else
+                                              ("ashr" if at == "s32" else "lshr"), a, n))
         else:
             pred = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}[cmp]
-            t = self.op("zext i1 %s to i64" % self.op("icmp %s i64 %s, %s" % (pred, a, b)))
+            t = self.op("zext i1 %s to i128" % self.op("icmp %s i128 %s, %s" % (pred, a, b)))
+        fw = 32 if not dsel else (8 if dsel[0] == "b" else 16)
         if "sat" in rest:
-            lo, hi = (-(1 << 31), (1 << 31) - 1) if dt == "s32" else (0, (1 << 32) - 1)
-            t = self.call_intr("i64", "llvm.smax.i64", ["i64 %s" % t, "i64 %d" % lo])
-            t = self.call_intr("i64", "llvm.smin.i64", ["i64 %s" % t, "i64 %d" % hi])
-        r = self.op("trunc i64 %s to i32" % t)
-        if op2:
-            c = self.get(ops[3], 32)
+            lo, hi = (-(1 << (fw - 1)), (1 << (fw - 1)) - 1) if dt == "s32" else (0, (1 << fw) - 1)
+            t = self.call_intr("i128", "llvm.smax.i128", ["i128 %s" % t, "i128 %d" % lo])
+            t = self.call_intr("i128", "llvm.smin.i128", ["i128 %s" % t, "i128 %d" % hi])
+        r = self.op("trunc i128 %s to i32" % t)
+        c = self.get(ops[3], 32) if len(ops) == 4 else None
+        if dsel:
+            sh = fw * int(dsel[1])
+            mask = ((1 << fw) - 1) << sh
+            f = self.op("and i32 %s, %d" % (self.op("shl i32 %s, %d" % (r, sh)), mask - (1 << 32) if mask >> 31 else mask))
+            keep = ~mask & 0xFFFFFFFF
+            cc = self.op("and i32 %s, %d" % (c, keep - (1 << 32) if keep >> 31 else keep))
+            r = self.op("or i32 %s, %s" % (cc, f))
+        elif op2:
             if op2[0] == "add":
                 r = self.op("add i32 %s, %s" % (r, c))
             else:
                 sg = "s" if dt == "s32" else "u"
                 r = self.call_intr("i32", "llvm.%s%s.i32" % (sg, op2[0]), ["i32 %s" % r, "i32 %s" % c])
-        self.write(ops[0], r, 32)
+        self.write(dreg, r, 32)
+
+    def i_vmad(self, mods, ops, opc):
+        """vmad.dtype.atype.btype{.po}{.sat}{.shr7|.shr15} d, {-}a{.sel},
+        {-}b{.sel}, {-}c (PTX ISA pseudo-code): the 128-bit product of the
+        extended operands; .po adds 1, a negated product is complemented
+        plus 1, else a negated c is complemented plus 1; c is extended signed
+        if any operand type is signed or anything is negated; .shr7/.shr15
+        shift (arithmetically when signed: an assumption) and keep 64 bits;
+        .sat clamps to the s32 or u32 range by that signedness; d is the low
+        32 bits."""
+        ts = [m for m in mods if m in ("u32", "s32")]
+        rest = [m for m in mods if m not in ("u32", "s32")]
+        if len(ts) != 3 or set(rest) - {"po", "sat", "shr7", "shr15"} or \
+                ("shr7" in rest and "shr15" in rest) or len(ops) != 4:
+            raise Unsupported(opc)
+        dt, at, bt = ts
+        neg = []
+        srcs = []
+        for o in ops[1:]:
+            o = o.strip()
+            neg.append(o.startswith("-"))
+            srcs.append(o.lstrip("-").strip())
+        if "po" in rest and any(neg):
+            raise Unsupported(opc)
+        if self.video_sel(ops[0])[1] or self.video_sel(srcs[2])[1]:
+            raise Unsupported(opc)
+        signed = at == "s32" or bt == "s32" or (neg[0] != neg[1]) or neg[2]
+        a, b = self.video_operand(srcs[0], at), self.video_operand(srcs[1], bt)
+        t = self.op("mul i128 %s, %s" % (a, b))
+        c = self.get(srcs[2], 32)
+        lsb = 0
+        if "po" in rest:
+            lsb = 1
+        elif neg[0] != neg[1]:
+            t = self.op("xor i128 %s, -1" % t)
+            lsb = 1
+        elif neg[2]:
+            c = self.op("xor i32 %s, -1" % c)
+            lsb = 1
+        c128 = self.op("%s i32 %s to i128" % ("sext" if signed else "zext", c))
+        t = self.op("add i128 %s, %s" % (t, c128))
+        if lsb:
+            t = self.op("add i128 %s, 1" % t)
+        sc = 7 if "shr7" in rest else 15 if "shr15" in rest else 0
+        if sc:
+            t = self.op("%s i128 %s, %d" % ("ashr" if signed else "lshr", t, sc))
+            t = self.op("trunc i128 %s to i64" % t)
+            t = self.op("%s i64 %s to i128" % ("sext" if signed else "zext", t))
+        if "sat" in rest:
+            if signed:
+                t = self.call_intr("i128", "llvm.smax.i128", ["i128 %s" % t, "i128 %d" % -(1 << 31)])
+                t = self.call_intr("i128", "llvm.smin.i128", ["i128 %s" % t, "i128 %d" % ((1 << 31) - 1)])
+            else:
+                t = self.call_intr("i128", "llvm.umin.i128", ["i128 %s" % t, "i128 %d" % ((1 << 32) - 1)])
+        self.write(ops[0].strip(), self.op("trunc i128 %s to i32" % t), 32)
+
+    def i_vshl(self, mods, ops, opc):
+        return self.scalar_video("vshl", mods, ops, opc)
+
+    def i_vshr(self, mods, ops, opc):
+        return self.scalar_video("vshr", mods, ops, opc)
 
     def i_vadd(self, mods, ops, opc):
         return self.scalar_video("vadd", mods, ops, opc)
@@ -1472,12 +1578,21 @@ class Lifter:
         vset2/vset4.atype.btype.cmp{.add} (PTX ISA pseudo-code): lanes of a and
         b (halfwords or bytes, extended by atype/btype) are combined exactly
         (vavrg: (s + 1) >> 1 if s >= 0 else s >> 1; vset: 1 or 0); .sat clamps
-        each lane to the dtype lane range; without .add the lanes form d,
-        with .add d = c + the sum of the lanes.  Only the default lane
-        selectors (.h10 / .b3210) and mask are modelled."""
+        each lane to the dtype lane range; without .add the lanes form d
+        (lanes outside the destination mask .h0/.h1/.b0... taken from c),
+        with .add d = c + the sum of the lanes in the mask.  Only the
+        default source lane selectors (.h10 / .b3210) are modelled."""
         L = 32 // n
-        if any("." in o.strip().split("%")[-1] for o in ops):
-            raise Unsupported("video lane selector or mask in " + opc)
+        if any("." in o.strip().split("%")[-1] for o in ops[1:]):
+            raise Unsupported("video lane selector in " + opc)
+        dreg, dmask = self.video_sel(ops[0])
+        lanes_on = list(range(n))
+        if dmask is not None:
+            mm = re.fullmatch(r"([hb])([0-3]+)", dmask)
+            if not mm or (mm.group(1) == "h") != (n == 2) or len(set(mm.group(2))) != len(mm.group(2)) \
+                    or any(int(x) >= n for x in mm.group(2)):
+                raise Unsupported("video mask ." + dmask)
+            lanes_on = sorted(int(x) for x in mm.group(2))
         ts = [m for m in mods if m in ("u32", "s32")]
         rest = [m for m in mods if m not in ("u32", "s32")]
         cmp = None
@@ -1535,13 +1650,18 @@ class Lifter:
             t = self.call_intr(vt, "llvm.smin." + sfx, ["%s %s" % (vt, t), "%s %s" % (vt, spl(hi))])
         if "add" in rest:
             acc = c
-            for k in range(n):
+            for k in lanes_on:
                 e = self.op("extractelement %s %s, i32 %d" % (vt, t, k))
                 acc = self.op("add i32 %s, %s" % (acc, e))
-            self.write(ops[0], acc, 32)
+            self.write(dreg, acc, 32)
         else:
             tr = self.op("trunc %s %s to <%d x i%d>" % (vt, t, n, L))
-            self.write(ops[0], self.op("bitcast <%d x i%d> %s to i32" % (n, L, tr)), 32)
+            if len(lanes_on) < n:
+                # lanes outside the mask come from c
+                cv = self.op("bitcast i32 %s to <%d x i%d>" % (c, n, L))
+                sel = "<" + ", ".join("i1 %s" % ("true" if k in lanes_on else "false") for k in range(n)) + ">"
+                tr = self.op("select <%d x i1> %s, <%d x i%d> %s, <%d x i%d> %s" % (n, sel, n, L, tr, n, L, cv))
+            self.write(dreg, self.op("bitcast <%d x i%d> %s to i32" % (n, L, tr)), 32)
 
     def i_vadd2(self, mods, ops, opc):
         return self.simd_video("vadd", 2, mods, ops, opc)
