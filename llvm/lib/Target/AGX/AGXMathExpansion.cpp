@@ -132,8 +132,10 @@ public:
 
   /// atan of a value in [0, inf] or NaN: the argument reduced to
   /// [0, tan(pi / 8)] around 0, pi / 4 or pi / 2.
-  Value *atanNonNegative(Value *A) {
-    Value *Big = gt(A, 2.414213562373095), *Mid = gt(A, 0.4142135623730950);
+  Value *atanNonNegative(Value *A, bool AtMostOne = false) {
+    Value *Mid = gt(A, 0.4142135623730950);
+    Value *Big = AtMostOne ? ConstantInt::getFalse(Mid->getType())
+                           : gt(A, 2.414213562373095);
     // One division, of the operands the range picks (-1 / a or
     // (a - 1) / (a + 1)): a select of two divisions computed both ways.
     Value *Q = div(sel(Big, k(-1.0), sub(A, k(1.0))),
@@ -192,7 +194,7 @@ public:
     Value *T = div(Mn, Mx);
     T = sel(B.CreateFCmpOEQ(Mx, k(0.0)), k(0.0), T);
     T = sel(B.CreateFCmpOEQ(Mn, k(INFINITY)), k(1.0), T);
-    Value *R = atanNonNegative(T);
+    Value *R = atanNonNegative(T, /*AtMostOne=*/true);
     R = sel(Swap, sub(k(M_PI_2), R), R);
     // x < 0 or x = -0: the left half plane.
     Value *Left = lt(copysign(k(1.0), X), 0.0);
