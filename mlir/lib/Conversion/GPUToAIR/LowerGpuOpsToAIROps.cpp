@@ -957,9 +957,9 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
         arith::SubFOp::create(rewriter, loc, u, one));
     r = sel(small, sel(eq(u, one), x, q), lu);
   }
-  // a half result: the division by the reciprocal (exp and log precise:
-  // with the hardware's, expm1 and log1p were up to 1.12 ulp off)
-  if (type.isF16())
+  // an f16 or bf16 result: the division by the reciprocal (exp and log
+  // precise: with the hardware's, expm1 and log1p were up to 1.12 ulp off)
+  if (type.isF16() || type.isBF16())
     approximateForHalf(r, x, HalfApproxDiv);
   if (!type.isF32() && !type.isF64())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
@@ -1080,13 +1080,26 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
   // square roots, asinh the square root (each half input's result as before;
   // asinh's division by the reciprocal changed 4, 2 of them further off, and
   // the hardware's log changed asinh's and atanh's small results)
-  if (type.isF16())
-    approximateForHalf(r, x,
-                       std::is_same_v<OpTy, math::CbrtOp>
-                           ? HalfApproxExpLog | HalfApproxSqrt | HalfApproxDiv
-                       : std::is_same_v<OpTy, math::AsinhOp>
-                           ? unsigned(HalfApproxSqrt)
-                           : HalfApproxSqrt | HalfApproxDiv);
+  if (type.isF16() || type.isBF16()) {
+    constexpr bool isCbrt = std::is_same_v<OpTy, math::CbrtOp>;
+    constexpr bool isAsinh = std::is_same_v<OpTy, math::AsinhOp>;
+    constexpr bool isAcosh = std::is_same_v<OpTy, math::AcoshOp>;
+    unsigned all = HalfApproxExpLog | HalfApproxSqrt | HalfApproxDiv;
+    unsigned kinds =
+        type.isF16()
+            ? (isCbrt    ? all
+               : isAsinh ? unsigned(HalfApproxSqrt)
+                         : HalfApproxSqrt | HalfApproxDiv)
+            // bf16 (L15-E332): acosh all; atanh none (its division by the
+            // reciprocal gave 0 for x beyond 2^126, not a NaN); the others
+            // the divisions and square roots (cbrt's hardware log and exp
+            // rounded 2 inputs the other way)
+            : (isAcosh                                ? all
+               : std::is_same_v<OpTy, math::AtanhOp> ? HalfApproxNone
+                                                     : HalfApproxSqrt |
+                                                           HalfApproxDiv);
+    approximateForHalf(r, x, kinds);
+  }
   if (!type.isF32())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
   rewriter.replaceOp(op, r);
