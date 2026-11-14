@@ -1783,6 +1783,11 @@ static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
   return DAG.getNode(ISD::SUB, DL, MVT::i32, F, C(128));
 }
 
+static cl::opt<bool> AGXSignedBytesALU16(
+    "agx-signed-bytes-alu16", cl::init(true), cl::Hidden,
+    cl::desc("A byte with a zero high byte sign-extended in a 16-bit "
+             "register as (x ^ 128) - 128 on the ALU"));
+
 static cl::opt<bool> BranchLowBitXor(
     "agx-branch-low-bit-xor",
     cl::desc("a branch on (a ^ x) & 1, a boolean, as a != (x & 1)"),
@@ -2198,8 +2203,52 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       return SDValue();
     // The low byte signed: ((x & 255) ^ 128) - 128, as below. (16 bits are
     // one addition with a sign-extended 16-bit source.)
-    if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32 ||
+    if (!DCI.isAfterLegalizeDAG() ||
         cast<VTSDNode>(N->getOperand(1))->getVT() != MVT::i8)
+      return SDValue();
+    // In a 16-bit register (an i8 value's, as loaded): the same on the
+    // 16-bit ALU, for the shift left and arithmetic shift right of the
+    // integer-multiply / bit-field unit (bfi and asr: 2 cycles of issue and
+    // latency 2.95 each, against 1.04 and 2 for xor and isub), where the
+    // high byte is known zero (a byte load's): elsewhere the and makes three
+    // and keeps the shifts' other folds from it (L15-E311).
+    // (not where a user extends it to 32 bits, which the 32-bit forms below
+    // fold, several bytes sharing one bias, or converts it, convert's s8
+    // source)
+    // (a byte load's high byte: zero once the and below makes it the
+    // zero-extending load, which costs nothing)
+    auto *Ld = dyn_cast<LoadSDNode>(N->getOperand(0));
+    bool ByteLoad = Ld && Ld->getMemoryVT() == MVT::i8 &&
+                    Ld->getExtensionType() != ISD::SEXTLOAD &&
+                    N->getOperand(0).hasOneUse();
+    if (N->getValueType(0) == MVT::i16 && AGXSignedBytesALU16 &&
+        (ByteLoad ||
+         DCI.DAG.computeKnownBits(N->getOperand(0)).countMinLeadingZeros() >=
+             8) &&
+        none_of(N->users(), [](const SDNode *U) {
+          switch (U->getOpcode()) {
+          case ISD::SIGN_EXTEND:
+          case ISD::ANY_EXTEND:
+          case ISD::ZERO_EXTEND:
+          case ISD::SINT_TO_FP:
+          case ISD::UINT_TO_FP:
+          case ISD::STRICT_SINT_TO_FP:
+          case ISD::STRICT_UINT_TO_FP:
+            return true;
+          default:
+            return false;
+          }
+        })) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDLoc DL(N);
+      auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i16); };
+      SDValue F = N->getOperand(0);
+      if (ByteLoad)
+        F = DAG.getNode(ISD::AND, DL, MVT::i16, F, C(255));
+      F = DAG.getNode(ISD::XOR, DL, MVT::i16, F, C(128));
+      return DAG.getNode(ISD::SUB, DL, MVT::i16, F, C(128));
+    }
+    if (N->getValueType(0) != MVT::i32)
       return SDValue();
     SDValue X = N->getOperand(0);
     unsigned P = 0;
