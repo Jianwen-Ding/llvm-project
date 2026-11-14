@@ -88,6 +88,20 @@ def intrinsic(name, args):
             t.add("ch")
             keep.append(base)
         return t, keep
+    m = re.fullmatch(r"cp\.async\.bulk\.tensor\.prefetch\.evict\.priority\.(%s)\.([1-5])d" % modes, name)
+    if m:
+        # (tmap, coords, offs, evict_policy): 0 = evict_normal (no qualifier), 1 = evict_last
+        mode, nd = m.group(1), int(m.group(2))
+        if mode not in G2S_MODES:
+            return None
+        ncoord, noff = _counts(mode, nd)
+        base = 1 + ncoord + noff
+        if len(args) != base + 1 or v[-1] not in ("0", "1"):
+            return None
+        t = {"prefetch", "%dd" % nd, "mode_" + G2S_MODES[mode]}
+        if v[-1] == "1":
+            t.add("evict_last")
+        return t, list(range(0, base))
     m = re.fullmatch(r"cp\.async\.bulk\.tensor\.prefetch\.(%s)\.([1-5])d" % modes, name)
     if m:
         mode, nd = m.group(1), int(m.group(2))
@@ -171,6 +185,8 @@ def ptx(mods, ops):
             t.add("mc32")
         elif x == "L2::cache_hint":
             t.add("ch")
+        elif x == "L2::evict_last" and "prefetch" in t:
+            t.add("evict_last")
         else:
             return None
     return t, _flatten(ops)

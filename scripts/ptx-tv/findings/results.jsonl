@@ -3548,10 +3548,10 @@
 {"function": "asyncwaitgroup", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
 {"function": "asyncwaitall", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
 {"function": "asynccommitgroup", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
-{"function": "asyncmbarrier", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
-{"function": "asyncmbarriershared", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
-{"function": "asyncmbarriernoinc", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
-{"function": "asyncmbarriernoincshared", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
+{"function": "asyncmbarrier", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
+{"function": "asyncmbarriershared", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
+{"function": "asyncmbarriernoinc", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
+{"function": "asyncmbarriernoincshared", "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
 {"function": "asynccasharedglobal4i8", "copy_model": "opaque", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
 {"function": "asynccasharedglobal8i8", "copy_model": "opaque", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
 {"function": "asynccasharedglobal16i8", "copy_model": "opaque", "probe": true, "status": "correct", "file": "async-copy.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx70"}
@@ -3563,7 +3563,7 @@
 {"function": "cp_async_bulk_g2s", "copy_model": "opaque", "probe": true, "status": "correct", "file": "cp-async-bulk-ptx86.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx86"}
 {"function": "cp_async_bulk_g2s_relaxed_scopes", "probe": true, "status": "correct", "file": "cp-async-bulk-g2s-relaxed.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx93"}
 {"function": "cp_async_bulk_g2s_relaxed_mc_ch", "probe": true, "status": "correct", "file": "cp-async-bulk-g2s-relaxed.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx93"}
-{"function": "cp_async_bulk_prefetch_evict_priority", "probe": true, "status": "correct", "file": "cp-async-bulk-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "cp_async_bulk_prefetch_evict_priority", "status": "correct", "file": "cp-async-bulk-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_s2g_bytemask", "probe": true, "status": "correct", "file": "cp-async-bulk-s2g-sm100.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx86"}
 {"function": "cp_async_bulk_g2s_validate_data", "probe": true, "status": "correct", "file": "cp-async-bulk-g2s-validate-data.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f -mattr=+ptx94"}
 {"function": "cp_async_bulk_g2s_relaxed_validate_data", "probe": true, "status": "correct", "file": "cp-async-bulk-g2s-validate-data.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f -mattr=+ptx94"}
@@ -3648,11 +3648,11 @@
 {"function": "cp_async_bulk_tensor_g2s_im2col", "status": "correct", "file": "cp-async-bulk-tensor-g2s-mc32.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_g2s_im2col_w", "status": "correct", "file": "cp-async-bulk-tensor-g2s-mc32.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_g2s_im2col_w_128", "status": "correct", "file": "cp-async-bulk-tensor-g2s-mc32.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "tile", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "im2col", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "im2col_w", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "im2col_w_128", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "tile_gather4", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "tile", "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "im2col", "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "im2col_w", "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "im2col_w_128", "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "tile_gather4", "status": "correct", "file": "cp-async-bulk-tensor-prefetch-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_g2s_im2colw_3d", "status": "correct", "file": "cp-async-bulk-tensor-g2s-im2colw.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "cp_async_bulk_tensor_g2s_im2colw_3d_cg1", "status": "correct", "file": "cp-async-bulk-tensor-g2s-im2colw.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "cp_async_bulk_tensor_g2s_im2colw_3d_cg2", "status": "correct", "file": "cp-async-bulk-tensor-g2s-im2colw.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
@@ -4164,14 +4164,14 @@
 {"function": "tensormap_replace_interleave_layout", "probe": true, "status": "correct", "file": "tensormap_replace.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx83"}
 {"function": "tensormap_replace_swizzle_mode", "probe": true, "status": "correct", "file": "tensormap_replace.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx83"}
 {"function": "tensormap_replace_fill_mode", "probe": true, "status": "correct", "file": "tensormap_replace.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx83"}
-{"function": "applypriority_async_bulk_evict_priority", "probe": true, "status": "correct", "file": "applypriority-async-bulk-global-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "applypriority_global_L2", "probe": true, "status": "correct", "file": "applypriority.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
-{"function": "applypriority_L2", "probe": true, "status": "correct", "file": "applypriority.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
-{"function": "tile", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "gather4", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "im2col", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "im2col_w", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "im2col_w_128", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "applypriority_async_bulk_evict_priority", "status": "correct", "file": "applypriority-async-bulk-global-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "applypriority_global_L2", "status": "correct", "file": "applypriority.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
+{"function": "applypriority_L2", "status": "correct", "file": "applypriority.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
+{"function": "tile", "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "gather4", "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "im2col", "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "im2col_w", "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
+{"function": "im2col_w_128", "status": "correct", "file": "applypriority-async-bulk-tensor-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "tile_override_addr", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-override-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "tile_override_addr_dim_stride", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-override-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "gather4_override_addr", "probe": true, "status": "correct", "file": "applypriority-async-bulk-tensor-override-evict-priority.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}

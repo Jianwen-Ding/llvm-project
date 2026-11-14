@@ -21,6 +21,7 @@ import tcgen05ls
 import tcgen05ops
 import tcgen05mma
 import tma
+import prio
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -328,6 +329,37 @@ def expand(text, lifter_mod, llc_args=None):
                 and not re.match(r"\s*%", line):
             removed = True
             continue
+        pr = prio.intrinsic(name, args)
+        if pr and not re.match(r"\s*%", line):
+            toks, keep = pr
+            short = llc_args is not None and any("short-ptr" in a or "shortptr" in a for a in llc_args)
+            kname = prio.name_of(toks) + ".n%d" % len(keep)
+            key_ = ("prio", name, tuple(args))
+            if key_ not in defs:
+                fname = "ptxtv_sem_%d_prio" % len(defs)
+                w = ["define internal void @%s(%s) alwaysinline {" % (
+                    fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+                cargs = []
+                for i in keep:
+                    t = args[i][0]
+                    if t.startswith("ptr"):
+                        narrow = re.match(r"ptr addrspace\((3|6|7)\)", t) and short
+                        w.append("  %%p%d = ptrtoint %s %%y%d to %s" % (i, t, i, "i32" if narrow else "i64"))
+                        if narrow:
+                            w.append("  %%c%d = zext i32 %%p%d to i64" % (i, i))
+                        else:
+                            w.append("  %%c%d = add i64 %%p%d, 0" % (i, i))
+                    elif t == "i64":
+                        w.append("  %%c%d = add i64 %%y%d, 0" % (i, i))
+                    else:
+                        w.append("  %%c%d = zext %s %%y%d to i64" % (i, t, i))
+                    cargs.append("i64 %%c%d" % i)
+                w += ["  call void @%s(%s)" % (kname, ", ".join(cargs)), "  ret void", "}"]
+                defs[key_] = (fname, "\n".join(w),
+                              {kname: "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(keep)))})
+            line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+            out_lines.append(line)
+            continue
         tt = tma.intrinsic(name, args)
         if tt and not re.match(r"\s*%", line):
             toks, keep = tt
@@ -595,7 +627,7 @@ def expand(text, lifter_mod, llc_args=None):
             line = line[:m.start()] + "@" + defs[key][0] + line[j:]
             out_lines.append(line)
             continue
-        if re.fullmatch(r"cp\.async\.bulk\.(commit\.group|wait\.group(\.read)?|prefetch\.L2)", name) \
+        if re.fullmatch(r"cp\.async\.bulk\.(commit\.group|wait\.group(\.read)?)", name) \
                 and not re.match(r"\s*%", line):
             removed = True
             continue

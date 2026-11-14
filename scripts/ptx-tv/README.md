@@ -158,6 +158,12 @@ single-thread semantics:
   PTX `im2col_no_offs`); operands in PTX order. The tensor map and the copy
   stay opaque. The `override` forms (tensor-map field overrides) and the
   non-default data-validity patterns remain probe-derived.
+* `applypriority` (L2, async bulk and async bulk tensor), the bulk prefetch
+  (`cp.async.bulk.prefetch.L2`, with cache hint or eviction priority; it was
+  a no-op before) and `cp.async.mbarrier.arrive` are uninterpreted calls
+  named by their documented modifiers (`prio.py`; evict_policy 0 =
+  `evict_normal`, 1 = `evict_last`), operands as zero-extended i64; the
+  eviction-priority tensor prefetch is part of `tma.py`.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -165,8 +171,6 @@ single-thread semantics:
   the first register upwards; an out-of-group index (implementation-specific
   in the ISA) is taken modulo the group size on both sides. `spcompress` is
   left opaque: its tie-breaking and NaN selection are implementation-specific.
-  `applypriority` stays opaque too (as a no-op, the address and eviction
-  policy would go unchecked).
 * Inline PTX assembly in the source (`asm_sem.py`) is replaced by an
   inlined function lifted from the template with its operands bound to
   parameters (outputs returned, tied operands and `i`/`n` immediates
@@ -275,8 +279,7 @@ What remains opaque or unproved, and why:
   modelled as a store, its single-memory meaning), texture/surface (opaque image state), `spcompress`
   (implementation-specific selection), `barrier.cluster`, `mapa`,
   `getctarank`, `clusterlaunchcontrol`, `pmevent`, `griddepcontrol`.
-  `applypriority` stays opaque on purpose (as a no-op the address and
-  eviction policy would go unchecked). Non-tensor `cp.reduce.async.bulk`
+ Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
   symbolic-size bulk copies (which already time out with copy semantics),
   Alive2 cannot prove it without bounded unrolling.

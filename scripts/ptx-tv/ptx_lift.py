@@ -1011,7 +1011,7 @@ class Lifter:
         if h is None:
             raise Unsupported("opcode " + opcode)
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
-                    "spdecompress", "multimem") or \
+                    "spdecompress", "multimem", "applypriority") or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
@@ -2254,6 +2254,10 @@ class Lifter:
         before cp.async.wait_* is a data race in PTX, so this only removes
         behaviours.  commit_group/wait_group/wait_all are then no-ops."""
         ms = set(mods)
+        import prio
+        pr = prio.ptx("cp", mods, ops)
+        if pr is not None:
+            return self.prio_call(pr, opc)
         import tma
         tg = tma.ptx(mods, ops)
         if tg is not None:
@@ -2479,6 +2483,34 @@ class Lifter:
             for k, r in enumerate(regs):
                 acc = self.op("insertelement %s %s, i32 %s, i32 %d" % (vt, acc, self.get(r, 32), k))
             self.emit("call void @%s(%s)" % (name, ", ".join(args + ["%s %s" % (vt, acc)])))
+
+    def prio_call(self, pr, opc):
+        """An uninterpreted call of prio.py, every operand as a zero-extended
+        i64 (registers at their width, immediates as constants)."""
+        import prio
+        toks, flat = pr
+        vals = []
+        for o in flat:
+            br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+            r = br.group(1) if br else o
+            if r in self.regs and self.regs[r] > 1:
+                w = self.regs[r]
+                v = self.get(r, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(r) is not None:
+                vals.append("i64 %d" % (self.imm(r) & ((1 << 64) - 1)))
+            else:
+                raise Unsupported("operand " + opc)
+        kname = prio.name_of(toks) + ".n%d" % len(vals)
+        self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(vals))))
+        self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+
+    def i_applypriority(self, mods, ops, opc):
+        import prio
+        pr = prio.ptx("applypriority", mods, ops)
+        if pr is None:
+            raise Unsupported("opcode " + opc)
+        return self.prio_call(pr, opc)
 
     def i_wgmma(self, mods, ops, opc):
         """wgmma.fence / commit_group / wait_group (.sync.aligned) only order
