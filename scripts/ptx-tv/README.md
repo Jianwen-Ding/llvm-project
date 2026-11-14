@@ -187,6 +187,12 @@ single-thread semantics:
   lane k with all computations, memory effects and UB unchanged; the
   function refines iff every lane variant does (vector refinement is
   lane-wise), and a failing lane is a real counterexample.
+* `PTXTV_STRIP_FMF=1` (used for results Alive2 leaves inconclusive because
+  it approximates `contract`/`afn`/`reassoc`/`arcp`): the source without
+  these flags (`fast` becomes `nnan ninf nsz`). They only permit additional
+  results, so the stricter source makes a proof sound for the original; a
+  counterexample proves nothing, and those stay inconclusive. Results are
+  tagged `stripped_fmf`.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such

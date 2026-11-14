@@ -1,16 +1,16 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query, then with the weaker check, then with element-wise vector accesses, then per lane for vector results (also combined, and combined with the weaker check). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query, then with the weaker check, then with element-wise vector accesses, then per lane for vector results (also combined, and combined with the weaker check); flag-approximation inconclusives re-run against the source without those flags. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4187.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3394 | 81.1% |
+| `correct` | 3403 | 81.3% |
 | `timeout` | 511 | 12.2% |
 | `mismatch-known` | 171 | 4.1% |
-| `inconclusive` | 68 | 1.6% |
+| `inconclusive` | 59 | 1.4% |
 | `mismatch-param-oob` | 33 | 0.8% |
 | `mismatch` | 7 | 0.2% |
 | `lift-unsupported` | 2 | 0.0% |
@@ -26,9 +26,11 @@ Of the correct results, 507 rely on probe-derived opaque instructions (probe.py)
 
 60 of the correct results were obtained by checking a vector result one lane at a time (`lanes`, PTXTV_LANES=1) after a timeout.
 
+9 of the correct results were proved against the source without the fast-math flags Alive2 approximates (`stripped_fmf`; a stricter source).
+
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 3605 (86.1%).
+Conclusive (proved correct or counterexample): 3614 (86.3%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 

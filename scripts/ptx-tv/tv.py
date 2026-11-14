@@ -273,6 +273,12 @@ def prepare_source(path, workdir):
                   r"alias\.scope|noalias|llvm\.access\.group|llvm\.loop|prof|annotation|"
                   r"srcloc|nvvm\.[\w.]+)\s+![\w.]+", "", text)
     text = rewrite_i1_fp(text)
+    if STRIP_FMF:
+        # contract/afn/reassoc/arcp only permit additional results: without
+        # them the source is stricter, so a proof against it also holds for
+        # the original (a counterexample does not)
+        text = re.sub(r"\b(contract|afn|reassoc|arcp)\s+", "", text)
+        text = re.sub(r"\bfast\s+", "nnan ninf nsz ", text)
     text = scalarize_vector_mem(text)
     text = resolve_nvvm_reflect(text, workdir)
     text = rewrite_counters(text)
@@ -496,6 +502,7 @@ def rewrite_i1_fp(text):
 
 
 LANES = os.environ.get("PTXTV_LANES", "0") == "1"
+STRIP_FMF = os.environ.get("PTXTV_STRIP_FMF", "0") == "1"
 
 
 def _ret_vec_re(fname):
@@ -966,6 +973,8 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         res["copy_model"] = "opaque"
     if SCALARIZE:
         res["scalarized"] = True
+    if STRIP_FMF:
+        res["stripped_fmf"] = True
     if L.used_probe:
         res["probe"] = True   # relies on a probe-derived opaque instruction
     if st == "mismatch":
