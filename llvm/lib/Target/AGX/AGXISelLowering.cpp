@@ -3109,6 +3109,11 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
   return DAG.getNode(ISD::FMUL, DL, VT, A, R, Flags);
 }
 
+static cl::opt<bool> HalfSqrtProduct(
+    "agx-half-sqrt-product",
+    cl::desc("half sqrt as the float x rsqrt_special(x) rounded to half"),
+    cl::init(true), cl::Hidden);
+
 /// float sqrt without afn, correctly rounded (denormals flushed): from
 /// y = rsqrt_special(x) (within 1 ulp; 1 for 0 and infinity),
 ///   s0 = x y, s = s0 + (x - s0^2) y / 2
@@ -3130,6 +3135,12 @@ SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
     EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
     SDValue Y = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rsqrt_special, VT, X);
     SDValue S0 = DAG.getNode(ISD::FMUL, DL, VT, X, Y);
+    // The float product itself, rounded to half, is the correctly rounded
+    // half square root for every half (simulator, all 65536): no correction
+    // step (L15-E334).
+    if (HalfSqrtProduct)
+      return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, S0,
+                         DAG.getTargetConstant(0, DL, MVT::i32));
     SDValue H = DAG.getNode(ISD::FMUL, DL, VT, Y, DAG.getConstantFP(0.5, DL, VT));
     SDValue Rem = DAG.getNode(ISD::FMA, DL, VT,
                               DAG.getNode(ISD::FNEG, DL, VT, S0), S0, X);
