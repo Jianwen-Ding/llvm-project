@@ -52,7 +52,7 @@ def main(path, out, title, config):
     nsc = sum(1 for r in fn if r["status"] == "correct" and r.get("scalarized"))
     if nsc:
         L.append("%d of the correct results were obtained with vector accesses split into "
-                 "element accesses on both sides (, PTXTV_SCALARIZE=1) after a "
+                 "element accesses on both sides (`scalarized`, PTXTV_SCALARIZE=1) after a "
                  "timeout." % nsc)
         L.append("")
     nun = sum(1 for r in fn if r["status"] == "correct" and r.get("unroll"))

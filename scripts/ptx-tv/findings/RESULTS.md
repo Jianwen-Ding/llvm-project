@@ -22,7 +22,7 @@ Of the correct results, 507 rely on probe-derived opaque instructions (probe.py)
 
 8 of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) after the check with cp.async/st.bulk copy semantics timed out.
 
-46 of the correct results were obtained with vector accesses split into element accesses on both sides (, PTXTV_SCALARIZE=1) after a timeout.
+46 of the correct results were obtained with vector accesses split into element accesses on both sides (`scalarized`, PTXTV_SCALARIZE=1) after a timeout.
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
