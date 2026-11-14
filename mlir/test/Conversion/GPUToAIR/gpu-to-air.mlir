@@ -647,6 +647,36 @@ gpu.module @simdgroup_all_reduce {
     memref.store %s, %a[%c0] : memref<1024xf32, 1>
     gpu.return
   }
+  // Integers of 8, 16 and 64 bits as well (exact in any order): their partials
+  // in threadgroup memory and one barrier, instead of the generic lowering.
+  // CHECK-LABEL: llvm.func @sum_i64(
+  gpu.func @sum_i64(%a: memref<1024xi64, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: llvm.store %{{.*}}, %{{.*}} : i64, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.load %{{.*}} : !llvm.ptr<3> -> i64
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xi64, 1>
+    %s = gpu.all_reduce add %v uniform {} : (i64) -> (i64)
+    memref.store %s, %a[%c0] : memref<1024xi64, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @max_i16(
+  gpu.func @max_i16(%a: memref<1024xi16, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: llvm.store %{{.*}}, %{{.*}} : i16, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.load %{{.*}} : !llvm.ptr<3> -> i16
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xi16, 1>
+    %s = gpu.all_reduce maxsi %v uniform {} : (i16) -> (i16)
+    memref.store %s, %a[%c0] : memref<1024xi16, 1>
+    gpu.return
+  }
   // A reduction whose result feeds the next one keeps its own round.
   // CHECK-LABEL: llvm.func @dependent(
   gpu.func @dependent(%a: memref<1024xf32, 1>) kernel

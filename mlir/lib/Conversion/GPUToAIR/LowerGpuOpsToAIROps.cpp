@@ -1959,7 +1959,11 @@ static std::optional<SimdgroupReduce> simdgroupReduce(gpu::AllReduceOp op) {
   if (!func || !threads || *threads == 0 || *threads % 32 || *threads > 1024)
     return std::nullopt;
   Type type = op.getType();
-  if (!type.isF32() && !type.isF16() && !type.isInteger(32))
+  // (Integers of 8, 16 and 64 bits too, which reduce to the same value in
+  // any order: subgroup_reduce's reductions of them, L15-E278.)
+  if (!type.isF32() && !type.isF16() &&
+      !(type.isInteger(8) || type.isInteger(16) || type.isInteger(32) ||
+        type.isInteger(64)))
     return std::nullopt;
   gpu::AllReduceOperation kind = *op.getOp();
   TypedAttr identity;
