@@ -156,6 +156,12 @@ single-thread semantics:
   cover only executions with at most that many iterations per loop (exact
   when every trip count is a constant within the bound) and record
   `"unroll"`.
+* `llvm.masked.load`/`llvm.masked.store` (`masked.py`) are expanded into
+  per-lane conditional accesses (LangRef: disabled lanes are not accessed)
+  in the source and in the lifted code, because Alive2 treats their current
+  form (alignment as a parameter attribute) as unknown calls. This also
+  applies to the masked load in the `cp.async` model, whose earlier results
+  only showed that both sides made the same unknown call.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
@@ -208,6 +214,10 @@ intrinsics' `i16` operands/results.
   PTX ISA error bounds have to be compared by hand.
 * `cas-based-atomic-load`: an atomic 128-bit load implemented as
   `atom.cas.b128 [a], 0, 0`, which needs writable memory.
+* `masked-load-widened`: a masked load lowered to a full-width aligned
+  load (with `.pragma "used_bytes_mask"` from PTX 8.3 on): it reads the
+  disabled lanes, which LLVM does not allow if they are not dereferenceable,
+  but stays within an aligned granule and cannot fault. Intended.
 * `indirect-call-asm-mode`: indirect calls through a pointer loaded from
   memory; Alive2's assembly mode fails or times out even on an unchanged
   call, so indirect calls are effectively unverified.

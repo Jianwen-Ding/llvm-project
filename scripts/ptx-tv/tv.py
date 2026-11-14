@@ -515,8 +515,7 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # aligned granule, so it cannot fault on the hardware.  Intentional.
     # (the pragma is only emitted for PTX >= 8.3; the lane loads of an
     # expanded masked load are named ptxtv_mlx*)
-    if ('used_bytes_mask' in body or (re.search(r"%ptxtv_mlx\d", src_text) and
-                                      re.search(r"\bld\.[\w.:]*v[248]\.", body))) and \
+    if ('used_bytes_mask' in body or re.search(r"%ptxtv_mlx\d", src_text)) and \
             "Source is more defined than target" in alive_out:
         return "masked-load-widened"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)

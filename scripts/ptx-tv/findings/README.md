@@ -214,11 +214,11 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4186 functions from 619
-test files; 3232 proved correct (505 through probe-derived opaque instructions,
-20 only with the weaker check); 32 counterexamples with out-of-bounds
+test files; 3238 proved correct (507 through probe-derived opaque instructions,
+20 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
-2/2b/3/4/5/6; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 138 in
-known modelling classes; 11 not lifted; 762 solver timeouts or inconclusive.
+2/2b/3/4/5/6; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 148 in
+known modelling classes; 11 not lifted; 745 solver timeouts or inconclusive.
 
 Not lifted (11): the two finding-5 kernels (invalid PTX), calls through
 `undef` or with ambiguous types, `stacksave`/`stackrestore` (unsupported by

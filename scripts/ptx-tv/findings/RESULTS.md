@@ -1,30 +1,30 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4186.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3232 | 77.2% |
-| `timeout` | 662 | 15.8% |
-| `mismatch-known` | 138 | 3.3% |
-| `inconclusive` | 100 | 2.4% |
-| `mismatch-param-oob` | 32 | 0.8% |
+| `correct` | 3238 | 77.4% |
+| `timeout` | 676 | 16.1% |
+| `mismatch-known` | 148 | 3.5% |
+| `inconclusive` | 69 | 1.6% |
+| `mismatch-param-oob` | 33 | 0.8% |
 | `lift-unsupported` | 11 | 0.3% |
 | `mismatch` | 10 | 0.2% |
 | `src-inline-asm` | 1 | 0.0% |
 
 20 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
 
-Of the correct results, 505 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
+Of the correct results, 507 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
 
-6 of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) after the check with cp.async/st.bulk copy semantics timed out.
+8 of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) after the check with cp.async/st.bulk copy semantics timed out.
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 3412 (81.5%).
+Conclusive (proved correct or counterexample): 3429 (81.9%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -52,6 +52,7 @@ All are finding 1 (sub-byte vectors) except `param-vectorize-device.ll` `callee_
 * `insertelt-dynamic.ll` `dynamic_i6`: st func_retval0+8 (8 bytes) > 8
 * `insertelt-dynamic.ll` `dynamic_i7`: st func_retval0+8 (8 bytes) > 8
 * `insertelt-dynamic.ll` `multiple_dynamic_i3`: st func_retval0+2 (2 bytes) > 2
+* `masked-store-variable-mask.ll` `global_variable_mask`: ld global_variable_mask_param_2+3 (1 bytes) > 1; ld global_variable_mask_param_2+2 (1 bytes) > 1
 * `param-load-store.ll` `test_v3i1`: ld test_v3i1_param_0+1 (1 bytes) > 1; ld test_v3i1_param_0+2 (1 bytes) > 1
 * `param-vectorize-device.ll` `callee_St4x3`: ld callee_St4x3_param_0+0 (16 bytes) > 12
 * `param-vectorize-device.ll` `callee_St4x7`: ld callee_St4x7_param_0+16 (16 bytes) > 28
@@ -96,6 +97,7 @@ finding 6.
 | `partword-atomic-word-access` | 80 |
 | `approximation-permitted-by-flags` | 21 |
 | `nan-payload` | 18 |
+| `masked-load-widened` | 10 |
 | `indirect-call-asm-mode` | 4 |
 | `approx-substitution` | 4 |
 | `aligned-overread-widened-load` | 3 |
