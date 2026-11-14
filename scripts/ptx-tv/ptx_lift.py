@@ -1011,7 +1011,7 @@ class Lifter:
         if h is None:
             raise Unsupported("opcode " + opcode)
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
-                    "spdecompress") or \
+                    "spdecompress", "multimem") or \
                 (base == "st" and ("bulk" in mods or "async" in mods)):
             return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
@@ -2349,6 +2349,18 @@ class Lifter:
             raise Unsupported("opcode " + opc)
         p = self.address(ops[0], "global" if "global" in mods else "generic")
         self.emit(discard_ir(p))
+
+    def i_multimem(self, mods, ops, opc):
+        """multimem.st.async.release.{sys,gpu}.global.T [a], v: a store to every
+        replica of a multimem address; in the single-memory model, a store to
+        a (the same as the source's st.async with isMultimem).  multimem
+        loads/reductions combine replicas and are not modelled."""
+        rest = [m for m in mods if m in TBITS]
+        other = set(mods) - set(rest)
+        if other in ({"st", "async", "release", "sys", "global"},
+                     {"st", "async", "release", "gpu", "global"}) and len(ops) == 2:
+            return self.i_st(["global"] + rest, ops, opc)
+        raise Unsupported("opcode " + opc)
 
     def st_bulk(self, mods, ops, opc):
         """st.bulk{.weak}{.shared::cta} [a], size, 0: zero `size` bytes

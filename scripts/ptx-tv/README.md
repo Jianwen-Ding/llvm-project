@@ -119,7 +119,7 @@ single-thread semantics:
   for these, and results record `"copy_model": "opaque"`.
 * `st.async` to `shared::cluster` is a store followed by the same opaque
   complete-tx (of the store's size) on the mbarrier; the `.release.{sys,gpu}`
-  (and `.mmio`) global forms are plain stores. `discard.L2` makes its
+  (and `.mmio`) global forms, and `multimem.st.async`, are plain stores. `discard.L2` makes its
   128-byte line indeterminate (a store of poison, 128-byte aligned).
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
@@ -233,7 +233,8 @@ What remains opaque or unproved, and why:
   collective tensor-memory and tensor-core operations), TMA
   (`cp.async.bulk.tensor`, `cp.reduce.async.bulk.tensor`) and
   `tensormap.replace` (the tensor-map layout is not public), `multimem`
-  (multi-device), texture/surface (opaque image state), `spcompress`
+  loads and reductions (they combine the replicas; `multimem.st.async` is
+  modelled as a store, its single-memory meaning), texture/surface (opaque image state), `spcompress`
   (implementation-specific selection), `barrier.cluster`, `mapa`,
   `getctarank`, `clusterlaunchcontrol`, `pmevent`, `griddepcontrol`.
   `applypriority` stays opaque on purpose (as a no-op the address and

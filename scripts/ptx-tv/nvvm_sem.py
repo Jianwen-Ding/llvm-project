@@ -370,7 +370,10 @@ def expand(text, lifter_mod, llc_args=None):
         sa = re.fullmatch(r"st\.async(\.sys|\.gpu|\.mmio\.sys)?\.i(8|16|32|64|128)", name)
         if sa and not re.match(r"\s*%", line) and (
                 (sa.group(1) is None and len(args) == 3) or
-                (sa.group(1) in (".sys", ".gpu") and len(args) == 3 and args[2][1] in ("0", "false")) or
+                # isMultimem (a store to every replica): a store in the
+                # single-memory model, as ptx_lift.i_multimem
+                (sa.group(1) in (".sys", ".gpu") and len(args) == 3 and
+                 args[2][1] in ("0", "false", "1", "true")) or
                 (sa.group(1) == ".mmio.sys" and len(args) == 2)):
             key = ("st.async", name, tuple(t for t, _ in args))
             if key not in defs:

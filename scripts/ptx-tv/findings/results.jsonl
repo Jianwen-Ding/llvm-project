@@ -3833,14 +3833,14 @@
 {"function": "test_spcompress_elmsz_b8_idxsz_b2_rpf_64", "probe": true, "status": "correct", "file": "spcompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spcompress_elmsz_b8_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spcompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spcompress_elmsz_b16_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spcompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_multimem_st_async_release_sys_b8", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_sys_b16", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_sys_b32", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_sys_b64", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_gpu_b8", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_gpu_b16", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_gpu_b32", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_multimem_st_async_release_gpu_b64", "probe": true, "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_sys_b8", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_sys_b16", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_sys_b32", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_sys_b64", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_gpu_b8", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_gpu_b16", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_gpu_b32", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
+{"function": "test_multimem_st_async_release_gpu_b64", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
 {"function": "test_tcgen05_alloc_exclusive_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
 {"function": "test_tcgen05_alloc_exclusive_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
 {"function": "test_tcgen05_alloc_exclusive_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
