@@ -323,11 +323,17 @@ intrinsics' `i16` operands/results.
 
 What remains opaque or unproved, and why:
 
-* Probe-derived opaque instructions are left for families without
-  single-thread semantics a TV check could use: `multimem` loads and
-  reductions (they combine the replicas; `multimem.st.async` is modelled as
-  a store, its single-memory meaning) and `st.bulk` under
-  `PTXTV_OPAQUE_COPIES=1`.
+* Probe-derived opaque instructions are no longer used by any result on
+  this suite: every intrinsic the tests use has a semantic or keyed model.
+  `probe.py` remains the fallback for intrinsics without one (for example
+  `multimem` loads and reductions, which this LLVM has no intrinsics for;
+  `multimem.st.async` is modelled as a store, its single-memory meaning).
+  Under `PTXTV_OPAQUE_COPIES=1`, `st.bulk` is keyed as well (`bulkkey.py`).
+* Three keyed texture/surface fetches through a global handle
+  (`tex-read-cuda.ll` `bar`/`baz`, `surf-read-cuda.ll` `bar`) time out
+  even at 120 s per query and with the weaker check, although source and
+  target are the same call; the `.trap` surface loads (not `willreturn`)
+  need the 120 s budget.
 * Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
   symbolic-size bulk copies (which already time out with copy semantics),

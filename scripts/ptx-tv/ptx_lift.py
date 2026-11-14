@@ -2668,6 +2668,12 @@ class Lifter:
     def st_bulk(self, mods, ops, opc):
         """st.bulk{.weak}{.shared::cta} [a], size, 0: zero `size` bytes
         (size a multiple of 8, a 8-byte aligned; initval must be 0)."""
+        import bulkkey
+        if bulkkey.OPAQUE:
+            bq = bulkkey.st_ptx(mods, ops)
+            if bq is None:
+                raise Unsupported("opcode " + opc)
+            return self.prio_call(bq, opc, bulkkey.name_of(bq[0], len(bq[1])))
         if not set(mods) <= {"bulk", "weak", "shared::cta"} or len(ops) != 3 or \
                 self.imm(ops[2].strip()) != 0:
             raise Unsupported("opcode " + opc)

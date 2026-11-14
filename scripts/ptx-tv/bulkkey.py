@@ -4,7 +4,8 @@ documented modifiers (NVPTXUsage: flag_mc/flag_ch/flag_oob, flag_scope
 cp.async size and src-size), derived independently from the intrinsic and
 from the PTX opcode; operands in PTX order as zero-extended i64.  Used where
 the copy-semantics model does not apply (relaxed, ignore_oob, cp_mask,
-multicast, data validity) and, with PTXTV_OPAQUE_COPIES=1, for all copies."""
+multicast, data validity) and, with PTXTV_OPAQUE_COPIES=1, for all copies
+and st.bulk."""
 import os
 import re
 
@@ -93,6 +94,11 @@ def intrinsic(name, args):
         return t, keep
     if name == "cp.async.bulk.shared.cta.to.cluster" and len(args) == 4:
         return {"s2s"}, [0, 2, 3, 1]
+    m = re.fullmatch(r"st\.bulk\.p([03])\.i(32|64)", name)
+    if m and OPAQUE and len(args) == 3:
+        # (dst, size, initval): only under PTXTV_OPAQUE_COPIES; otherwise
+        # st.bulk has its zeroing semantics (nvvm_sem / ptx_lift.st_bulk)
+        return {"st_bulk"} | ({"shared"} if m.group(1) == "3" else set()), [0, 1, 2]
     m = re.fullmatch(r"cp\.async\.(ca|cg)\.shared\.global\.(4|8|16)(\.s)?", name)
     if m:
         return {"cp_async", m.group(1), "size" + m.group(2)} | ({"srcsize"} if m.group(3) else set()), \
@@ -158,3 +164,10 @@ def semantic(tokens):
         return True
     return tokens == {"s2s"} or (len(tokens & {"g2s_cluster", "g2s_cta", "s2g"}) == 1 and
                                  len(tokens) <= 2 and tokens - {"g2s_cluster", "g2s_cta", "s2g"} <= {"ch"})
+
+
+def st_ptx(mods, ops):
+    """st.bulk{.weak}{.shared::cta} [a], size, initval as (tokens, operands)."""
+    if not set(mods) <= {"bulk", "weak", "shared::cta"} or "bulk" not in mods or len(ops) != 3:
+        return None
+    return {"st_bulk"} | ({"shared"} if "shared::cta" in mods else set()), tma._flatten(ops)
