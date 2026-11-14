@@ -3479,6 +3479,69 @@ static bool rangedCompares(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXOwnValueShifts(
+    "agx-own-value-shifts", cl::init(true), cl::Hidden,
+    cl::desc("a select of the own value where a SIMD-group shift by a "
+             "constant has no source lane, dropped"));
+
+/// select(lane < 32 - k, shuffle_down(v, k), v) and
+/// select(lane >= k, shuffle_up(v, k), v), k a constant in [1, 32): AIR's
+/// shifts leave the lanes without a source their own value (as
+/// convert-gpu-to-air takes them for shifts by constants), so the select
+/// is the shuffle (a loop-written reduction's step once unrolled)
+/// (L15-E302).
+static bool ownValueShifts(Function &F) {
+  if (!AGXOwnValueShifts)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Value *Cond, *T, *Fv;
+    if (!match(&I, m_Select(m_Value(Cond), m_Value(T), m_Value(Fv))))
+      continue;
+    // (through the bitcasts of a float's shuffle as i32)
+    auto Peel = [](Value *V) {
+      while (auto *BC = dyn_cast<BitCastInst>(V))
+        V = BC->getOperand(0);
+      return V;
+    };
+    bool Swapped = false;
+    auto *Sh = dyn_cast<IntrinsicInst>(Peel(T));
+    if (!Sh || (Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_down &&
+                Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_up)) {
+      Sh = dyn_cast<IntrinsicInst>(Peel(Fv));
+      std::swap(T, Fv);
+      Swapped = true;
+    }
+    if (!Sh || (Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_down &&
+                Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_up) ||
+        Peel(Sh->getArgOperand(0)) != Peel(Fv))
+      continue;
+    const APInt *K, *C;
+    CmpPredicate P;
+    Value *L;
+    if (!match(Sh->getArgOperand(1), m_APInt(K)) || K->uge(32) || K->isZero() ||
+        !match(Cond, m_ICmp(P, m_Value(L), m_APInt(C))) ||
+        !match(L, m_Intrinsic<Intrinsic::agx_thread_index_in_simdgroup>()))
+      continue;
+    ICmpInst::Predicate Pr =
+        Swapped ? ICmpInst::getInversePredicate(P) : ICmpInst::Predicate(P);
+    uint64_t k = K->getZExtValue(), c = C->getZExtValue();
+    bool Down = Sh->getIntrinsicID() == Intrinsic::agx_simd_shuffle_down;
+    // the condition is exactly "the source lane exists"
+    bool Exact = Down ? (Pr == ICmpInst::ICMP_ULT && c == 32 - k) ||
+                            (Pr == ICmpInst::ICMP_ULE && c == 31 - k)
+                      : (Pr == ICmpInst::ICMP_UGE && c == k) ||
+                            (Pr == ICmpInst::ICMP_UGT && c == k - 1);
+    if (!Exact)
+      continue;
+    I.replaceAllUsesWith(T);
+    I.eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXConvertedMinMaxNum(
     "agx-converted-minmax-num", cl::init(true), cl::Hidden,
     cl::desc("maximum / minimum whose only use is a float-to-integer "
@@ -4069,6 +4132,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   // (before the scan recognition, which matches the folded segment tests)
   Changed |= rangedCompares(F);
   Changed |= simdScans(F, ST);
+  Changed |= ownValueShifts(F);
   Changed |= mergeLoopExits(F);
   Changed |= forwardOwnSlots(F);
   Changed |= strideDivisions(F);
