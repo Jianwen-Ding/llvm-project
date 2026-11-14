@@ -138,9 +138,9 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-NEXT:    device_load 0, i32, x, r2, u2_u3, r1, signed
 ; CHECK-NEXT:    device_load 1, i32, x, r3, u0_u1, r1, signed
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    simd_shuffle_xor r4, r2, 1
+; CHECK-NEXT:    quad_shuffle_xor r4, r2, 1
 ; CHECK-NEXT:    wait 1
-; CHECK-NEXT:    simd_shuffle_xor r5, r3, 1
+; CHECK-NEXT:    quad_shuffle_xor r5, r3, 1
 ; CHECK-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
 ; CHECK-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
 ; CHECK-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
@@ -169,9 +169,9 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; NOPUSH-NEXT:    device_load 0, i32, x, r2, u2_u3, r1, signed
 ; NOPUSH-NEXT:    device_load 1, i32, x, r3, u0_u1, r1, signed
 ; NOPUSH-NEXT:    wait 0
-; NOPUSH-NEXT:    simd_shuffle_xor r4, r2, 1
+; NOPUSH-NEXT:    quad_shuffle_xor r4, r2, 1
 ; NOPUSH-NEXT:    wait 1
-; NOPUSH-NEXT:    simd_shuffle_xor r5, r3, 1
+; NOPUSH-NEXT:    quad_shuffle_xor r5, r3, 1
 ; NOPUSH-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
 ; NOPUSH-NEXT:    fcmpsel lt, r7, r3, r5, 1, 0
 ; NOPUSH-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
@@ -202,9 +202,9 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; COPY-NEXT:    device_load 0, i32, x, r2, u2_u3, r1, signed
 ; COPY-NEXT:    device_load 1, i32, x, r3, u0_u1, r1, signed
 ; COPY-NEXT:    wait 0
-; COPY-NEXT:    simd_shuffle_xor r4, r2, 1
+; COPY-NEXT:    quad_shuffle_xor r4, r2, 1
 ; COPY-NEXT:    wait 1
-; COPY-NEXT:    simd_shuffle_xor r5, r3, 1
+; COPY-NEXT:    quad_shuffle_xor r5, r3, 1
 ; COPY-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
 ; COPY-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
 ; COPY-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6

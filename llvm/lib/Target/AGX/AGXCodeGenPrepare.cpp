@@ -3542,6 +3542,40 @@ static bool ownValueShifts(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXQuadXorShuffles(
+    "agx-quad-xor-shuffles", cl::init(true), cl::Hidden,
+    cl::desc("a SIMD-group xor shuffle by 1, 2 or 3 as the quad-group's"));
+
+/// simd_shuffle_xor(v, m) for m in {1, 2, 3}: lane ^ m is in the lane's
+/// quad, so it is quad_shuffle_xor(v, m), which issues in half the cycles
+/// (the M2 Max coverage recordings: 1.04 against 2.0 per step, latency 3.9
+/// against 4.8): a butterfly's last two steps, a 2-D 2 x 2 exchange
+/// (L15-E304).
+static bool quadXorShuffles(Function &F) {
+  if (!AGXQuadXorShuffles)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : instructions(F)) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    const APInt *M;
+    if (!II || II->getIntrinsicID() != Intrinsic::agx_simd_shuffle_xor ||
+        !match(II->getArgOperand(1), m_APInt(M)) || M->isZero() ||
+        M->ugt(3))
+      continue;
+    // (the quad shuffle's selected types: 16- and 32-bit scalars; a wider
+    // value's shuffle is split in legalization, which the quad one is not)
+    Type *Ty = II->getType();
+    if (Ty->isVectorTy() || (Ty->getPrimitiveSizeInBits() != 16 &&
+                             Ty->getPrimitiveSizeInBits() != 32))
+      continue;
+    II->setCalledFunction(Intrinsic::getOrInsertDeclaration(
+        F.getParent(), Intrinsic::agx_quad_shuffle_xor, {II->getType()}));
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXConvertedMinMaxNum(
     "agx-converted-minmax-num", cl::init(true), cl::Hidden,
     cl::desc("maximum / minimum whose only use is a float-to-integer "
@@ -4151,6 +4185,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= foldConditionChains(F, TTI);
   Changed |= nonNegXorDivisions(F);
   Changed |= floorModulos(F);
+  // (last: the lane analyses above see the SIMD-group shuffles)
+  Changed |= quadXorShuffles(F);
   Changed |= convertedMinMaxNum(F);
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);

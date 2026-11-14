@@ -19,7 +19,7 @@ define agx_kernel void @butterfly(ptr addrspace(1) %p, i32 %n) {
 ; CHECK-NEXT:    get_sr r2, sr52 (thread_index_in_simdgroup)
 ; CHECK-NEXT:    xor r2, r2, 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    simd_shuffle_xor r3, r1, 2
+; CHECK-NEXT:    quad_shuffle_xor r3, r1, 2
 ; CHECK-NEXT:    icmpsel slt, r1, r2, u2, r3, r1
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

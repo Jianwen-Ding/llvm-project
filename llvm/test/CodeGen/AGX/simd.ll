@@ -9,7 +9,7 @@ define agx_kernel void @shuffles(ptr addrspace(1) %out, float %x, i32 %i) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    simd_shuffle r1, u2, u3l
-; CHECK-NEXT:    simd_shuffle_xor r1, r1, 1
+; CHECK-NEXT:    simd_shuffle_xor r1, r1, 16
 ; CHECK-NEXT:    simd_shuffle_down r1, r1, 2
 ; CHECK-NEXT:    quad_shuffle r1, r1, 3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
@@ -23,7 +23,7 @@ define agx_kernel void @shuffles(ptr addrspace(1) %out, float %x, i32 %i) {
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap
   %a = call float @llvm.agx.simd.shuffle.f32(float %x, i32 %i)
-  %b = call float @llvm.agx.simd.shuffle.xor.f32(float %a, i32 1)
+  %b = call float @llvm.agx.simd.shuffle.xor.f32(float %a, i32 16)
   %c = call float @llvm.agx.simd.shuffle.down.f32(float %b, i32 2)
   %d = call float @llvm.agx.quad.shuffle.f32(float %c, i32 3)
   store float %d, ptr addrspace(1) %out
