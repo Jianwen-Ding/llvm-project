@@ -105,8 +105,11 @@ known (xor) or one comparison of the lane; the other shuffles compute the source
 `gpu.subgroup_reduce` over clusters of 4 lanes is AIR's quad-group reduction (`air.quad_sum` ...), over 32 the
 SIMD-group's. `maximumf` / `minimumf` of `f32` (a NaN if any lane's is, -0.0 below +0.0) are not AIR's float
 maximum and minimum, which are `maxnum` / `minnum`: they are the signed `i32` maximum (minimum) of the keys
-`b ^ ((b >>s 31) & 0x7fffffff)` of the floats' bits, decoded the same way, or a NaN where the group's or of "is NaN"
-is set (alive2: `tests/alive-tv/gpu/subgroup-maximum-key`, `subgroup-minimum-key`).
+`b ^ ((b >>s 31) & 0x7fffffff)` of the floats' bits, decoded the same way. A NaN's key is replaced by the largest
+float's, the quiet NaN's (by the smallest's, `0xffffffff`'s, whose decoded NaN then selects the quiet NaN), so that
+no second reduction (an or of "is NaN") is needed (alive2: `tests/alive-tv/gpu/subgroup-maximum-nan-key`,
+`subgroup-minimum-nan-key`); a value with two such reductions keeps its own key for both and selects a NaN where the
+group's or of "is NaN" is set (`subgroup-maximum-key`, `subgroup-minimum-key`).
 
 A uniform `gpu.all_reduce` of an `f16`, `f32` or `i32` by an operation AIR's SIMD-group reductions have, in a
 kernel whose `known_block_size` is a multiple of 32 threads (whole SIMD-groups), is the SIMD-group reduction, each

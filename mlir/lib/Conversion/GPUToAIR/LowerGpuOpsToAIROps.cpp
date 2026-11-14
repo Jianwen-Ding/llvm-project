@@ -547,11 +547,33 @@ static Value orderedFloatKey(ConversionPatternRewriter &rewriter, Location loc,
   return LLVM::XOrOp::create(rewriter, loc, bits, mask);
 }
 
+/// Whether another gpu.subgroup_reduce maximumf / minimumf reduces the value
+/// of \p op: they share its key and "is NaN" (and, over the same lanes, the
+/// or of it).
+static bool sharesNaNOr(gpu::SubgroupReduceOp op) {
+  for (Operation *user : op.getValue().getUsers()) {
+    auto other = dyn_cast<gpu::SubgroupReduceOp>(user);
+    if (other && other != op &&
+        (other.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+         other.getOp() == gpu::AllReduceOperation::MINIMUMF))
+      return true;
+  }
+  return false;
+}
+
 /// gpu.subgroup_reduce maximumf / minimumf of f32: AIR's float SIMD-group
 /// maximum and minimum are maxnum and minnum, which drop NaNs and may order
 /// the zeros either way, so it is the signed i32 maximum (minimum) of the
-/// floats' keys, decoded, or a NaN where the group's or of "is NaN" is set
-/// (alive2: tests/alive-tv/gpu/subgroup-maximum-key, subgroup-minimum-key).
+/// floats' keys, decoded. A NaN's key is replaced by the largest (smallest)
+/// float's, the quiet NaN 0x7fc00000's (0xffffffff's), so that a NaN anywhere
+/// gives that key, which decodes to the quiet NaN (to a NaN, which is replaced
+/// by the quiet NaN), without a second reduction, an or of "is NaN"
+/// (L15-E276; alive2: tests/alive-tv/gpu/subgroup-maximum-nan-key,
+/// subgroup-minimum-nan-key). Where another such reduction of the value
+/// shares the key, the keys are the values' own and a NaN is selected where
+/// the or of "is NaN" is set (alive2: subgroup-maximum-key,
+/// subgroup-minimum-key), which keeps the selects off the key's path to the
+/// reductions (agx_cost throughput: a maximum and minimum of one value).
 static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
                                 gpu::SubgroupReduceOp op, Value value,
                                 StringRef group) {
@@ -559,30 +581,47 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
   Type i32 = rewriter.getI32Type();
   Type f32 = value.getType();
   bool isMax = op.getOp() == gpu::AllReduceOperation::MAXIMUMF;
+  auto i32Cst = [&](int64_t v) {
+    return LLVM::ConstantOp::create(rewriter, loc, i32,
+                                    rewriter.getI32IntegerAttr(v));
+  };
+  Value nan = LLVM::ConstantOp::create(
+      rewriter, loc, f32,
+      rewriter.getFloatAttr(f32, APFloat::getQNaN(APFloat::IEEEsingle())));
   // Used twice: one value even if it is undefined.
   value = LLVM::FreezeOp::create(rewriter, loc, value);
+  Value isNaN = LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno,
+                                     value, value);
   Value key = orderedFloatKey(
       rewriter, loc, LLVM::BitcastOp::create(rewriter, loc, i32, value));
+  bool shared = sharesNaNOr(op);
+  // (key(0x7fc00000) = 0x7fc00000, key(0xffffffff) = INT32_MIN)
+  if (!shared)
+    key = LLVM::SelectOp::create(rewriter, loc, isNaN,
+                                 i32Cst(isMax ? 0x7fc00000 : INT32_MIN), key);
   Value reduced =
       callAIR(rewriter, op,
               ("air." + group + (isMax ? "_max" : "_min") + ".s.i32").str(),
               i32, {key}, AIREffects::Convergent);
   Value result = LLVM::BitcastOp::create(
       rewriter, loc, f32, orderedFloatKey(rewriter, loc, reduced));
-  Value isNaN = LLVM::ZExtOp::create(
-      rewriter, loc, i32,
-      LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno, value,
-                           value));
-  Value anyNaN = callAIR(rewriter, op, ("air." + group + "_or.s.i32").str(),
-                         i32, {isNaN}, AIREffects::Convergent);
-  Value nan = LLVM::ConstantOp::create(
-      rewriter, loc, f32,
-      rewriter.getFloatAttr(f32, APFloat::getQNaN(APFloat::IEEEsingle())));
-  return LLVM::SelectOp::create(
-      rewriter, loc,
-      LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::ne, anyNaN,
-                           LLVM::ConstantOp::create(rewriter, loc, i32, 0)),
-      nan, result);
+  Value anyNaN;
+  if (shared) {
+    Value any =
+        callAIR(rewriter, op, ("air." + group + "_or.s.i32").str(), i32,
+                {LLVM::ZExtOp::create(rewriter, loc, i32, isNaN)},
+                AIREffects::Convergent);
+    anyNaN = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::ne, any,
+                                  i32Cst(0));
+  } else if (!isMax) {
+    // The minimum's key is INT32_MIN, 0xffffffff's, exactly where there is a
+    // NaN: the decoded result is a NaN exactly there.
+    anyNaN = LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno,
+                                  result, result);
+  } else {
+    return result;
+  }
+  return LLVM::SelectOp::create(rewriter, loc, anyNaN, nan, result);
 }
 
 /// math.expm1 and math.log1p accurate for small arguments, where MathToLLVM's

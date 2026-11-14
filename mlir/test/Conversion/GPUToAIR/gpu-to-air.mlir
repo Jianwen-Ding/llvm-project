@@ -249,24 +249,52 @@ gpu.module @clusters {
 
 // maximumf / minimumf of f32 (NaN if any lane's is, -0.0 below +0.0, which
 // AIR's float maximum, a maxnum, does not give): the signed i32 maximum of
-// the keys b ^ ((b >>s 31) & 0x7fffffff), decoded, or a NaN where the
-// group's or of "is NaN" is set.
+// the keys b ^ ((b >>s 31) & 0x7fffffff), decoded. A value reduced once: a
+// NaN's key replaced by the quiet NaN's (by 0xffffffff's, INT32_MIN, whose
+// decoded NaN then selects the quiet NaN), no or of "is NaN". A value that
+// two reductions share: its own key, and a NaN where the group's or of
+// "is NaN" is set.
 gpu.module @ordered_float_reduce {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%out: memref<8xf32, 1>, %v: f32) kernel {
     // CHECK: %[[F:.*]] = llvm.freeze
+    // CHECK: llvm.fcmp "uno" %[[F]], %[[F]]
     // CHECK: %[[B:.*]] = llvm.bitcast %[[F]] : f32 to i32
     // CHECK: %[[S:.*]] = llvm.ashr %[[B]]
     // CHECK: %[[M:.*]] = llvm.and %[[S]]
     // CHECK: %[[K:.*]] = llvm.xor %[[B]], %[[M]]
     // CHECK: llvm.call @air.simd_max.s.i32(%[[K]])
-    // CHECK: llvm.fcmp "uno" %[[F]], %[[F]]
     // CHECK: llvm.call @air.simd_or.s.i32
     // CHECK: llvm.select
     %mx = gpu.subgroup_reduce maximumf %v : (f32) -> f32
     // CHECK: llvm.call @air.quad_min.s.i32
     // CHECK: llvm.call @air.quad_or.s.i32
     %mn = gpu.subgroup_reduce minimumf %v cluster(size = 4) : (f32) -> f32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    memref.store %mx, %out[%c0] : memref<8xf32, 1>
+    memref.store %mn, %out[%c1] : memref<8xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @single(
+  gpu.func @single(%out: memref<8xf32, 1>, %v: f32, %w: f32) kernel {
+    // CHECK: %[[F:.*]] = llvm.freeze
+    // CHECK: %[[N:.*]] = llvm.fcmp "uno" %[[F]], %[[F]]
+    // CHECK: %[[B:.*]] = llvm.bitcast %[[F]] : f32 to i32
+    // CHECK: %[[S:.*]] = llvm.ashr %[[B]]
+    // CHECK: %[[M:.*]] = llvm.and %[[S]]
+    // CHECK: %[[K0:.*]] = llvm.xor %[[B]], %[[M]]
+    // CHECK: %[[K:.*]] = llvm.select %[[N]], %{{.*}}, %[[K0]] : i1, i32
+    // CHECK: llvm.call @air.simd_max.s.i32(%[[K]])
+    // CHECK-NOT: _or.s.i32
+    %mx = gpu.subgroup_reduce maximumf %v : (f32) -> f32
+    // CHECK: %[[Q:.*]] = llvm.call @air.quad_min.s.i32
+    // CHECK-NOT: _or.s.i32
+    // CHECK: %[[R:.*]] = llvm.bitcast %{{.*}} : i32 to f32
+    // CHECK: %[[RN:.*]] = llvm.fcmp "uno" %[[R]], %[[R]]
+    // CHECK: llvm.select %[[RN]], %{{.*}}, %[[R]]
+    // CHECK-NOT: _or.s.i32
+    %mn = gpu.subgroup_reduce minimumf %w cluster(size = 4) : (f32) -> f32
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     memref.store %mx, %out[%c0] : memref<8xf32, 1>
@@ -602,17 +630,15 @@ gpu.module @simdgroup_all_reduce {
     gpu.return
   }
   // maximumf of f32: the SIMD-group reductions are subgroup_reduce's
-  // (ordered keys' signed maximum and an or of "is NaN"), no shuffles.
+  // (the ordered keys' signed maximum), no shuffles.
   // CHECK-LABEL: llvm.func @maximum(
   gpu.func @maximum(%a: memref<1024xf32, 1>) kernel
       attributes {known_block_size = array<i32: 256, 1, 1>} {
     // CHECK-NOT: llvm.call @air.simd_shuffle
     // CHECK: llvm.call @air.simd_max.s.i32
-    // CHECK: llvm.call @air.simd_or.s.i32
     // CHECK: llvm.call @air.wg.barrier
     // CHECK-NOT: llvm.call @air.simd_shuffle
     // CHECK: llvm.call @air.simd_max.s.i32
-    // CHECK: llvm.call @air.simd_or.s.i32
     // CHECK-NOT: llvm.call @air.simd_shuffle
     // CHECK: llvm.return
     %c0 = arith.constant 0 : index
