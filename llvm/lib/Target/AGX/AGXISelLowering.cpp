@@ -357,14 +357,25 @@ static cl::opt<bool> AGXDecomposeMul(
     "agx-decompose-mul", cl::Hidden, cl::init(true),
     cl::desc("Multiply 32-bit values by 3, 5, 9 or 17 with a shifted iadd"));
 
+static cl::opt<bool> AGXDecomposeMulMore(
+    "agx-decompose-mul-more",
+    cl::desc("16-bit multiplications by 2^k + 1, and multiplications by "
+             "1 - 2^k, as a shifted add / sub"),
+    cl::init(true), cl::Hidden);
+
 bool AGXTargetLowering::decomposeMulByConstant(LLVMContext &Context, EVT VT,
                                                SDValue C) const {
   // x * (2^k + 1), k <= 4: iadd x, x << k (an ALU instruction) instead of
   // imadd (SFU).
   auto *N = dyn_cast<ConstantSDNode>(C);
-  if (!AGXDecomposeMul || VT != MVT::i32 || !N)
+  if (!AGXDecomposeMul || !N || (VT != MVT::i32 && !(AGXDecomposeMulMore && VT == MVT::i16)))
     return false;
-  const APInt &V = N->getAPIntValue();
+  int64_t V = N->getAPIntValue().getSExtValue();
+  // and x * (1 - 2^k) for k = 3, 4: isub x, x << k (the combiner's
+  // -((x << k) - x); -3 it takes as -(x + (x << 1)), two instructions, so
+  // not); 16-bit likewise (L15-E356)
+  if (AGXDecomposeMulMore && (V == -7 || V == -15))
+    return true;
   return V == 3 || V == 5 || V == 9 || V == 17;
 }
 
