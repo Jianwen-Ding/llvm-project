@@ -216,11 +216,11 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4187 functions from 619
-test files; 3404 proved correct (507 through probe-derived opaque instructions,
+test files; 3409 proved correct (507 through probe-derived opaque instructions,
 50 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in
-known modelling classes; 2 not lifted; 569 solver timeouts or inconclusive.
+known modelling classes; 2 not lifted; 564 solver timeouts or inconclusive.
 
 Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
 functions are compared after LLVM's
@@ -241,7 +241,8 @@ checking vector results one lane at a time (`lanes`) 32 more; both together
 at 10 s per query 17 more; all of these with the weaker check 18 more. Of the results Alive2 left
 inconclusive because of approximated fast-math flags, 9 were proved
 against the source without those flags (`stripped_fmf`), and 1 timeouts
-with such flags likewise. Some proofs are
+with such flags likewise. Another solver seed
+(`--smt-random-seed=1`) proved 5 more. Some proofs are
 sensitive to machine load: a regression re-run under load turned 28
 previously correct functions into timeouts; 19 of them were proved again
 with a 30 s per-query budget (recorded as `smt_to`), 9 remain timeouts.
