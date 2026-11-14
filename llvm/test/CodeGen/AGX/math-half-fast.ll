@@ -73,3 +73,16 @@ define void @atan_bf(ptr addrspace(1) %p) {
   store bfloat %r, ptr addrspace(1) %p
   ret void
 }
+
+; half asin: the hardware's square root (L15-E333)
+; CHECK-LABEL: asin_h:
+; CHECK: rsqrt_special [[R:r[0-9]+]], [[X:r[0-9]+]]
+; CHECK-NEXT: fmul32 {{r[0-9]+}}, [[X]], [[R]]
+; CHECK-NOT: rsqrt_special
+; CHECK: stop
+define void @asin_h(ptr addrspace(1) %p) {
+  %x = load half, ptr addrspace(1) %p
+  %r = call half @llvm.asin.f16(half %x)
+  store half %r, ptr addrspace(1) %p
+  ret void
+}

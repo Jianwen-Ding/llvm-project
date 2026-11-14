@@ -67,6 +67,12 @@ static cl::opt<bool> HalfFastDivision(
     cl::desc("half math functions' divisions by the hardware's reciprocal"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> NarrowFastSqrt(
+    "agx-narrow-fast-sqrt",
+    cl::desc("half and bfloat math functions' square roots by the "
+             "hardware's approximation"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
@@ -114,7 +120,13 @@ public:
   Value *copysign(Value *Mag, Value *Sign) {
     return call(Intrinsic::copysign, {Mag, Sign});
   }
-  Value *sqrt(Value *X) { return call(Intrinsic::sqrt, {X}); }
+  /// \p Approx: the hardware's square root for a half or bfloat result,
+  /// where every such result was checked to be the same (L15-E333).
+  Value *sqrt(Value *X, bool Approx = false) {
+    if (Approx && NarrowResult && NarrowFastSqrt)
+      return hw(Intrinsic::sqrt, X);
+    return call(Intrinsic::sqrt, {X});
+  }
   Value *exp(Value *X) { return call(Intrinsic::exp, {X}); }
   Value *expPrecise(Value *X, bool NoOverflow = false) {
     return expHiLo(X, nullptr, /*Bounded=*/false,
@@ -194,7 +206,7 @@ public:
     Value *A = abs(X);
     // Above 0.5: asin(a) = pi / 2 - 2 asin(sqrt((1 - a) / 2)).
     Value *Big = gt(A, 0.5);
-    Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)));
+    Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)), /*Approx=*/true);
     // One polynomial, of the argument the range picks.
     Value *P = asinSmall(sel(Big, S, A));
     Value *R = sel(Big, sub(k(M_PI_2), mul(k(2.0), P)), P);
@@ -207,7 +219,9 @@ public:
     Value *A = abs(X);
     // |x| > 0.5: acos(|x|) = 2 asin(sqrt((1 - |x|) / 2)), and
     // acos(-|x|) = pi - acos(|x|); else pi / 2 - asin(x).
-    Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)));
+    // (bfloat: the hardware's square root; half: one result was further
+    // off with it)
+    Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)), /*Approx=*/!HalfResult);
     Value *Big = gt(A, 0.5);
     // One polynomial, of the argument the range picks.
     Value *P = asinSmall(sel(Big, S, A));
