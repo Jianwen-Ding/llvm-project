@@ -2016,11 +2016,17 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
   using namespace PatternMatch;
   if (!AGXSIMDScans || !ST.hasSIMDReduce())
     return false;
-  SmallVector<std::pair<Instruction *, Value *>, 4> Scans;
+  // The prefix goes after the last shuffle (d = 16), which the threads of
+  // the scan execute together: the last add may have been sunk into a
+  // branch (e.g. under the last thread's store of the SIMD-group's total),
+  // where a prefix would see only that branch's threads. All five shuffles
+  // are in one block.
+  SmallVector<std::tuple<Instruction *, Value *, Instruction *>, 4> Scans;
   for (Instruction &I : instructions(F)) {
     if (I.getOpcode() != Instruction::Add || !I.getType()->isIntegerTy(32))
       continue;
     Value *X = &I;
+    Instruction *Top = nullptr;
     bool Ok = true;
     for (uint64_t D : {16, 8, 4, 2, 1}) {
       auto *A = dyn_cast<BinaryOperator>(X);
@@ -2041,6 +2047,11 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
               match(Sh, m_Intrinsic<Intrinsic::agx_simd_shuffle_up>(
                             m_Specific(Prev), m_SpecificInt(D))) &&
               keepsLanesFrom(Sel->getCondition(), OnTrue, D)) {
+            auto *ShI = cast<Instruction>(Sh);
+            if (!Top)
+              Top = ShI;
+            if (ShI->getParent() != Top->getParent())
+              break;
             X = Prev;
             Found = true;
             break;
@@ -2053,10 +2064,10 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
       }
     }
     if (Ok)
-      Scans.push_back({&I, X});
+      Scans.push_back({&I, X, Top});
   }
-  for (auto [End, V] : Scans) {
-    IRBuilder<> B(End);
+  for (auto [End, V, Top] : Scans) {
+    IRBuilder<> B(Top->getNextNode());
     Value *Prefix = B.CreateIntrinsic(Intrinsic::agx_simd_prefix,
                                       {V->getType()},
                                       {V, B.getInt32(AGX::SIMD_IADD)});

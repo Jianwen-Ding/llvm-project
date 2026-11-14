@@ -102,3 +102,44 @@ define agx_kernel void @wronglanes(ptr addrspace(1) %p, ptr addrspace(1) %o) {
   store i32 %a16, ptr addrspace(1) %o, align 4
   ret void
 }
+
+; The last add only feeds the last thread's store of the SIMD-group's total
+; and is sunk under it: the prefix stays with the shuffles, before the
+; branch, where all the scan's threads are active (in the branch it would
+; see only thread 31).
+; CHECK-LABEL: sunk:
+; CHECK: simd_prefix_iadd
+; CHECK: if_icmp
+; CHECK-NOT: simd_prefix_iadd
+; CHECK: stop
+define agx_kernel void @sunk(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %x = load i32, ptr addrspace(1) %p
+  %s0 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %x, i32 1)
+  %c0 = icmp uge i32 %lane, 1
+  %z0 = select i1 %c0, i32 %s0, i32 0
+  %v0 = add i32 %x, %z0
+  %s1 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %v0, i32 2)
+  %c1 = icmp uge i32 %lane, 2
+  %z1 = select i1 %c1, i32 %s1, i32 0
+  %v1 = add i32 %v0, %z1
+  %s2 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %v1, i32 4)
+  %c2 = icmp uge i32 %lane, 4
+  %z2 = select i1 %c2, i32 %s2, i32 0
+  %v2 = add i32 %v1, %z2
+  %s3 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %v2, i32 8)
+  %c3 = icmp uge i32 %lane, 8
+  %z3 = select i1 %c3, i32 %s3, i32 0
+  %v3 = add i32 %v2, %z3
+  %s4 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %v3, i32 16)
+  %c4 = icmp uge i32 %lane, 16
+  %z4 = select i1 %c4, i32 %s4, i32 0
+  %last = icmp eq i32 %lane, 31
+  br i1 %last, label %st, label %done
+st:
+  %v4 = add i32 %v3, %z4
+  store i32 %v4, ptr addrspace(1) %o
+  br label %done
+done:
+  ret void
+}
