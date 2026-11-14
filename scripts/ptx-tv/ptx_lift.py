@@ -1424,7 +1424,7 @@ class Lifter:
         32; vshr shifts arithmetically for a signed a).  The exact result is
         saturated to the dtype range, or to the selected destination field's
         (.sat); then either the secondary .add (wrapping) / .min / .max with
-        c (in the dtype's signedness; unsigned for vset: an assumption) or,
+        c (see below; vset, which has no dtype, takes c unsigned) or,
         with a destination selector, merged into c at that field (low bits
         of the result).  Per the ISA's optSaturate/optSecOp, .min/.max see
         the intermediate wrapped to 33 bits and c extended by the dtype."""
@@ -1509,7 +1509,7 @@ class Lifter:
         extended operands; .po adds 1, a negated product is complemented
         plus 1, else a negated c is complemented plus 1; c is extended signed
         if any operand type is signed or anything is negated; .shr7/.shr15
-        shift (arithmetically when signed: an assumption) and keep 64 bits;
+        shift and keep 64 bits (the shift kind does not matter after the mask);
         .sat clamps to the s32 or u32 range by that signedness; d is the low
         32 bits."""
         ts = [m for m in mods if m in ("u32", "s32")]
