@@ -766,6 +766,28 @@ gpu.module @shuffle_reduce {
     memref.store %r, %a[%c0] : memref<64xf16, 1>
     gpu.return
   }
+  // i8 and i16: AIR's i32 reduction of the values extended (signed for a
+  // signed minimum or maximum), truncated; no shuffles.
+  // CHECK-LABEL: llvm.func @narrow(
+  gpu.func @narrow(%a: memref<64xi16, 1>, %b: memref<64xi8, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xi16, 1>
+    %w = memref.load %b[%c0] : memref<64xi8, 1>
+    // CHECK-NOT: simd_shuffle
+    // CHECK: %[[S:.*]] = llvm.sext %{{.*}} : i16 to i32
+    // CHECK: %[[M:.*]] = llvm.call @air.quad_min.s.i32(%[[S]])
+    // CHECK: llvm.trunc %[[M]] : i32 to i16
+    %r = gpu.subgroup_reduce minsi %v cluster(size = 4) : (i16) -> i16
+    // CHECK-NOT: simd_shuffle
+    // CHECK: %[[Z:.*]] = llvm.zext %{{.*}} : i8 to i32
+    // CHECK: %[[A:.*]] = llvm.call @air.simd_sum.s.i32(%[[Z]])
+    // CHECK: llvm.trunc %[[A]] : i32 to i8
+    // CHECK-NOT: simd_shuffle
+    %q = gpu.subgroup_reduce add %w : (i8) -> i8
+    memref.store %r, %a[%c0] : memref<64xi16, 1>
+    memref.store %q, %b[%c0] : memref<64xi8, 1>
+    gpu.return
+  }
 }
 
 // -----

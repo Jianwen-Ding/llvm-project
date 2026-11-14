@@ -2216,10 +2216,38 @@ struct LowerGpuOpsToAIROpsPass final
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
-    // has quad-group and SIMD-group ones; of i8, i16, i64; maximumf of f16):
-    // xor shuffles at 1, 2, 4, ... within each cluster (the order AIR's
-    // reductions add in), which the shuffle lowering takes to AIR.
+    // has quad-group and SIMD-group ones; of i64, i8 and i16 being widened
+    // first; maximumf of f16): xor shuffles at 1, 2, 4, ... within each
+    // cluster (the order AIR's reductions add in), which the shuffle lowering
+    // takes to AIR.
     {
+      // i8 and i16: the i32 reduction of the values extended (sign-extended
+      // for a signed minimum or maximum), truncated, the same value (the
+      // others are exact modulo 2^n), and AIR's 32-bit reduction instead of
+      // shuffles (L15-E279).
+      SmallVector<gpu::SubgroupReduceOp> narrow;
+      m.walk([&](gpu::SubgroupReduceOp op) {
+        Type type = op.getType();
+        if (type.isInteger(8) || type.isInteger(16))
+          narrow.push_back(op);
+      });
+      IRRewriter rewriter(ctx);
+      for (gpu::SubgroupReduceOp op : narrow) {
+        rewriter.setInsertionPoint(op);
+        Location loc = op.getLoc();
+        Type i32 = rewriter.getI32Type();
+        bool isSigned = op.getOp() == gpu::AllReduceOperation::MINSI ||
+                        op.getOp() == gpu::AllReduceOperation::MAXSI;
+        Value wide =
+            isSigned
+                ? Value(arith::ExtSIOp::create(rewriter, loc, i32, op.getValue()))
+                : Value(arith::ExtUIOp::create(rewriter, loc, i32, op.getValue()));
+        auto reduced = gpu::SubgroupReduceOp::create(
+            rewriter, loc, wide, op.getOp(), op.getUniform(),
+            op.getClusterSize(), op.getClusterStride());
+        rewriter.replaceOpWithNewOp<arith::TruncIOp>(op, op.getType(),
+                                                     reduced.getResult());
+      }
       SmallVector<Operation *> clustered;
       m.walk([&](gpu::SubgroupReduceOp op) {
         if (!airSubgroupReduce(op))
