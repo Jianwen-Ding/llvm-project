@@ -3358,6 +3358,122 @@ static bool floorModulos(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXRangedCompares(
+    "agx-ranged-compares", cl::init(true), cl::Hidden,
+    cl::desc("integer compares that the ranges of a lane or thread index "
+             "decide, folded"));
+
+/// The range of V through additions, subtractions and masks by constants,
+/// from the ranges ValueTracking gives its leaves (a SIMD lane's [0, 32)).
+static ConstantRange rangeThroughOffsets(Value *V, const SimplifyQuery &SQ,
+                                         unsigned Depth = 0) {
+  using namespace PatternMatch;
+  unsigned W = V->getType()->getScalarSizeInBits();
+  const APInt *C;
+  Value *X;
+  if (Depth < 6) {
+    if (match(V, m_Add(m_Value(X), m_APInt(C))))
+      return rangeThroughOffsets(X, SQ, Depth + 1).add(ConstantRange(*C));
+    if (match(V, m_Sub(m_Value(X), m_APInt(C))))
+      return rangeThroughOffsets(X, SQ, Depth + 1).sub(ConstantRange(*C));
+    if (match(V, m_Sub(m_APInt(C), m_Value(X))))
+      return ConstantRange(*C).sub(rangeThroughOffsets(X, SQ, Depth + 1));
+    if (match(V, m_And(m_Value(X), m_APInt(C))))
+      return rangeThroughOffsets(X, SQ, Depth + 1)
+          .binaryAnd(ConstantRange(*C));
+  }
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return ConstantRange(CI->getValue());
+  if (!V->getType()->isIntegerTy())
+    return ConstantRange::getFull(W);
+  return computeConstantRange(V, /*ForSigned=*/false, SQ)
+      .intersectWith(computeConstantRange(V, /*ForSigned=*/true, SQ));
+}
+
+/// An integer compare of such a value against a constant (a shuffle's
+/// segment test lane - k < 32 once the offset k is a constant) that its
+/// range decides: the constant (L15-E300).
+static bool rangedCompares(Function &F) {
+  if (!AGXRangedCompares)
+    return false;
+  using namespace PatternMatch;
+  SimplifyQuery SQ(F.getDataLayout());
+  // The special registers' ranges for the analysis only (taken off again,
+  // as after straight-line strength reduction: loop strength reduction makes
+  // 64-bit offsets with them).
+  SmallVector<WeakVH, 8> Ranged;
+  AGX::addSpecialRegisterRanges(F, &Ranged);
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *Cmp = dyn_cast<ICmpInst>(&I);
+    if (!Cmp || !Cmp->getOperand(0)->getType()->isIntegerTy() ||
+        (isa<Constant>(Cmp->getOperand(0)) &&
+         isa<Constant>(Cmp->getOperand(1))))
+      continue;
+    SimplifyQuery Q = SQ.getWithInstruction(Cmp);
+    ConstantRange R = rangeThroughOffsets(Cmp->getOperand(0), Q);
+    ConstantRange K = rangeThroughOffsets(Cmp->getOperand(1), Q);
+    if (R.isFullSet() || K.isFullSet())
+      continue;
+    std::optional<bool> Known;
+    if (R.icmp(Cmp->getPredicate(), K))
+      Known = true;
+    else if (R.icmp(Cmp->getInversePredicate(), K))
+      Known = false;
+    if (!Known) {
+      // x + k against c where x's range keeps the addition from wrapping in
+      // the compare's signedness: x against c - k (lane - k < 0 is lane < k,
+      // which the SIMD scan recognition takes).
+      Value *X;
+      const APInt *KcP;
+      const APInt *Cc = K.getSingleElement();
+      APInt KcV;
+      if (match(Cmp->getOperand(0), m_Add(m_Value(X), m_APInt(KcP))))
+        KcV = *KcP;
+      else if (match(Cmp->getOperand(0), m_Sub(m_Value(X), m_APInt(KcP))))
+        KcV = -*KcP;
+      else
+        continue;
+      const APInt *Kc = &KcV;
+      if (!Cc || Cmp->isEquality())
+        continue;
+      ConstantRange RX = rangeThroughOffsets(X, Q);
+      bool Signed = Cmp->isSigned();
+      bool Overflow;
+      APInt NewC = Signed ? Cc->ssub_ov(*Kc, Overflow)
+                          : Cc->usub_ov(*Kc, Overflow);
+      if (Overflow ||
+          (Signed ? RX.signedAddMayOverflow(ConstantRange(*Kc))
+                  : RX.unsignedAddMayOverflow(ConstantRange(*Kc))) !=
+              ConstantRange::OverflowResult::NeverOverflows)
+        continue;
+      Cmp->setOperand(0, X);
+      Cmp->setOperand(1, ConstantInt::get(X->getType(), NewC));
+      // (signed and unsigned agree on a non-negative x and c - k: unsigned,
+      // the form the scan recognition matches)
+      if (Signed && RX.isAllNonNegative() && NewC.isNonNegative())
+        Cmp->setPredicate(Cmp->getUnsignedPredicate());
+      Changed = true;
+      continue;
+    }
+    SmallSetVector<Instruction *, 4> Users;
+    for (User *U : Cmp->users())
+      if (auto *UI = dyn_cast<Instruction>(U))
+        Users.insert(UI);
+    Cmp->replaceAllUsesWith(ConstantInt::getBool(Cmp->getType(), *Known));
+    // (the and / or of the other bound with the constant: that bound; the
+    // dead instructions are left to the later cleanups)
+    for (Instruction *UI : Users)
+      if (Value *V = simplifyInstruction(UI, Q))
+        UI->replaceAllUsesWith(V);
+    Changed = true;
+  }
+  for (WeakVH &V : Ranged)
+    if (auto *CI = dyn_cast_or_null<CallBase>(V))
+      CI->removeRetAttr(Attribute::Range);
+  return Changed;
+}
+
 static cl::opt<bool> AGXConvertedMinMaxNum(
     "agx-converted-minmax-num", cl::init(true), cl::Hidden,
     cl::desc("maximum / minimum whose only use is a float-to-integer "
@@ -3945,6 +4061,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   bool Changed = diagnoseDoubles(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
+  // (before the scan recognition, which matches the folded segment tests)
+  Changed |= rangedCompares(F);
   Changed |= simdScans(F, ST);
   Changed |= mergeLoopExits(F);
   Changed |= forwardOwnSlots(F);
