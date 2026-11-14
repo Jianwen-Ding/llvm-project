@@ -340,27 +340,26 @@ mismatch.
 * `slct` (s32 and f32 selector; `.ftz` flushes the selector first; a NaN
   selector picks either operand, as the ISA leaves it unspecified), `madc`,
   `mad{.hi,.lo}.cc`, `mad.hi.sat.s32`, `mad24.hi.sat.s32` (`slct_mad`).
-* SIMD video instructions `vadd2/4`, `vsub2/4`, `vavrg2/4`, `vabsdiff2/4`,
-  `vmin2/4`, `vmax2/4` (u32/s32 lane types, mixed, `.sat`, `.add`) and
-  `vset2/4` (all comparisons, `.add`), default lane selectors and mask
-  (`video_simd`, 180 functions; two need a 120 s budget).
-* Scalar video instructions `vadd`, `vsub`, `vabsdiff`, `vmin`, `vmax`
-  (u32/s32 and mixed operand types, `.sat`, secondary `.add`/`.min`/`.max`
-  with c) and `vset` (all comparisons, secondary operations)
-  (`video_scalar`, 232 functions). The pseudo-code does not say which
-  signedness the secondary min/max uses; the model takes the destination
-  type's (unsigned for `vset`).
-* Video operand selectors (`.b0`-`.b3`, `.h0`/`.h1`, extended by the
-  operand's type), destination selectors (merge into c; `.sat` clamps to
-  the field's range), `vshl`/`vshr` (`.clamp`/`.wrap`) (`video_sel`, 348
-  functions), SIMD destination masks (`.h0/.h1/.h10`, `.b0`... : lanes
-  outside the mask from c; `.add` sums only the masked lanes)
-  (`video_mask`, 96 functions), and `vmad` (`.po`, negated operands,
-  `.shr7`/`.shr15`, `.sat`; the scale shift is taken as arithmetic for a
-  signed result, an assumption) (`video_vmad`: 273 of 336 prove, none
-  mismatches; the other 63, all with operand selectors, time out even at
-  120 s, while every modifier combination proves without selectors). Source lane selectors of
-  the SIMD forms are rejected.
+* Video instructions, from the pseudo-code of the public PTX ISA document
+  (section 9.7.20; `isa_tests/gen_video.py` generates the scalar and
+  source-selector references):
+  * SIMD `vadd2/4`, `vsub2/4`, `vavrg2/4`, `vabsdiff2/4`, `vmin2/4`,
+    `vmax2/4`, `vset2/4` (u32/s32 and mixed lanes, `.sat`, `.add`)
+    (`video_simd`, 180 functions; two need 120 s), destination masks
+    (`video_mask`, 96), and source lane selectors over the halfwords/bytes
+    of the pair b:a (`.hxy`, `.bxyzw`, defaults `.h10`/`.b3210` for a and
+    `.h32`/`.b7654` for b) (`video_simdsel`, 200).
+  * Scalar `vadd`, `vsub`, `vabsdiff`, `vmin`, `vmax`, `vset` with `.sat`
+    and secondary `.add/.min/.max`; as in `optSaturate`/`optSecOp`, the
+    intermediate is a `.s33` value (it wraps to 33 bits without `.sat`) and
+    c is extended by the destination type (unsigned for `vset`, which has
+    none) (`video_scalar`, 232; two time out even at 120 s). Operand and
+    destination selectors (`.b0`-`.b3`, `.h0`/`.h1`; `.sat` clamps to the
+    field) and `vshl`/`vshr` (`.clamp`/`.wrap`) (`video_sel`, 348).
+  * `vmad` (`.po`, negated operands, `.shr7`/`.shr15` keeping 64 bits
+    extended by the final signedness, `.sat`) (`video_vmad`: 273 of 336
+    prove, none mismatches; the other 63, all with operand selectors, time
+    out even at 120 s).
 * `set` (`set.cmp{.boolop}.dtype.stype`: all ones, 1.0 or 0) (`set`), and
   `sqrt.rz/.rm/.rp` (LLVM's constrained square root in that mode; the
   `slow_sqrt` references are not decided by Alive2 within 600 s, so that
@@ -381,9 +380,8 @@ mismatch.
 Two batches of inline-PTX forms (264 in total: arithmetic, conversions,
 memory with cache and ordering qualifiers, atomics, mbarrier, special
 registers, fences, cross-thread operations, ...) were used to look for gaps
-through the inline-asm path; the remaining rejections are `cvt` narrowing
-without a rounding modifier (invalid PTX) and the SIMD video source lane
-selectors.
+through the inline-asm path; the remaining rejection is `cvt` narrowing
+without a rounding modifier, which the ISA requires.
 
 ## Target cleanup
 

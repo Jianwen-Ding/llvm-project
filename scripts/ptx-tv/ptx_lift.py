@@ -1426,7 +1426,8 @@ class Lifter:
         (.sat); then either the secondary .add (wrapping) / .min / .max with
         c (in the dtype's signedness; unsigned for vset: an assumption) or,
         with a destination selector, merged into c at that field (low bits
-        of the result)."""
+        of the result).  Per the ISA's optSaturate/optSecOp, .min/.max see
+        the intermediate wrapped to 33 bits and c extended by the dtype."""
         ts = [m for m in mods if m in ("u32", "s32")]
         rest = [m for m in mods if m not in ("u32", "s32")]
         cmp = shmode = None
@@ -1480,8 +1481,17 @@ class Lifter:
             lo, hi = (-(1 << (fw - 1)), (1 << (fw - 1)) - 1) if dt == "s32" else (0, (1 << fw) - 1)
             t = self.call_intr("i128", "llvm.smax.i128", ["i128 %s" % t, "i128 %d" % lo])
             t = self.call_intr("i128", "llvm.smin.i128", ["i128 %s" % t, "i128 %d" % hi])
-        r = self.op("trunc i128 %s to i32" % t)
         c = self.get(ops[3], 32) if len(ops) == 4 else None
+        if op2 and op2[0] in ("min", "max"):
+            # optSecOp works on .s33 values: the intermediate (saturated or
+            # not) wraps to 33 bits, c is extended by the dtype (vset:
+            # unsigned), and the comparison is signed
+            t33 = self.op("trunc i128 %s to i33" % t)
+            t = self.op("sext i33 %s to i128" % t33)
+            cx = self.op("%s i32 %s to i128" % ("sext" if dt == "s32" else "zext", c))
+            t = self.call_intr("i128", "llvm.s%s.i128" % op2[0], ["i128 %s" % t, "i128 %s" % cx])
+            op2 = []
+        r = self.op("trunc i128 %s to i32" % t)
         if dsel:
             sh = fw * int(dsel[1])
             mask = ((1 << fw) - 1) << sh
@@ -1490,11 +1500,7 @@ class Lifter:
             cc = self.op("and i32 %s, %d" % (c, keep - (1 << 32) if keep >> 31 else keep))
             r = self.op("or i32 %s, %s" % (cc, f))
         elif op2:
-            if op2[0] == "add":
-                r = self.op("add i32 %s, %s" % (r, c))
-            else:
-                sg = "s" if dt == "s32" else "u"
-                r = self.call_intr("i32", "llvm.%s%s.i32" % (sg, op2[0]), ["i32 %s" % r, "i32 %s" % c])
+            r = self.op("add i32 %s, %s" % (r, c))
         self.write(dreg, r, 32)
 
     def i_vmad(self, mods, ops, opc):
@@ -1586,11 +1592,21 @@ class Lifter:
         (vavrg: (s + 1) >> 1 if s >= 0 else s >> 1; vset: 1 or 0); .sat clamps
         each lane to the dtype lane range; without .add the lanes form d
         (lanes outside the destination mask .h0/.h1/.b0... taken from c),
-        with .add d = c + the sum of the lanes in the mask.  Only the
-        default source lane selectors (.h10 / .b3210) are modelled."""
+        with .add d = c + the sum of the lanes in the mask.  Source lanes
+        are selected from the halfwords/bytes of the pair b:a (.hxy, .bxyzw;
+        the last digit is lane 0; defaults .h10/.b3210 for a, .h32/.b7654
+        for b)."""
         L = 32 // n
-        if any("." in o.strip().split("%")[-1] for o in ops[1:]):
-            raise Unsupported("video lane selector in " + opc)
+        if "." in ops[3].strip().split("%")[-1]:
+            raise Unsupported("video selector on c in " + opc)
+        sels = []
+        for o, dflt in ((ops[1], "10" if n == 2 else "3210"), (ops[2], "32" if n == 2 else "7654")):
+            r, s = self.video_sel(o)
+            if s is None:
+                s = ("h" if n == 2 else "b") + dflt
+            if (s[0] == "h") != (n == 2) or len(s) != n + 1 or any(int(x) >= 2 * n for x in s[1:]):
+                raise Unsupported("video lane selector ." + s)
+            sels.append([int(x) for x in reversed(s[1:])])    # lane i <- element sel[i]
         dreg, dmask = self.video_sel(ops[0])
         lanes_on = list(range(n))
         if dmask is not None:
@@ -1620,10 +1636,17 @@ class Lifter:
             raise Unsupported(opc)
         vt = "<%d x i32>" % n
 
-        def lanes(v, t):
-            x = self.op("bitcast i32 %s to <%d x i%d>" % (v, n, L))
+        # the 2n halfwords/bytes of the pair (b:a): 0..n-1 from a, n..2n-1 from b
+        ra, rb = self.get(self.video_sel(ops[1])[0], 32), self.get(self.video_sel(ops[2])[0], 32)
+        ab = self.op("or i64 %s, %s" % (self.op("zext i32 %s to i64" % ra),
+                                         self.op("shl i64 %s, 32" % self.op("zext i32 %s to i64" % rb))))
+        pair = self.op("bitcast i64 %s to <%d x i%d>" % (ab, 2 * n, L))
+
+        def lanes(sel, t):
+            x = self.op("shufflevector <%d x i%d> %s, <%d x i%d> poison, <%d x i32> <%s>" % (
+                2 * n, L, pair, 2 * n, L, n, ", ".join("i32 %d" % k for k in sel)))
             return self.op("%s <%d x i%d> %s to %s" % ("sext" if t == "s32" else "zext", n, L, x, vt))
-        va, vb = lanes(self.get(ops[1], 32), at), lanes(self.get(ops[2], 32), bt)
+        va, vb = lanes(sels[0], at), lanes(sels[1], bt)
         c = self.get(ops[3], 32)
         sfx = "v%di32" % n
         if op == "vadd":
