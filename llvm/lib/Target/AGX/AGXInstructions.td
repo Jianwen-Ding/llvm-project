@@ -847,6 +847,17 @@ def : Pat<(i32 (AGXbfi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
           (BFI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXextr7 AGXIntSrc32:$lo, AGXIntSrc32:$hi, AGXIntSrc32:$s)),
           (EXTR_I32 0, $lo, 0, $hi, 0, $s, 0)>;
+// A field of a 64-bit value by a register amount, trunc(x >> n) & (2^k - 1):
+// one extr with the field's width (its masked register-offset form recorded:
+// coverage alu/extr_r14_r6_r7_r8_mask_*) (L15-E359).
+def agx_extr7_oneuse : PatFrag<(ops node:$lo, node:$hi, node:$s),
+                               (AGXextr7 node:$lo, node:$hi, node:$s), [{
+  return N->hasOneUse();
+}]>;
+def : Pat<(i32 (and (agx_extr7_oneuse AGXIntSrc32:$lo, AGXIntSrc32:$hi,
+                                      AGXIntSrc32:$s),
+                    agx_field_mask:$m)),
+          (EXTR_I32 0, $lo, 0, $hi, 0, $s, (AGXFieldWidth $m))>;
 def : Pat<(i32 (AGXshlhi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
           (SHLHI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXsra7 AGXIntSrc32:$a, AGXIntSrc32:$s)),

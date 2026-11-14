@@ -50,3 +50,18 @@ define void @andshl(ptr addrspace(1) %p, i32 %x, i32 %n) {
   store i32 %r, ptr addrspace(1) %p
   ret void
 }
+
+; trunc(x >> n) & 255 of a 64-bit x: one extr with the field's width
+; (L15-E359).
+; CHECK-LABEL: field64:
+; CHECK: extr {{r[0-9]+}}, {{[ur][0-9]+}}, {{[ur][0-9]+}}, {{[ur][0-9]+}}, mask 0xFF
+; CHECK-NOT: and
+; CHECK: stop
+define void @field64(ptr addrspace(1) %p, i64 %x, i32 %n) {
+  %nz = zext i32 %n to i64
+  %s = lshr i64 %x, %nz
+  %t = trunc i64 %s to i32
+  %r = and i32 %t, 255
+  store i32 %r, ptr addrspace(1) %p
+  ret void
+}
