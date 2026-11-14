@@ -30,6 +30,7 @@ open-source LLVM NVPTX backend; no vendor tools or code are used):
     `@nvvm.<intrinsic>` (the driver renames `@llvm.nvvm.X` to `@nvvm.X` in
     the source), so only the mapping intrinsic -> instruction is checked.
 """
+import os
 import re
 import struct
 import sys
@@ -2206,7 +2207,7 @@ class Lifter:
             pv = self.op("load ptr, %s, align 8" % p)
             self.emit("store ptr %s, ptr %s" % (pv, self.dyn_slot(d0)))
             v = self.op("ptrtoint ptr %s to i64" % pv)
-        elif vec > 1 and eb >= 8:
+        elif vec > 1 and eb >= 8 and SCALARIZE:
             # a vector access as one access per element (Alive2 relates these
             # to the source's element accesses far more easily than a single
             # wide integer); the first keeps the whole vector's alignment
@@ -2438,7 +2439,7 @@ class Lifter:
         if len(srcs) != vec:
             raise Unsupported("vector arity " + opc)
         total = eb * vec
-        if vec > 1 and eb >= 8:
+        if vec > 1 and eb >= 8 and SCALARIZE:
             for k, s_ in enumerate(srcs):
                 q = self.lane_ptr(p, k * eb // 8)
                 self.emit("store i%d %s, %s, align %d" % (
@@ -2920,6 +2921,12 @@ class Lifter:
 
     def i_nanosleep(self, mods, ops, opc):
         self.ucall("void", "nanosleep", ["i32 " + self.get(ops[0], 32)])
+
+
+# PTXTV_SCALARIZE=1: vector ld/st as one access per element (tv.py does the
+# same to the source); a fallback for timeouts, since it helps when source
+# and PTX use the same element width and hurts when they do not
+SCALARIZE = os.environ.get("PTXTV_SCALARIZE", "0") == "1"
 
 
 def lane_align(A, off):

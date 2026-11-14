@@ -396,7 +396,7 @@ def expand_fp_reductions(text):
 
 ELT_BYTES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16, "half": 2,
              "bfloat": 2, "float": 4, "double": 8, "ptr": 8}
-SCALARIZE = os.environ.get("PTXTV_SCALARIZE", "1") == "1"
+SCALARIZE = os.environ.get("PTXTV_SCALARIZE", "0") == "1"
 
 
 def _lane_align(A, off):
@@ -428,16 +428,19 @@ def scalarize_vector_mem(text):
             n, es = int(n), ELT_BYTES[m.group(4)]
             A = int(A or es)
             vt = "<%d x %s>" % (n, et)
+            k0 = cnt[0]
+            cnt[0] += 1
             acc = "poison"
             for k in range(n):
                 q = p
                 if k:
-                    q = "%s.sp%d" % (r, k)
+                    q = "%%ptxtv_lp%d.%d" % (k0, k)
                     out.append("%s%s = getelementptr i8, %s %s, i64 %d" % (ind, q, pty, p, k * es))
                 al = A if k == 0 else _lane_align(A, k * es)
-                out.append("%s%s.se%d = load %s, %s %s, align %d" % (ind, r, k, et, pty, q, al))
-                dst = r if k == n - 1 else "%s.sv%d" % (r, k)
-                out.append("%s%s = insertelement %s %s, %s %s.se%d, i32 %d" % (ind, dst, vt, acc, et, r, k, k))
+                e = "%%ptxtv_le%d.%d" % (k0, k)
+                out.append("%s%s = load %s, %s %s, align %d" % (ind, e, et, pty, q, al))
+                dst = r if k == n - 1 else "%%ptxtv_lv%d.%d" % (k0, k)
+                out.append("%s%s = insertelement %s %s, %s %s, i32 %d" % (ind, dst, vt, acc, et, e, k))
                 acc = dst
             continue
         m = sp.match(line)
@@ -898,6 +901,8 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         res["assume"] = "partword-word-accessible"
     if nvvm_sem.OPAQUE_COPIES:
         res["copy_model"] = "opaque"
+    if SCALARIZE:
+        res["scalarized"] = True
     if L.used_probe:
         res["probe"] = True   # relies on a probe-derived opaque instruction
     if st == "mismatch":
