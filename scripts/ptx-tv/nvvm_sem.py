@@ -19,6 +19,7 @@ import probe
 import sparse
 import tcgen05ls
 import tcgen05ops
+import tcgen05mma
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -326,6 +327,35 @@ def expand(text, lifter_mod, llc_args=None):
                 and not re.match(r"\s*%", line):
             removed = True
             continue
+        tm = tcgen05mma.intrinsic(name, args)
+        if tm and not re.match(r"\s*%", line):
+            toks, keep = tm
+            itys = []
+            for i in keep:
+                t = args[i][0]
+                itys.append("i32" if t.startswith("ptr addrspace(6)") else
+                            (t if re.fullmatch(r"i\d+", t) else None))
+            if None not in itys:
+                kname = tcgen05mma.name_of(toks).replace("::", "__") + "." + "_".join(itys)
+                fname = "ptxtv_sem_" + re.sub(r"[^\w]", "_", kname)
+                key_ = ("tcgen05mma", name, tuple(args))
+                if key_ not in defs:
+                    w = ["define internal void @%s(%s) alwaysinline {" % (
+                        fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+                    cargs = []
+                    for i, it in zip(keep, itys):
+                        t = args[i][0]
+                        if t.startswith("ptr"):
+                            w.append("  %%c%d = ptrtoint %s %%y%d to i32" % (i, t, i))
+                            cargs.append("i32 %%c%d" % i)
+                        else:
+                            cargs.append("%s %%y%d" % (t, i))
+                    w += ["  call void @%s(%s)" % (kname, ", ".join(cargs)), "  ret void", "}"]
+                    defs[key_] = (fname, "\n".join(w),
+                                  {kname: "declare void @%s(%s) nounwind" % (kname, ", ".join(itys))})
+                line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                out_lines.append(line)
+                continue
         to = tcgen05ops.intrinsic(name, args)
         if to and not re.match(r"\s*%", line):
             toks, keep = to

@@ -3999,10 +3999,10 @@
 {"function": "tcgen05_mma_sp_mxf4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale-ptx88-aa.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_mxf4nvf4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale-ptx88-aa.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_mxf4nvf4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale-ptx88-aa.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
-{"function": "tcgen05_mma_i8_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_i8_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_i8_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_i8_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_i8_cta1", "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_i8_cta1", "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_i8_cta2", "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_i8_cta2", "status": "correct", "file": "tcgen05-mma-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_decompress_b_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-decompress-b.ll", "llc": "-mcpu=sm_107f -march=nvptx64 -mattr=+ptx94"}
 {"function": "tcgen05_mma_decompress_b_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-decompress-b.ll", "llc": "-mcpu=sm_107f -march=nvptx64 -mattr=+ptx94"}
 {"function": "tcgen05_mma_i8_shared_disable_output_lane_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-i8.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
@@ -4031,14 +4031,14 @@
 {"function": "tcgen05_mma_mxf4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_mxf4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_mxf4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
-{"function": "tcgen05_mma_fp16_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_fp16_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_fp16_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_fp16_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_tf32_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_tf32_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_tf32_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_tf32_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_fp16_cg1", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_fp16_cg2", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_fp16_cg1", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_fp16_cg2", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_tf32_cg1", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_tf32_cg2", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_tf32_cg1", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_tf32_cg2", "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_fp16_shared_scale_d_disable_output_lane_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_fp16_shared_scale_d_disable_output_lane_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_tf32_shared_scale_d_disable_output_lane_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
@@ -4098,26 +4098,26 @@
 {"function": "tcgen05_mma_ws_sp_fp16_zero_col_mask", "probe": true, "status": "correct", "file": "tcgen05-mma-ws.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_ws_tf32", "probe": true, "status": "correct", "file": "tcgen05-mma-ws.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_ws_f8f6f4", "probe": true, "status": "correct", "file": "tcgen05-mma-ws.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_collector_b_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_f16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_f8f6f4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_tf32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_f8f6f4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_ti16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_ti16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_scale_d_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_scale_d_f16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_scale_d_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_collector_b_scale_d_tf32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_f16_cta1", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_f16_cta2", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_tf32_cta1", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_f8f6f4_cta1", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_tf32_cta2", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_f8f6f4_cta2", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_ti16_cta1", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_ti16_cta2", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_scale_d_f16_cta1", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_scale_d_f16_cta2", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_scale_d_tf32_cta1", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_collector_b_scale_d_tf32_cta2", "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_sp_collector_b_block_scale_mxf8f6f4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_sp_collector_b_block_scale_mxf8f6f4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_sp_collector_b_block_scale_mxf8f6f4_block32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_sp_collector_b_block_scale_mxf8f6f4_block32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_ti16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_ti16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_ti16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_sp_ti16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_ti16_cta1", "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_ti16_cta1", "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_ti16_cta2", "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_sp_ti16_cta2", "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_ws_ti16", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_ti16_disable_output_lane_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_ti16_disable_output_lane_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
@@ -4130,14 +4130,14 @@
 {"function": "test_wgmma_fence_sync_aligned", "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
 {"function": "test_wgmma_commit_group_sync_aligned", "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
 {"function": "test_wgmma_wait_group_sync_aligned", "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
-{"function": "tcgen05_mma_collector_b_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_f16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_f8f6f4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_tf32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_f8f6f4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_ti16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_ti16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_f16_cta1", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_f16_cta2", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_tf32_cta1", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_f8f6f4_cta1", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_tf32_cta2", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_f8f6f4_cta2", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_ti16_cta1", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_ti16_cta2", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf8f6f4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf8f6f4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
@@ -4147,13 +4147,13 @@
 {"function": "tcgen05_mma_collector_b_block_scale_mxf4nvf4_block16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf4nvf4_block32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf8f6f4_block32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_scale_d_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_scale_d_tf32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_collector_b_scale_d_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_scale_d_f16_cta1", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_scale_d_tf32_cta2", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_collector_b_scale_d_tf32_cta1", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf8f6f4_block32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf4_block32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_block_scale_mxf4nvf4_block32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "tcgen05_mma_no_explicit_collector_b", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
+{"function": "tcgen05_mma_no_explicit_collector_b", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tensormap_replace_global_address", "probe": true, "status": "correct", "file": "tensormap_replace.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx83"}
 {"function": "tensormap_replace_rank", "probe": true, "status": "correct", "file": "tensormap_replace.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx83"}
 {"function": "tensormap_replace_box_dim", "probe": true, "status": "correct", "file": "tensormap_replace.ll", "llc": "-verify-machineinstrs -mtriple=nvptx64 -mcpu=sm_90a -mattr=+ptx83"}
@@ -4182,18 +4182,18 @@
 {"function": "st_bulk_shared_cta", "status": "correct", "file": "st_bulk.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx86"}
 {"function": "st_bulk_i32", "status": "correct", "file": "st_bulk_i32.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx90"}
 {"function": "st_bulk_shared_cta_i32", "status": "correct", "file": "st_bulk_i32.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx90"}
-{"function": "tcgen05_mma_fp16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_fp16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_f8f6f4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_f8f6fr_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_fp16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_fp16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_tf32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_tf32_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_f8f6f4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "tcgen05_mma_sp_f8f6fr_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_fp16_cta1", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_fp16_cta1", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_tf32_cta1", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_tf32_cta1", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_f8f6f4_cta1", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_f8f6fr_cta1", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_fp16_cta2", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_fp16_cta2", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_tf32_cta2", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_tf32_cta2", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_f8f6f4_cta2", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
+{"function": "tcgen05_mma_sp_f8f6fr_cta2", "status": "correct", "file": "tcgen05-mma.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "foo", "probe": true, "status": "correct", "file": "surf-write-cuda.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_20 -verify-machineinstrs"}
 {"function": "bar", "probe": true, "status": "correct", "file": "surf-write-cuda.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_20 -verify-machineinstrs"}
 {"function": "t0", "probe": true, "status": "correct", "file": "texsurf-queries.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_20 -verify-machineinstrs"}
@@ -4276,3 +4276,4 @@
 {"function": "test_tcgen05_cp_32x128_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_cp_32x128_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_cp_64x128_v1_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "tcgen05_mma_collector_b_scale_d_f16_cta2", "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}

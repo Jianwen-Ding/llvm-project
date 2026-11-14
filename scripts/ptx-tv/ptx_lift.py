@@ -1016,6 +1016,8 @@ class Lifter:
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
                 (base == "tcgen05" and mods[:1] in (["ld"], ["st"])) or \
+                (base == "tcgen05" and mods[:1] == ["mma"] and not set(mods) & {
+                    "ws", "block_scale", "block16", "block32", "disable_output_lane"}) or \
                 (base == "tcgen05" and mods[:1] in (["alloc"], ["dealloc"], ["relinquish_alloc_permit"],
                                                    ["commit"], ["cp"], ["shift"], ["wait::ld"],
                                                    ["wait::st"], ["fence::before_thread_sync"],
@@ -2362,6 +2364,27 @@ class Lifter:
         other tcgen05 instructions are probe-derived."""
         import tcgen05ls
         import tcgen05ops
+        import tcgen05mma
+        mm_ = tcgen05mma.ptx(mods, ops)
+        if mm_ is not None:
+            toks, canon = mm_
+            vals, tys = [], []
+            for o in canon:
+                br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+                r = br.group(1) if br else o
+                if r in self.regs:
+                    w = self.regs[r]
+                    vals.append("i%d %s" % (w, self.get(r, w)))
+                    tys.append("i%d" % w)
+                elif self.imm(r) is not None:
+                    vals.append("i64 %d" % self.imm(r))
+                    tys.append("i64")
+                else:
+                    raise Unsupported("operand " + opc)
+            kname = tcgen05mma.name_of(toks).replace("::", "__") + "." + "_".join(tys)
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(tys)))
+            self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+            return
         rr = tcgen05ls.red_ptx(mods)
         if rr is not None:
             shape, num, ty, op, ab, nan = rr
