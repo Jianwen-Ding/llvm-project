@@ -2791,6 +2791,17 @@ void AGXTargetLowering::finalizeLowering(MachineFunction &MF) const {
     MachineRegisterInfo &MRI = MF.getRegInfo();
     for (MachineBasicBlock &MBB : MF)
       for (MachineInstr &MI : MBB) {
+        // An iadd of the frame address (to a private array's element at a
+        // variable index): the frame index as its immediate source, the
+        // object's offset after frame lowering, without the mov_imm.
+        if (MI.getOpcode() == AGX::IADD_I32 && !MI.getOperand(1).getImm() &&
+            MI.getOperand(2).isReg() && MI.getOperand(2).getReg().isVirtual()) {
+          MachineInstr *FA = MRI.getUniqueVRegDef(MI.getOperand(2).getReg());
+          if (FA && FA->getOpcode() == AGX::FRAME_ADDR &&
+              FA->getOperand(1).isFI() && !FA->getOperand(1).getTargetFlags())
+            MI.getOperand(2).ChangeToFrameIndex(FA->getOperand(1).getIndex());
+          continue;
+        }
         switch (MI.getOpcode()) {
         case AGX::STACK_LOAD_16:
         case AGX::STACK_LOAD_32:
@@ -2813,14 +2824,19 @@ void AGXTargetLowering::finalizeLowering(MachineFunction &MF) const {
         MachineInstr *Add = MRI.getUniqueVRegDef(O->getReg());
         if (!Add || Add->getOpcode() != AGX::IADD_I32 ||
             Add->getOperand(1).getImm() || Add->getOperand(3).getImm() ||
-            !Add->getOperand(2).isReg() || !Add->getOperand(4).isImm() ||
-            !Add->getOperand(5).isImm())
+            !Add->getOperand(4).isImm() || !Add->getOperand(5).isImm())
           continue;
-        MachineInstr *FA = Add->getOperand(2).getReg().isVirtual()
-                               ? MRI.getUniqueVRegDef(Add->getOperand(2).getReg())
-                               : nullptr;
-        if (!FA || FA->getOpcode() != AGX::FRAME_ADDR ||
-            !FA->getOperand(1).isFI() || FA->getOperand(1).getTargetFlags())
+        // (the frame address, or the frame index the iadd took above)
+        const MachineOperand *FI = &Add->getOperand(2);
+        if (FI->isReg()) {
+          MachineInstr *FA =
+              FI->getReg().isVirtual() ? MRI.getUniqueVRegDef(FI->getReg())
+                                       : nullptr;
+          if (!FA || FA->getOpcode() != AGX::FRAME_ADDR)
+            continue;
+          FI = &FA->getOperand(1);
+        }
+        if (!FI->isFI() || FI->getTargetFlags())
           continue;
         int64_t Shift = Add->getOperand(5).getImm();
         int64_t C = Add->getOperand(4).getImm();
@@ -2829,7 +2845,7 @@ void AGXTargetLowering::finalizeLowering(MachineFunction &MF) const {
         C <<= Shift;
         if (C >= (1 << 12))
           continue;
-        O->ChangeToFrameIndex(FA->getOperand(1).getIndex(), unsigned(C));
+        O->ChangeToFrameIndex(FI->getIndex(), unsigned(C));
       }
   }
   TargetLowering::finalizeLowering(MF);

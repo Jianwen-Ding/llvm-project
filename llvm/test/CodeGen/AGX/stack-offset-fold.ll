@@ -5,7 +5,11 @@
 ; is an immediate offset, the object's offset plus the constant (b, at 32: b[5]
 ; at 52), instead of the frame address and an iadd per access (L15-E288).
 
+; At a variable index, the iadd takes the object's offset as its immediate
+; source (no mov_imm of the frame address) (L15-E289).
 ; CHECK-LABEL: priv2:
+; CHECK-NOT: mov_imm {{r[0-9]+}}, 32
+; CHECK: iadd {{r[0-9]+}}, 32, {{r[0-9]+}}, lsl 2
 ; CHECK: stack_load 1, i32, x, {{r[0-9]+}}, 52
 ; OFF-LABEL: priv2:
 ; OFF: mov_imm [[B:r[0-9]+]], 32
