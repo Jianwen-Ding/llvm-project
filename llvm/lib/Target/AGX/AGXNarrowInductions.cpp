@@ -1090,6 +1090,80 @@ static std::optional<APInt> lowerBound(const SCEV *S, ScalarEvolution &SE,
 /// provably does not wrap (upperBound). Before the structurizer, which
 /// leaves SCEV no trip count. L15-E230 found the straight-line version no
 /// better: there the copy is paid where the additions were.
+static cl::opt<unsigned> AGXHoistAddressOffsets(
+    "agx-hoist-address-offsets", cl::init(8), cl::Hidden,
+    cl::desc("In an innermost loop, an i64 address (b + x) + c with b "
+             "invariant as (b + c) + x, for up to this many new bases"));
+
+/// The PTX front end's integer address of a field, gep i8 (inttoptr (b + x)),
+/// c, with b invariant in the loop and x not: as inttoptr ((b + c) + x), its
+/// base hoisted, the access takes the base and x as its index register (a
+/// 64-bit addition per access each iteration before: embedding's second
+/// half of a float4). A new base is a register pair live through the loop:
+/// at most AGXHoistAddressOffsets of them per loop.
+static bool hoistAddressOffsets(Loop &L) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader();
+  if (!Pre || !AGXHoistAddressOffsets)
+    return false;
+  struct Use_ {
+    GetElementPtrInst *G;
+    Value *B, *X;
+    int64_t C;
+  };
+  SmallVector<Use_, 8> Uses;
+  for (BasicBlock *BB : L.blocks())
+    for (Instruction &I : *BB) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      const APInt *C;
+      if (!G || G->getNumIndices() != 1 ||
+          !G->getSourceElementType()->isIntegerTy(8) ||
+          !match(G->getOperand(1), m_APInt(C)) || C->isZero() ||
+          G->getAddressSpace() != AGX::DEVICE_ADDRESS)
+        continue;
+      auto *I2P = dyn_cast<IntToPtrInst>(G->getPointerOperand());
+      if (!I2P)
+        continue;
+      auto *A = dyn_cast<BinaryOperator>(I2P->getOperand(0));
+      if (!A || A->getOpcode() != Instruction::Add || !L.contains(A) ||
+          !A->getType()->isIntegerTy(64))
+        continue;
+      Value *B = A->getOperand(0), *X = A->getOperand(1);
+      if (!L.isLoopInvariant(B))
+        std::swap(B, X);
+      if (!L.isLoopInvariant(B) || L.isLoopInvariant(X) ||
+          isa<Constant>(B))
+        continue;
+      // only accesses through it
+      if (!all_of(G->users(), [&](User *U) {
+            if (auto *Ld = dyn_cast<LoadInst>(U))
+              return Ld->getPointerOperand() == G;
+            if (auto *St = dyn_cast<StoreInst>(U))
+              return St->getPointerOperand() == G;
+            return false;
+          }))
+        continue;
+      Uses.push_back({G, B, X, C->getSExtValue()});
+    }
+  SmallVector<std::pair<Value *, int64_t>, 4> Bases;
+  for (Use_ &U : Uses)
+    if (!is_contained(Bases, std::make_pair(U.B, U.C)))
+      Bases.push_back({U.B, U.C});
+  if (Uses.empty() || Bases.size() > AGXHoistAddressOffsets)
+    return false;
+  IRBuilder<> PB(Pre->getTerminator());
+  DenseMap<std::pair<Value *, int64_t>, Value *> NewBase;
+  for (auto [B, C] : Bases)
+    NewBase[{B, C}] = PB.CreateAdd(B, ConstantInt::get(B->getType(), C));
+  for (Use_ &U : Uses) {
+    IRBuilder<> B(U.G);
+    Value *A = B.CreateAdd(NewBase[{U.B, U.C}], U.X);
+    U.G->replaceAllUsesWith(B.CreateIntToPtr(A, U.G->getType()));
+    U.G->eraseFromParent();
+  }
+  return true;
+}
+
 static bool shareLoopIndexBases(Function &F, LoopInfo &LI,
                                 ScalarEvolution &SE) {
   if (!LoopIndexBases || LI.empty())
@@ -1297,6 +1371,9 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
     }
   }
   Changed |= shareLoopIndexBases(F, LI, SE);
+  for (Loop *L : LI.getLoopsInPreorder())
+    if (L->isInnermost())
+      Changed |= hoistAddressOffsets(*L);
   if (!AGXSplitWideCounters)
     return Changed;
   // Innermost loops only: each split adds blocks that the other loops'
