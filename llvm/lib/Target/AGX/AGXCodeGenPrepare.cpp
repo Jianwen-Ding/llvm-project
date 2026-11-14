@@ -4613,6 +4613,39 @@ static bool narrowMaskedIndices(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> BFloatSqrtProduct(
+    "agx-bfloat-sqrt-product",
+    cl::desc("bfloat sqrt as the float x rsqrt_special(x) rounded to bfloat"),
+    cl::init(true), cl::Hidden);
+
+/// A bfloat square root (computed in float, the float one correctly rounded
+/// with its remainder correction and small-argument scaling, then rounded):
+/// the float product x rsqrt_special(x) rounded to bfloat is the same for
+/// every bfloat where float arithmetic flushes (simulator, all 65536:
+/// L15-E335). rsqrt_special gives 1 for 0 and infinity, so zeros,
+/// infinities and NaNs come out of the product.
+static bool bfloatSqrts(Function &F, const AGXSubtarget &ST) {
+  if (!BFloatSqrtProduct || ST.hasIEEEFP32())
+    return false;
+  SmallVector<IntrinsicInst *, 4> Sqrts;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::sqrt &&
+          II->getType()->isBFloatTy() && !II->hasApproxFunc())
+        Sqrts.push_back(II);
+  for (IntrinsicInst *II : Sqrts) {
+    IRBuilder<> B(II);
+    Value *X = B.CreateFPExt(II->getArgOperand(0), B.getFloatTy());
+    Value *Y = B.CreateIntrinsic(Intrinsic::agx_rsqrt_special,
+                                 {B.getFloatTy()}, {X});
+    Value *R = B.CreateFPTrunc(B.CreateFMul(X, Y), II->getType());
+    R->takeName(II);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+  }
+  return !Sqrts.empty();
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -4638,6 +4671,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= combineUniformAtomics(F, TTI);
   Changed |= lowerConstrainedFP(F);
   Changed |= expandMath(F, ST);
+  Changed |= bfloatSqrts(F, ST);
   Changed |= flushHalfDenormals(F);
   Changed |= flushFloatMinMax(F);
   Changed |= expandDivisions(F);
