@@ -549,7 +549,8 @@ def classify(out, err, rc):
         return "correct"
     if "Transformation doesn't verify" in o:
         return "mismatch"
-    if "Timeout" in o or "timeout" in o or "max. memory exceeded" in o:
+    if "Timeout" in o or "timeout" in o or "max. memory exceeded" in o or \
+            "smt-canceled" in o:
         return "timeout"
     if "Couldn't prove the correctness" in o or "approximated" in o or \
             "incomplete quantifiers" in o:
