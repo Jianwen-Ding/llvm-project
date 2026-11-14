@@ -102,6 +102,9 @@ zero high half and its single fence around a threadgroup barrier, `-agx-merge-ba
 `gpu.shuffle` by a constant offset within the SIMD-group is AIR's own `shuffle_xor` (within any power-of-two width),
 `shuffle_up` or `shuffle_down` (over the whole SIMD-group), whose source lanes are those and whose valid flag is
 known (xor) or one comparison of the lane; the other shuffles compute the source lane and use the index shuffle.
+`gpu.rotate` is a shuffle down by the offset and up by width - offset (AIR has no rotate), selected by the lane's
+position in its segment; `gpu.subgroup_broadcast` is AIR's shuffle of the lane or its broadcast of the first active
+lane.
 `gpu.subgroup_reduce` over clusters of 4 lanes is AIR's quad-group reduction (`air.quad_sum` ...), over 32 the
 SIMD-group's. `maximumf` / `minimumf` of `f32` (a NaN if any lane's is, -0.0 below +0.0) are not AIR's float
 maximum and minimum, which are `maxnum` / `minnum`: they are the signed `i32` maximum (minimum) of the keys

@@ -664,6 +664,44 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
   }
 };
 
+/// gpu.subgroup_broadcast: AIR's shuffle of the (uniform) lane, or its
+/// broadcast of the first active lane (the first set bit of the ballot of
+/// the active lanes), per 32-bit part (L15-E298).
+struct GPUSubgroupBroadcastOpLowering
+    : ConvertOpToLLVMPattern<gpu::SubgroupBroadcastOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupBroadcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    Type i32 = rewriter.getI32Type();
+    bool first =
+        op.getBroadcastType() == gpu::BroadcastType::first_active_lane;
+    Value lane16;
+    if (!first) {
+      if (!adaptor.getLane())
+        return rewriter.notifyMatchFailure(op, "no lane");
+      lane16 = LLVM::TruncOp::create(rewriter, loc, rewriter.getI16Type(),
+                                     adaptor.getLane());
+    }
+    SmallVector<Value> parts;
+    if (failed(LLVM::decomposeValue(rewriter, loc, adaptor.getSrc(), i32,
+                                    parts)))
+      return rewriter.notifyMatchFailure(op, "cannot split value into i32");
+    SmallVector<Value> results;
+    for (Value part : parts)
+      results.push_back(
+          first ? callAIR(rewriter, op, "air.simd_broadcast_first.u.i32", i32,
+                          {part}, AIREffects::Convergent)
+                : callAIR(rewriter, op, "air.simd_shuffle.u.i32", i32,
+                          {part, lane16}, AIREffects::Convergent));
+    rewriter.replaceOp(op, LLVM::composeValue(rewriter, loc, results,
+                                              adaptor.getSrc().getType()));
+    return success();
+  }
+};
+
 struct GPUBallotOpLowering : ConvertOpToLLVMPattern<gpu::BallotOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -1332,6 +1370,48 @@ static LogicalResult rewritePow2FloorCeilDiv(OpTy op, PatternRewriter &rewriter)
     q = arith::AddIOp::create(rewriter, loc, q, up);
   }
   rewriter.replaceOp(op, q);
+  return success();
+}
+
+/// gpu.rotate (AIR has no rotate): lane j of a segment of `width` takes lane
+/// j + offset where that is in the segment, a shuffle down by offset, else
+/// lane j + offset - width, a shuffle up by width - offset; both uniform AIR
+/// shifts over the SIMD-group, and a select by the lane's position in its
+/// segment; valid where the lane is below width (L15-E298).
+static LogicalResult rewriteRotate(gpu::RotateOp op, PatternRewriter &rewriter) {
+  Location loc = op.getLoc();
+  uint32_t off = op.getOffset(), width = op.getWidth();
+  Type i32 = rewriter.getI32Type();
+  auto c = [&](int64_t v) {
+    return arith::ConstantOp::create(rewriter, loc, i32,
+                                     rewriter.getI32IntegerAttr(v));
+  };
+  Value lane = arith::IndexCastOp::create(
+      rewriter, loc, i32,
+      gpu::LaneIdOp::create(rewriter, loc, rewriter.getIndexAttr(32)));
+  Value valid =
+      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult, lane,
+                            c(width));
+  Value value = op.getValue();
+  if (off == 0) {
+    rewriter.replaceOp(op, {value, valid});
+    return success();
+  }
+  Value down = gpu::ShuffleOp::create(rewriter, loc, value, c(off), c(32),
+                                      gpu::ShuffleMode::DOWN)
+                   .getShuffleResult();
+  Value up = gpu::ShuffleOp::create(rewriter, loc, value, c(width - off),
+                                    c(32), gpu::ShuffleMode::UP)
+                 .getShuffleResult();
+  Value inSegment = arith::CmpIOp::create(
+      rewriter, loc, arith::CmpIPredicate::ult,
+      arith::AddIOp::create(rewriter, loc,
+                            arith::AndIOp::create(rewriter, loc, lane,
+                                                  c(width - 1)),
+                            c(off)),
+      c(width));
+  rewriter.replaceOp(
+      op, {arith::SelectOp::create(rewriter, loc, inSegment, down, up), valid});
   return success();
 }
 
@@ -2419,6 +2499,7 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteIPowI);
       patterns.add(rewritePow2FloorCeilDiv<arith::FloorDivSIOp>);
       patterns.add(rewritePow2FloorCeilDiv<arith::CeilDivSIOp>);
+      patterns.add(rewriteRotate);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
@@ -2653,6 +2734,7 @@ void mlir::populateGpuToAIRConversionPatterns(
       converter, "air.simdgroups_per_threadgroup");
   patterns.add<GPUSubgroupSizeOpLowering, GPUBarrierOpLowering,
                GPUShuffleOpLowering, GPUBallotOpLowering,
+               GPUSubgroupBroadcastOpLowering,
                GPUSubgroupReduceOpLowering, MatrixLoadOpLowering,
                MatrixStoreOpLowering, MatrixMultiplyAccumulateOpLowering,
                MatrixFillOpLowering>(converter);

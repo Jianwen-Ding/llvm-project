@@ -1111,3 +1111,30 @@ gpu.module @loop_uniform_shuffle {
     gpu.return
   }
 }
+
+// -----
+
+// gpu.rotate: a shuffle down by the offset and up by width - offset, both AIR
+// shifts, and a select by the lane's position in its segment; valid below
+// width. gpu.subgroup_broadcast: AIR's shuffle of the lane, or its broadcast
+// of the first active lane (L15-E298).
+gpu.module @rotate_broadcast {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32, %l: i32) kernel {
+    // CHECK: llvm.call @air.simd_shuffle_down.u.i32
+    // CHECK: llvm.call @air.simd_shuffle_up.u.i32
+    // CHECK: llvm.select
+    %r, %ok = gpu.rotate %v, 1, 8 : f32
+    // CHECK: llvm.call @air.simd_shuffle.u.i32
+    %b = gpu.subgroup_broadcast %v, specific_lane %l : f32
+    // CHECK: llvm.call @air.simd_broadcast_first.u.i32
+    %f = gpu.subgroup_broadcast %v, first_active_lane : f32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    memref.store %r, %out[%c0] : memref<8xf32, 1>
+    memref.store %b, %out[%c1] : memref<8xf32, 1>
+    memref.store %f, %out[%c2] : memref<8xf32, 1>
+    gpu.return
+  }
+}
