@@ -428,20 +428,68 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
           native = "air.simd_shuffle_xor.u.i32";
         break;
       case gpu::ShuffleMode::UP:
-        if (*width == 32)
-          native = "air.simd_shuffle_up.u.i32";
+        native = "air.simd_shuffle_up.u.i32";
         break;
       case gpu::ShuffleMode::DOWN:
-        if (*width == 32)
-          native = "air.simd_shuffle_down.u.i32";
+        native = "air.simd_shuffle_down.u.i32";
         break;
       case gpu::ShuffleMode::IDX:
         break;
       }
     }
+    // A narrower power-of-two segment (up, down) or a constant lane (idx):
+    // the same AIR shuffle with a uniform offset or lane, and the thread's own
+    // value where the source lane is outside its segment, as below (no
+    // per-thread lane, which would take a shuffle per quad position)
+    // (L15-E285).
+    bool ownOutside = false;
+    if (width && offset && *offset >= 0 && *width <= 32 &&
+        llvm::isPowerOf2_64(*width) &&
+        ((native.empty() && op.getMode() == gpu::ShuffleMode::IDX &&
+          *offset < 32) ||
+         (*width < 32 && *offset < *width &&
+          (op.getMode() == gpu::ShuffleMode::UP ||
+           op.getMode() == gpu::ShuffleMode::DOWN)))) {
+      if (op.getMode() == gpu::ShuffleMode::IDX)
+        native = "air.simd_shuffle.u.i32";
+      ownOutside = true;
+    }
 
     Value valid, lane16;
-    if (!native.empty()) {
+    if (ownOutside) {
+      lane16 = LLVM::ConstantOp::create(rewriter, loc, i16, *offset);
+      Value lane = callAIR(rewriter, op, "air.thread_index_in_simdgroup", i32,
+                           {}, AIREffects::None, laneRange);
+      auto c = [&](int64_t v) {
+        return LLVM::ConstantOp::create(rewriter, loc, i32, v);
+      };
+      Value start = LLVM::AndOp::create(rewriter, loc, i32, lane, c(-*width));
+      Value srcLane;
+      switch (op.getMode()) {
+      case gpu::ShuffleMode::UP:
+        srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane, c(*offset));
+        break;
+      case gpu::ShuffleMode::DOWN:
+        srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane, c(*offset));
+        break;
+      default:
+        srcLane = c(*offset);
+        break;
+      }
+      // (up's source is below the segment's end, down's not below its start)
+      Value aboveStart = LLVM::ICmpOp::create(
+          rewriter, loc, LLVM::ICmpPredicate::sge, srcLane, start);
+      Value belowEnd = LLVM::ICmpOp::create(
+          rewriter, loc, LLVM::ICmpPredicate::slt, srcLane,
+          LLVM::AddOp::create(rewriter, loc, i32, start, c(*width)));
+      valid = op.getMode() == gpu::ShuffleMode::UP     ? aboveStart
+              : op.getMode() == gpu::ShuffleMode::DOWN ? belowEnd
+                                                       : LLVM::AndOp::create(
+                                                             rewriter, loc,
+                                                             aboveStart,
+                                                             belowEnd)
+                                                             .getResult();
+    } else if (!native.empty()) {
       lane16 = LLVM::ConstantOp::create(rewriter, loc, i16, *offset);
       if (op.getMode() == gpu::ShuffleMode::XOR || *offset == 0) {
         valid = LLVM::ConstantOp::create(rewriter, loc, i1, 1);
@@ -509,6 +557,9 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
                                  AIREffects::Convergent));
     Value result = LLVM::composeValue(rewriter, loc, shuffled,
                                       adaptor.getValue().getType());
+    if (ownOutside)
+      result = LLVM::SelectOp::create(rewriter, loc, valid, result,
+                                      adaptor.getValue());
     rewriter.replaceOp(op, {result, valid});
     return success();
   }

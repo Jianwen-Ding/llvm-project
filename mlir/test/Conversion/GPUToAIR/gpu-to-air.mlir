@@ -187,7 +187,9 @@ gpu.module @one_simdgroup {
 // Shuffles by constant offsets within the SIMD-group are AIR's shuffle_up,
 // shuffle_down and shuffle_xor (xor within any power of two): the lanes a
 // shift leaves keep their value, which is what gpu.shuffle's valid flag
-// says; other shuffles read the lane they compute.
+// says; other shuffles read the lane they compute (L15-E285: shifts within
+// narrower segments and idx of a constant lane too, with a select of the own
+// value).
 gpu.module @shuffles {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%out: memref<8xi32, 1>, %v: i32, %o: i32) kernel {
@@ -207,10 +209,21 @@ gpu.module @shuffles {
     %down, %okdown = gpu.shuffle down %v, %c16, %c32 : i32
     // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
     %x8, %okx8 = gpu.shuffle xor %v, %c2, %c8 : i32
-    // Within segments of 8 lanes, a shift needs the lane arithmetic.
-    // CHECK: llvm.icmp "sge"
-    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // Within segments of 8 lanes, a shift by a constant is the same
+    // shuffle_down, and the thread's own value where the source lane is past
+    // its segment's end; an idx of a constant lane, the shuffle of that lane
+    // and the own value outside its segment (no per-thread lane).
+    // CHECK: %[[L8:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: llvm.and %[[L8]]
+    // CHECK: %[[OK8:.*]] = llvm.icmp "slt"
+    // CHECK: %[[D8:.*]] = llvm.call @air.simd_shuffle_down.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // CHECK: llvm.select %[[OK8]], %[[D8]], %{{.*}} : i1, i32
     %d8, %okd8 = gpu.shuffle down %v, %c2, %c8 : i32
+    // CHECK: llvm.icmp "sge"
+    // CHECK: llvm.icmp "slt"
+    // CHECK: %[[I8:.*]] = llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // CHECK: llvm.select %{{.*}}, %[[I8]], %{{.*}} : i1, i32
+    %i8, %oki8 = gpu.shuffle idx %v, %c2, %c8 : i32
     // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
     %xo, %okxo = gpu.shuffle xor %v, %o, %c32 : i32
     %c0 = arith.constant 0 : index
@@ -223,6 +236,8 @@ gpu.module @shuffles {
     memref.store %x8, %out[%c2i] : memref<8xi32, 1>
     memref.store %d8, %out[%c3] : memref<8xi32, 1>
     memref.store %xo, %out[%c4] : memref<8xi32, 1>
+    %c5 = arith.constant 5 : index
+    memref.store %i8, %out[%c5] : memref<8xi32, 1>
     gpu.return
   }
 }
