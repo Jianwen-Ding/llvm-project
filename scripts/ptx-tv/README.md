@@ -319,6 +319,16 @@ packing of `spdecompress` operands, and that an `e2m1x2`
 value and a single `ue8m0` scale (`.scale.n1`) occupy the low 8 bits of the
 intrinsics' `i16` operands/results.
 
+## Target cleanup
+
+Before the check, `tv.drop_dead_param_loads` removes from the lifted target
+unused loads that read a `.param` slot at offset 0 within its size (they
+cannot be UB) and slots that are then only stored to, and forwards a
+call-site return slot's single store to its same-size loads in the same
+block (as a bitcast; `mem2reg` cannot when the types differ). Out-of-bounds
+`.param` reads (finding 1) are not of this form and are still checked.
+Alive2's assembly mode is very slow on such dead reloads of a stored pointer.
+
 ## Coverage limits
 
 What remains opaque or unproved, and why:
@@ -329,15 +339,12 @@ What remains opaque or unproved, and why:
   `multimem` loads and reductions, which this LLVM has no intrinsics for;
   `multimem.st.async` is modelled as a store, its single-memory meaning).
   Under `PTXTV_OPAQUE_COPIES=1`, `st.bulk` is keyed as well (`bulkkey.py`).
-* Three keyed texture/surface fetches through a global handle
-  (`tex-read-cuda.ll` `bar`/`baz`, `surf-read-cuda.ll` `bar`) time out
-  even at 120 s per query and with the weaker check, although source and
-  target are the same call; the `.trap` surface loads (not `willreturn`)
-  need the 120 s budget.
-* Non-tensor `cp.reduce.async.bulk`
-  has single-thread semantics but a runtime element count; like the
-  symbolic-size bulk copies (which already time out with copy semantics),
-  Alive2 cannot prove it without bounded unrolling.
+* `tex-read-cuda.ll` `baz` (a keyed fetch added to the result of an
+  unknown external call) times out even at 120 s per query; the `.trap`
+  surface loads (not `willreturn`) need the 120 s budget.
+* Non-tensor `cp.reduce.async.bulk` has no intrinsic in this LLVM (the
+  tensor reductions are modelled in `tma.py`), so the backend cannot emit it
+  from IR.
 * Solver timeouts: mostly floating point (f16/bf16 done in f32, directed
   rounding, mixed precision). Larger budgets, the weaker
   `--disable-poison-input` check, element-wise vector accesses, per-lane

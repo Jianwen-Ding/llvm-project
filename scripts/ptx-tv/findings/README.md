@@ -267,11 +267,11 @@ regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 6334 functions from 623
 test files (including the 2130 distinct functions of the generated `wmma*.py`
-tests); 5561 proved correct (none through probe-derived opaque instructions,
+tests); 5581 proved correct (none through probe-derived opaque instructions,
 55 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in
-known modelling classes; 2 not lifted; 559 solver timeouts or inconclusive.
+known modelling classes; 2 not lifted; 539 solver timeouts or inconclusive.
 
 Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
 functions are compared after LLVM's

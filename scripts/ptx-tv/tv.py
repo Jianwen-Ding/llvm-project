@@ -915,6 +915,12 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     if rc:
         res.update(status="lift-invalid-ir", detail=err[-400:])
         return res
+    with open(tgt_f) as f:
+        t0 = f.read()
+    t1 = drop_dead_param_loads(t0)
+    if t1 != t0:
+        with open(tgt_f, "w") as f:
+            f.write(t1)
     nl = vector_ret_lanes(ext, fname) if LANES else 0
     if nl:
         # check each lane of the returned vector separately (see lane_variant)
@@ -993,6 +999,82 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     if st in ("mismatch",) or keep:
         res["dir"] = fdir
     return res
+
+
+def _forward_cs_slots(text):
+    """A call-site slot (`%cs.N`, alloca of the lifted call's return value)
+    with a single store whose same-size loads follow it in the same block:
+    replace the loads by the stored value (bitcast if the types differ) and
+    drop the slot.  mem2reg cannot do this when the types differ."""
+    lines = text.split("\n")
+    for p in sorted(set(re.findall(r"^\s*(%cs\.\d+) = alloca", text, re.M))):
+        idx = [k for k, l in enumerate(lines) if re.search(re.escape(p) + r"\b", l)]
+        al = [k for k in idx if re.match(r"\s*" + re.escape(p) + r" = alloca", lines[k])]
+        st = [k for k in idx if re.match(r"\s*store (\w+) ([%\w.]+), ptr " + re.escape(p) +
+                                       r"(?:, align \d+)?\s*$", lines[k])]
+        ld = [k for k in idx if re.match(r"\s*%[\w.]+ = load (\w+), ptr " + re.escape(p) +
+                                       r"(?:, align \d+)?\s*$", lines[k])]
+        if len(al) != 1 or len(st) != 1 or len(al) + len(st) + len(ld) != len(idx):
+            continue
+        sm = re.match(r"\s*store (\w+) ([%\w.]+)", lines[st[0]])
+        sty, sval = sm.group(1), sm.group(2)
+        ok = True
+        for k in ld:
+            lm = re.match(r"\s*(%[\w.]+) = load (\w+)", lines[k])
+            between = lines[st[0] + 1:k]
+            if k < st[0] or any(re.match(r"\s*[\w.$-]+:", l) for l in between) or \
+                    _TBYTES.get(lm.group(2)) is None or _TBYTES.get(lm.group(2)) != _TBYTES.get(sty) or \
+                    "ptr" in (sty, lm.group(2)) and sty != lm.group(2):
+                ok = False
+        if not ok:
+            continue
+        for k in ld:
+            lm = re.match(r"(\s*)(%[\w.]+) = load (\w+)", lines[k])
+            ind, dst, lty = lm.groups()
+            lines[k] = "%s%s = bitcast %s %s to %s" % (ind, dst, sty, sval, lty)
+        for k in sorted(al + st, reverse=True):
+            del lines[k]
+    return "\n".join(lines)
+
+
+_TBYTES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16, "ptr": 8, "half": 2, "bfloat": 2,
+           "float": 4, "double": 8}
+
+
+def drop_dead_param_loads(text):
+    """Remove unused loads that read a `%param.N` slot (an alloca of the
+    lifted `.param` space) at offset 0 within its size, then slots that are
+    only stored to.  Such loads cannot be UB and have no effect; out-of-
+    bounds .param reads (finding 1) are not of this form and are kept.
+    Alive2's asm mode is slow on dead reloads of a stored pointer."""
+    text = _forward_cs_slots(text)
+    sizes = {m.group(1): int(m.group(2)) for m in
+             re.finditer(r"^\s*(%param\.\d+) = alloca \[(\d+) x i8\]", text, re.M)}
+    if not sizes:
+        return text
+    lines = text.split("\n")
+    changed = True
+    while changed:
+        changed = False
+        body = "\n".join(lines)
+        for k, l in enumerate(lines):
+            m = re.match(r"\s*(%[\w.]+) = load (\w+), ptr (%param\.\d+)(?:, align \d+)?\s*$", l)
+            if not m or m.group(3) not in sizes or _TBYTES.get(m.group(2), 99) > sizes[m.group(3)]:
+                continue
+            if len(re.findall(re.escape(m.group(1)) + r"\b", body)) == 1:
+                lines[k] = None
+                changed = True
+        lines = [l for l in lines if l is not None]
+    body = "\n".join(lines)
+    for p in sizes:
+        uses = [l for l in lines if re.search(re.escape(p) + r"\b", l)]
+        defs = [l for l in uses if re.match(r"\s*" + re.escape(p) + r" = alloca", l)]
+        stores = [l for l in uses if re.match(r"\s*store (\w+) [%\w.]+, ptr " + re.escape(p) +
+                                                r"(?:, align \d+)?\s*$", l)]
+        if len(defs) == 1 and len(defs) + len(stores) == len(uses) and \
+                all(_TBYTES.get(re.match(r"\s*store (\w+)", l).group(1), 99) <= sizes[p] for l in stores):
+            lines = [l for l in lines if l not in uses]
+    return "\n".join(lines)
 
 
 def process_file(path, args):
