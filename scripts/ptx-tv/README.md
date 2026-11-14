@@ -279,8 +279,7 @@ What remains opaque or unproved, and why:
   have documentation-derived models), `tensormap.replace` (the tensor-map layout is not
   public), `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is
-  modelled as a store, its single-memory meaning), texture/surface (opaque image state), `spcompress`
-  (implementation-specific selection), `barrier.cluster`, `mapa`,
+  modelled as a store, its single-memory meaning), texture/surface (opaque image state), `barrier.cluster`, `mapa`,
   `getctarank`, `clusterlaunchcontrol`, `pmevent`, `griddepcontrol`.
  Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
