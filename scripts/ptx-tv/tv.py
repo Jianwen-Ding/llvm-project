@@ -495,6 +495,42 @@ def rewrite_i1_fp(text):
     return text
 
 
+LANES = os.environ.get("PTXTV_LANES", "0") == "1"
+
+
+def _ret_vec_re(fname):
+    return re.compile(r"^(define [^@\n]*?)<(\d+) x ([^>]+)>(\s+@%s\()" % re.escape(fname), re.M)
+
+
+def vector_ret_lanes(text, fname):
+    m = _ret_vec_re(fname).search(text)
+    return int(m.group(2)) if m and int(m.group(2)) <= 8 else 0
+
+
+def lane_variant(text, fname, k):
+    """The module with `fname` returning only lane k of its vector result.
+    Everything else (all computations, memory effects, UB) is unchanged, so
+    the function refines iff every lane variant does (vector refinement is
+    lane-wise)."""
+    rx = _ret_vec_re(fname)
+    m = rx.search(text)
+    n, et = m.group(2), m.group(3).strip()
+    vt = "<%s x %s>" % (n, et)
+    start = m.start()
+    end = text.index("\n}", start) + 2
+    body = text[start:end]
+    body = rx.sub(lambda mm: "%s%s%s" % (mm.group(1), et, mm.group(4)), body, count=1)
+    cnt = [0]
+
+    def ret(mm):
+        cnt[0] += 1
+        v = "%%ptxtv_lane%d" % cnt[0]
+        return "%s%s = extractelement %s %s, i32 %d\n%sret %s %s" % (
+            mm.group(1), v, vt, mm.group(2), k, mm.group(1), et, v)
+    body = re.sub(r"^(\s*)ret %s (.+?)\s*$" % re.escape(vt), ret, body, flags=re.M)
+    return text[:start] + body + text[end:]
+
+
 def module_symbols(text):
     defines, decls, globals_, typedefs = {}, {}, {}, {}
     for l in text.split("\n"):
@@ -872,14 +908,41 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     if rc:
         res.update(status="lift-invalid-ir", detail=err[-400:])
         return res
-    try:
-        rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
-                            "--disable-undef-input", "--smt-to=%d" % smt_to] + ALIVE_EXTRA + [
-                            "--func=" + fname.strip('"')],
-                           timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
-    except subprocess.TimeoutExpired:
-        res.update(status="timeout", detail="wall clock")
-        return res
+    nl = vector_ret_lanes(ext, fname) if LANES else 0
+    if nl:
+        # check each lane of the returned vector separately (see lane_variant)
+        outs = []
+        for k in range(nl):
+            sk, tk = src_f + ".lane%d.ll" % k, tgt_f + ".lane%d.ll" % k
+            with open(sk, "w") as f:
+                f.write(lane_variant(open(src_f).read(), fname, k))
+            with open(tk, "w") as f:
+                f.write(lane_variant(open(tgt_f).read(), fname, k))
+            try:
+                rc, out, err = run([ALIVE, sk, tk, "--tgt-is-asm", "--disable-undef-input",
+                                    "--smt-to=%d" % smt_to] + ALIVE_EXTRA +
+                                   ["--func=" + fname.strip('"')],
+                                   timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+            except subprocess.TimeoutExpired:
+                rc, out, err = 1, "ERROR: Timeout (wall clock)", ""
+            st_k = classify(out, err, rc)
+            outs.append((st_k, out, err, rc))
+            if st_k != "correct":
+                break
+        res["lanes"] = nl
+        if all(o[0] == "correct" for o in outs) and len(outs) == nl:
+            rc, out, err = 0, "Transformation seems to be correct! (all %d lanes)" % nl, ""
+        else:
+            _, out, err, rc = outs[-1]
+    else:
+        try:
+            rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
+                                "--disable-undef-input", "--smt-to=%d" % smt_to] + ALIVE_EXTRA + [
+                                "--func=" + fname.strip('"')],
+                               timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+        except subprocess.TimeoutExpired:
+            res.update(status="timeout", detail="wall clock")
+            return res
     # Loops: Alive2 only reasons about loop-free code unless asked to unroll.
     # Retry with bounded unrolling; such results only cover executions with
     # at most UNROLL iterations per loop and are tagged.
