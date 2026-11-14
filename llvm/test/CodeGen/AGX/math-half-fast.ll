@@ -61,3 +61,15 @@ define void @tanh_bf(ptr addrspace(1) %p) {
   store bfloat %r, ptr addrspace(1) %p
   ret void
 }
+
+; bfloat atan: the division by the reciprocal too (L15-E331)
+; CHECK-LABEL: atan_bf:
+; CHECK: rcp
+; CHECK-NOT: bitop
+; CHECK: stop
+define void @atan_bf(ptr addrspace(1) %p) {
+  %x = load bfloat, ptr addrspace(1) %p
+  %r = call bfloat @llvm.atan.bf16(bfloat %x)
+  store bfloat %r, ptr addrspace(1) %p
+  ret void
+}

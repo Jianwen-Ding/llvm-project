@@ -76,6 +76,8 @@ class MathBuilder {
   bool NoDenormals;
   // The result is rounded to half (L15-E329).
   bool HalfResult;
+  // The result is rounded to half or bfloat (L15-E329, E331).
+  bool NarrowResult;
   // Divisions correctly rounded even for a half result (atan2: with the
   // reciprocal's, results near a tie between two halves were rounded the
   // other way, on the functional model).
@@ -83,8 +85,9 @@ class MathBuilder {
 
 public:
   MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false,
-              bool HalfResult = false)
-      : B(B), Ty(Ty), NoDenormals(NoDenormals), HalfResult(HalfResult) {}
+              bool HalfResult = false, bool NarrowResult = false)
+      : B(B), Ty(Ty), NoDenormals(NoDenormals), HalfResult(HalfResult),
+        NarrowResult(NarrowResult) {}
 
   /// The hardware's approximation of \p ID (afn's).
   Value *hw(Intrinsic::ID ID, Value *X) {
@@ -153,9 +156,9 @@ public:
   Value *add(Value *A, Value *X) { return B.CreateFAdd(A, X); }
   Value *sub(Value *A, Value *X) { return B.CreateFSub(A, X); }
   Value *div(Value *A, Value *X) {
-    // A half result: a times the hardware's reciprocal (L15-E329; scalars:
-    // the reciprocal intrinsic does not split)
-    if (HalfResult && HalfFastDivision && !PreciseDivision &&
+    // A half or bfloat result: a times the hardware's reciprocal (L15-E329,
+    // E331; scalars: the reciprocal intrinsic does not split)
+    if (NarrowResult && HalfFastDivision && !PreciseDivision &&
         !Ty->isVectorTy())
       return mul(A, B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {X}));
     return B.CreateFDiv(A, X);
@@ -710,7 +713,9 @@ static Value *inFloat(IRBuilderBase &B, Type *Ty, ArrayRef<Value *> Args,
   for (Value *A : Args)
     Ext.push_back(Ty == F32 ? A : B.CreateFPExt(A, F32));
   MathBuilder M(B, F32, FlushF32 || Ty != F32,
-                Ty->getScalarType()->isHalfTy());
+                Ty->getScalarType()->isHalfTy(),
+                Ty->getScalarType()->isHalfTy() ||
+                    Ty->getScalarType()->isBFloatTy());
   Value *R = Fn(M, Ext);
   return Ty == F32 ? R : B.CreateFPTrunc(R, Ty);
 }
