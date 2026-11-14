@@ -513,7 +513,11 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # are marked with `.pragma "used_bytes_mask"`: reads disabled lanes (UB
     # in LLVM terms if they are not dereferenceable), but stays within an
     # aligned granule, so it cannot fault on the hardware.  Intentional.
-    if 'used_bytes_mask' in body and "Source is more defined than target" in alive_out:
+    # (the pragma is only emitted for PTX >= 8.3; the lane loads of an
+    # expanded masked load are named ptxtv_mlx*)
+    if ('used_bytes_mask' in body or (re.search(r"%ptxtv_mlx\d", src_text) and
+                                      re.search(r"\bld\.[\w.:]*v[248]\.", body))) and \
+            "Source is more defined than target" in alive_out:
         return "masked-load-widened"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.

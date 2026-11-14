@@ -57,14 +57,14 @@ def helper(kind, fname, vty, pty, A):
         L.append("  %%q%d = getelementptr inbounds %s, %s %%p, i32 %d" % (k, et, pty, k))
         al = lane_align(A, k * es)
         if kind == "load":
-            L.append("  %%x%d = load %s, %s %%q%d, align %d" % (k, et, pty, k, al))
+            L.append("  %%ptxtv_mlx%d = load %s, %s %%q%d, align %d" % (k, et, pty, k, al))
         else:
             L.append("  %%s%d = extractelement %s %%v, i32 %d" % (k, vty, k))
             L.append("  store %s %%s%d, %s %%q%d, align %d" % (et, k, pty, k, al))
         L.append("  br label %%j%d" % k)
         L.append("j%d:" % k)
         if kind == "load":
-            L.append("  %%e%d = phi %s [ %%x%d, %%a%d ], [ %%t%d, %%l%d ]" % (k, et, k, k, k, k))
+            L.append("  %%e%d = phi %s [ %%ptxtv_mlx%d, %%a%d ], [ %%t%d, %%l%d ]" % (k, et, k, k, k, k))
             L.append("  %%r%d = insertelement %s %s, %s %%e%d, i32 %d" % (k, vty, acc, et, k, k))
             acc = "%%r%d" % k
         L.append("  br label %%l%d" % (k + 1))
