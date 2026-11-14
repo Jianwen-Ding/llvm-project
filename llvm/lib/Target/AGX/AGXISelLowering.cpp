@@ -2959,6 +2959,30 @@ static std::optional<int> magnitudeLog2Bound(SDValue V, unsigned Depth = 0) {
     return std::nullopt;
   case ISD::FSQRT:
     return 64;
+  case ISD::INTRINSIC_WO_CHAIN:
+  case ISD::FEXP2: {
+    // 2^x of an x that is <= 0 (or a NaN): at most 1 (L15-E346)
+    if (V.getOpcode() == ISD::INTRINSIC_WO_CHAIN &&
+        V.getConstantOperandVal(0) != Intrinsic::agx_exp2)
+      return std::nullopt;
+    SDValue X = V.getOperand(V.getOpcode() == ISD::FEXP2 ? 0 : 1);
+    auto NonPosConst = [](SDValue C) {
+      auto *F = dyn_cast<ConstantFPSDNode>(C);
+      return F && (F->isNegative() || F->isZero()) && !F->isNaN();
+    };
+    bool NonPos =
+        NonPosConst(X) ||
+        (X.getOpcode() == ISD::FNEG &&
+         X.getOperand(0).getOpcode() == ISD::FABS) ||
+        (X.getOpcode() == ISD::FMUL &&
+         ((X.getOperand(0).getOpcode() == ISD::FABS &&
+           NonPosConst(X.getOperand(1))) ||
+          (X.getOperand(1).getOpcode() == ISD::FABS &&
+           NonPosConst(X.getOperand(0)))));
+    if (NonPos)
+      return 1;
+    return std::nullopt;
+  }
   case ISD::FABS:
   case ISD::FNEG:
     return magnitudeLog2Bound(V.getOperand(0), Depth + 1);
