@@ -989,8 +989,9 @@ ErfPolynomialApproximation::matchAndRewrite(math::ErfOp op,
 
   Value isNegativeArg =
       arith::CmpFOp::create(builder, arith::CmpFPredicate::OLT, operand, zero);
-  Value negArg = arith::NegFOp::create(builder, operand);
-  Value x = arith::SelectOp::create(builder, isNegativeArg, negArg, operand);
+  // |x|: -0 and +0 give the same +0 below (the first interval's p0 is +0),
+  // which the sign select at the end keeps either way.
+  Value x = math::AbsFOp::create(builder, operand);
 
   Value offset = offsets[0];
   Value p[polyDegree + 1];

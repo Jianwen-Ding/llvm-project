@@ -36,8 +36,7 @@
 // CHECK-DAG:     %[[val_cst_27:.*]] = arith.constant 2.000000e+00 : f32
 // CHECK-DAG:     %[[val_cst_28:.*]] = arith.constant 3.750000e+00 : f32
 // CHECK:         %[[val_0:.*]] = arith.cmpf olt, %[[val_arg0]], %[[val_cst]] : f32
-// CHECK:         %[[val_1:.*]] = arith.negf %[[val_arg0]] : f32
-// CHECK:         %[[val_2:.*]] = arith.select %[[val_0]], %[[val_1]], %[[val_arg0]] : f32
+// CHECK:         %[[val_2:.*]] = math.absf %[[val_arg0]] : f32
 // CHECK:         %[[val_3:.*]] = arith.cmpf olt, %[[val_2]], %[[val_cst_26]] : f32
 // CHECK:         %[[val_4:.*]] = arith.select %[[val_3]], %[[val_cst_1]], %[[val_cst_5]] : f32
 // CHECK:         %[[val_5:.*]] = arith.select %[[val_3]], %[[val_cst_14]], %[[val_cst_18]] : f32
@@ -193,7 +192,7 @@ func.func @erfc_scalar(%arg0: f32) -> f32 {
 // CHECK-SAME:                     %[[arg0:.*]]: vector<8xf32>) -> vector<8xf32> {
 // CHECK:           %[[zero:.*]] = arith.constant dense<0.000000e+00> : vector<8xf32>
 // CHECK-NOT:       erf
-// CHECK-COUNT-20:  select
+// CHECK-COUNT-19:  select
 // CHECK:           %[[res:.*]] = arith.select
 // CHECK:           return %[[res]] : vector<8xf32>
 // CHECK:         }
@@ -207,7 +206,7 @@ func.func @erf_vector(%arg0: vector<8xf32>) -> vector<8xf32> {
 // CHECK:           %[[zero:.*]] = arith.constant dense<0.000000e+00> : vector<[8]xf32>
 // CHECK-NOT:       erf
 // CHECK-NOT:       vector<8xf32>
-// CHECK-COUNT-20:  select {{.*}} : vector<[8]xi1>, vector<[8]xf32>
+// CHECK-COUNT-19:  select {{.*}} : vector<[8]xi1>, vector<[8]xf32>
 // CHECK:           %[[res:.*]] = arith.select {{.*}} : vector<[8]xi1>, vector<[8]xf32>
 // CHECK:           return %[[res]] : vector<[8]xf32>
 // CHECK:         }
