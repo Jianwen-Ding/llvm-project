@@ -231,6 +231,12 @@ gpu.module @shuffles {
     // CHECK: %[[XO:.*]] = llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M]]) : (i32, i16) -> i32
     // CHECK: llvm.select %{{.*}}, %[[XO]], %{{.*}} : i1, i32
     %xo, %okxo = gpu.shuffle xor %v, %o, %c32 : i32
+    // Down by a uniform offset of either sign: shuffle_down by it, or
+    // shuffle_up by its negation, by its sign (L15-E296).
+    // CHECK: %[[DN:.*]] = llvm.call @air.simd_shuffle_down.u.i32
+    // CHECK: %[[UP:.*]] = llvm.call @air.simd_shuffle_up.u.i32
+    // CHECK: llvm.select %{{.*}}, %[[DN]], %[[UP]] : i1, i32
+    %du, %okdu = gpu.shuffle down %v, %o, %c8 : i32
     // A per-thread mask: the general path, the lane it computes.
     // CHECK: %[[LD:.*]] = llvm.call @air.thread_index_in_simdgroup()
     // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
@@ -251,6 +257,8 @@ gpu.module @shuffles {
     memref.store %i8, %out[%c5] : memref<8xi32, 1>
     %c6 = arith.constant 6 : index
     memref.store %xd, %out[%c6] : memref<8xi32, 1>
+    %c7 = arith.constant 7 : index
+    memref.store %du, %out[%c7] : memref<8xi32, 1>
     gpu.return
   }
 }

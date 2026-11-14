@@ -479,14 +479,29 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
     // or shuffle_xor of it, the source lane being the lane or lane ^ mask
     // (past the SIMD-group: outside the segment), and the own value outside
     // the segment, as for a constant (L15-E286).
+    // Up and down by a uniform offset of either sign: AIR's shift by it, or
+    // the opposite shift by its negation where it is negative (the source
+    // lane lane -+ offset either way), selected by its sign (L15-E296).
     bool uniformOffset = false;
+    StringRef opposite;
     if (!offset && width && *width <= 32 && llvm::isPowerOf2_64(*width) &&
-        (op.getMode() == gpu::ShuffleMode::IDX ||
-         op.getMode() == gpu::ShuffleMode::XOR) &&
         op->hasAttr(kUniformOffsetAttr)) {
-      native = op.getMode() == gpu::ShuffleMode::IDX
-                   ? "air.simd_shuffle.u.i32"
-                   : "air.simd_shuffle_xor.u.i32";
+      switch (op.getMode()) {
+      case gpu::ShuffleMode::IDX:
+        native = "air.simd_shuffle.u.i32";
+        break;
+      case gpu::ShuffleMode::XOR:
+        native = "air.simd_shuffle_xor.u.i32";
+        break;
+      case gpu::ShuffleMode::UP:
+        native = "air.simd_shuffle_up.u.i32";
+        opposite = "air.simd_shuffle_down.u.i32";
+        break;
+      case gpu::ShuffleMode::DOWN:
+        native = "air.simd_shuffle_down.u.i32";
+        opposite = "air.simd_shuffle_up.u.i32";
+        break;
+      }
       ownOutside = uniformOffset = true;
     }
     if (width && offset && *offset >= 0 && *width <= 32 &&
@@ -539,8 +554,11 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
       Value belowEnd = LLVM::ICmpOp::create(
           rewriter, loc, LLVM::ICmpPredicate::slt, srcLane,
           LLVM::AddOp::create(rewriter, loc, i32, start, c(*width)));
-      valid = op.getMode() == gpu::ShuffleMode::UP     ? aboveStart
-              : op.getMode() == gpu::ShuffleMode::DOWN ? belowEnd
+      // (with a uniform offset of either sign, both bounds)
+      valid = !uniformOffset && op.getMode() == gpu::ShuffleMode::UP
+                  ? aboveStart
+              : !uniformOffset && op.getMode() == gpu::ShuffleMode::DOWN
+                  ? belowEnd
                                                        : LLVM::AndOp::create(
                                                              rewriter, loc,
                                                              aboveStart,
@@ -609,9 +627,25 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
                                     parts)))
       return rewriter.notifyMatchFailure(op, "cannot split value into i32");
     SmallVector<Value> shuffled;
-    for (Value part : parts)
-      shuffled.push_back(callAIR(rewriter, op, native, i32, {part, lane16},
-                                 AIREffects::Convergent));
+    Value nonNegative, negLane16;
+    if (!opposite.empty()) {
+      Value off = adaptor.getOffset();
+      Value zero32 = LLVM::ConstantOp::create(rewriter, loc, i32, 0);
+      nonNegative = LLVM::ICmpOp::create(rewriter, loc,
+                                         LLVM::ICmpPredicate::sge, off, zero32);
+      negLane16 = LLVM::TruncOp::create(
+          rewriter, loc, i16, LLVM::SubOp::create(rewriter, loc, zero32, off));
+    }
+    for (Value part : parts) {
+      Value v = callAIR(rewriter, op, native, i32, {part, lane16},
+                        AIREffects::Convergent);
+      if (!opposite.empty())
+        v = LLVM::SelectOp::create(
+            rewriter, loc, nonNegative, v,
+            callAIR(rewriter, op, opposite, i32, {part, negLane16},
+                    AIREffects::Convergent));
+      shuffled.push_back(v);
+    }
     Value result = LLVM::composeValue(rewriter, loc, shuffled,
                                       adaptor.getValue().getType());
     if (ownOutside)
