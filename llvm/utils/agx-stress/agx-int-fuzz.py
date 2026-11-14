@@ -83,6 +83,22 @@ def gen(seed):
     elif k<0.90:
       fn=R.choice(['uadd.sat','usub.sat','sadd.sat','ssub.sat']); b=pick(w)
       decl.add(f'declare {T} @llvm.{fn}.{T}({T}, {T})'); body.append(f'  {r} = call {T} @llvm.{fn}.{T}({T} {a[0]}, {T} {b[0]})'); ops.append((r,w,(fn,a[0],b[0])))
+    elif k<0.93:
+      # division by a variable positive odd divisor (no division by zero, no INT_MIN / -1)
+      b=pick(w); op=R.choice(['udiv','urem','sdiv','srem']); dm=nv(); d=nv()
+      body+=[f'  {dm} = and {T} {b[0]}, {(1<<(w-2))-1}', f'  {d} = or {T} {dm}, 1', f'  {r} = {op} {T} {a[0]}, {d}']
+      ops+=[(dm,w,('and',b[0],(1<<(w-2))-1)),(d,w,('or',dm,1)),(r,w,(op,a[0],d))]
+    elif k<0.96 and w==32:
+      # the high word of a 64-bit product (signed or unsigned)
+      b=pick(32); e=R.choice(['zext','sext']); x=nv(); y=nv(); p_=nv(); h=nv()
+      body+=[f'  {x} = {e} i32 {a[0]} to i64', f'  {y} = {e} i32 {b[0]} to i64', f'  {p_} = mul i64 {x}, {y}', f'  {h} = lshr i64 {p_}, 32', f'  {r} = trunc i64 {h} to i32']
+      ops+=[(x,64,(e,a[0],32)),(y,64,(e,b[0],32)),(p_,64,('mul',x,y)),(h,64,('lshr',p_,32)),(r,32,('trunc',h))]
+    elif k<0.98 and len(vals)>=2:
+      # an and / or of two compares into a select
+      b=pick(w); c1=nv(); c2=nv(); c=nv(); x=pick(w); y=pick(w)
+      p1,p2=R.choice(['slt','ult','eq','ne','sgt']),R.choice(['sle','ugt','eq','ne','uge']); lg=R.choice(['and','or'])
+      body+=[f'  {c1} = icmp {p1} {T} {a[0]}, {b[0]}', f'  {c2} = icmp {p2} {T} {b[0]}, {x[0]}', f'  {c} = {lg} i1 {c1}, {c2}', f'  {r} = select i1 {c}, {T} {x[0]}, {T} {y[0]}']
+      ops.append((r,w,('sel2',lg,p1,a[0],b[0],p2,b[0],x[0],x[0],y[0])))
     else:
       nw=R.choice([x for x in (8,16,32,64,64) if x!=w])
       if nw<w: body.append(f'  {r} = trunc {T} {a[0]} to i{nw}'); ops.append((r,nw,('trunc',a[0])))
@@ -126,12 +142,19 @@ def evaluate(ops, outs, inputs):
         p,a,b=op[1],g(op[2]),g(op[3]); sa,sb=sx(a,w),sx(b,w)
         c={'eq':a==b,'ne':a!=b,'slt':sa<sb,'sle':sa<=sb,'sgt':sa>sb,'sge':sa>=sb,'ult':a<b,'ule':a<=b,'ugt':a>b,'uge':a>=b}[p]
         v=g(op[4]) if c else g(op[5])
+      elif k=='sel2':
+        def cmp(p,a,b):
+          sa,sb=sx(a,w),sx(b,w)
+          return {'eq':a==b,'ne':a!=b,'slt':sa<sb,'sle':sa<=sb,'sgt':sa>sb,'sge':sa>=sb,'ult':a<b,'ule':a<=b,'ugt':a>b,'uge':a>=b}[p]
+        c1=cmp(op[2],g(op[3]),g(op[4])); c2=cmp(op[5],g(op[6]),g(op[7]))
+        c= (c1 and c2) if op[1]=='and' else (c1 or c2)
+        v=g(op[8]) if c else g(op[9])
       elif k in ('smin','smax','umin','umax'):
         a,b=g(op[1]),g(op[2])
         if k[0]=='s': v=(min if k=='smin' else max)(sx(a,w),sx(b,w))
         else: v=(min if k=='umin' else max)(a,b)
       elif k in ('udiv','urem','sdiv','srem'):
-        a,d=g(op[1]),op[2]
+        a,d=g(op[1]),g(op[2])
         if k=='udiv': v=a//d
         elif k=='urem': v=a%d
         else:
