@@ -149,15 +149,15 @@ single-thread semantics:
   disable-output-lane (the lane mask as a vector operand) and `ws` (collector
   buffer `b0`-`b3`, zero-column mask) variants are modelled the same way;
   only the newer `decompress_b` forms remain probe-derived.
-* TMA global-to-shared copies (`cp.async.bulk.tensor.g2s.{tile,im2col,
-  tile.gather4,im2col.w,im2col.w.128}`, default data-validity pattern) are
-  uninterpreted calls named by mode, dimension, cta group, multicast (16-
-  or 32-bit mask) and cache hint, derived independently from the intrinsic
-  (NVPTXUsage's flag description) and from the PTX opcode (`tma.py`);
-  operands in a canonical order (destination, tensor map, coordinates,
-  mbarrier, im2col offsets, mask, hint). The tensor map and the copy stay
-  opaque. The `.cta`, `override` and data-validity forms and the other TMA
-  directions remain probe-derived.
+* TMA (`cp.async.bulk.tensor` g2s and g2s `.cta`, s2g, `cp.reduce` with
+  the `red_op` table, and prefetch; tile, im2col, gather4/scatter4 and
+  im2col::w modes; default data-validity pattern) are uninterpreted calls
+  named by direction, mode, dimension, cta group, multicast (16- or 32-bit
+  mask), reduction and cache hint, derived independently from the intrinsic
+  (NVPTXUsage) and from the PTX opcode (`tma.py`; s2g/reduce `im2col` is
+  PTX `im2col_no_offs`); operands in PTX order. The tensor map and the copy
+  stay opaque. The `override` forms (tensor-map field overrides) and the
+  non-default data-validity patterns remain probe-derived.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -268,9 +268,9 @@ What remains opaque or unproved, and why:
 * Probe-derived opaque instructions are left for families without
   single-thread semantics a TV check could use: the `tcgen05.mma`
   `decompress_b` forms (not in NVPTXUsage; all other `tcgen05` operations
-  have documentation-derived models), TMA
-  (`cp.async.bulk.tensor`, `cp.reduce.async.bulk.tensor`) and
-  `tensormap.replace` (the tensor-map layout is not public), `multimem`
+  have documentation-derived models), the TMA
+  `override` and data-validity forms and `tensormap.replace` (the tensor-map
+  layout is not public), `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is
   modelled as a store, its single-memory meaning), texture/surface (opaque image state), `spcompress`
   (implementation-specific selection), `barrier.cluster`, `mapa`,
