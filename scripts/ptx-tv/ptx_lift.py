@@ -1850,8 +1850,11 @@ class Lifter:
     def fminmax(self, mods, ops, opc, is_min):
         t = self.types_of(mods)[0]
         fty = FPTY[t]
+        # PTX ISA semantics of min/max: a NaN operand yields the other operand,
+        # two NaNs give NaN, and -0.0 < +0.0 -- LLVM's minimumnum/maximumnum;
+        # with .NaN any NaN gives NaN -- minimum/maximum
         fn = ("minimum" if is_min else "maximum") if "NaN" in mods else \
-            ("minnum" if is_min else "maxnum")
+            ("minimumnum" if is_min else "maximumnum")
         args = [self.ftz_in(self.getf(o, t), fty, "ftz" in mods) for o in ops[1:]]
         if "xorsign" in mods:
             # min/max.xorsign.abs: |a| op |b| with sign bit sign(a) ^ sign(b)
