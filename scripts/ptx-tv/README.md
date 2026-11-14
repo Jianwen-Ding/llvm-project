@@ -224,6 +224,32 @@ packing of `spdecompress` operands, and that an `e2m1x2`
 value and a single `ue8m0` scale (`.scale.n1`) occupy the low 8 bits of the
 intrinsics' `i16` operands/results.
 
+## Coverage limits
+
+What remains opaque or unproved, and why:
+
+* Probe-derived opaque instructions are left for families without
+  single-thread semantics a TV check could use: `tcgen05` (warp/CTA
+  collective tensor-memory and tensor-core operations), TMA
+  (`cp.async.bulk.tensor`, `cp.reduce.async.bulk.tensor`) and
+  `tensormap.replace` (the tensor-map layout is not public), `multimem`
+  (multi-device), texture/surface (opaque image state), `spcompress`
+  (implementation-specific selection), `barrier.cluster`, `mapa`,
+  `getctarank`, `clusterlaunchcontrol`, `pmevent`, `griddepcontrol`.
+  `applypriority` stays opaque on purpose (as a no-op the address and
+  eviction policy would go unchecked). Non-tensor `cp.reduce.async.bulk`
+  has single-thread semantics but a runtime element count; like the
+  symbolic-size bulk copies (which already time out with copy semantics),
+  Alive2 cannot prove it without bounded unrolling.
+* Solver timeouts: mostly floating point (f16/bf16 done in f32, directed
+  rounding, mixed precision). Larger budgets, the weaker
+  `--disable-poison-input` check, element-wise vector accesses, per-lane
+  checks, stricter sources and other solver seeds each recover only a few
+  percent of them.
+* Inconclusive: transcendental functions (`llvm.exp2`, `llvm.log2`,
+  `llvm.sin`, ...) and fast-math flags Alive2 approximates where the proof
+  against the stricter source does not go through.
+
 ## Known false-alarm classes (labelled automatically)
 
 * `partword-atomic-word-access`: sub-word atomics expanded into a CAS loop on
