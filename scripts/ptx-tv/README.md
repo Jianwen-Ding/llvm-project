@@ -101,7 +101,9 @@ single-thread semantics:
   from the PTX opcode and the NVVM intrinsic (`mbar.py`); defaults that one
   side spells out (scope `.cta`, the default semantics of each operation,
   layout `v0`) are dropped.
-* Fences (including `fence.proxy.*`) and prefetches are no-ops; the source's
+* Fences (including `fence.proxy.*` and the `wgmma` fence/commit/wait
+  operations, which only order the opaque asynchronous MMA) and prefetches
+  are no-ops; the source's
   fence/prefetch intrinsics are removed accordingly. `fma.rn.oob` is
   uninterpreted.
 * Asynchronous copies get their documented single-thread semantics, as

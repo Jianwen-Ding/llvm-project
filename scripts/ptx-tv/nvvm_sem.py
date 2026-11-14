@@ -313,7 +313,8 @@ def expand(text, lifter_mod, llc_args=None):
             ty = re.sub(r"\b(noundef|immarg|signext|zeroext|inreg)\b", "", ty).strip()
             args.append((ty, val))
         # memory barriers: no-ops under single-thread semantics (as in tgt)
-        if re.fullmatch(r"membar\.\w+|fence\.[\w.]+|prefetch\.[\w.]+|prefetchu\.[\w.]+", name) \
+        if re.fullmatch(r"membar\.\w+|fence\.[\w.]+|prefetch\.[\w.]+|prefetchu\.[\w.]+|"
+                        r"wgmma\.(fence|commit_group|wait_group)\.sync\.aligned", name) \
                 and not re.match(r"\s*%", line):
             removed = True
             continue

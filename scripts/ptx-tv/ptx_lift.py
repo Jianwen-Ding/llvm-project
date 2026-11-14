@@ -1012,6 +1012,8 @@ class Lifter:
             raise Unsupported("opcode " + opcode)
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
                     "spdecompress", "multimem") or \
+                (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
+                                                     "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)):
             return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
@@ -2349,6 +2351,15 @@ class Lifter:
             raise Unsupported("opcode " + opc)
         p = self.address(ops[0], "global" if "global" in mods else "generic")
         self.emit(discard_ir(p))
+
+    def i_wgmma(self, mods, ops, opc):
+        """wgmma.fence / commit_group / wait_group (.sync.aligned) only order
+        the asynchronous warpgroup MMA (itself opaque): no-ops under
+        single-thread semantics, like the other fences."""
+        if mods in (["fence", "sync", "aligned"], ["commit_group", "sync", "aligned"],
+                    ["wait_group", "sync", "aligned"]):
+            return
+        raise Unsupported("opcode " + opc)
 
     def i_multimem(self, mods, ops, opc):
         """multimem.st.async.release.{sys,gpu}.global.T [a], v: a store to every

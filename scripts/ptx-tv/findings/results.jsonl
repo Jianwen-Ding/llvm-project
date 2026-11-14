@@ -4127,9 +4127,9 @@
 {"function": "tcgen05_mma_ws_ti16_b1_b2_b3", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_ws_ti16_zero_col_mask", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_ws_sp_ti16_zero_col_mask", "probe": true, "status": "correct", "file": "tcgen05-mma-ti16-kind.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "test_wgmma_fence_sync_aligned", "probe": true, "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
-{"function": "test_wgmma_commit_group_sync_aligned", "probe": true, "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
-{"function": "test_wgmma_wait_group_sync_aligned", "probe": true, "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
+{"function": "test_wgmma_fence_sync_aligned", "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
+{"function": "test_wgmma_commit_group_sync_aligned", "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
+{"function": "test_wgmma_wait_group_sync_aligned", "status": "correct", "file": "wgmma-sm90a-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_90a -mattr=+ptx80"}
 {"function": "tcgen05_mma_collector_b_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_f16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_collector_b_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
