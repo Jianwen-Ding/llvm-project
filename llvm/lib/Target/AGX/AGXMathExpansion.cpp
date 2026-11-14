@@ -275,7 +275,8 @@ public:
   /// reciprocal step would be a NaN), without the general division.
   Value *quarterOver(Value *H) {
     Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {H});
-    Value *Y = HalfResult && HalfFastHyperbolic
+    // (a half or bfloat result: no Newton step, L15-E329, E338)
+    Value *Y = NarrowResult && HalfFastHyperbolic
                    ? Y0
                    : fma(fma(B.CreateFNeg(H), Y0, k(1.0)), Y0, Y0);
     // (a half result is infinite from h = 2^16: no select)
@@ -328,7 +329,7 @@ public:
     // special cases.
     Value *D = add(S, k(1.0));
     Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
-    Value *Y = HalfResult && HalfFastHyperbolic
+    Value *Y = NarrowResult && HalfFastHyperbolic
                    ? Y0
                    : fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
     Value *Big = copysign(sub(k(1.0), mul(k(2.0), Y)), X);
