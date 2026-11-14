@@ -32,6 +32,7 @@
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
@@ -404,6 +405,11 @@ namespace {
 /// instructions. Their scalar evolution of a kernel with millions of
 /// instructions (Blender Cycles' shade_shadow, everything inlined) took
 /// gigabytes, for address arithmetic sharing meant for unrolled tiles.
+static cl::opt<bool> AGXFarOffsetIndices(
+    "agx-far-offset-indices", cl::init(true), cl::Hidden,
+    cl::desc("a device address's constant offset past the immediate index as "
+             "a 32-bit index add"));
+
 class AGXStraightLineSRPass : public FunctionPass {
   TargetMachine *TM;
   unsigned Level;
@@ -466,9 +472,64 @@ public:
         }
       }
     }
+    if (AGXFarOffsetIndices)
+      Changed |= farOffsetIndices(F);
     for (WeakVH &V : Ranged)
       if (auto *CI = dyn_cast_or_null<CallBase>(V))
         CI->removeRetAttr(Attribute::Range);
+    return Changed;
+  }
+
+  /// gep i8 (gep T, B, zext(t)), C, whose C / sizeof(T) is past the device
+  /// accesses' signed 16-bit immediate index (the rows of a 2-D buffer at a
+  /// thread's column, which the passes above made the neighbour's address
+  /// plus C): gep T, B, zext(t + C / sizeof(T)), the 32-bit add not wrapping
+  /// by t's range (with the thread bounds still on), so that the access
+  /// takes B and the index register instead of a 64-bit address and add per
+  /// row (L15-E291).
+  static bool farOffsetIndices(Function &F) {
+    using namespace PatternMatch;
+    const DataLayout &DL = F.getDataLayout();
+    bool Changed = false;
+    for (Instruction &I : make_early_inc_range(instructions(F))) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      if (!G || G->getNumIndices() != 1 ||
+          !G->getSourceElementType()->isIntegerTy(8))
+        continue;
+      auto *CI = dyn_cast<ConstantInt>(G->getOperand(1));
+      auto *P = dyn_cast<GetElementPtrInst>(G->getPointerOperand());
+      Value *T;
+      if (!CI || !P || P->getNumIndices() != 1 ||
+          !match(P->getOperand(1), m_ZExt(m_Value(T))) ||
+          !T->getType()->isIntegerTy(32) ||
+          G->getPointerAddressSpace() != 1)
+        continue;
+      TypeSize Size = DL.getTypeAllocSize(P->getSourceElementType());
+      if (Size.isScalable() || Size.getFixedValue() == 0)
+        continue;
+      int64_t S = Size.getFixedValue(), C = CI->getSExtValue();
+      if (C % S || isInt<16>(C / S))
+        continue;
+      int64_t K = C / S;
+      ConstantRange R = computeConstantRange(T, /*ForSigned=*/false,
+                                             SimplifyQuery(DL, G));
+      if (R.isFullSet() ||
+          (K > 0 && R.getUnsignedMax().getZExtValue() + uint64_t(K) >
+                        uint64_t(UINT32_MAX)) ||
+          (K < 0 && R.getUnsignedMin().getZExtValue() < uint64_t(-K)))
+        continue;
+      IRBuilder<> B(G);
+      Value *Idx = B.CreateAdd(T, B.getInt32(uint32_t(K)), "",
+                               /*HasNUW=*/K > 0, /*HasNSW=*/false);
+      Value *NG = B.CreateGEP(P->getSourceElementType(),
+                              P->getPointerOperand(),
+                              B.CreateZExt(Idx, P->getOperand(1)->getType()),
+                              "", G->getNoWrapFlags() & P->getNoWrapFlags());
+      NG->takeName(G);
+      G->replaceAllUsesWith(NG);
+      G->eraseFromParent();
+      Changed = true;
+    }
     return Changed;
   }
 };
