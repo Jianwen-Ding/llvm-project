@@ -240,6 +240,9 @@ def prepare_source(path, workdir):
                   r"alias\.scope|noalias|llvm\.access\.group|llvm\.loop|prof|annotation|"
                   r"srcloc|nvvm\.[\w.]+)\s+![\w.]+", "", text)
     text = rewrite_i1_fp(text)
+    text = resolve_nvvm_reflect(text, workdir)
+    text = rewrite_counters(text)
+    text = expand_fp_reductions(text)
     # stack save/restore: opaque calls (the lifter emits the same)
     text = re.sub(r"@llvm\.stacksave(\.p\d+)?\(", "@ptx.stacksave(", text)
     text = re.sub(r"@llvm\.stackrestore(\.p\d+)?\(", "@ptx.stackrestore(", text)
@@ -252,6 +255,109 @@ def prepare_source(path, workdir):
     if rc:
         raise RuntimeError("renamed source does not verify: " + err[-300:])
     return src, text
+
+
+def resolve_nvvm_reflect(text, workdir):
+    """__nvvm_reflect("P") calls as the constants NVPTXUsage documents:
+    __CUDA_FTZ from the "nvvm-reflect-ftz" module flag, __CUDA_ARCH the
+    target's SM version times 10 (the CUDA __CUDA_ARCH__ convention; the
+    target is read from the PTX's .target line), everything else 0."""
+    if "@__nvvm_reflect(" not in text:
+        return text
+    strs = {}
+    for m in re.finditer(r'^@("[^"]*"|[-\w$.]+)\s*=[^\n]*\bc"([^"]*)\\00"', text, re.M):
+        strs[m.group(1)] = m.group(2)
+    ftz = re.search(r'!\{i32 \d+, !"nvvm-reflect-ftz", i32 (\d+)\}', text)
+    arch = 0
+    try:
+        tm = re.search(r"^\s*\.target\s+sm_(\d+)", open(os.path.join(workdir, "out.ptx")).read(), re.M)
+        arch = int(tm.group(1)) * 10 if tm else 0
+    except OSError:
+        pass
+    vals = {"__CUDA_FTZ": int(ftz.group(1)) if ftz else 0, "__CUDA_ARCH": arch}
+
+    def sub(m):
+        g = re.search(r'@("[^"]*"|[-\w$.]+)', m.group(3))
+        if not g or g.group(1) not in strs:
+            return m.group(0)
+        return "%s%s = add i32 %d, 0" % (m.group(1), m.group(2), vals.get(strs[g.group(1)], 0))
+    return re.sub(r"^(\s*)(%[\w.$-]+) = (?:tail )?call i32 @__nvvm_reflect\((.*)\)\s*$",
+                  sub, text, flags=re.M)
+
+
+COUNTERS = {"readcyclecounter": "clock64", "readsteadycounter": "globaltimer"}
+
+
+def rewrite_counters(text):
+    """llvm.readcyclecounter/readsteadycounter are target-specific counters
+    (LangRef); NVPTX reads %clock64 / %globaltimer (an assumption taken from
+    the backend), which the lifter models as opaque special-register reads."""
+    for intr, sreg in COUNTERS.items():
+        if "@llvm.%s(" % intr not in text:
+            continue
+        text = re.sub(r"^declare [^\n]*@llvm\.%s\(\)[^\n]*\n?" % intr, "", text, flags=re.M)
+        text = text.replace("@llvm.%s(" % intr, "@nvvm.read.ptx.sreg.%s(" % sreg)
+        if not re.search(r"^declare [^\n]*@nvvm\.read\.ptx\.sreg\.%s\(" % sreg, text, re.M):
+            text += ("\ndeclare i64 @nvvm.read.ptx.sreg.%s() nounwind willreturn "
+                     "memory(inaccessiblemem: readwrite)\n" % sreg)
+    return text
+
+
+RED_OPS = {"fadd": ("fadd", True), "fmul": ("fmul", True),
+           "fmax": ("llvm.maxnum", False), "fmin": ("llvm.minnum", False),
+           "fmaximum": ("llvm.maximum", False), "fminimum": ("llvm.minimum", False),
+           "fmaximumnum": ("llvm.maximumnum", False), "fminimumnum": ("llvm.minimumnum", False)}
+
+
+def expand_fp_reductions(text):
+    """llvm.vector.reduce.f* as the sequential scalar operations LangRef
+    defines (fadd/fmul in order from the start value; with `reassoc` any
+    order is allowed, which Alive2 approximates either way).  Alive2 does
+    not know these intrinsics."""
+    if "@llvm.vector.reduce.f" not in text:
+        return text
+    out, decls = [], set()
+    pat = re.compile(r"^(\s*)(%[\w.$-]+) = (?:tail )?call ((?:(?:fast|nnan|ninf|nsz|arcp|contract|afn|"
+                     r"reassoc)\s+)*)(half|bfloat|float|double) @llvm\.vector\.reduce\.(\w+)\.v(\d+)\w+\("
+                     r"(.*)\)\s*$")
+    for line in text.split("\n"):
+        m = pat.match(line)
+        if not m or m.group(5) not in RED_OPS:
+            out.append(line)
+            continue
+        ind, res, fmf, t, kind, n, argtext = m.groups()
+        n = int(n)
+        args = [a.strip() for a in argtext.split(",")]
+        opname, has_start = RED_OPS[kind]
+        if has_start:
+            if len(args) != 2:
+                out.append(line)
+                continue
+            acc = args[0].split()[-1]
+            vec = args[1].split()[-1]
+            first = 0
+        else:
+            vec = args[0].split()[-1]
+            out.append("%s%s.e0 = extractelement <%d x %s> %s, i32 0" % (ind, res, n, t, vec))
+            acc = "%s.e0" % res
+            first = 1
+        for k in range(first, n):
+            e = "%s.e%d" % (res, k)
+            if k:
+                out.append("%s%s = extractelement <%d x %s> %s, i32 %d" % (ind, e, n, t, vec, k))
+            else:
+                out.append("%s%s = extractelement <%d x %s> %s, i32 0" % (ind, e, n, t, vec))
+            dst = res if k == n - 1 else "%s.a%d" % (res, k)
+            if opname.startswith("llvm."):
+                iname = "%s.%s" % (opname, {"half": "f16", "bfloat": "bf16", "float": "f32", "double": "f64"}[t])
+                decls.add("declare %s @%s(%s, %s)" % (t, iname, t, t))
+                out.append("%s%s = call %s%s @%s(%s %s, %s %s)" % (ind, dst, fmf, t, iname, t, acc, t, e))
+            else:
+                out.append("%s%s = %s %s%s %s, %s" % (ind, dst, opname, fmf, t, acc, e))
+            acc = dst
+    have = set(re.findall(r"^declare [^@]*@([\w.$\"-]+)\(", text, re.M))
+    out += [d for d in sorted(decls) if re.search(r"@([\w.]+)\(", d).group(1) not in have]
+    return "\n".join(out)
 
 
 FP_ONE = {"half": ("0xH3C00", "0xHBC00"), "bfloat": ("0xR3F80", "0xRBF80"),
