@@ -329,6 +329,58 @@ def expand(text, lifter_mod, llc_args=None):
                 and not re.match(r"\s*%", line):
             removed = True
             continue
+        cl = prio._cluster(name, args)
+        if cl:
+            toks, keep, has_res = cl
+            ret = call_ret_type(line, m.start()) if has_res else "void"
+            res_m = re.match(r"\s*(%[\w.$-]+)\s*=", line)
+            short = llc_args is not None and any("short-ptr" in a or "shortptr" in a for a in llc_args)
+            ok = ret is not None and (not has_res or res_m)
+            tys = []
+            for i in keep:
+                t = args[i][0]
+                tys.append("i128" if t == "i128" else "i64")
+            if ok:
+                kname = prio.name_of(toks) + ".n" + "_".join(tys) + (".r" if has_res else "")
+                key_ = ("cluster", name, tuple(args), ret)
+                if key_ not in defs:
+                    fname = "ptxtv_sem_%d_cl" % len(defs)
+                    w = ["define internal %s @%s(%s) alwaysinline {" % (
+                        ret, fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+                    cargs = []
+                    for i, it in zip(keep, tys):
+                        t = args[i][0]
+                        if t.startswith("ptr"):
+                            narrow = re.match(r"ptr addrspace\((3|6|7)\)", t) and short
+                            w.append("  %%p%d = ptrtoint %s %%y%d to %s" % (i, t, i, "i32" if narrow else "i64"))
+                            w.append(("  %%c%d = zext i32 %%p%d to i64" if narrow else "  %%c%d = add i64 %%p%d, 0") % (i, i))
+                        elif t in ("i64", "i128"):
+                            w.append("  %%c%d = add %s %%y%d, 0" % (i, t, i))
+                        else:
+                            w.append("  %%c%d = zext %s %%y%d to i64" % (i, t, i))
+                        cargs.append("%s %%c%d" % (it, i))
+                    rty = "i64" if has_res else "void"
+                    call = "call %s @%s(%s)" % (rty, kname, ", ".join(cargs))
+                    if not has_res:
+                        w += ["  " + call, "  ret void"]
+                    else:
+                        w.append("  %r = " + call)
+                        if ret.startswith("ptr"):
+                            narrow = re.match(r"ptr addrspace\((3|6|7)\)", ret) and short
+                            if narrow:
+                                w.append("  %r32 = trunc i64 %r to i32")
+                                w.append("  %%o = inttoptr i32 %%r32 to %s" % ret)
+                            else:
+                                w.append("  %%o = inttoptr i64 %%r to %s" % ret)
+                        else:
+                            w.append("  %%o = trunc i64 %%r to %s" % ret)
+                        w.append("  ret %s %%o" % ret)
+                    w.append("}")
+                    defs[key_] = (fname, "\n".join(w),
+                                  {kname: "declare %s @%s(%s) nounwind" % (rty, kname, ", ".join(tys))})
+                line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                out_lines.append(line)
+                continue
         pr = prio.intrinsic(name, args)
         if pr and not re.match(r"\s*%", line):
             toks, keep = pr

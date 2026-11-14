@@ -165,6 +165,13 @@ single-thread semantics:
   named by their documented modifiers (`prio.py`; evict_policy 0 =
   `evict_normal`, 1 = `evict_last`), operands as zero-extended i64; the
   eviction-priority tensor prefetch is part of `tma.py`.
+* `tensormap.replace` (all documented fields; `.p1`/`.p3` = `.global`/
+  `.shared::cta`) and the cluster/grid operations (`barrier.cluster`,
+  `griddepcontrol`, `pmevent.mask`, `clusterlaunchcontrol.try_cancel` and
+  `query_cancel`, `getctarank`, `mapa`) are uninterpreted calls keyed by
+  their documented modifiers (`prio.py`), operands as zero-extended i64
+  (the 128-bit cluster-launch-control handle as i128), results returned as
+  i64 and truncated to the destination.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -276,11 +283,9 @@ What remains opaque or unproved, and why:
 * Probe-derived opaque instructions are left for families without
   single-thread semantics a TV check could use: the `tcgen05.mma`
   `decompress_b` forms (not in NVPTXUsage; all other `tcgen05` operations
-  have documentation-derived models), `tensormap.replace` (the tensor-map layout is not
-  public), `multimem`
+  have documentation-derived models),  `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is
-  modelled as a store, its single-memory meaning), texture/surface (opaque image state), `barrier.cluster`, `mapa`,
-  `getctarank`, `clusterlaunchcontrol`, `pmevent`, `griddepcontrol`.
+  modelled as a store, its single-memory meaning), texture/surface (opaque image state).
  Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
   symbolic-size bulk copies (which already time out with copy semantics),

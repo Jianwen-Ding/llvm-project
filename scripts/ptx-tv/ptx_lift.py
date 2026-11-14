@@ -1011,7 +1011,9 @@ class Lifter:
         if h is None:
             raise Unsupported("opcode " + opcode)
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
-                    "spdecompress", "spcompress", "multimem", "applypriority") or \
+                    "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
+                    "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa") or \
+                (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
@@ -2505,6 +2507,67 @@ class Lifter:
         self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(vals))))
         self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
 
+    def cluster_call(self, base, mods, ops, opc):
+        """Keyed cluster/grid operation (prio.cluster_ptx); operands as
+        zero-extended i64 (128-bit as i128), result as i64 truncated to the
+        destination register."""
+        import prio
+        r = prio.cluster_ptx(base, mods, ops)
+        if r is None:
+            raise Unsupported("opcode " + opc)
+        toks, flat, res = r
+        vals, tys = [], []
+        for o in flat:
+            br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+            x = br.group(1) if br else o
+            if x in self.regs and self.regs[x] == 128:
+                vals.append("i128 %s" % self.get(x, 128))
+                tys.append("i128")
+            elif x in self.regs and self.regs[x] > 1:
+                w = self.regs[x]
+                v = self.get(x, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+                tys.append("i64")
+            elif self.imm(x) is not None:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+                tys.append("i64")
+            else:
+                raise Unsupported("operand " + opc)
+        kname = prio.name_of(toks) + ".n" + "_".join(tys) + (".r" if res else "")
+        rty = "i64" if res else "void"
+        self.declare(kname, "declare %s @%s(%s) nounwind" % (rty, kname, ", ".join(tys)))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if res is None:
+            self.emit(call)
+            return
+        v = self.op(call)
+        w = self.regs.get(res)
+        if w is None:
+            raise Unsupported("result " + opc)
+        self.write(res, self.resize(v, 64, w, False) if w != 64 else v, w)
+
+    def i_griddepcontrol(self, mods, ops, opc):
+        return self.cluster_call("griddepcontrol", mods, ops, opc)
+
+    def i_pmevent(self, mods, ops, opc):
+        return self.cluster_call("pmevent", mods, ops, opc)
+
+    def i_clusterlaunchcontrol(self, mods, ops, opc):
+        return self.cluster_call("clusterlaunchcontrol", mods, ops, opc)
+
+    def i_getctarank(self, mods, ops, opc):
+        return self.cluster_call("getctarank", mods, ops, opc)
+
+    def i_mapa(self, mods, ops, opc):
+        return self.cluster_call("mapa", mods, ops, opc)
+
+    def i_tensormap(self, mods, ops, opc):
+        import prio
+        pr = prio.ptx("tensormap", mods, ops)
+        if pr is None:
+            raise Unsupported("opcode " + opc)
+        return self.prio_call(pr, opc)
+
     def i_applypriority(self, mods, ops, opc):
         import prio
         pr = prio.ptx("applypriority", mods, ops)
@@ -2905,6 +2968,8 @@ class Lifter:
         self.barrier(mods, ops, opc, True)
 
     def i_barrier(self, mods, ops, opc):
+        if mods[:1] == ["cluster"]:
+            return self.cluster_call("barrier", mods, ops, opc)
         self.barrier(mods, ops, opc, "aligned" in mods)
 
     def barrier(self, mods, ops, opc, aligned):

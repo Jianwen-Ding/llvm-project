@@ -35,7 +35,79 @@ def intrinsic(name, args):
     return _intrinsic(name, args)
 
 
+TM_FIELDS = {"global.address", "rank", "global.stride", "element.stride", "global.dim", "box.dim",
+             "elemtype", "interleave.layout", "swizzle.mode", "swizzle.atomicity", "fill.mode"}
+
+
+def _tensormap(name):
+    m = re.fullmatch(r"tensormap\.replace\.(.+)\.p([013])", name)
+    if not m or m.group(1) not in TM_FIELDS:
+        return None
+    return {"tmreplace", "f_" + m.group(1).replace(".", "_"),
+            {"0": "generic", "1": "global", "3": "shared"}[m.group(2)]}
+
+
+def _cluster(name, args):
+    """(tokens, keep, has_result) for the cluster/grid operations."""
+    m = re.fullmatch(r"barrier\.cluster\.(arrive|wait)(\.relaxed)?(\.aligned)?", name)
+    if m and not args:
+        return {"bcluster", m.group(1)} | ({"relaxed"} if m.group(2) else set()) | \
+            ({"aligned"} if m.group(3) else set()), [], False
+    m = re.fullmatch(r"griddepcontrol\.(launch\.dependents|wait)", name)
+    if m and not args:
+        return {"griddep", m.group(1).replace(".", "_")}, [], False
+    if name == "pm.event.mask" and len(args) == 1:
+        return {"pmevent_mask"}, [0], False
+    m = re.fullmatch(r"clusterlaunchcontrol\.try_cancel\.async(\.multicast)?\.shared", name)
+    if m and len(args) == 2:
+        return {"clc_try_cancel"} | ({"multicast"} if m.group(1) else set()), [0, 1], False
+    m = re.fullmatch(r"clusterlaunchcontrol\.query_cancel\.(is_canceled|get_first_ctaid\.[xyz])", name)
+    if m and len(args) == 1:
+        return {"clc_query", m.group(1).replace(".", "_")}, [0], True
+    m = re.fullmatch(r"(getctarank|mapa)(\.shared\.cluster)?", name)
+    if m and len(args) == (1 if m.group(1) == "getctarank" else 2):
+        return {m.group(1)} | ({"shared_cluster"} if m.group(2) else set()), list(range(len(args))), True
+    return None
+
+
+def cluster_ptx(base, mods, ops):
+    """(tokens, operand texts, result register or None) or None."""
+    flat = tma._flatten(ops)
+    if base == "barrier" and mods[:1] == ["cluster"] and len(mods) >= 2 and mods[1] in ("arrive", "wait") \
+            and set(mods[2:]) <= {"relaxed", "aligned"} and not flat:
+        return {"bcluster", mods[1]} | set(mods[2:]), [], None
+    if base == "griddepcontrol" and mods in (["launch_dependents"], ["wait"]) and not flat:
+        return {"griddep", mods[0]}, [], None
+    if base == "pmevent" and mods == ["mask"] and len(flat) == 1:
+        return {"pmevent_mask"}, flat, None
+    if base == "clusterlaunchcontrol":
+        if mods[:3] == ["try_cancel", "async", "shared::cta"] and mods[3] == "mbarrier::complete_tx::bytes" \
+                and mods[-1] == "b128" and mods[4:-1] in ([], ["multicast::cluster::all"]):
+            return {"clc_try_cancel"} | ({"multicast"} if mods[4:-1] else set()), flat, None
+        if mods[:1] == ["query_cancel"] and len(flat) == 2:
+            q = mods[1]
+            if q == "is_canceled" and mods[2:] == ["pred", "b128"]:
+                return {"clc_query", "is_canceled"}, flat[1:], flat[0]
+            mm = re.fullmatch(r"get_first_ctaid::([xyz])", q)
+            if mm and mods[2:] == ["b32", "b128"]:
+                return {"clc_query", "get_first_ctaid_" + mm.group(1)}, flat[1:], flat[0]
+        return None
+    if base in ("getctarank", "mapa"):
+        rest = mods
+        t = {base}
+        if rest and rest[0] == "shared::cluster":
+            t.add("shared_cluster")
+            rest = rest[1:]
+        if rest not in (["u32"], ["u64"]) or len(flat) != (2 if base == "getctarank" else 3):
+            return None
+        return t, flat[1:], flat[0]
+    return None
+
+
 def _intrinsic(name, args):
+    tm = _tensormap(name)
+    if tm:
+        return tm, list(range(len(args)))
     v = [x for _, x in args]
     m = re.fullmatch(r"applypriority(\.global)?\.L2\.evict\.normal", name)
     if m and len(args) == 2 and v[1] == "128":
@@ -69,6 +141,18 @@ def _intrinsic(name, args):
 def ptx(base, mods, ops):
     """(tokens, operand texts in PTX order) or None."""
     flat = tma._flatten(ops)
+    if base == "tensormap" and len(mods) >= 5 and mods[:2] == ["replace", "tile"]:
+        f = mods[2]
+        if f.replace("_", ".") not in TM_FIELDS:
+            return None
+        rest = mods[3:]
+        sp = "generic"
+        if rest and rest[0] in ("global", "shared::cta"):
+            sp = "global" if rest[0] == "global" else "shared"
+            rest = rest[1:]
+        if len(rest) != 2 or rest[0] != "b1024" or rest[1] not in ("b32", "b64"):
+            return None
+        return {"tmreplace", "f_" + f, sp}, flat
     if base == "applypriority":
         if mods in (["L2::evict_normal"], ["global", "L2::evict_normal"]):
             if len(flat) == 2 and flat[1] == "128":
