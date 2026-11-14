@@ -13,8 +13,7 @@ define agx_kernel void @c16(ptr addrspace(1) %p, i16 %a) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bitop 0101, r1, u2l, 0
-; CHECK-NEXT:    ffs r1, r1
+; CHECK-NEXT:    ffs r1, u2l
 ; CHECK-NEXT:    isub r1, 15, r1
 ; CHECK-NEXT:    device_store 0, i16, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
@@ -64,8 +63,7 @@ define agx_kernel void @c8(ptr addrspace(1) %p, i8 %a) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    and r1l, u2l, 255
-; CHECK-NEXT:    bitop 0101, r1, r1l, 0
-; CHECK-NEXT:    ffs r1, r1
+; CHECK-NEXT:    ffs r1, r1l
 ; CHECK-NEXT:    isub r1, 15, r1
 ; CHECK-NEXT:    isub r1l, r1l, 8
 ; CHECK-NEXT:    device_store 0, i8, x, r1l, u0_u1, 0, signed
@@ -118,8 +116,7 @@ define agx_kernel void @t16z(ptr addrspace(1) %p, i16 %a) {
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    isub r1l, u2l, 1
 ; CHECK-NEXT:    bitop 0100, r1l, r1l, u2l
-; CHECK-NEXT:    bitop 0101, r1, r1l, 0
-; CHECK-NEXT:    popcount r1, r1
+; CHECK-NEXT:    popcount r1, r1l
 ; CHECK-NEXT:    device_store 0, i16, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -137,16 +134,13 @@ define agx_kernel void @t16z(ptr addrspace(1) %p, i16 %a) {
 define agx_kernel void @t16(ptr addrspace(1) %p, i16 %a) {
 ; CHECK-LABEL: t16:
 ; CHECK:         // uniform registers: 12 x 16-bit (threadgroups_per_grid at u3)
-; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 2 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bitop 0101, r1, u2l, 0
-; CHECK-NEXT:    mov_imm r2, 65536
-; CHECK-NEXT:    or r1, r1, r2
-; CHECK-NEXT:    bitrev r1, r1
-; CHECK-NEXT:    ffs r1, r1
-; CHECK-NEXT:    isub r1, 31, r1
+; CHECK-NEXT:    isub r1l, u2l, 1
+; CHECK-NEXT:    bitop 0100, r1l, r1l, u2l
+; CHECK-NEXT:    popcount r1, r1l
 ; CHECK-NEXT:    device_store 0, i16, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

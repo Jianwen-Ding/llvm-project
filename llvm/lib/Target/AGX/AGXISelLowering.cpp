@@ -68,6 +68,11 @@ static cl::opt<bool> AGXWordShifts128(
     "agx-word-shifts-128", cl::init(true), cl::Hidden,
     cl::desc("Variable 128-bit shifts on the 32-bit words"));
 
+static cl::opt<bool> CttzHalfPopcount(
+    "agx-cttz16-popcount",
+    cl::desc("16-bit cttz as the popcount of (x - 1) & ~x"), cl::init(true),
+    cl::Hidden);
+
 AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                                      const AGXSubtarget &ST)
     : TargetLowering(TM, ST), ST(ST) {
@@ -173,6 +178,11 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // once instead of twice.)
   setOperationAction({ISD::CTPOP, ISD::CTLZ, ISD::CTTZ, ISD::CTLZ_ZERO_POISON},
                      MVT::i16, Promote);
+  // cttz of 16 bits as popcount((x - 1) & ~x) in 16 bits (16 for 0), the
+  // popcount reading the 16-bit register (L15-E361), instead of the
+  // promotion's or of 2^16, bitrev, ffs and subtraction.
+  if (CttzHalfPopcount)
+    setOperationAction(ISD::CTTZ, MVT::i16, Custom);
   setOperationAction({ISD::CTLZ, ISD::CTTZ}, MVT::i64, Custom);
   // Averages without the widened addition (a 64-bit add on the wide issue
   // slot): (a & b) + ((a ^ b) >> 1), and (a | b) - ((a ^ b) >> 1) rounding
@@ -830,7 +840,22 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
   case ISD::MUL:
     return lowerMUL64(Op, DAG);
   case ISD::CTLZ:
+    return lowerCTLZ_CTTZ64(Op, DAG);
   case ISD::CTTZ:
+    if (Op.getValueType() == MVT::i16) {
+      SDLoc DL(Op);
+      SDValue X = Op.getOperand(0);
+      SDValue Low = DAG.getNode(
+          ISD::AND, DL, MVT::i16,
+          DAG.getNode(ISD::XOR, DL, MVT::i16, X,
+                      DAG.getAllOnesConstant(DL, MVT::i16)),
+          DAG.getNode(ISD::SUB, DL, MVT::i16, X,
+                      DAG.getConstant(1, DL, MVT::i16)));
+      return DAG.getNode(
+          ISD::TRUNCATE, DL, MVT::i16,
+          DAG.getNode(ISD::CTPOP, DL, MVT::i32,
+                      DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i32, Low)));
+    }
     return lowerCTLZ_CTTZ64(Op, DAG);
   case ISD::AVGFLOORU:
   case ISD::AVGCEILU:

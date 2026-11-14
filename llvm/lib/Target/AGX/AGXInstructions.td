@@ -223,6 +223,18 @@ def POPCOUNT_I32 : AGXALUPseudo<POPCOUNT_g13, (outs GPR32:$dst),
 def FFS_I32 : AGXALUPseudo<FFS_g13, (outs GPR32:$dst),
                            (ins SrcMods:$src0_mods, Src32Op:$src0), [],
                            [WriteIMul]>;
+// The same with a 16-bit source, zero-extended (recorded: coverage
+// alu/popcount_r14_r6l, ffs_r14_r6l, bitrev_r14_r6l); AGXFoldOperands puts
+// them in place of a zero extension's move and the 32-bit form (L15-E361).
+def BITREV_I32_FROM16 : AGXALUPseudo<BITREV_g13, (outs GPR32:$dst),
+                                     (ins SrcMods:$src0_mods, Src16Op:$src0),
+                                     [], [WriteIMul]>;
+def POPCOUNT_I32_FROM16 : AGXALUPseudo<POPCOUNT_g13, (outs GPR32:$dst),
+                                       (ins SrcMods:$src0_mods, Src16Op:$src0),
+                                       [], [WriteIMul]>;
+def FFS_I32_FROM16 : AGXALUPseudo<FFS_g13, (outs GPR32:$dst),
+                                  (ins SrcMods:$src0_mods, Src16Op:$src0), [],
+                                  [WriteIMul]>;
 def INTL_I32 : AGXALUPseudo<INTL_g13, (outs GPR32:$dst),
                             (ins SrcMods:$src0_mods, Src32Op:$src0,
                                  SrcMods:$src1_mods, Src32Op:$src1), [],

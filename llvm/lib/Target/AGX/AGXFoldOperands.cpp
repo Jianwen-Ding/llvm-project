@@ -37,6 +37,12 @@ static cl::opt<bool> FoldWidenedBranchConds(
     cl::desc("Branch on a zero-extended 16-bit condition's 16 bits"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> FoldWidened16Sources(
+    "agx-fold-widened-16-sources",
+    cl::desc("popcount / ffs / bitrev of a zero-extended 16-bit value read "
+             "the 16-bit register"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 
 class AGXFoldOperands : public MachineFunctionPass {
@@ -289,6 +295,45 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
       FoldInto(*Br, *Def);
     Def->eraseFromParent();
     Changed = true;
+  }
+
+  // A popcount, ffs or bitrev of a zero-extended 16-bit value reads the 16
+  // bits itself: the 16-bit source forms zero-extend (recorded on the M2),
+  // so the extension's move goes where it has no other use (L15-E361).
+  if (FoldWidened16Sources) {
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : make_early_inc_range(MBB)) {
+        unsigned New = MI.getOpcode() == AGX::POPCOUNT_I32 ? AGX::POPCOUNT_I32_FROM16
+                       : MI.getOpcode() == AGX::FFS_I32    ? AGX::FFS_I32_FROM16
+                       : MI.getOpcode() == AGX::BITREV_I32 ? AGX::BITREV_I32_FROM16
+                                                           : 0;
+        if (!New)
+          continue;
+        // (dst, src0_mods, src0)
+        MachineOperand &S = MI.getOperand(2);
+        if (!MI.getOperand(1).isImm() || MI.getOperand(1).getImm() || !S.isReg() ||
+            !S.getReg().isVirtual() || S.getSubReg())
+          continue;
+        MachineInstr *Def = MRI.getVRegDef(S.getReg());
+        // (dst, table, src0_mods, src0, src1_mods, src1): a move of src0.
+        if (!Def || Def->getOpcode() != AGX::BITOP_I32_FROM16 ||
+            Def->getOperand(1).getImm() != 0b1010 ||
+            Def->getOperand(2).getImm() || !Def->getOperand(3).isReg() ||
+            !Def->getOperand(5).isImm() || Def->getOperand(5).getImm())
+          continue;
+        MachineOperand Src16 = Def->getOperand(3);
+        Src16.setIsKill(false);
+        if (Src16.getReg().isVirtual())
+          MRI.clearKillFlags(Src16.getReg());
+        BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(New),
+                MI.getOperand(0).getReg())
+            .addImm(0)
+            .add(Src16);
+        MI.eraseFromParent();
+        if (MRI.use_nodbg_empty(Def->getOperand(0).getReg()))
+          Def->eraseFromParent();
+        Changed = true;
+      }
   }
   return Changed;
 }
