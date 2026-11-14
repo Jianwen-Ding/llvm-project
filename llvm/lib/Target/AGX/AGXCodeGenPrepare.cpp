@@ -3381,6 +3381,11 @@ static ConstantRange rangeThroughOffsets(Value *V, const SimplifyQuery &SQ,
     if (match(V, m_And(m_Value(X), m_APInt(C))))
       return rangeThroughOffsets(X, SQ, Depth + 1)
           .binaryAnd(ConstantRange(*C));
+    if (match(V, m_Or(m_Value(X), m_APInt(C))))
+      return rangeThroughOffsets(X, SQ, Depth + 1).binaryOr(ConstantRange(*C));
+    if (match(V, m_Xor(m_Value(X), m_APInt(C))))
+      return rangeThroughOffsets(X, SQ, Depth + 1)
+          .binaryXor(ConstantRange(*C));
   }
   if (auto *CI = dyn_cast<ConstantInt>(V))
     return ConstantRange(CI->getValue());

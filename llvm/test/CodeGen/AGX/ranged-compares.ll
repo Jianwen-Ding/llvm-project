@@ -39,6 +39,31 @@ define internal i32 @step(i32 %x, i32 %lane, i32 %start, i32 %end, i32 %d) alway
   %r = add i32 %x, %v
   ret i32 %r
 }
+; The range through xor (and or) by a constant too: a butterfly step's
+; segment test, lane ^ d in [lane & -32, (lane & -32) + 32), is true, and the
+; select of the own value goes (L15-E301).
+; CHECK-LABEL: butterfly:
+; CHECK: simd_shuffle_xor
+; CHECK-NOT: icmpsel
+; CHECK: stop
+define agx_kernel void @butterfly(ptr addrspace(1) %p) {
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr i32, ptr addrspace(1) %p, i32 %t
+  %x = load i32, ptr addrspace(1) %q
+  %start = and i32 %lane, -32
+  %end = add i32 %start, 32
+  %src = xor i32 %lane, 16
+  %lo = icmp sge i32 %src, %start
+  %hi = icmp slt i32 %src, %end
+  %ok = and i1 %lo, %hi
+  %u = call i32 @llvm.agx.simd.shuffle.xor.i32(i32 %x, i32 16)
+  %v = select i1 %ok, i32 %u, i32 %x
+  %r = add i32 %x, %v
+  store i32 %r, ptr addrspace(1) %q
+  ret void
+}
+declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)
 declare i32 @llvm.agx.thread.index.in.simdgroup()
 declare i32 @llvm.agx.thread.position.in.grid.x()
 declare i32 @llvm.agx.simd.shuffle.up.i32(i32, i32)
