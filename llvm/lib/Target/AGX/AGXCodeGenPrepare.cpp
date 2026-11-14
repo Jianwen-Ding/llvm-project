@@ -51,6 +51,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CycleAnalysis.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
@@ -4162,11 +4163,182 @@ static bool expandRoundToInt(Function &F) {
   return !Calls.empty();
 }
 
+static cl::opt<bool> AGXExpBelowLoopMax(
+    "agx-exp-below-loop-max",
+    cl::desc("exp(x - m) without its overflow tests where m is an earlier "
+             "loop's maximum of the values x reads"),
+    cl::init(true), cl::Hidden);
+
+/// m with its single-incoming phis (LCSSA) looked through.
+static Value *stripSinglePhis(Value *V) {
+  while (auto *P = dyn_cast<PHINode>(V)) {
+    if (P->getNumIncomingValues() != 1)
+      break;
+    V = P->getIncomingValue(0);
+  }
+  return V;
+}
+
+/// exp(x - m) where m is an earlier loop's running maximum (maxnum,
+/// maximumnum or maximum, every iteration) of a load whose address
+/// recurrence {s, +, t} is x's load's, x's loop running at most as many
+/// iterations, and nothing that writes memory or synchronizes between the
+/// two: each x is a value the maximum took in, so x - m is at most 0 (or a
+/// denormal where the maximum's comparison flushes) or a NaN, and e^(x - m)
+/// does not overflow (a softmax's or cross-entropy's second pass).
+static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
+                            ScalarEvolution &SE) {
+  using namespace PatternMatch;
+  Value *X, *M;
+  if (!match(E->getArgOperand(0), m_FSub(m_Value(X), m_Value(M))) ||
+      !E->getType()->isFloatTy())
+    return false;
+  // A SIMD-group's maximum of it (fmax: NaN-dropping, at least this lane's
+  // own value, which it takes in where the reduction runs).
+  if (auto *R = dyn_cast<IntrinsicInst>(M);
+      R && R->getIntrinsicID() == Intrinsic::agx_simd_reduce &&
+      match(R->getArgOperand(1), m_SpecificInt(AGX::SIMD_FMAX)))
+    M = R->getArgOperand(0);
+  // L1's value after it, or (a phi) another where L1 did not run, which L2
+  // then does not either (the same guard): the exponential only runs in L2.
+  PHINode *Exit = dyn_cast<PHINode>(M);
+  Value *MV = stripSinglePhis(M);
+  if (Exit && Exit->getNumIncomingValues() > 1) {
+    MV = nullptr;
+    for (Value *In : Exit->incoming_values())
+      if (auto *II = dyn_cast<IntrinsicInst>(stripSinglePhis(In)))
+        MV = II;
+  }
+  auto *U = dyn_cast_or_null<IntrinsicInst>(MV);
+  if (!U || !(U->getIntrinsicID() == Intrinsic::maxnum ||
+              U->getIntrinsicID() == Intrinsic::maximumnum ||
+              U->getIntrinsicID() == Intrinsic::maximum))
+    return false;
+  Loop *L1 = LI.getLoopFor(U->getParent());
+  auto *L2Load = dyn_cast<LoadInst>(X);
+  if (!L1 || !L2Load || !L2Load->isSimple())
+    return false;
+  Loop *L2 = LI.getLoopFor(L2Load->getParent());
+  BasicBlock *Latch1 = L1->getLoopLatch();
+  if (!L2 || L1 == L2 || L1->contains(L2) || L2->contains(L1) || !Latch1)
+    return false;
+  // u = max(p, v) with p the header phi it updates, v a load of L1
+  PHINode *P = nullptr;
+  LoadInst *V = nullptr;
+  for (unsigned I = 0; I < 2; ++I) {
+    auto *Phi = dyn_cast<PHINode>(U->getArgOperand(I));
+    auto *Ld = dyn_cast<LoadInst>(U->getArgOperand(1 - I));
+    if (Phi && Ld && Phi->getParent() == L1->getHeader() &&
+        Phi->getIncomingValueForBlock(Latch1) == U)
+      P = Phi, V = Ld;
+  }
+  if (!P || !V || !V->isSimple() || V->getType() != X->getType() ||
+      !L1->contains(V))
+    return false;
+  // both every iteration
+  DominatorTree DT(*E->getFunction());
+  if (Exit && Exit->getNumIncomingValues() > 1) {
+    CondBrInst *G1 = L1->getLoopGuardBranch(), *G2 = L2->getLoopGuardBranch();
+    if (!G1 || !G2 || G1->getCondition() != G2->getCondition() ||
+        (G1->getSuccessor(0) == L1->getLoopPreheader()) !=
+            (G2->getSuccessor(0) == L2->getLoopPreheader()))
+      return false;
+    for (unsigned I = 0, N = Exit->getNumIncomingValues(); I < N; ++I)
+      if (stripSinglePhis(Exit->getIncomingValue(I)) != U &&
+          isPotentiallyReachable(L1->getHeader(), Exit->getIncomingBlock(I),
+                                 nullptr, &DT))
+        return false;
+  }
+  if (!DT.dominates(V->getParent(), Latch1) ||
+      !DT.dominates(U->getParent(), Latch1))
+    return false;
+  // The addresses the same function of the iteration: their expressions the
+  // same but for L1's recurrences in the one where the other has L2's, with
+  // the same operands (sext {r, +, 1} of each loop: iteration k of either
+  // reads one address). L1 runs at most once before the load: its maximum
+  // is the value of u after its last iteration.
+  std::function<bool(const SCEV *, const SCEV *)> Same =
+      [&](const SCEV *S1, const SCEV *S2) -> bool {
+    if (S1 == S2)
+      return SE.isLoopInvariant(S1, L1) && SE.isLoopInvariant(S1, L2);
+    if (S1->getSCEVType() != S2->getSCEVType() ||
+        S1->getType() != S2->getType())
+      return false;
+    if (auto *R1 = dyn_cast<SCEVAddRecExpr>(S1)) {
+      auto *R2 = cast<SCEVAddRecExpr>(S2);
+      if (R1->getLoop() != L1 || R2->getLoop() != L2 ||
+          R1->getNumOperands() != R2->getNumOperands())
+        return false;
+      for (unsigned I = 0, N = R1->getNumOperands(); I < N; ++I)
+        if (!Same(R1->getOperand(I), R2->getOperand(I)))
+          return false;
+      return true;
+    }
+    if (auto *C1 = dyn_cast<SCEVCastExpr>(S1))
+      return Same(C1->getOperand(), cast<SCEVCastExpr>(S2)->getOperand());
+    if (auto *N1 = dyn_cast<SCEVNAryExpr>(S1)) {
+      auto *N2 = cast<SCEVNAryExpr>(S2);
+      if (N1->getNumOperands() != N2->getNumOperands())
+        return false;
+      for (unsigned I = 0, N = N1->getNumOperands(); I < N; ++I)
+        if (!Same(N1->getOperand(I), N2->getOperand(I)))
+          return false;
+      return true;
+    }
+    return false;
+  };
+  if (!Same(SE.getSCEV(V->getPointerOperand()),
+            SE.getSCEV(L2Load->getPointerOperand())))
+    return false;
+  if (L1->getLoopDepth() != 1 || L2->getLoopDepth() != 1)
+    return false;
+  const SCEV *B1 = SE.getBackedgeTakenCount(L1);
+  const SCEV *B2 = SE.getBackedgeTakenCount(L2);
+  if (isa<SCEVCouldNotCompute>(B1) || isa<SCEVCouldNotCompute>(B2) ||
+      !(B1 == B2 || SE.isKnownPredicate(ICmpInst::ICMP_ULE, B2, B1)))
+    return false;
+  // nothing between L1 and the load writes memory or waits for other threads
+  BasicBlock *H1 = L1->getHeader(), *To = L2Load->getParent();
+  for (BasicBlock &BB : *E->getFunction()) {
+    if (!isPotentiallyReachable(H1, &BB, nullptr, &DT, &LI) ||
+        !isPotentiallyReachable(&BB, To, nullptr, &DT, &LI))
+      continue;
+    for (Instruction &I : BB)
+      // (barriers have side effects; a SIMD-group reduction does not
+      // touch memory)
+      if (I.mayWriteToMemory() || I.mayHaveSideEffects() ||
+          (isa<CallBase>(I) && !isa<IntrinsicInst>(I)))
+        return false;
+  }
+  return true;
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
   bool Changed = expandRoundToInt(F);
   Changed |= expandPowI(F);
   Changed |= expandFRem(F, ST);
   Changed |= convertIntsToBFloatOnce(F);
+  // (before the expansions below: the analysis needs the loops and loads
+  // as they are)
+  SmallPtrSet<IntrinsicInst *, 4> ExpNoOverflow;
+  if (AGXExpBelowLoopMax) {
+    SmallVector<IntrinsicInst *, 4> Exps;
+    for (Instruction &I : instructions(F))
+      if (auto *II = dyn_cast<IntrinsicInst>(&I);
+          II && II->getIntrinsicID() == Intrinsic::exp)
+        Exps.push_back(II);
+    if (!Exps.empty()) {
+      DominatorTree DT(F);
+      LoopInfo LI(DT);
+      TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+      TargetLibraryInfo TLI(TLII, &F);
+      AssumptionCache AC(F);
+      ScalarEvolution SE(F, TLI, AC, DT, LI);
+      for (IntrinsicInst *II : Exps)
+        if (expBelowLoopMax(II, LI, SE))
+          ExpNoOverflow.insert(II);
+    }
+  }
   // An expansion may use functions that are expanded in turn (tan's sin).
   for (;;) {
     SmallVector<IntrinsicInst *, 8> Calls;
@@ -4190,9 +4362,10 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
       B.setFastMathFlags(II->getFastMathFlags());
       SmallVector<Value *, 2> Args(II->args());
       Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args,
-                                 !ST.hasIEEEFP32());
+                                 !ST.hasIEEEFP32(), ExpNoOverflow.count(II));
       R->takeName(II);
       II->replaceAllUsesWith(R);
+      ExpNoOverflow.erase(II);
       II->eraseFromParent();
     }
     Changed = true;

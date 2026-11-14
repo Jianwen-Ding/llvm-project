@@ -38,6 +38,11 @@ static cl::opt<bool> NegatedClamp(
     cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
     cl::Hidden);
 
+static cl::opt<bool> ExpMaxDifference(
+    "agx-exp-max-difference",
+    cl::desc("e^(a - max(a, b)) without the overflow clamp and select"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> IntegerLdexp(
     "agx-exp-integer-scale",
     cl::desc("the exponentials' 2^n scale as an exponent addition where f32 "
@@ -76,7 +81,33 @@ public:
   }
   Value *sqrt(Value *X) { return call(Intrinsic::sqrt, {X}); }
   Value *exp(Value *X) { return call(Intrinsic::exp, {X}); }
-  Value *expPrecise(Value *X) { return expHiLo(X, nullptr); }
+  Value *expPrecise(Value *X, bool NoOverflow = false) {
+    return expHiLo(X, nullptr, /*Bounded=*/false,
+                   (ExpMaxDifference && NoOverflow) || noExpOverflow(X));
+  }
+
+  /// x = a - max(a, b) (maxnum, maximumnum or maximum, either order: a
+  /// softmax's exponent): at most 0, or a denormal where the maximum's
+  /// comparison flushes, or a NaN; e^x does not overflow, so the clamp above
+  /// and the +inf select go (L15-E270).
+  static bool noExpOverflow(Value *X) {
+    if (!ExpMaxDifference || !X->getType()->isFloatTy())
+      return false;
+    Value *A, *M;
+    if (!match(X, m_FSub(m_Value(A), m_Value(M))))
+      return false;
+    auto *II = dyn_cast<IntrinsicInst>(M);
+    if (!II)
+      return false;
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::maxnum:
+    case Intrinsic::maximumnum:
+    case Intrinsic::maximum:
+      return II->getArgOperand(0) == A || II->getArgOperand(1) == A;
+    default:
+      return false;
+    }
+  }
   Value *log(Value *X) { return call(Intrinsic::log, {X}); }
   Value *sel(Value *C, Value *T, Value *F) { return B.CreateSelect(C, T, F); }
   Value *gt(Value *A, double V) { return B.CreateFCmpOGT(A, k(V)); }
@@ -332,7 +363,7 @@ public:
   }
   /// v * 2^n for an integral n in [-252, 254], in two steps. The split is
   /// done on the integer: i >> 1 and i - (i >> 1) are both in [-126, 127].
-  Value *ldexp(Value *V, Value *N) {
+  Value *ldexp(Value *V, Value *N, bool NoOverflow = false) {
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
     Value *I = B.CreateFreeze(B.CreateFPToSI(N, intTy()));
@@ -345,7 +376,8 @@ public:
       Value *S = B.CreateAdd(B.CreateBitCast(V, intTy()),
                              B.CreateShl(I, ki(23)));
       Value *R = B.CreateBitCast(S, Ty);
-      R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
+      if (!NoOverflow)
+        R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
       R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
       return sel(B.CreateFCmpUNO(V, V), V, R);
     }
@@ -367,10 +399,14 @@ public:
   /// \p Bounded: the caller clamped its argument so that hi is finite and
   /// its n within ldexp's range (exp2, exp10), and the result over- and
   /// underflows by itself: no clamp of hi here and no +inf / +0 selects.
-  Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false) {
+  Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false,
+                 bool NoOverflow = false) {
     Value *C;
     Value *Y;
-    if (!Bounded && NegatedClamp && match(Hi, m_FNeg(m_Value(Y)))) {
+    if (NoOverflow && !Bounded && !Lo) {
+      // (at most a denormal above 0: only the clamp below)
+      C = sel(lt(Hi, -104.0), k(-104.0), Hi);
+    } else if (!Bounded && NegatedClamp && match(Hi, m_FNeg(m_Value(Y)))) {
       // e^-y (sigmoid, silu): clamp y to the mirrored bounds and negate the
       // result, the same value (a NaN y stays a NaN), so that the negation
       // folds into the multiplication's constant and the fma's .neg instead
@@ -385,7 +421,7 @@ public:
     Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
-    Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N);
+    Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N, NoOverflow && !Lo);
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.
@@ -635,7 +671,8 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 }
 
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
-                       ArrayRef<Value *> Args, bool FlushF32) {
+                       ArrayRef<Value *> Args, bool FlushF32,
+                       bool ExpNoOverflow) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
                    switch (ID) {
@@ -660,7 +697,7 @@ Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                    case Intrinsic::cos:
                      return M.sinCos(A[0], true);
                    case Intrinsic::exp:
-                     return M.expPrecise(A[0]);
+                     return M.expPrecise(A[0], ExpNoOverflow);
                    case Intrinsic::exp2:
                      return M.exp2Precise(A[0]);
                    case Intrinsic::exp10:
