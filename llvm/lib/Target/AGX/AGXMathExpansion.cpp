@@ -85,8 +85,8 @@ static cl::opt<bool> NarrowSinCosReduction(
 
 static cl::opt<bool> BFloatShortPolys(
     "agx-bfloat-short-polys",
-    cl::desc("bfloat tanh, sinh, cosh, asin, acos with their polynomials' "
-             "highest terms left out"),
+    cl::desc("bfloat tanh, sinh, cosh, asin, acos (and AIR's asinh, acosh, "
+             "atanh, tanpi) with their polynomials' highest terms left out"),
     cl::init(true), cl::Hidden);
 
 namespace {
@@ -375,6 +375,8 @@ public:
   }
 
   Value *asinh(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     Value *A = abs(X);
     Value *Z = mul(X, X);
     Value *Small =
@@ -391,6 +393,8 @@ public:
   }
 
   Value *acosh(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     Value *Z = sub(X, k(1.0));
     // Near 1: sqrt(z) times a polynomial (and NaN below 1).
     Value *Near = mul(sqrt(Z),
@@ -404,6 +408,8 @@ public:
   }
 
   Value *atanh(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     Value *A = abs(X);
     Value *Z = mul(X, X);
     Value *Small =
@@ -464,6 +470,8 @@ public:
   }
 
   Value *tanpi(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     // (half: the correctly rounded division; with the reciprocal's, 2 half
     // results were further off. bfloat: the same results either way)
     PreciseDivision = HalfResult;
