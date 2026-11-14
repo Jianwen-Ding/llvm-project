@@ -1788,6 +1788,11 @@ static cl::opt<bool> AGXSignedBytesALU16(
     cl::desc("A byte with a zero high byte sign-extended in a 16-bit "
              "register as (x ^ 128) - 128 on the ALU"));
 
+static cl::opt<bool> AGXShiftedFieldInsert(
+    "agx-shifted-field-insert", cl::init(true), cl::Hidden,
+    cl::desc("(x << s) | q, s above 4 and q zero in x's field, as one bfi "
+             "of x into q"));
+
 static cl::opt<bool> BranchLowBitXor(
     "agx-branch-low-bit-xor",
     cl::desc("a branch on (a ^ x) & 1, a boolean, as a != (x & 1)"),
@@ -2172,7 +2177,11 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       bool Insert = Q.getOpcode() == ISD::AND &&
                     isa<ConstantSDNode>(Q.getOperand(1)) &&
                     Q.getConstantOperandAPInt(1) == ~Field;
-      if (!Insert && (S % 8 != 0 || Field.popcount() % 8 != 0))
+      // (or a plain shift by more than iadd's 4 places: a bfi on the same
+      // unit already, so the insert saves the or (L15-E317): a 2-D or 3-D
+      // index (y << 6) | x)
+      bool UnitShift = AGXShiftedFieldInsert && P == Sh && S > 4;
+      if (!Insert && !UnitShift && (S % 8 != 0 || Field.popcount() % 8 != 0))
         continue;
       if (Insert)
         Q = Q.getOperand(0);
