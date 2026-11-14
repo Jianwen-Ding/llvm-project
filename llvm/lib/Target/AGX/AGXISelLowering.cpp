@@ -3002,6 +3002,12 @@ static cl::opt<bool> BoundedDivisions(
              "below 2^-124 by how they are computed: no size test"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> FDivKnownNotNaN(
+    "agx-fdiv-known-not-nan",
+    cl::desc("float division: no NaN select for an operand known not to be "
+             "a NaN"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> IntDivisorScale(
     "agx-fdiv-int-divisor",
     cl::desc("float division by an integer converted to float: the "
@@ -3112,9 +3118,13 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   // One compare-and-select per operand.
   SDValue NaN =
       DAG.getConstantFP(APFloat::getQNaN(APFloat::IEEEsingle()), DL, VT);
-  for (SDValue X : NaNOperands)
+  for (SDValue X : NaNOperands) {
+    // (none for an operand known not to be a NaN: L15-E345)
+    if (FDivKnownNotNaN && DAG.isKnownNeverNaN(X))
+      continue;
     R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, X, X, ISD::SETUO), NaN,
                       R);
+  }
   return R;
 }
 

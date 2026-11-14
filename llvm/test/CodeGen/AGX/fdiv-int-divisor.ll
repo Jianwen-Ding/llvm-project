@@ -44,3 +44,14 @@ define void @half_num(ptr addrspace(1) %p, half %h, float %b) {
   ret void
 }
 declare float @llvm.sqrt.f32(float)
+
+; No NaN select for an operand known not to be a NaN (the converted integer
+; divisor): one for the dividend only (L15-E345).
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=NAN
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-fdiv-known-not-nan=0 < %s | FileCheck %s --check-prefix=NANOFF
+; NAN-LABEL: mean:
+; NAN-COUNT-1: fcmpsel eq
+; NAN-NOT: fcmpsel eq
+; NAN: stop
+; NANOFF-LABEL: mean:
+; NANOFF-COUNT-2: fcmpsel eq
