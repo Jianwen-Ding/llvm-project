@@ -9,6 +9,7 @@ same instruction model the lifter uses for the backend's output.
 
 Intrinsics with no entry here are left as uninterpreted calls.
 """
+import os
 import re
 
 from llvmsig import parse_sig, split_top
@@ -203,6 +204,56 @@ def synth_ptx(fname, ret, argtys, instr):
     return "\n".join(lines)
 
 
+def bulk_copy_operands(name, args):
+    """(dst, src, size, mbar-or-None) argument indices of a non-tensor
+    cp.async.bulk intrinsic call that ptx_lift.bulk_copy_ir models (no
+    multicast, out-of-bounds handling or data validation), else None."""
+    v = [x for _, x in args]
+    if name == "cp.async.bulk.shared.cta.to.global" and len(args) == 5:
+        return (0, 1, 2, None)
+    if name == "cp.async.bulk.shared.cta.to.cluster" and len(args) == 4:
+        return (0, 2, 3, 1)
+    if name == "cp.async.bulk.global.to.shared.cluster" and len(args) in (8, 9) and \
+            v[6] in ("0", "false") and (len(args) == 8 or v[8] == "0"):
+        return (0, 2, 3, 1)
+    if name == "cp.async.bulk.global.to.shared.cta" and len(args) == 10 and \
+            v[8] in ("0", "false") and v[9] == "0":
+        return (0, 2, 3, 1)
+    return None
+
+
+def cp_async_helper(fname, level, size, argtys, lifter_mod):
+    """Helper for llvm.nvvm.cp.async.<level>.shared.global.<size>[.s]: the
+    lifter's model of `cp.async.<level>.shared.global [d], [s], size{, n}`
+    (ptx_lift.cp_async_ir) applied to the call's operands."""
+    if level == "cg" and size != 16:
+        return None
+    w = ["define internal void @%s(%s) alwaysinline {" % (
+        fname, ", ".join("%s %%y%d" % (t, k) for k, t in enumerate(argtys)))]
+    ptrs = []
+    for k in (0, 1):
+        if argtys[k] != "ptr":
+            w.append("  %%x%d = addrspacecast %s %%y%d to ptr" % (k, argtys[k], k))
+            ptrs.append("ptr %%x%d" % k)
+        else:
+            ptrs.append("ptr %%y%d" % k)
+    n = "%y2" if len(argtys) == 3 else str(size)
+    cnt = [0]
+
+    def fresh():
+        cnt[0] += 1
+        return "%%c%d" % cnt[0]
+    lines, decls = lifter_mod.cp_async_ir(size, ptrs[0], ptrs[1], n, fresh)
+    w += ["  " + l for l in lines]
+    w.append("  ret void\n}")
+    return "\n".join(w), decls
+
+
+# PTXTV_OPAQUE_COPIES=1: keep cp.async / cp.async.bulk / st.bulk as
+# probe-derived opaque instructions instead of their copy semantics (Alive2
+# often times out on symbolic-size copies); results are tagged.
+OPAQUE_COPIES = os.environ.get("PTXTV_OPAQUE_COPIES") == "1"
+
 CALL_RE = re.compile(r"@llvm\.nvvm\.([\w.]+)\(")
 
 
@@ -264,6 +315,86 @@ def expand(text, lifter_mod, llc_args=None):
         if re.fullmatch(r"membar\.\w+|fence\.[\w.]+|prefetch\.[\w.]+|prefetchu\.[\w.]+", name) \
                 and not re.match(r"\s*%", line):
             removed = True
+            continue
+        # cp.async groups: the copies are modelled as completing at once
+        # (ptx_lift.i_cp), so committing and waiting are no-ops
+        if re.fullmatch(r"cp\.async\.(commit\.group|wait\.group|wait\.all)", name) \
+                and not re.match(r"\s*%", line):
+            removed = True
+            continue
+        if re.fullmatch(r"cp\.async\.bulk\.(commit\.group|wait\.group(\.read)?|prefetch\.L2)", name) \
+                and not re.match(r"\s*%", line):
+            removed = True
+            continue
+        bk = None if OPAQUE_COPIES else bulk_copy_operands(name, args)
+        if bk and not re.match(r"\s*%", line):
+            key = ("bulk", name, tuple(args))
+            if key not in defs:
+                fname = "ptxtv_sem_%d" % len(defs)
+                w = ["define internal void @%s(%s) alwaysinline {" % (
+                    fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+                ptrs = {}
+                for k in bk:
+                    if k is None or k == bk[2]:
+                        continue
+                    t = args[k][0]
+                    if t != "ptr":
+                        w.append("  %%x%d = addrspacecast %s %%y%d to ptr" % (k, t, k))
+                        ptrs[k] = "ptr %%x%d" % k
+                    else:
+                        ptrs[k] = "ptr %%y%d" % k
+                cnt = [0]
+
+                def fresh():
+                    cnt[0] += 1
+                    return "%%c%d" % cnt[0]
+                lines, decls = lifter_mod.bulk_copy_ir(
+                    ptrs[bk[0]], ptrs[bk[1]], "%%y%d" % bk[2],
+                    ptrs[bk[3]] if bk[3] is not None else None, fresh)
+                w += ["  " + l for l in lines] + ["  ret void\n}"]
+                defs[key] = (fname, "\n".join(w), decls)
+            line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+            out_lines.append(line)
+            continue
+        if not OPAQUE_COPIES and re.fullmatch(r"st\.bulk\.p[03]\.i(32|64)", name) and len(args) == 3 \
+                and args[2][1] == "0" and not re.match(r"\s*%", line):
+            key = ("st.bulk", name, tuple(t for t, _ in args))
+            if key not in defs:
+                fname = "ptxtv_sem_%d" % len(defs)
+                w = ["define internal void @%s(%s %%y0, %s %%y1, i64 %%y2) alwaysinline {" % (
+                    fname, args[0][0], args[1][0])]
+                ptr = "ptr %y0"
+                if args[0][0] != "ptr":
+                    w.append("  %%x0 = addrspacecast %s %%y0 to ptr" % args[0][0])
+                    ptr = "ptr %x0"
+                n = "%y1"
+                if args[1][0] == "i32":
+                    w.append("  %n = zext i32 %y1 to i64")
+                    n = "%n"
+                cnt = [0]
+
+                def fresh():
+                    cnt[0] += 1
+                    return "%%c%d" % cnt[0]
+                lines, decls = lifter_mod.st_bulk_ir(ptr, n, fresh)
+                w += ["  " + l for l in lines] + ["  ret void\n}"]
+                defs[key] = (fname, "\n".join(w), decls)
+            line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+            out_lines.append(line)
+            continue
+        cpm = re.fullmatch(r"cp\.async\.(ca|cg)\.shared\.global\.(4|8|16)(\.s)?", name)
+        if cpm and not OPAQUE_COPIES and not re.match(r"\s*%", line):
+            key = ("cp.async", name, tuple(t for t, _ in args))
+            if key not in defs:
+                fname = "ptxtv_sem_%d" % len(defs)
+                body = cp_async_helper(fname, cpm.group(1), int(cpm.group(2)),
+                                       [t for t, _ in args], lifter_mod)
+                if body is None:
+                    out_lines.append(line)
+                    continue
+                defs[key] = (fname, body[0], body[1])
+            line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+            out_lines.append(line)
             continue
         # f32 shuffles are data movement: express them via the i32 form,
         # which is what the .b32 PTX instruction is lifted to.

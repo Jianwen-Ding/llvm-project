@@ -44,6 +44,11 @@ def main(path, out, title, config):
              "(probe.py): they check the surrounding code and operand plumbing, not "
              "the instruction selection of the intrinsic itself." % nprobe)
     L.append("")
+    nop = sum(1 for r in fn if r["status"] == "correct" and r.get("copy_model") == "opaque")
+    if nop:
+        L.append("%d of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) "
+                 "after the check with cp.async/st.bulk copy semantics timed out." % nop)
+        L.append("")
     L.append("Conclusive (proved correct or counterexample): %d (%.1f%%)." % (concl, 100.0 * concl / n))
     L.append("")
     oob = [r for r in fn if r["status"] == "mismatch-param-oob"]

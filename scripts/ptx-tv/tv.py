@@ -546,6 +546,8 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     st = classify(out, err, rc)
     if ALIVE_EXTRA:
         res["alive_extra"] = " ".join(ALIVE_EXTRA)
+    if nvvm_sem.OPAQUE_COPIES:
+        res["copy_model"] = "opaque"
     if L.used_probe:
         res["probe"] = True   # relies on a probe-derived opaque instruction
     if st == "mismatch":

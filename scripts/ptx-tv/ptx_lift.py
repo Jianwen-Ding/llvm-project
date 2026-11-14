@@ -1010,8 +1010,9 @@ class Lifter:
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
-        if base in ("fence", "membar", "prefetch", "prefetchu"):
-            return h(mods, ops, opcode)   # no-ops whatever the modifiers
+        if base in ("fence", "membar", "prefetch", "prefetchu", "cp") or \
+                (base == "st" and "bulk" in mods):
+            return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
                 raise Unsupported("modifier .%s in %s" % (m, opcode))
@@ -2211,10 +2212,113 @@ class Lifter:
             x = self.resize(x, total, eb, False)
             self.write(d, x, eb, is_signed(t))
 
+    # ---- non-bulk asynchronous copy (cp.async) ------------------------------
+    CP_ASYNC_MODS = {"async", "ca", "cg", "shared", "shared::cta", "global",
+                     "L2::cache_hint", "L2::64B", "L2::128B", "L2::256B"}
+
+    def i_cp(self, mods, ops, opc):
+        """cp.async.{ca,cg}.shared{::cta}.global [d], [s], cp-size{, src-size |
+        , ignore-src}{, cache-policy}: copy src-size bytes (default cp-size)
+        and zero-fill the rest up to cp-size; ignore-src copies zeros.  The
+        copy is modelled as completing at once: reading the destination
+        before cp.async.wait_* is a data race in PTX, so this only removes
+        behaviours.  commit_group/wait_group/wait_all are then no-ops."""
+        ms = set(mods)
+        if "bulk" in ms and "tensor" not in ms:
+            return self.cp_async_bulk(ms, ops, opc)
+        if ms == {"async", "commit_group"} or ms == {"async", "wait_group"} or \
+                ms == {"async", "wait_all"}:
+            return
+        if "async" not in ms or not ms <= self.CP_ASYNC_MODS or \
+                len(ms & {"ca", "cg"}) != 1 or "global" not in ms or \
+                not ms & {"shared", "shared::cta"}:
+            raise Unsupported("opcode " + opc)
+        rest = [o.strip() for o in ops[3:]]
+        if "L2::cache_hint" in ms:
+            if not rest:
+                raise Unsupported("opcode " + opc)
+            rest = rest[:-1]      # cache-policy: a hint only
+        size = self.imm(ops[2].strip())
+        if size not in (4, 8, 16) or ("cg" in ms and size != 16) or len(rest) > 1:
+            raise Unsupported("opcode " + opc)
+        d = self.address(ops[0], "shared")
+        s = self.address(ops[1], "global")
+        if not rest:
+            n = self.const(size, 32)
+        elif rest[0] in self.regs and self.regs[rest[0]] == 1:
+            ign = self.get(rest[0], 1)
+            n = self.op("select i1 %s, i32 0, i32 %d" % (ign, size))
+        else:
+            n = self.get(rest[0], 32)
+        self.cp_async_copy(size, d, s, n)
+
+    def cp_async_bulk(self, ms, ops, opc):
+        """Non-tensor cp.async.bulk without multicast/masks/validation, as a
+        copy completing at once (see i_cp), plus an opaque complete-tx on the
+        mbarrier for the global/shared::cta -> shared forms.  Bulk prefetch
+        and the bulk-group operations are then no-ops."""
+        hint = "L2::cache_hint" in ms
+        ms = ms - {"L2::cache_hint"}
+        if ms in ({"async", "bulk", "commit_group"}, {"async", "bulk", "wait_group"},
+                  {"async", "bulk", "wait_group", "read"}):
+            return
+        if ms == {"async", "bulk", "prefetch", "L2", "global"}:
+            return
+        ops = [o.strip() for o in ops]
+        mb = "mbarrier::complete_tx::bytes"
+        if ms in ({"async", "bulk", "shared::cluster", "global", mb},
+                  {"async", "bulk", "shared::cta", "global", mb}) and \
+                len(ops) == 4 + hint:
+            dsp, ssp, mbar = "shared", "global", ops[3]
+        elif ms == {"async", "bulk", "shared::cluster", "shared::cta", mb} and \
+                not hint and len(ops) == 4:
+            dsp, ssp, mbar = "shared", "shared", ops[3]
+        elif ms == {"async", "bulk", "global", "shared::cta", "bulk_group"} and \
+                len(ops) == 3 + hint:
+            dsp, ssp, mbar = "global", "shared", None
+        else:
+            raise Unsupported("opcode " + opc)
+        # operand order is [dst], [src] for every form; a bare register or
+        # symbol in brackets
+        d = self.address(ops[0], dsp)
+        sp = self.address(ops[1], ssp)
+        n = self.get(ops[2], 32)
+        mp = self.address(mbar, "shared") if mbar else None
+        lines, decls = bulk_copy_ir(d, sp, n, mp, self.tmp)
+        for l in lines:
+            self.emit(l)
+        self.extra_decls.update(decls)
+
+    def cp_async_copy(self, size, d, s, n):
+        """d, s: typed pointer operands; n: i32 number of bytes to copy."""
+        lines, decls = cp_async_ir(size, d, s, n, self.tmp)
+        for l in lines:
+            self.emit(l)
+        self.extra_decls.update(decls)
+
+    def st_bulk(self, mods, ops, opc):
+        """st.bulk{.weak}{.shared::cta} [a], size, 0: zero `size` bytes
+        (size a multiple of 8, a 8-byte aligned; initval must be 0)."""
+        if not set(mods) <= {"bulk", "weak", "shared::cta"} or len(ops) != 3 or \
+                self.imm(ops[2].strip()) != 0:
+            raise Unsupported("opcode " + opc)
+        p = self.address(ops[0], "shared" if "shared::cta" in mods else "generic")
+        sz = ops[1].strip()
+        if sz in self.regs and self.regs[sz] == 32:
+            n = self.resize(self.get(sz, 32), 32, 64, False)
+        else:
+            n = self.get(sz, 64)
+        lines, decls = st_bulk_ir(p, n, self.tmp)
+        for l in lines:
+            self.emit(l)
+        self.extra_decls.update(decls)
+
     def i_ldu(self, mods, ops, opc):
         self.i_ld(mods, ops, opc)
 
     def i_st(self, mods, ops, opc):
+        if "bulk" in mods:
+            return self.st_bulk(mods, ops, opc)
         self.check_mem_mods(mods, opc)
         t, vec, space = self.mem_info(mods)
         eb = TBITS[t]
@@ -2684,6 +2788,80 @@ class Lifter:
 
     def i_nanosleep(self, mods, ops, opc):
         self.ucall("void", "nanosleep", ["i32 " + self.get(ops[0], 32)])
+
+
+def cp_async_ir(size, d, s, n, fresh):
+    """IR for one cp.async of cp-size `size`: n (an i32) bytes from s, zeros
+    up to `size`, both addresses aligned to `size`, n <= size.  d, s are
+    typed pointer operands ("ptr %x"); fresh() returns a new value name."""
+    L, decls = [], {"llvm.assume": "declare void @llvm.assume(i1)"}
+
+    def op(text):
+        t = fresh()
+        L.append("%s = %s" % (t, text))
+        return t
+    ok = op("icmp ule i32 %s, %d" % (n, size))
+    L.append("call void @llvm.assume(i1 %s)" % ok)            # src-size <= cp-size
+    for p in (d, s):                                            # aligned to cp-size
+        a = op("ptrtoint %s to i64" % p)
+        z = op("icmp eq i64 %s, 0" % op("and i64 %s, %d" % (a, size - 1)))
+        L.append("call void @llvm.assume(i1 %s)" % z)
+    # bytes [0, n) from s, zeros after: one masked byte-vector load
+    vt = "<%d x i8>" % size
+    mname = "llvm.masked.load.v%di8.p0" % size
+    decls[mname] = "declare %s @%s(ptr, <%d x i1>, %s)" % (vt, mname, size, vt)
+    ins = op("insertelement <%d x i32> poison, i32 %s, i64 0" % (size, n))
+    spl = op("shufflevector <%d x i32> %s, <%d x i32> poison, <%d x i32> zeroinitializer"
+             % (size, ins, size, size))
+    idx = ", ".join("i32 %d" % k for k in range(size))
+    mask = op("icmp ult <%d x i32> <%s>, %s" % (size, idx, spl))
+    sp = s.split(" ", 1)
+    v = op("call %s @%s(%s align %d %s, <%d x i1> %s, %s zeroinitializer)"
+           % (vt, mname, sp[0], size, sp[1], size, mask, vt))
+    L.append("store %s %s, %s, align %d" % (vt, v, d, size))
+    return L, decls
+
+
+def bulk_copy_ir(d, s, n, mbar, fresh):
+    """IR for a non-tensor cp.async.bulk: copy n (an i32, a multiple of 16)
+    bytes from s to d (both 16-byte aligned), then, if mbar is given, an
+    opaque complete-tx of n bytes on it."""
+    L = []
+    decls = {"llvm.assume": "declare void @llvm.assume(i1)",
+             "llvm.memcpy.p0.p0.i64": "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)"}
+
+    def op(text):
+        t = fresh()
+        L.append("%s = %s" % (t, text))
+        return t
+    n64 = op("zext i32 %s to i64" % n)
+    for v in (n64, op("ptrtoint %s to i64" % d), op("ptrtoint %s to i64" % s)):
+        z = op("icmp eq i64 %s, 0" % op("and i64 %s, 15" % v))
+        L.append("call void @llvm.assume(i1 %s)" % z)
+    L.append("call void @llvm.memcpy.p0.p0.i64(%s, %s, i64 %s, i1 false)" % (d, s, n64))
+    if mbar:
+        decls["ptx.cp.async.bulk.complete_tx"] = \
+            "declare void @ptx.cp.async.bulk.complete_tx(ptr, i32) nounwind"
+        L.append("call void @ptx.cp.async.bulk.complete_tx(%s, i32 %s)" % (mbar, n))
+    return L, decls
+
+
+def st_bulk_ir(p, n, fresh):
+    """IR for st.bulk: zero n (an i64) bytes at p (a typed pointer operand);
+    n must be a multiple of 8 and p 8-byte aligned."""
+    L = []
+    decls = {"llvm.assume": "declare void @llvm.assume(i1)",
+             "llvm.memset.p0.i64": "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)"}
+
+    def op(text):
+        t = fresh()
+        L.append("%s = %s" % (t, text))
+        return t
+    for v in (n, op("ptrtoint %s to i64" % p)):
+        z = op("icmp eq i64 %s, 0" % op("and i64 %s, 7" % v))
+        L.append("call void @llvm.assume(i1 %s)" % z)
+    L.append("call void @llvm.memset.p0.i64(%s, i8 0, i64 %s, i1 false)" % (p, n))
+    return L, decls
 
 
 def lift_function(ptx_text, sig, name_map, decls, globals_, ptx_name,

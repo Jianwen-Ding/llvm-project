@@ -104,6 +104,19 @@ single-thread semantics:
 * Fences (including `fence.proxy.*`) and prefetches are no-ops; the source's
   fence/prefetch intrinsics are removed accordingly. `fma.rn.oob` is
   uninterpreted.
+* Asynchronous copies get their documented single-thread semantics, as
+  copies that complete at once (reading the destination before the matching
+  wait is a data race in PTX, so this only removes behaviours):
+  `cp.async.{ca,cg}.shared.global` copies `src-size` bytes and zero-fills up
+  to `cp-size` (one masked byte-vector load), `st.bulk` zeroes `size` bytes,
+  and non-tensor `cp.async.bulk` without multicast, masks or validation is a
+  copy followed by an opaque complete-tx of `size` bytes on the mbarrier.
+  Size and alignment requirements are assumptions (UB otherwise). The
+  commit/wait-group operations and bulk prefetch are then no-ops. The same
+  IR (`cp_async_ir`, `st_bulk_ir`, `bulk_copy_ir` in `ptx_lift.py`) is used
+  for the NVVM intrinsics. Alive2 often times out on symbolic-size copies;
+  `PTXTV_OPAQUE_COPIES=1` falls back to probe-derived opaque instructions
+  for these, and results record `"copy_model": "opaque"`.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such

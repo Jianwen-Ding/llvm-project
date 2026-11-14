@@ -197,7 +197,7 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4167 functions from 619
-test files; 3123 proved correct (668 through probe-derived opaque instructions,
+test files; 3123 proved correct (655 through probe-derived opaque instructions,
 20 only with the weaker check); 30 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 124 in
