@@ -1014,6 +1014,8 @@ class Lifter:
                     "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
                     "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa",
                     "txq", "suq", "suld", "sust", "tex", "wmma", "mma", "ldmatrix", "stmatrix") or \
+                re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]", base) or \
+                base in ("createpolicy", "istypeof", "tld4", "sured") or \
                 (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
@@ -1316,6 +1318,197 @@ class Lifter:
         if "hi" in mods:
             p = self.op("lshr i64 %s, 16" % p)
         self.write(ops[0], self.op("trunc i64 %s to i32" % p), 32)
+
+    # ---- opaque state: keyed calls ------------------------------------------
+    def opaque_keyed(self, base, mods, ops, opc, dest):
+        """An instruction whose result depends on state outside the
+        single-thread model (cache policies, texture/surface objects) as an
+        uninterpreted call named by its modifiers; operands (brackets and
+        vectors flattened) as zero-extended i64, the destination (scalar,
+        predicate or vector) from i64 results.  Inline asm using it is lifted
+        the same way on both sides, so the check covers operand binding."""
+        import tma
+        ops = [o.strip() for o in ops]
+        res = []
+        if dest:
+            res = self.vec_ops(ops[0]) or [ops[0]]
+            ops = ops[1:]
+        vals = []
+        for o in tma._flatten(ops):
+            x = o.strip()
+            br = re.fullmatch(r"\[\s*([%\w$.]+)\s*\]", x)
+            x = br.group(1) if br else x
+            if x in self.regs:
+                w = self.regs[x]
+                v = self.get(x, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(x) is not None:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            elif x in self.handle_params and self.handle_params[x].startswith("i64 "):
+                vals.append(self.handle_params[x])
+            elif re.fullmatch(r"[A-Za-z_$][\w$.]*", x):
+                vals.append("i64 %s" % self.get(x, 64))
+            else:
+                raise Unsupported("operand " + opc)
+        kname = "ptx.opaque.%s.%s.r%d.n%d" % (base, "_".join(m.replace("::", "__") for m in mods) or "x",
+                                               len(res), len(vals))
+        rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
+        self.declare(kname, "declare %s @%s(%s) nounwind willreturn" % (
+            rty, kname, ", ".join(["i64"] * len(vals))))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if not res:
+            self.emit(call)
+            return
+        v = self.op(call)
+        for k, d in enumerate(res):
+            if d == "_":
+                continue
+            if d not in self.regs:
+                raise Unsupported("operand " + opc)
+            e = self.op("extractvalue %s %s, %d" % (rty, v, k))
+            w = self.regs[d]
+            self.write(d, self.resize(e, 64, w, False) if w != 64 else e, w)
+
+    def i_createpolicy(self, mods, ops, opc):
+        if not mods or mods[0] not in ("fractional", "range", "cvt") or mods[-1] != "b64":
+            raise Unsupported(opc)
+        return self.opaque_keyed("createpolicy", mods, ops, opc, True)
+
+    def i_istypeof(self, mods, ops, opc):
+        if mods not in (["texref"], ["samplerref"], ["surfref"]):
+            raise Unsupported(opc)
+        return self.opaque_keyed("istypeof", mods, ops, opc, True)
+
+    def i_tld4(self, mods, ops, opc):
+        if not mods or mods[0] not in ("r", "g", "b", "a"):
+            raise Unsupported(opc)
+        return self.opaque_keyed("tld4", mods, ops, opc, True)
+
+    def i_sured(self, mods, ops, opc):
+        if not mods or mods[0] not in ("b", "p"):
+            raise Unsupported(opc)
+        return self.opaque_keyed("sured", mods, ops, opc, False)
+
+    # ---- SIMD video instructions -----------------------------------------
+    VOP = {"vadd", "vsub", "vavrg", "vabsdiff", "vmin", "vmax", "vset"}
+
+    def simd_video(self, op, n, mods, ops, opc):
+        """vop2/vop4.dtype.atype.btype{.sat|.add} d, a, b, c and
+        vset2/vset4.atype.btype.cmp{.add} (PTX ISA pseudo-code): lanes of a and
+        b (halfwords or bytes, extended by atype/btype) are combined exactly
+        (vavrg: (s + 1) >> 1 if s >= 0 else s >> 1; vset: 1 or 0); .sat clamps
+        each lane to the dtype lane range; without .add the lanes form d,
+        with .add d = c + the sum of the lanes.  Only the default lane
+        selectors (.h10 / .b3210) and mask are modelled."""
+        L = 32 // n
+        if any("." in o.strip().split("%")[-1] for o in ops):
+            raise Unsupported("video lane selector or mask in " + opc)
+        ts = [m for m in mods if m in ("u32", "s32")]
+        rest = [m for m in mods if m not in ("u32", "s32")]
+        cmp = None
+        if op == "vset":
+            if len(ts) != 2:
+                raise Unsupported(opc)
+            dt, at, bt = None, ts[0], ts[1]
+            cmps = [m for m in rest if m in ("eq", "ne", "lt", "le", "gt", "ge")]
+            if len(cmps) != 1:
+                raise Unsupported(opc)
+            cmp = cmps[0]
+            rest = [m for m in rest if m != cmp]
+        else:
+            if len(ts) != 3:
+                raise Unsupported(opc)
+            dt, at, bt = ts
+        if not set(rest) <= {"sat", "add"} or ("sat" in rest and "add" in rest) or \
+                ("sat" in rest and op == "vset"):
+            raise Unsupported(opc)
+        vt = "<%d x i32>" % n
+
+        def lanes(v, t):
+            x = self.op("bitcast i32 %s to <%d x i%d>" % (v, n, L))
+            return self.op("%s <%d x i%d> %s to %s" % ("sext" if t == "s32" else "zext", n, L, x, vt))
+        va, vb = lanes(self.get(ops[1], 32), at), lanes(self.get(ops[2], 32), bt)
+        c = self.get(ops[3], 32)
+        sfx = "v%di32" % n
+        if op == "vadd":
+            t = self.op("add %s %s, %s" % (vt, va, vb))
+        elif op == "vsub":
+            t = self.op("sub %s %s, %s" % (vt, va, vb))
+        elif op == "vavrg":
+            s = self.op("add %s %s, %s" % (vt, va, vb))
+            nonneg = self.op("icmp sge %s %s, zeroinitializer" % (vt, s))
+            s1 = self.op("add %s %s, %s" % (vt, s, "<" + ", ".join(["i32 1"] * n) + ">"))
+            up = self.op("ashr %s %s, %s" % (vt, s1, "<" + ", ".join(["i32 1"] * n) + ">"))
+            dn = self.op("ashr %s %s, %s" % (vt, s, "<" + ", ".join(["i32 1"] * n) + ">"))
+            t = self.op("select <%d x i1> %s, %s %s, %s %s" % (n, nonneg, vt, up, vt, dn))
+        elif op == "vabsdiff":
+            d0 = self.op("sub %s %s, %s" % (vt, va, vb))
+            t = self.call_intr(vt, "llvm.abs." + sfx, ["%s %s" % (vt, d0), "i1 false"])
+        elif op in ("vmin", "vmax"):
+            t = self.call_intr(vt, "llvm.s%s.%s" % (op[1:], sfx), ["%s %s" % (vt, va), "%s %s" % (vt, vb)])
+        else:
+            pred = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}[cmp]
+            b1 = self.op("icmp %s %s %s, %s" % (pred, vt, va, vb))
+            t = self.op("zext <%d x i1> %s to %s" % (n, b1, vt))
+        if "sat" in rest:
+            if dt == "s32":
+                lo, hi = -(1 << (L - 1)), (1 << (L - 1)) - 1
+            else:
+                lo, hi = 0, (1 << L) - 1
+            spl = lambda k: "<" + ", ".join(["i32 %d" % k] * n) + ">"
+            t = self.call_intr(vt, "llvm.smax." + sfx, ["%s %s" % (vt, t), "%s %s" % (vt, spl(lo))])
+            t = self.call_intr(vt, "llvm.smin." + sfx, ["%s %s" % (vt, t), "%s %s" % (vt, spl(hi))])
+        if "add" in rest:
+            acc = c
+            for k in range(n):
+                e = self.op("extractelement %s %s, i32 %d" % (vt, t, k))
+                acc = self.op("add i32 %s, %s" % (acc, e))
+            self.write(ops[0], acc, 32)
+        else:
+            tr = self.op("trunc %s %s to <%d x i%d>" % (vt, t, n, L))
+            self.write(ops[0], self.op("bitcast <%d x i%d> %s to i32" % (n, L, tr)), 32)
+
+    def i_vadd2(self, mods, ops, opc):
+        return self.simd_video("vadd", 2, mods, ops, opc)
+
+    def i_vadd4(self, mods, ops, opc):
+        return self.simd_video("vadd", 4, mods, ops, opc)
+
+    def i_vsub2(self, mods, ops, opc):
+        return self.simd_video("vsub", 2, mods, ops, opc)
+
+    def i_vsub4(self, mods, ops, opc):
+        return self.simd_video("vsub", 4, mods, ops, opc)
+
+    def i_vavrg2(self, mods, ops, opc):
+        return self.simd_video("vavrg", 2, mods, ops, opc)
+
+    def i_vavrg4(self, mods, ops, opc):
+        return self.simd_video("vavrg", 4, mods, ops, opc)
+
+    def i_vabsdiff2(self, mods, ops, opc):
+        return self.simd_video("vabsdiff", 2, mods, ops, opc)
+
+    def i_vabsdiff4(self, mods, ops, opc):
+        return self.simd_video("vabsdiff", 4, mods, ops, opc)
+
+    def i_vmin2(self, mods, ops, opc):
+        return self.simd_video("vmin", 2, mods, ops, opc)
+
+    def i_vmin4(self, mods, ops, opc):
+        return self.simd_video("vmin", 4, mods, ops, opc)
+
+    def i_vmax2(self, mods, ops, opc):
+        return self.simd_video("vmax", 2, mods, ops, opc)
+
+    def i_vmax4(self, mods, ops, opc):
+        return self.simd_video("vmax", 4, mods, ops, opc)
+
+    def i_vset2(self, mods, ops, opc):
+        return self.simd_video("vset", 2, mods, ops, opc)
+
+    def i_vset4(self, mods, ops, opc):
+        return self.simd_video("vset", 4, mods, ops, opc)
 
     def i_mad24(self, mods, ops, opc):
         """mad24{.hi,.lo}{.sat}: 24x24-bit product (48 bits), its low 32 or

@@ -52,12 +52,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("names", nargs="*")
     ap.add_argument("-j", type=int, default=4)
+    ap.add_argument("--smt-to", type=int, default=10000)
     a = ap.parse_args()
     names = a.names or sorted(f[:-3] for f in os.listdir(os.path.join(HERE, "isa_tests"))
                               if f.endswith(".ll") and not f.endswith(".ref.ll"))
     bad = 0
     with ProcessPoolExecutor(a.j) as ex:
-        for rs in ex.map(case, names):
+        for rs in ex.map(case, names, [a.smt_to] * len(names)):
             for r in rs:
                 bad += r["status"] != "correct"
                 print(json.dumps(r))

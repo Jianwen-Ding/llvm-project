@@ -319,6 +319,30 @@ packing of `spdecompress` operands, and that an `e2m1x2`
 value and a single `ue8m0` scale (`.scale.n1`) occupy the low 8 bits of the
 intrinsics' `i16` operands/results.
 
+## Instructions the backend does not emit
+
+`isa_selftest.py` checks the lifter's model of PTX instructions that no
+test can reach through `llc` (they only appear in inline assembly): each
+case in `isa_tests/` pairs functions whose bodies are inline PTX (compiled
+by `llc` and lifted) with reference IR written lane by lane from the PTX
+ISA's description or pseudo-code, and Alive2 proves that the lifted PTX
+refines the reference. A deliberately wrong reference is reported as a
+mismatch.
+
+* `slct` (s32 and f32 selector; `.ftz` flushes the selector first; a NaN
+  selector picks either operand, as the ISA leaves it unspecified), `madc`,
+  `mad{.hi,.lo}.cc`, `mad.hi.sat.s32`, `mad24.hi.sat.s32` (`slct_mad`).
+* SIMD video instructions `vadd2/4`, `vsub2/4`, `vavrg2/4`, `vabsdiff2/4`,
+  `vmin2/4`, `vmax2/4` (u32/s32 lane types, mixed, `.sat`, `.add`) and
+  `vset2/4` (all comparisons, `.add`), default lane selectors and mask
+  (`video_simd`, 180 functions; two need a 120 s budget). Lane selectors
+  and masks are rejected (`lift-unsupported`), as are the scalar video
+  instructions.
+* `createpolicy`, `istypeof`, `tld4` and `sured` depend on state outside
+  the single-thread model and are keyed calls named by their modifiers;
+  `isa_tests/inline/opaque.ll` checks them through the inline-asm path
+  (`tv.py`), where both sides lift the template the same way.
+
 ## Target cleanup
 
 Before the check, `tv.drop_dead_param_loads` removes from the lifted target
