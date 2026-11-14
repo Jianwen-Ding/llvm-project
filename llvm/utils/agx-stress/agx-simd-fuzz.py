@@ -3,8 +3,11 @@
 
 Each seed generates a kernel of 6-18 operations over all 32 threads of each SIMD-group: shuffles by constants
 (simd / quad, xor, up, down, rotate up), shuffles by an index computed from the thread index ((lane op c) & 31),
-selects on comparisons of the thread index, integer add / xor / and / or / sub, and Hillis-Steele add scans (of
-earlier results too); then a last value used only under `lane == c`, which the optimizer sinks into that branch.
+selects on comparisons of the thread index, integer add / xor / and / or / sub, Hillis-Steele add scans (of earlier
+results too) and xor butterflies of every integer reduction op in any distance order; a branch on a data-dependent
+condition holding SIMD-group and quad reductions, exclusive prefixes (quad: add, the simulator's only one) and
+ballots of the active threads; then a last value used only under `lane == c`, which the optimizer sinks into that
+branch. With an llc that sets -agx-simd-reductions it also checks the butterflies as reductions (L15-E381).
 The model computes each SIMD-group's 32 lanes with the backend's own lane rules (LanePermutation::source; up and
 down keep a thread's own value where the source is outside). This covers the shuffle recognitions (lane
 permutations, own-value shifts, quad xors, shuffle selects, scans) and their placement (EXPERIMENTS.md L15-E365,
@@ -66,6 +69,19 @@ def gen(seed):
     elif k<0.85:
       b=R.choice(vals); op=R.choice(['add','xor','and','or','sub'])
       body.append(f'  {r} = {op} i32 {a}, {b}'); ops.append((r,op,a,b))
+    elif k<0.92:
+      # an xor butterfly over all 32 lanes: op(v, shuffle_xor(v, d)) for d in some order
+      dists=[1,2,4,8,16]; R.shuffle(dists); opn=R.choice(['add','and','or','xor','smin','smax','umin','umax']); v=a
+      for d in dists:
+        kind='quad.shuffle.xor' if d<=2 and R.random()<0.5 else 'simd.shuffle.xor'
+        decl.add(f'declare i32 @llvm.agx.{kind}.i32(i32, i32)'); sh=nv(); w=nv()
+        body.append(f'  {sh} = call i32 @llvm.agx.{kind}.i32(i32 {v}, i32 {d})'); ops.append((sh,'shfl',kind,v,d))
+        x,y=(v,sh) if R.random()<0.5 else (sh,v)
+        if opn in ('add','and','or','xor'): body.append(f'  {w} = {opn} i32 {x}, {y}'); ops.append((w,opn,x,y))
+        else:
+          decl.add(f'declare i32 @llvm.{opn}.i32(i32, i32)'); body.append(f'  {w} = call i32 @llvm.{opn}.i32(i32 {x}, i32 {y})'); ops.append((w,opn,x,y))
+        v=w
+      body.append(f'  {r} = add i32 {v}, 0'); ops.append((r,'add',v,'0'))
     else:
       # Hillis-Steele inclusive add scan
       decl.add('declare i32 @llvm.agx.simd.shuffle.up.i32(i32, i32)'); v=a
@@ -78,6 +94,23 @@ def gen(seed):
   outs=vals[-4:]
   for j,o in enumerate(outs):
     body+=[f'  %o{j} = getelementptr i32, ptr addrspace(1) %q, i32 {j*65536}', f'  %o{j}b = getelementptr i32, ptr addrspace(1) %o{j}, i32 %t', f'  store i32 {o}, ptr addrspace(1) %o{j}b']
+  # a divergent region: SIMD-group reductions / exclusive prefixes / ballots over the active threads
+  dv=R.choice(vals); dk=R.choice([1,3,0x55,0x80000000,7]); dc=nv(); dt=nv()
+  body+=[f'  {dt} = and i32 {dv}, {dk}', f'  {dc} = icmp ne i32 {dt}, 0', f'  br i1 {dc}, label %div, label %join', 'div:']
+  divops=[]
+  for j in range(R.randint(1,4)):
+    kind=R.choice(['simd.reduce','simd.prefix','quad.reduce','quad.prefix','ballot'])
+    r=nv(); a_=R.choice(vals)
+    if kind=='ballot':
+      bc=nv(); decl.add('declare i32 @llvm.agx.simd.ballot(i1)')
+      body+=[f'  {bc} = icmp ult i32 {a_}, {R.choice([0x40000000,0x80000000,0xc0000000])}', f'  {r} = call i32 @llvm.agx.simd.ballot(i1 {bc})']
+      divops.append((r,'ballot',a_,int(body[-2].split(', ')[-1])))
+    else:
+      opc=16 if kind=='quad.prefix' else R.choice([16,0,2,4,20,22,28,30]); decl.add(f'declare i32 @llvm.agx.{kind}.i32(i32, i32)')
+      body.append(f'  {r} = call i32 @llvm.agx.{kind}.i32(i32 {a_}, i32 {opc})'); divops.append((r,kind,a_,opc))
+    body+=[f'  %d{j} = getelementptr i32, ptr addrspace(1) %q, i32 {(5+j)*65536}', f'  %d{j}b = getelementptr i32, ptr addrspace(1) %d{j}, i32 %t', f'  store i32 {r}, ptr addrspace(1) %d{j}b']
+  body+=['  br label %join','join:']
+  ops.append(('#div',(dv,dk),divops))
   # a last value used only under lane == c (sunk into the branch)
   cl=R.randrange(32); last=R.choice(vals); s=nv()
   decl.add('declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)')
@@ -89,8 +122,9 @@ def gen(seed):
   return '\n'.join(L)+'\n', ops, outs, (cl,last,s)
 def evaluate(ops, outs, fin, x0, x1):
   # x0, x1: lists of 32 lanes for one SIMD-group
-  e={}
+  e={}; div=None
   for op in ops:
+    if op[0]=='#div': div=op; continue
     r,k=op[0],op[1]
     if k=='in': v=[ (x0 if op[2]==0 else x1)[l] for l in range(32)]
     elif k=='lane': v=list(range(32))
@@ -104,12 +138,45 @@ def evaluate(ops, outs, fin, x0, x1):
     elif k=='selz': v=[e[op[3]][l] if e[op[2]][l] else 0 for l in range(32)]
     else:
       a=e[op[2]]; b=e[op[3]] if isinstance(op[3],str) and op[3] in e else [int(op[3])]*32
-      f={'add':lambda x,y:x+y,'xor':lambda x,y:x^y,'and':lambda x,y:x&y,'or':lambda x,y:x|y,'sub':lambda x,y:x-y,'shl':lambda x,y:x<<y,'lshr':lambda x,y:x>>y}[k]
+      sx_=lambda v: v-(1<<32) if v>>31 else v
+      f={'smin':lambda x,y:x if sx_(x)<=sx_(y) else y,'smax':lambda x,y:x if sx_(x)>=sx_(y) else y,'umin':min,'umax':max,'add':lambda x,y:x+y,'xor':lambda x,y:x^y,'and':lambda x,y:x&y,'or':lambda x,y:x|y,'sub':lambda x,y:x-y,'shl':lambda x,y:x<<y,'lshr':lambda x,y:x>>y}[k]
       v=[f(a[l],b[l]) for l in range(32)]
     e[r]=[x&M if isinstance(x,int) else x for x in v]
   cl,last,s=fin
-  return [e[o] for o in outs], (e[last][cl]+e[s][cl])&M
-
+  dres=[]
+  if div:
+    (dv,dk),divops=div[1],div[2]
+    act=[(e[dv][l]&dk)!=0 for l in range(32)]
+    ID={16:0,0:M,2:0,4:0,20:0x7fffffff,22:0x80000000,28:M,30:0}
+    def comb(o,x,y):
+      sx=lambda v: v-(1<<32) if v>>31 else v
+      if o==16: return (x+y)&M
+      if o==0: return x&y
+      if o==2: return x|y
+      if o==4: return x^y
+      if o==20: return x if sx(x)<=sx(y) else y
+      if o==22: return x if sx(x)>=sx(y) else y
+      if o==28: return min(x,y)
+      return max(x,y)
+    for (r,kind,a_,p) in divops:
+      v=[None]*32
+      if kind=='ballot':
+        m=sum(1<<l for l in range(32) if act[l] and e[a_][l]<p)
+        for l in range(32):
+          if act[l]: v[l]=m
+      else:
+        w=4 if kind.startswith('quad') else 32
+        for base in range(0,32,w):
+          lanes=[l for l in range(base,base+w) if act[l]]
+          if kind.endswith('reduce'):
+            t=ID[p]
+            for l in lanes: t=comb(p,t,e[a_][l])
+            for l in lanes: v[l]=t
+          else:
+            t=ID[p]
+            for l in lanes: v[l]=t; t=comb(p,t,e[a_][l])
+      dres.append(v)
+  return [e[o] for o in outs], (e[last][cl]+e[s][cl])&M, dres
 
 N = 256
 
@@ -129,7 +196,7 @@ def run_seed(seed, a, tmp):
     inp[65536:65536 + N] = rng.integers(0, 2**32, N, dtype=np.uint64).astype(np.uint32)
     fin_, fout = os.path.join(tmp, "in.bin"), os.path.join(tmp, "out.bin")
     inp.tofile(fin_)
-    nb = 5 * 65536 * 4
+    nb = 9 * 65536 * 4
     subprocess.run([a.run, code, "--grid", "%d,1,1" % N, "--wg", "64,1,1", "--map", "0x1000000=" + fin_,
                     "--alloc", "0x2000000=%d" % nb, "--dump", "0x2000000=%d:%s" % (nb, fout),
                     "--uniform", "0=16777216", "--uniform", "1=0", "--uniform", "2=33554432", "--uniform", "3=0"],
@@ -138,12 +205,17 @@ def run_seed(seed, a, tmp):
     for gi in range(N // 32):
         x0 = [int(v) for v in inp[gi * 32:gi * 32 + 32]]
         x1 = [int(v) for v in inp[65536 + gi * 32:65536 + gi * 32 + 32]]
-        res, fv = evaluate(ops, outs, fin, x0, x1)
+        res, fv, dres = evaluate(ops, outs, fin, x0, x1)
         for j, o in enumerate(outs):
             g = [int(v) for v in got[j * 65536 + gi * 32:j * 65536 + gi * 32 + 32]]
             if g != res[j]:
                 bad = [l for l in range(32) if g[l] != res[j][l]]
                 return src, "SIMD-group %d, %s: lanes %s differ" % (gi, o, bad[:8])
+        for j, dv in enumerate(dres):
+            g = [int(v) for v in got[(5 + j) * 65536 + gi * 32:(5 + j) * 65536 + gi * 32 + 32]]
+            bad = [l for l in range(32) if dv[l] is not None and g[l] != dv[l]]
+            if bad:
+                return src, "SIMD-group %d, divergent operation %d: lanes %s differ" % (gi, j, bad[:8])
         g9 = int(got[4 * 65536 + gi * 32 + fin[0]])
         if g9 != fv:
             return src, "SIMD-group %d: the store under lane == %d wrote %#x, the model %#x" % (gi, fin[0], g9, fv)
