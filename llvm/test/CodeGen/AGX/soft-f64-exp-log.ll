@@ -7,6 +7,10 @@
 
 ; CHECK-LABEL: @dexp(
 ; CHECK-NOT: call double @llvm.exp
+; y 2^k1 as k1 added to y's exponent field (L15-E326): an i64 add and a
+; select of y where it is a NaN
+; CHECK: [[KS:%.*]] = shl i64 {{.*}}, 52
+; CHECK-NEXT: add i64 [[KS]], {{%.*}}
 ; CHECK-NOT: {{fmul|fdiv|fadd|fsub}} double
 ; CHECK: ret void
 define agx_kernel void @dexp(ptr addrspace(1) %p, double %x) {

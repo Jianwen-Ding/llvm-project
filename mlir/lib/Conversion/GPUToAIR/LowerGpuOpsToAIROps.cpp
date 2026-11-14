@@ -1146,7 +1146,16 @@ static LogicalResult rewriteExpF64(math::ExpOp op, PatternRewriter &rewriter) {
         b, f64,
         arith::ShLIOp::create(b, arith::AddIOp::create(b, e, ci(1023)), ci(52)));
   };
-  rewriter.replaceOp(op, mul(mul(y, pow2(k1)), pow2(k2)));
+  // y 2^k1 is exact and normal (y within [0.7, 1.42], k1 within [-538,
+  // 512]): k1 added to y's exponent field, one integer addition for a double
+  // multiplication; a NaN x keeps y (L15-E326)
+  Value scaled = arith::BitcastOp::create(
+      b, f64,
+      arith::AddIOp::create(b, arith::BitcastOp::create(b, i64, y),
+                            arith::ShLIOp::create(b, k1, ci(52))));
+  scaled = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::UNO, y, y), y,
+               scaled);
+  rewriter.replaceOp(op, mul(scaled, pow2(k2)));
   return success();
 }
 
@@ -1292,7 +1301,14 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     e = fma(e, lo, e);
     Value ki = arith::FPToSIOp::create(b, i64, k);
     Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
-    r = mul(mul(e, pow2(k1)), pow2(arith::SubIOp::create(b, ki, k1)));
+    // e 2^k1 exact and normal (e within [0.7, 1.42], k1 within [-540,
+    // 515]): on the exponent field, as in exp (L15-E326)
+    Value scaled = arith::BitcastOp::create(
+        b, f64,
+        arith::AddIOp::create(b, arith::BitcastOp::create(b, i64, e),
+                              arith::ShLIOp::create(b, k1, ci(52))));
+    scaled = sel(fcmp(arith::CmpFPredicate::UNO, e, e), e, scaled);
+    r = mul(scaled, pow2(arith::SubIOp::create(b, ki, k1)));
   } else if constexpr (std::is_same_v<OpTy, math::Log2Op> ||
                        std::is_same_v<OpTy, math::Log10Op>) {
     Value tiny = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p-1022));
@@ -1343,11 +1359,15 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     Value w = math::ExpOp::create(b, sel(below, a, mul(c(0.5), a)));
     Value t = accurateExpM1(b, b.getLoc(), a, w);
     Value tp1 = add(t, c(1.0));
-    Value small = mul(h, sub(mul(c(2.0), t), div(mul(t, t), tp1)));
-    Value mid = mul(h, add(t, div(t, tp1)));
+    // (one division by t + 1, of t^2 below 1 and of t from it, each lane's
+    // the same: L15-E323)
+    Value below1 = fcmp(arith::CmpFPredicate::OLT, a, c(1.0));
+    Value q = div(sel(below1, mul(t, t), t), tp1);
+    Value small = mul(h, sub(mul(c(2.0), t), q));
+    Value mid = mul(h, add(t, q));
     Value large = mul(h, w);
     Value huge = mul(mul(mul(h, c(2.0)), w), mul(c(0.5), w));
-    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(1.0)), small,
+    r = sel(below1, small,
             sel(fcmp(arith::CmpFPredicate::OLT, a, c(22.0)), mid,
                 sel(below, large, huge)));
     // tiny x: x itself (also -0)
@@ -1357,12 +1377,13 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     static_assert(std::is_same_v<OpTy, math::TanhOp>);
     Value a = math::AbsFOp::create(b, x);
     Value t1 = math::ExpM1Op::create(b, mul(c(2.0), a));
-    Value z1 = sub(c(1.0), div(c(2.0), add(t1, c(2.0))));
     // below 1: t / (t + 2) with t = e^2a - 1 > 0, whose relative error
     // passes on scaled by 2 / (t + 2) <= 1 (fdlibm's e^-2a - 1 form scales
-    // it by up to 1.8)
-    Value z2 = div(t1, add(t1, c(2.0)));
-    Value z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(1.0)), z1, z2);
+    // it by up to 1.8); from 1, 1 - 2 / (t + 2). One division, of 2 or t
+    // as the range picks (L15-E323).
+    Value from1 = fcmp(arith::CmpFPredicate::OGE, a, c(1.0));
+    Value q = div(sel(from1, c(2.0), t1), add(t1, c(2.0)));
+    Value z = sel(from1, sub(c(1.0), q), q);
     // below 2^-9: a - a^3/3 + 2a^5/15 (next term 2^-58 relative), as expm1's
     // error would otherwise reach 3 ulp there
     Value a2 = mul(a, a);

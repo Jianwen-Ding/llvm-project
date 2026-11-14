@@ -1019,7 +1019,20 @@ gpu.module @exp_log_f64 {
     // CHECK-NOT: llvm.intr.exp
     // CHECK: llvm.intr.roundeven
     // CHECK: llvm.fdiv
-    // CHECK: llvm.shl
+    // y 2^k1 on y's exponent field, then one multiplication by 2^k2
+    // (L15-E326)
+    // CHECK-NEXT: llvm.fsub
+    // CHECK-NEXT: llvm.fsub
+    // CHECK-NEXT: %[[Y:.*]] = llvm.fsub
+    // CHECK-NEXT: %[[K:.*]] = llvm.fptosi
+    // CHECK: %[[K1:.*]] = llvm.ashr %[[K]]
+    // CHECK: %[[YB:.*]] = llvm.bitcast %[[Y]] : f64 to i64
+    // CHECK: %[[KS:.*]] = llvm.shl %[[K1]]
+    // CHECK: %[[SB:.*]] = llvm.add %[[YB]], %[[KS]] : i64
+    // CHECK: %[[S:.*]] = llvm.bitcast %[[SB]] : i64 to f64
+    // CHECK: %[[NAN:.*]] = llvm.fcmp "uno" %[[Y]], %[[Y]]
+    // CHECK: %[[SY:.*]] = llvm.select %[[NAN]], %[[Y]], %[[S]]
+    // CHECK: llvm.fmul %[[SY]], %{{.*}} : f64
     // CHECK-NOT: llvm.intr.log
     // CHECK: llvm.fdiv
     // CHECK: llvm.sitofp
@@ -1203,6 +1216,26 @@ gpu.module @loop_carried_offset {
       scf.yield %x2, %off2 : i32, i32
     }
     memref.store %r#0, %out[%c0] : memref<8xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 sinh and tanh: one division each of their own beside those of the exp
+// and expm1 they use (sinh's t^2 or t by t + 1, tanh's t or 2 by t + 2, the
+// dividend selected: L15-E323): 8 divisions in all, 10 before.
+gpu.module @f64_sinh_tanh_one_division {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK-COUNT-8: llvm.fdiv
+    // CHECK-NOT: llvm.fdiv
+    // CHECK: llvm.return
+    %s = math.sinh %v : f64
+    %t = math.tanh %s : f64
+    memref.store %t, %a[%c0] : memref<8xf64, 1>
     gpu.return
   }
 }

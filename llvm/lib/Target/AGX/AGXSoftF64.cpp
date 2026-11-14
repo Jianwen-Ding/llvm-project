@@ -22,8 +22,10 @@
 #include "AGXSubtarget.h"
 #include "llvm/ADT/FloatingPointMode.h"
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -60,6 +62,11 @@ static cl::opt<bool> AGXSoftF64SaturateSelect(
     "agx-soft-f64-saturate-select", cl::init(true), cl::Hidden,
     cl::desc("Double to integer conversions as the fast path with a select "
              "of the saturated value, not a slow path"));
+
+static cl::opt<bool> AGXSoftF64Pow2Mul(
+    "agx-soft-f64-pow2-mul", cl::init(true), cl::Hidden,
+    cl::desc("Double multiplication by a constant power of two: the short "
+             "path adds its exponent"));
 
 static cl::opt<unsigned> AGXSoftF64FastPathsMax(
     "agx-soft-f64-fast-paths-max", cl::init(256), cl::Hidden,
@@ -396,6 +403,34 @@ public:
     Valid = B.CreateOr(AnyZero, Valid);
     return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y)))};
   }
+  /// X * Y where Y's significand field is zero (Y a power of two, a zero
+  /// or an infinity), where X and Y are normal and so is the product, or X
+  /// is zero and Y normal: Y's exponent added to X's exponent field, exactly,
+  /// and the signs combined; and whether it is (L15-E327).
+  std::pair<Value *, Value *> mulPow2Fast(Value *X, Value *Y) {
+    auto Field = [&](Value *V) {
+      return B.CreateTrunc(B.CreateAnd(B.CreateLShr(V, 52), c64(F64.expAll())), I32);
+    };
+    Value *EX = Field(X), *EY = Field(Y);
+    Value *SignY = B.CreateAnd(Y, c64(F64.signBit()));
+    // (Y's magnitude is its exponent field << 52)
+    Value *Bits = B.CreateXor(
+        B.CreateAdd(X, B.CreateSub(B.CreateXor(Y, SignY),
+                                   c64(uint64_t(F64.Bias) << 52))),
+        SignY);
+    auto InRange = [&](Value *E) {
+      return B.CreateICmpULT(B.CreateSub(E, c32(1)), c32(F64.expAll() - 1));
+    };
+    Value *YNormal = InRange(EY);
+    Value *Valid = B.CreateAnd(
+        B.CreateAnd(InRange(EX), YNormal),
+        InRange(B.CreateSub(B.CreateAdd(EX, EY), c32(F64.Bias))));
+    // a zero X: a zero with the sign of the product
+    Value *Zero = isZero(X, F64);
+    Bits = select(Zero, B.CreateXor(X, SignY), Bits);
+    return {Bits, B.CreateOr(B.CreateAnd(Zero, YNormal), Valid)};
+  }
+
   /// X + Y rounded to nearest even where both are normal and so is the
   /// result (not zero), and whether they are. The significands go 10 places
   /// up, the smaller is aligned with a sticky bit, and the sum or difference
@@ -1384,8 +1419,27 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     // Normal operands with a normal result take a short path; the others
     // (zeros, denormals, infinities, NaNs, underflow, overflow) the general
     // one, in a conditional block.
+    // a factor with a zero significand field (a constant power of two, or
+    // the bits of one built as e << 52): its exponent added (L15-E327)
+    std::optional<std::pair<Value *, Value *>> Pow2;
+    for (unsigned K = 0; Mul && AGXSoftF64Pow2Mul && K < 2 && !Pow2; ++K) {
+      Value *V = I.getOperand(1 - K);
+      bool IsPow2 = false;
+      if (auto *CF = dyn_cast<ConstantFP>(V)) {
+        int L = CF->getValueAPF().getExactLog2Abs();
+        IsPow2 = L >= -1022 && L <= 1023;
+      } else if (auto *BC = dyn_cast<BitCastInst>(V)) {
+        KnownBits Known = computeKnownBits(BC->getOperand(0),
+                                           I.getDataLayout());
+        IsPow2 = Known.Zero.countr_one() >= 52;
+      }
+      if (IsPow2)
+        Pow2 = SD.mulPow2Fast(K ? Y : X, K ? X : Y);
+    }
     auto [Fast, Valid] =
-        Mul ? SD.mulFast(X, Y)
+        Pow2 ? *Pow2
+        : Mul
+            ? SD.mulFast(X, Y)
             : SD.addFast(X, Sub ? B.CreateXor(Y, SD.c64(F64.signBit())) : Y);
     R = Dbl(withSlowPath(I, B, Fast, Valid, [&](SoftDouble &Slow) {
       return Mul ? Slow.mul(X, Y) : Slow.add(X, Y, Sub);
@@ -1726,7 +1780,14 @@ static Value *expandExpF64(IRBuilder<> &B, Value *X) {
   auto Pow2 = [&](Value *E) {
     return B.CreateBitCast(B.CreateShl(B.CreateAdd(E, CI(1023)), CI(52)), F);
   };
-  return B.CreateFMul(B.CreateFMul(Y, Pow2(K1)), Pow2(K2));
+  // y 2^k1 is exact and normal (y within [0.7, 1.42], k1 within [-538,
+  // 512]): k1 added to y's exponent field, one integer addition for a double
+  // multiplication; a NaN x keeps y (whose k is a NaN's conversion)
+  // (L15-E326)
+  Value *Scaled = B.CreateBitCast(
+      B.CreateAdd(B.CreateBitCast(Y, I), B.CreateShl(K1, CI(52))), F);
+  Scaled = B.CreateSelect(B.CreateFCmpUNO(Y, Y), Y, Scaled);
+  return B.CreateFMul(Scaled, Pow2(K2));
 }
 
 static Value *expandLogF64(IRBuilder<> &B, Value *X) {
