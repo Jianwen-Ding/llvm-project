@@ -1,14 +1,14 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query, then with the weaker check, then with element-wise vector accesses, then per lane for vector results (also combined, and combined with the weaker check); flag-approximation inconclusives re-run against the source without those flags (also timeouts with such flags); remaining timeouts re-run with another solver seed. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`, keyed calls); bulk-copy, tcgen05.mma decompress_b and texture files re-run with their keyed models; st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query, then with the weaker check, then with element-wise vector accesses, then per lane for vector results (also combined, and combined with the weaker check); flag-approximation inconclusives re-run against the source without those flags (also timeouts with such flags); remaining timeouts re-run with another solver seed. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4204.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3426 | 81.5% |
-| `timeout` | 505 | 12.0% |
+| `correct` | 3428 | 81.5% |
+| `timeout` | 503 | 12.0% |
 | `mismatch-known` | 171 | 4.1% |
 | `inconclusive` | 59 | 1.4% |
 | `mismatch-param-oob` | 33 | 0.8% |
@@ -18,9 +18,9 @@ Functions checked: 4204.
 
 55 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
 
-Of the correct results, 28 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
+Of the correct results, 0 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
 
-8 of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) after the check with cp.async/st.bulk copy semantics timed out.
+12 of the correct results used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`: copies as keyed calls, bulkkey.py) after the check with cp.async/cp.async.bulk copy semantics timed out.
 
 81 of the correct results were obtained with vector accesses split into element accesses on both sides (`scalarized`, PTXTV_SCALARIZE=1) after a timeout.
 
@@ -30,7 +30,7 @@ Of the correct results, 28 rely on probe-derived opaque instructions (probe.py):
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 3637 (86.5%).
+Conclusive (proved correct or counterexample): 3639 (86.6%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 

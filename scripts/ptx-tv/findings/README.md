@@ -201,6 +201,15 @@ support only a 32-bit multicast mask and are not overloaded, so their names
 have no `.i32` suffix; the documented name is rejected by the backend as an
 unknown intrinsic.
 
+A fifth, an omission: the `tcgen05.mma` `decompress_b` intrinsics
+(`@llvm.nvvm.tcgen05.mma.{shared,tensor}.f8f6f4.decompress_b`, the
+`.disable_output_lane.cg{1,2}` and the `mxf8f6f4.block_scale.block32`
+variants, tested by `tcgen05-mma*-decompress-b.ll`) are defined in
+`IntrinsicsNVVM.td` but not described in NVPTXUsage; their argument layout
+(the decompression-table pointer after the common arguments and scale
+pointers, before the disable-output-lane mask and the flags) can only be
+read from the TableGen definitions.
+
 Severity: documentation only. Fix direction: swap `%args` and `%offset` in
 the documented `tcgen05.st.16x32bx2` signature and give `tcgen05.ld.red`
 its two-element struct result.
@@ -257,11 +266,11 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4204 functions from 619
-test files; 3426 proved correct (28 through probe-derived opaque instructions,
-50 only with the weaker check); 33 counterexamples with out-of-bounds
+test files; 3428 proved correct (none through probe-derived opaque instructions,
+55 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in
-known modelling classes; 2 not lifted; 564 solver timeouts or inconclusive.
+known modelling classes; 2 not lifted; 562 solver timeouts or inconclusive.
 
 Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
 functions are compared after LLVM's

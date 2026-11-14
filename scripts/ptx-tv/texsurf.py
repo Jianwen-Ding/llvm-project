@@ -2,7 +2,7 @@
 documented modifiers, derived independently from the NVVM intrinsic name and
 from the PTX opcode (the image state stays opaque): txq/suq queries,
 suld/sust (.b, by geometry, vector width, bit size and clamp mode) and the
-unified tex fetches (geometry, result and coordinate types, .level/.grad).
+tex fetches, unified or with a separate sampler (geometry, result and coordinate types, .level/.grad).
 Operands in PTX order as zero-extended i64; results returned as i64 each."""
 import re
 
@@ -29,11 +29,13 @@ def intrinsic(name):
     if m and m.group(1) in GEOM:
         n = int(m.group(2)[1]) if m.group(2) else 1
         return {"sust", "g_" + m.group(1), "b%d" % TYBITS[m.group(3)], "v%d" % n, m.group(4)}, 0
-    m = re.fullmatch(r"tex\.unified\.(\w+)\.v4(f32|s32|u32)\.(s32|f32)(\.level|\.grad)?", name)
-    if m and m.group(1) in GEOM:
-        t = {"tex", "g_" + m.group(1), "r_" + m.group(2), "c_" + m.group(3)}
-        if m.group(4):
-            t.add(m.group(4)[1:])
+    m = re.fullmatch(r"tex(\.unified)?\.(\w+)\.v4(f32|s32|u32)\.(s32|f32)(\.level|\.grad)?", name)
+    if m and m.group(2) in GEOM:
+        t = {"tex", "g_" + m.group(2), "r_" + m.group(3), "c_" + m.group(4)}
+        if not m.group(1):
+            t.add("sampler")     # independent mode: [tex, sampler, coords]
+        if m.group(5):
+            t.add(m.group(5)[1:])
         return t, 4
     return None
 
@@ -65,3 +67,19 @@ def ptx(base, mods):
             t.add(extra)
         return t, True
     return None
+
+
+def tex_has_sampler(op):
+    """Whether a tex operand `[t, s, {c..}]` names a separate sampler."""
+    inner = re.sub(r"\{[^}]*\}", "C", op.strip().strip("[]"))
+    return len([x for x in inner.split(",") if x.strip()]) == 3
+
+
+def attrs(tokens):
+    """Function attributes of a keyed call, as LLVM declares the intrinsics:
+    willreturn except for the .trap surface accesses (which may trap);
+    queries memory(none), loads/fetches memory(read), stores memory(write)."""
+    a = "nounwind" if "trap" in tokens else "nounwind willreturn"
+    if tokens & {"txq", "suq"}:
+        return a + " memory(none)"
+    return a + (" memory(write)" if "sust" in tokens else " memory(read)")

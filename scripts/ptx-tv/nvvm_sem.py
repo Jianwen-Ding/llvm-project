@@ -22,6 +22,7 @@ import tcgen05ops
 import tcgen05mma
 import tma
 import prio
+import bulkkey
 import texsurf
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
@@ -216,6 +217,7 @@ def bulk_copy_operands(name, args):
     cp.async.bulk intrinsic call that ptx_lift.bulk_copy_ir models (no
     multicast, out-of-bounds handling or data validation), else None."""
     v = [x for _, x in args]
+    name = re.sub(r"^(cp\.async\.bulk\.global\.to\.shared\.cluster)\.i(16|32)$", r"\1", name)
     if name == "cp.async.bulk.shared.cta.to.global" and len(args) == 5:
         return (0, 1, 2, None)
     if name == "cp.async.bulk.shared.cta.to.cluster" and len(args) == 4:
@@ -254,6 +256,32 @@ def cp_async_helper(fname, level, size, argtys, lifter_mod):
     w += ["  " + l for l in lines]
     w.append("  ret void\n}")
     return "\n".join(w), decls
+
+
+def keyed_helper(fname, args, keep, kname, short):
+    """(fname, body, decls) of a helper calling the uninterpreted kname with
+    the kept arguments as zero-extended i64 (shared::cta/cluster and tmem
+    pointers narrowed to 32 bits under short pointers)."""
+    w = ["define internal void @%s(%s) alwaysinline {" % (
+        fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+    cargs = []
+    for i in keep:
+        t = args[i][0]
+        if t.startswith("ptr"):
+            narrow = re.match(r"ptr addrspace\((3|6|7)\)", t) and short
+            w.append("  %%p%d = ptrtoint %s %%y%d to %s" % (i, t, i, "i32" if narrow else "i64"))
+            if narrow:
+                w.append("  %%c%d = zext i32 %%p%d to i64" % (i, i))
+            else:
+                w.append("  %%c%d = add i64 %%p%d, 0" % (i, i))
+        elif t == "i64":
+            w.append("  %%c%d = add i64 %%y%d, 0" % (i, i))
+        else:
+            w.append("  %%c%d = zext %s %%y%d to i64" % (i, t, i))
+        cargs.append("i64 %%c%d" % i)
+    w += ["  call void @%s(%s)" % (kname, ", ".join(cargs)), "  ret void", "}"]
+    return (fname, "\n".join(w),
+            {kname: "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(keep)))})
 
 
 # PTXTV_OPAQUE_COPIES=1: keep cp.async / cp.async.bulk / st.bulk as
@@ -384,8 +412,8 @@ def expand(text, lifter_mod, llc_args=None):
                                 acc = "%%a%d" % k
                             w.append("  ret %s %s" % (ret, acc))
                     w.append("}")
-                    defs[key_] = (fname, "\n".join(w), {kname: "declare %s @%s(%s) nounwind" % (
-                        rty, kname, ", ".join(["i64"] * len(args)))})
+                    defs[key_] = (fname, "\n".join(w), {kname: "declare %s @%s(%s) " % (
+                        rty, kname, ", ".join(["i64"] * len(args))) + texsurf.attrs(toks)})
                 line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
                 out_lines.append(line)
                 continue
@@ -442,33 +470,18 @@ def expand(text, lifter_mod, llc_args=None):
                 out_lines.append(line)
                 continue
         pr = prio.intrinsic(name, args)
+        if pr is None and (OPAQUE_COPIES or (bulk_copy_operands(name, args) is None and
+                                             not name.startswith("cp.async.c"))):
+            bq = bulkkey.intrinsic(name, args)
+            if bq:
+                pr = (bq[0], bq[1], bulkkey.name_of(bq[0], len(bq[1])))
         if pr and not re.match(r"\s*%", line):
-            toks, keep = pr
+            toks, keep = pr[0], pr[1]
             short = llc_args is not None and any("short-ptr" in a or "shortptr" in a for a in llc_args)
-            kname = prio.name_of(toks) + ".n%d" % len(keep)
+            kname = pr[2] if len(pr) > 2 else prio.name_of(toks) + ".n%d" % len(keep)
             key_ = ("prio", name, tuple(args))
             if key_ not in defs:
-                fname = "ptxtv_sem_%d_prio" % len(defs)
-                w = ["define internal void @%s(%s) alwaysinline {" % (
-                    fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
-                cargs = []
-                for i in keep:
-                    t = args[i][0]
-                    if t.startswith("ptr"):
-                        narrow = re.match(r"ptr addrspace\((3|6|7)\)", t) and short
-                        w.append("  %%p%d = ptrtoint %s %%y%d to %s" % (i, t, i, "i32" if narrow else "i64"))
-                        if narrow:
-                            w.append("  %%c%d = zext i32 %%p%d to i64" % (i, i))
-                        else:
-                            w.append("  %%c%d = add i64 %%p%d, 0" % (i, i))
-                    elif t == "i64":
-                        w.append("  %%c%d = add i64 %%y%d, 0" % (i, i))
-                    else:
-                        w.append("  %%c%d = zext %s %%y%d to i64" % (i, t, i))
-                    cargs.append("i64 %%c%d" % i)
-                w += ["  call void @%s(%s)" % (kname, ", ".join(cargs)), "  ret void", "}"]
-                defs[key_] = (fname, "\n".join(w),
-                              {kname: "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(keep)))})
+                defs[key_] = keyed_helper("ptxtv_sem_%d_prio" % len(defs), args, keep, kname, short)
             line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
             out_lines.append(line)
             continue

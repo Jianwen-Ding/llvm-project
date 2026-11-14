@@ -1019,7 +1019,7 @@ class Lifter:
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
                 (base == "tcgen05" and mods[:1] in (["ld"], ["st"])) or \
-                (base == "tcgen05" and mods[:1] == ["mma"] and "decompress::lut::b" not in mods) or \
+                (base == "tcgen05" and mods[:1] == ["mma"]) or \
                 (base == "tcgen05" and mods[:1] in (["alloc"], ["dealloc"], ["relinquish_alloc_permit"],
                                                    ["commit"], ["cp"], ["shift"], ["wait::ld"],
                                                    ["wait::st"], ["fence::before_thread_sync"],
@@ -2261,6 +2261,10 @@ class Lifter:
         pr = prio.ptx("cp", mods, ops)
         if pr is not None:
             return self.prio_call(pr, opc)
+        import bulkkey
+        bq = bulkkey.ptx(mods, ops)
+        if bq is not None and (bulkkey.OPAQUE or not bulkkey.semantic(bq[0])):
+            return self.prio_call(bq, opc, bulkkey.name_of(bq[0], len(bq[1])))
         import tma
         tg = tma.ptx(mods, ops)
         if tg is not None:
@@ -2487,7 +2491,7 @@ class Lifter:
                 acc = self.op("insertelement %s %s, i32 %s, i32 %d" % (vt, acc, self.get(r, 32), k))
             self.emit("call void @%s(%s)" % (name, ", ".join(args + ["%s %s" % (vt, acc)])))
 
-    def prio_call(self, pr, opc):
+    def prio_call(self, pr, opc, kname=None):
         """An uninterpreted call of prio.py, every operand as a zero-extended
         i64 (registers at their width, immediates as constants)."""
         import prio
@@ -2504,7 +2508,7 @@ class Lifter:
                 vals.append("i64 %d" % (self.imm(r) & ((1 << 64) - 1)))
             else:
                 raise Unsupported("operand " + opc)
-        kname = prio.name_of(toks) + ".n%d" % len(vals)
+        kname = kname or prio.name_of(toks) + ".n%d" % len(vals)
         self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(vals))))
         self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
 
@@ -2569,6 +2573,8 @@ class Lifter:
         if r is None:
             raise Unsupported("opcode " + opc)
         toks, res_first = r
+        if base == "tex" and len(ops) >= 2 and texsurf.tex_has_sampler(ops[1]):
+            toks = toks | {"sampler"}
         flat = tma._flatten(ops)
         res = []
         if res_first:
@@ -2595,7 +2601,8 @@ class Lifter:
                 raise Unsupported("operand " + opc)
         kname = texsurf.name_of(toks, len(res), len(vals))
         rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
-        self.declare(kname, "declare %s @%s(%s) nounwind" % (rty, kname, ", ".join(["i64"] * len(vals))))
+        self.declare(kname, "declare %s @%s(%s) " % (rty, kname, ", ".join(["i64"] * len(vals)))
+                     + texsurf.attrs(toks))
         call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
         if not res:
             self.emit(call)

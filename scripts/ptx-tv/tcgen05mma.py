@@ -39,7 +39,39 @@ def _block(kind, blk):
 
 
 def intrinsic(name, args):
-    """(tokens, canonical arg indices) or None."""
+    """(tokens, canonical arg indices) or None.  The .decompress_b forms
+    (IntrinsicsNVVM.td: the decompression table pointer follows the common
+    arguments / scale pointers; kind f8f6f4 or mxf8f6f4.block32; NVPTXUsage
+    does not describe them) map onto the corresponding base forms, with the
+    table pointer last in canonical order."""
+    m = re.fullmatch(r"tcgen05\.mma\.(shared|tensor)\.(f8f6f4(?:\.disable_output_lane\.cg[12])?"
+                     r"|mxf8f6f4\.block_scale\.block32)\.decompress_b", name)
+    if m:
+        sp, form = m.group(1), m.group(2)
+        if form == "f8f6f4":
+            if len(args) != 9:
+                return None
+            r = _intrinsic("tcgen05.mma." + sp, args[:5] + [("i32", "2")] + args[6:])
+            back, lut = list(range(5)), 5
+        elif form.startswith("f8f6f4.disable"):
+            if len(args) != 9:
+                return None
+            r = _intrinsic("tcgen05.mma.%s.%s" % (sp, form[len("f8f6f4."):]),
+                           args[:5] + [args[6], ("i32", "2")] + args[7:])
+            back, lut = [0, 1, 2, 3, 4, 6], 5
+        else:
+            if len(args) != 11:
+                return None
+            r = _intrinsic("tcgen05.mma.%s.mxf8f6f4.block_scale.block32" % sp, args[:7] + args[8:])
+            back, lut = list(range(7)), 7
+        if r is None:
+            return None
+        t, keep = r
+        return t | {"decompress_lut_b"}, [back[i] for i in keep] + [lut]
+    return _intrinsic(name, args)
+
+
+def _intrinsic(name, args):
     v = [x for _, x in args]
     m = re.fullmatch(r"tcgen05\.mma\.ws(\.sp)?\.(shared|tensor)(\.zero_col_mask)?", name)
     if m:
@@ -119,6 +151,14 @@ def ptx(mods, ops):
     """(tokens, operands in canonical order) or None."""
     if not mods or mods[0] != "mma":
         return None
+    if "decompress::lut::b" in mods:
+        # [d], a, b, [lut], idesc, ...: the table operand follows b
+        if len(ops) < 5 or "ws" in mods or "sp" in mods:
+            return None
+        r = ptx([x for x in mods if x != "decompress::lut::b"], list(ops[:3]) + list(ops[4:]))
+        if r is None:
+            return None
+        return r[0] | {"decompress_lut_b"}, r[1] + [ops[3].strip()]
     if "block_scale" in mods:
         return _ptx_block_scale(mods, ops)
     if len(mods) > 1 and mods[1] == "ws":

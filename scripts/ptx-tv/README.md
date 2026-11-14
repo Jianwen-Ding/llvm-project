@@ -116,9 +116,17 @@ single-thread semantics:
   Size and alignment requirements are assumptions (UB otherwise). The
   commit/wait-group operations and bulk prefetch are then no-ops. The same
   IR (`cp_async_ir`, `st_bulk_ir`, `bulk_copy_ir` in `ptx_lift.py`) is used
-  for the NVVM intrinsics. Alive2 often times out on symbolic-size copies;
-  `PTXTV_OPAQUE_COPIES=1` falls back to probe-derived opaque instructions
-  for these, and results record `"copy_model": "opaque"`.
+  for the NVVM intrinsics. The other non-tensor bulk copies (`.relaxed`
+  with a scope, `.ignore_oob` with its bounds, `.cp_mask` byte mask,
+  multicast with 16- or 32-bit mask, data validity) are uninterpreted calls
+  keyed by their documented modifiers (`bulkkey.py`: NVPTXUsage's
+  `flag_mc`/`flag_ch`/`flag_oob`, the `flag_scope` table 0-3 =
+  `.cta`/`.cluster`/`.gpu`/`.sys` and the validity-pattern table), derived
+  independently from the intrinsic and from the PTX opcode, operands in PTX
+  order as zero-extended i64. Alive2 often times out on symbolic-size
+  copies; `PTXTV_OPAQUE_COPIES=1` uses the same keyed calls for every
+  `cp.async`/`cp.async.bulk` copy (`st.bulk` stays probe-derived), and
+  results record `"copy_model": "opaque"`.
 * `st.async` to `shared::cluster` is a store followed by the same opaque
   complete-tx (of the store's size) on the mbarrier; the `.release.{sys,gpu}`
   (and `.mmio`) global forms, and `multimem.st.async`, are plain stores. `discard.L2` makes its
@@ -147,8 +155,13 @@ single-thread semantics:
   (`mxf8f6f4`/`mxf4`/`mxf4nvf4`; a missing scale-vector size is `.block32`
   for `mxf4` and the only size for `mxf8f6f4`, per the PTX ISA),
   disable-output-lane (the lane mask as a vector operand) and `ws` (collector
-  buffer `b0`-`b3`, zero-column mask) variants are modelled the same way;
-  only the newer `decompress_b` forms remain probe-derived.
+  buffer `b0`-`b3`, zero-column mask) variants are modelled the same way.
+  The `decompress_b` forms (base, disable-output-lane and `mxf8f6f4`
+  block-scale; not described in NVPTXUsage, so their argument layout is
+  taken from `IntrinsicsNVVM.td`: the table pointer follows the common
+  arguments and scale pointers) map onto those models plus a
+  `decompress::lut::b` token, with the table operand last in canonical
+  order.
 * TMA (`cp.async.bulk.tensor` g2s and g2s `.cta`, s2g, `cp.reduce` with
   the `red_op` table, and prefetch; tile, im2col, gather4/scatter4 and
   im2col::w modes; default data-validity pattern) are uninterpreted calls
@@ -177,8 +190,12 @@ single-thread semantics:
   fetches) are uninterpreted calls keyed by their modifiers, derived from
   the intrinsic name and from the PTX opcode (`texsurf.py`); the image state
   stays opaque. Handles are the `.texref`/`.surfref` parameter or the
-  symbol's address. The older non-unified `tex` form with a separate
-  sampler remains probe-derived.
+  symbol's address. The non-unified `tex` form with a separate sampler
+  (`[tex, sampler, {coords}]`) adds a `sampler` token. The keyed calls carry
+  the function attributes LLVM declares for the intrinsics (`willreturn`
+  except the `.trap` surface accesses, which may trap; `memory(none)`,
+  `memory(read)` or `memory(write)`); without `willreturn` Alive2's
+  asm-mode check of even a single fetch times out.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -288,13 +305,11 @@ intrinsics' `i16` operands/results.
 What remains opaque or unproved, and why:
 
 * Probe-derived opaque instructions are left for families without
-  single-thread semantics a TV check could use: the `tcgen05.mma`
-  `decompress_b` forms (not in NVPTXUsage; all other `tcgen05` operations
-  have documentation-derived models),  `multimem`
-  loads and reductions (they combine the replicas; `multimem.st.async` is
-  modelled as a store, its single-memory meaning) and the non-unified `tex`
-  form with a separate sampler.
- Non-tensor `cp.reduce.async.bulk`
+  single-thread semantics a TV check could use: `multimem` loads and
+  reductions (they combine the replicas; `multimem.st.async` is modelled as
+  a store, its single-memory meaning), `st.bulk` under
+  `PTXTV_OPAQUE_COPIES=1`, and `mma.sync` forms the lifter does not model.
+* Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
   symbolic-size bulk copies (which already time out with copy semantics),
   Alive2 cannot prove it without bounded unrolling.

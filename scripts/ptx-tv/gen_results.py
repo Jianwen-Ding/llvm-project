@@ -46,8 +46,9 @@ def main(path, out, title, config):
     L.append("")
     nop = sum(1 for r in fn if r["status"] == "correct" and r.get("copy_model") == "opaque")
     if nop:
-        L.append("%d of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) "
-                 "after the check with cp.async/st.bulk copy semantics timed out." % nop)
+        L.append("%d of the correct results used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`: "
+                 "copies as keyed calls, bulkkey.py) after the check with cp.async/cp.async.bulk "
+                 "copy semantics timed out." % nop)
         L.append("")
     nsc = sum(1 for r in fn if r["status"] == "correct" and r.get("scalarized"))
     if nsc:
