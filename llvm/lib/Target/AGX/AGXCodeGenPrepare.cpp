@@ -570,6 +570,11 @@ static bool isCheapDivision(const BinaryOperator &BO) {
          (Div64ConstMulHi && BO.getType()->isIntegerTy(64));
 }
 
+static cl::opt<bool> AGXDivSignFromXor(
+    "agx-div-sign-from-xor",
+    cl::desc("Signed 32-bit division's quotient sign as (x ^ d) <s 0"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> ShareDivisors(
     "agx-share-divisors", cl::init(true), cl::Hidden,
     cl::desc("Compute the reciprocal of a 32-bit divisor once where the "
@@ -580,6 +585,7 @@ namespace {
 /// estimate z of 2^32 / |y|.
 struct Divisor {
   Value *Y, *Neg, *Z;
+  Value *H; // the divisor itself (signed: before its absolute value)
 };
 
 /// Divisors computed once each. A divisor that is a cheap pure expression
@@ -706,7 +712,7 @@ public:
         B.CreateZExt(Z, B.getInt64Ty()),
         B.CreateZExt(B.CreateMul(B.CreateNeg(YAbs), Z), B.getInt64Ty()));
     Z = B.CreateAdd(Z, B.CreateTrunc(B.CreateLShr(P, 32), B.getInt32Ty()));
-    Divisor D{YAbs, Neg, Z};
+    Divisor D{YAbs, Neg, Z, H};
     if (ShareDivisors)
       It->second = D;
     else
@@ -759,7 +765,12 @@ static Value *expandDivRem32(BinaryOperator &BO, DivisorCache &Divisors) {
   Value *XNeg = nullptr, *Neg = nullptr;
   if (IsSigned) {
     XNeg = B.CreateICmpSLT(X, B.getInt32(0));
-    Neg = IsRem ? XNeg : B.CreateXor(XNeg, D.Neg);
+    // the quotient's sign: (x ^ d) <s 0, one xor and a compare the final
+    // select takes, not x <s 0 xor d <s 0 (L15-E324)
+    Neg = IsRem                ? XNeg
+          : AGXDivSignFromXor ? B.CreateICmpSLT(B.CreateXor(X, D.H),
+                                                 B.getInt32(0))
+                               : B.CreateXor(XNeg, D.Neg);
     X = B.CreateSelect(XNeg, B.CreateNeg(X), X);
   }
   auto MulHi = [&](Value *A, Value *C) {

@@ -648,11 +648,11 @@
   "waits": 3
  },
  "cuda_rope.ll:rope:agx-g13g": {
-  "bytes": 662,
-  "cycles": 284.0,
+  "bytes": 646,
+  "cycles": 282.8,
   "gprs": 14,
   "groups": 96,
-  "instructions": 100,
+  "instructions": 98,
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 44.9,
@@ -660,11 +660,11 @@
   "waits": 1
  },
  "cuda_rope.ll:rope:agx-g14c": {
-  "bytes": 662,
-  "cycles": 284.0,
+  "bytes": 646,
+  "cycles": 282.8,
   "gprs": 14,
   "groups": 96,
-  "instructions": 100,
+  "instructions": 98,
   "launch_inputs": true,
   "tg_bytes": 0,
   "tput": 44.9,
