@@ -55,6 +55,11 @@ def main(path, out, title, config):
                  "element accesses on both sides (`scalarized`, PTXTV_SCALARIZE=1) after a "
                  "timeout." % nsc)
         L.append("")
+    nla = sum(1 for r in fn if r["status"] == "correct" and r.get("lanes"))
+    if nla:
+        L.append("%d of the correct results were obtained by checking a vector result one "
+                 "lane at a time (`lanes`, PTXTV_LANES=1) after a timeout." % nla)
+        L.append("")
     nun = sum(1 for r in fn if r["status"] == "correct" and r.get("unroll"))
     if nun:
         L.append("%d of the correct results involve loops and were checked with bounded "

@@ -182,6 +182,11 @@ single-thread semantics:
   relating a vector access to differently shaped ones (even a 2 x i16 copy
   split in two) but proves element-wise copies at once; it does not help
   where the PTX uses another element width than the source.
+* `PTXTV_LANES=1` (used for timeouts; results record `lanes`): a function
+  returning `<N x T>` is checked once per lane, both sides returning only
+  lane k with all computations, memory effects and UB unchanged; the
+  function refines iff every lane variant does (vector refinement is
+  lane-wise), and a failing lane is a real counterexample.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
