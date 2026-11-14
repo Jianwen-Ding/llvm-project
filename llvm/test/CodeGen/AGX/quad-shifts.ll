@@ -5,7 +5,9 @@
 ; a SIMD-group shift and a select of the own value where the source lane is
 ; past the segment) is the quad-group's shift, which keeps the own value
 ; there; within 2 lanes the select stays on the quad shift. Wider segments,
-; and a shift read outside of such selects, stay (L15-E305).
+; and a shift read outside of such selects, stay (L15-E305). The conditions
+; are compared by their values at the 32 lanes, whatever their form, such as
+; convert-gpu-to-air's lane % w tests as InstCombine leaves them (L15-E306).
 
 ; CHECK-LABEL: four:
 ; CHECK-NOT: icmpsel
@@ -86,6 +88,33 @@ define agx_kernel void @stays(ptr addrspace(1) %p, ptr addrspace(1) %o) {
   store i32 %s, ptr addrspace(1) %qo
   ret void
 }
+; CHECK-LABEL: forms:
+; CHECK-NOT: simd_shuffle
+; CHECK-DAG: quad_shuffle_down {{r[0-9]+}}, {{r[0-9]+}}, 1
+; CHECK-DAG: quad_shuffle_up {{r[0-9]+}}, {{r[0-9]+}}, 1
+; CHECK: icmpsel
+; CHECK-NOT: icmpsel
+define agx_kernel void @forms(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr i32, ptr addrspace(1) %p, i32 %t
+  %v = load i32, ptr addrspace(1) %q
+  ; down by 1 within 4: lane % 4 < 3
+  %p4 = and i32 %lane, 3
+  %in = icmp ne i32 %p4, 3
+  %d = call i32 @llvm.agx.simd.shuffle.down.i32(i32 %v, i32 1)
+  %r0 = select i1 %in, i32 %d, i32 %v
+  ; up by 1 within 2: lane % 2 >= 1
+  %p2 = and i32 %lane, 1
+  %out = icmp eq i32 %p2, 0
+  %u = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %v, i32 1)
+  %r1 = select i1 %out, i32 %v, i32 %u
+  %s = add i32 %r0, %r1
+  %qo = getelementptr i32, ptr addrspace(1) %o, i32 %t
+  store i32 %s, ptr addrspace(1) %qo
+  ret void
+}
+
 declare i32 @llvm.agx.thread.index.in.simdgroup()
 declare i32 @llvm.agx.thread.position.in.grid.x()
 declare i32 @llvm.agx.simd.shuffle.down.i32(i32, i32)

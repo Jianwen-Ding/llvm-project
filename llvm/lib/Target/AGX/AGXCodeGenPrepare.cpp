@@ -52,6 +52,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CycleAnalysis.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
@@ -3581,51 +3582,62 @@ static cl::opt<bool> AGXQuadShifts(
     cl::desc("a SIMD-group shift by a constant within segments of 2 or 4 "
              "lanes as the quad-group's"));
 
-/// select(lane + k < (lane & -w) + w, shuffle_down(v, k), v) and
-/// select(lane - k < (lane & -w), v, shuffle_up(v, k)), w 2 or 4 and k in
-/// [1, w) (convert-gpu-to-air's gpu.shuffle down / up within w lanes): where
-/// the select takes the shuffle, its source lane is in the lane's quad, so
-/// the shuffle is the quad-group's, which issues in half the cycles (the
-/// M2 Max coverage recordings, as quadXorShuffles). With w = 4 the select
-/// takes the own value exactly where the quad shift has no source lane,
-/// which the quad shift leaves its own value (the masked hardware
-/// recordings), so it goes (L15-E305).
+/// The value of a condition of the SIMD lane alone at each of the 32 lanes
+/// (bit L: at lane L), through the constant folding of its instructions, or
+/// none where it reads anything else.
+static std::optional<uint32_t> laneTruth(Value *Cond, const DataLayout &DL) {
+  using namespace PatternMatch;
+  std::function<Constant *(Value *, unsigned, unsigned)> Eval =
+      [&](Value *V, unsigned L, unsigned Depth) -> Constant * {
+    if (auto *C = dyn_cast<Constant>(V))
+      return C;
+    if (match(V, m_Intrinsic<Intrinsic::agx_thread_index_in_simdgroup>()))
+      return ConstantInt::get(V->getType(), L);
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || Depth > 8 ||
+        !(isa<BinaryOperator, CmpInst, CastInst, SelectInst>(I)))
+      return nullptr;
+    SmallVector<Constant *, 3> Ops;
+    for (Value *Op : I->operands()) {
+      Constant *C = Eval(Op, L, Depth + 1);
+      if (!C)
+        return nullptr;
+      Ops.push_back(C);
+    }
+    return ConstantFoldInstOperands(I, Ops, DL);
+  };
+  uint32_t Mask = 0;
+  for (unsigned L = 0; L < 32; ++L) {
+    auto *C = dyn_cast_or_null<ConstantInt>(Eval(Cond, L, 0));
+    if (!C)
+      return std::nullopt;
+    if (C->isOne())
+      Mask |= 1u << L;
+  }
+  return Mask;
+}
+
+/// A simd_shuffle_down / up by a constant k in [1, 4) whose every use
+/// (through bitcasts and truncations) is a select of it and the own value
+/// on a condition of the lane that takes it only where lane % 4 + k < 4
+/// (down) or lane % 4 >= k (up), as convert-gpu-to-air's gpu.shuffle down /
+/// up within 2 or 4 lanes: it reads a lane of the thread's quad wherever it
+/// is taken, so it is the quad-group shift, which issues in half the cycles
+/// (the M2 Max coverage recordings, as quadXorShuffles). A select that
+/// takes it exactly there goes: the quad shift keeps the own value where
+/// its source is past the quad (the masked hardware recordings)
+/// (L15-E305). The conditions are compared by their values at the 32 lanes,
+/// whatever their form (L15-E306).
 static bool quadShifts(Function &F) {
   if (!AGXQuadShifts)
     return false;
+  const DataLayout &DL = F.getDataLayout();
   using namespace PatternMatch;
   // (through the casts of a 16-bit or float value's shuffle as i32)
   auto Peel = [](Value *V) {
     while (isa<BitCastInst, TruncInst, ZExtInst, SExtInst>(V))
       V = cast<Instruction>(V)->getOperand(0);
     return V;
-  };
-  // The segment width w, the shift (> 0 down, < 0 up) and the lane of a
-  // condition lane + k < (lane & -w) + w (down: true where the shuffle is
-  // taken) or lane - k < (lane & -w) (up: true where the own value is).
-  auto Segment = [](Value *Cond, int64_t &W, int64_t &Shift) {
-    CmpPredicate P;
-    Value *A, *B, *L1, *L2;
-    const APInt *D, *M, *E = nullptr;
-    if (!match(Cond, m_ICmp(P, m_Value(A), m_Value(B))) ||
-        (P != ICmpInst::ICMP_SLT && P != ICmpInst::ICMP_ULT) ||
-        !match(A, m_Add(m_Value(L1), m_APInt(D))) ||
-        !match(L1, m_Intrinsic<Intrinsic::agx_thread_index_in_simdgroup>()))
-      return false;
-    if (!match(B, m_Add(m_And(m_Value(L2), m_APInt(M)), m_APInt(E))) &&
-        !match(B, m_And(m_Value(L2), m_APInt(M))))
-      return false;
-    if (L2 != L1 || (M->getSExtValue() != -2 && M->getSExtValue() != -4))
-      return false;
-    W = -M->getSExtValue();
-    int64_t d = D->getSExtValue(), e = E ? E->getSExtValue() : 0;
-    if (d > 0 && d < W && e == W)
-      Shift = d;
-    else if (d < 0 && -d < W && e == 0)
-      Shift = d;
-    else
-      return false;
-    return true;
   };
   bool Changed = false;
   for (Instruction &Inst : instructions(F)) {
@@ -3641,12 +3653,15 @@ static bool quadShifts(Function &F) {
         (Ty->getPrimitiveSizeInBits() != 16 &&
          Ty->getPrimitiveSizeInBits() != 32))
       continue;
-    int64_t k = K->getZExtValue();
+    unsigned k = K->getZExtValue();
+    // the lanes whose quad shift has a source lane
+    uint32_t Quad = 0;
+    for (unsigned L = 0; L < 32; ++L)
+      if (Down ? (L & 3) + k < 4 : (L & 3) >= k)
+        Quad |= 1u << L;
     Value *Own = Peel(Sh->getArgOperand(0));
-    // every use, through the casts, a select of the own value where the
-    // shift leaves the lane's segment of 2 or 4
     SmallVector<Value *, 4> Work{Sh};
-    SmallVector<std::pair<SelectInst *, Value *>, 4> Fours;
+    SmallVector<std::pair<SelectInst *, Value *>, 4> Exact;
     bool OK = true;
     while (OK && !Work.empty()) {
       Value *V = Work.pop_back_val();
@@ -3656,21 +3671,25 @@ static bool quadShifts(Function &F) {
           continue;
         }
         auto *Sel = dyn_cast<SelectInst>(U);
-        int64_t W, Shift;
-        if (!Sel || !Segment(Sel->getCondition(), W, Shift) ||
-            Shift != (Down ? k : -k) || W <= k) {
+        bool OnTrue = Sel && Sel->getTrueValue() == V;
+        Value *OwnSide =
+            Sel ? (OnTrue ? Sel->getFalseValue() : Sel->getTrueValue())
+                : nullptr;
+        std::optional<uint32_t> T =
+            Sel && OwnSide != V && Peel(OwnSide) == Own
+                ? laneTruth(Sel->getCondition(), DL)
+                : std::nullopt;
+        if (!T) {
           OK = false;
           break;
         }
-        // down: the shuffle where true; up: the own value where true
-        Value *ShSide = Down ? Sel->getTrueValue() : Sel->getFalseValue();
-        Value *OwnSide = Down ? Sel->getFalseValue() : Sel->getTrueValue();
-        if (ShSide != V || OwnSide == V || Peel(OwnSide) != Own) {
+        uint32_t Takes = OnTrue ? *T : ~*T;
+        if (Takes & ~Quad) {
           OK = false;
           break;
         }
-        if (W == 4)
-          Fours.push_back({Sel, V});
+        if (Takes == Quad)
+          Exact.push_back({Sel, V});
       }
     }
     if (!OK)
@@ -3679,7 +3698,7 @@ static bool quadShifts(Function &F) {
         F.getParent(),
         Down ? Intrinsic::agx_quad_shuffle_down : Intrinsic::agx_quad_shuffle_up,
         {Ty}));
-    for (auto [Sel, V] : Fours) {
+    for (auto [Sel, V] : Exact) {
       Sel->replaceAllUsesWith(V);
       Sel->eraseFromParent();
     }

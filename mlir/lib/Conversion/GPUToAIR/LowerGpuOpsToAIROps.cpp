@@ -557,38 +557,56 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
       auto c = [&](int64_t v) {
         return LLVM::ConstantOp::create(rewriter, loc, i32, v);
       };
-      Value start = LLVM::AndOp::create(rewriter, loc, i32, lane, c(-*width));
-      Value srcLane;
-      switch (op.getMode()) {
-      case gpu::ShuffleMode::UP:
-        srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane, off);
-        break;
-      case gpu::ShuffleMode::DOWN:
-        srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane, off);
-        break;
-      case gpu::ShuffleMode::XOR:
-        srcLane = LLVM::XOrOp::create(rewriter, loc, i32, lane, off);
-        break;
-      default:
-        srcLane = off;
-        break;
+      // A constant offset's test is the lane's position in its segment (or,
+      // for idx, the segment): up by k, lane % w >= k; down, lane % w < w - k;
+      // idx of lane c, lane & -w == c & -w (L15-E306).
+      if (!uniformOffset) {
+        Value pos = LLVM::AndOp::create(rewriter, loc, i32, lane,
+                                        c(op.getMode() == gpu::ShuffleMode::IDX
+                                              ? -*width
+                                              : *width - 1));
+        switch (op.getMode()) {
+        case gpu::ShuffleMode::UP:
+          valid = LLVM::ICmpOp::create(rewriter, loc,
+                                       LLVM::ICmpPredicate::uge, pos,
+                                       c(*offset));
+          break;
+        case gpu::ShuffleMode::DOWN:
+          valid = LLVM::ICmpOp::create(rewriter, loc,
+                                       LLVM::ICmpPredicate::ult, pos,
+                                       c(*width - *offset));
+          break;
+        default:
+          valid = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::eq,
+                                       pos, c(*offset & -*width));
+          break;
+        }
+      } else {
+        Value start =
+            LLVM::AndOp::create(rewriter, loc, i32, lane, c(-*width));
+        Value srcLane;
+        switch (op.getMode()) {
+        case gpu::ShuffleMode::UP:
+          srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane, off);
+          break;
+        case gpu::ShuffleMode::DOWN:
+          srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane, off);
+          break;
+        case gpu::ShuffleMode::XOR:
+          srcLane = LLVM::XOrOp::create(rewriter, loc, i32, lane, off);
+          break;
+        default:
+          srcLane = off;
+          break;
+        }
+        // (the source lane in the segment: a uniform offset may be negative)
+        Value aboveStart = LLVM::ICmpOp::create(
+            rewriter, loc, LLVM::ICmpPredicate::sge, srcLane, start);
+        Value belowEnd = LLVM::ICmpOp::create(
+            rewriter, loc, LLVM::ICmpPredicate::slt, srcLane,
+            LLVM::AddOp::create(rewriter, loc, i32, start, c(*width)));
+        valid = LLVM::AndOp::create(rewriter, loc, aboveStart, belowEnd);
       }
-      // (up's source is below the segment's end, down's not below its start)
-      Value aboveStart = LLVM::ICmpOp::create(
-          rewriter, loc, LLVM::ICmpPredicate::sge, srcLane, start);
-      Value belowEnd = LLVM::ICmpOp::create(
-          rewriter, loc, LLVM::ICmpPredicate::slt, srcLane,
-          LLVM::AddOp::create(rewriter, loc, i32, start, c(*width)));
-      // (with a uniform offset of either sign, both bounds)
-      valid = !uniformOffset && op.getMode() == gpu::ShuffleMode::UP
-                  ? aboveStart
-              : !uniformOffset && op.getMode() == gpu::ShuffleMode::DOWN
-                  ? belowEnd
-                                                       : LLVM::AndOp::create(
-                                                             rewriter, loc,
-                                                             aboveStart,
-                                                             belowEnd)
-                                                             .getResult();
     } else if (!native.empty()) {
       lane16 = LLVM::ConstantOp::create(rewriter, loc, i16, *offset);
       if (op.getMode() == gpu::ShuffleMode::XOR || *offset == 0) {

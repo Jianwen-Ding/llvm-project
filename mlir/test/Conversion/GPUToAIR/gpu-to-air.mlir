@@ -212,17 +212,21 @@ gpu.module @shuffles {
     // Within segments of 8 lanes, a shift by a constant is the same
     // shuffle_down, and the thread's own value where the source lane is past
     // its segment's end; an idx of a constant lane, the shuffle of that lane
-    // and the own value outside its segment (no per-thread lane).
+    // and the own value outside its segment (no per-thread lane). The tests:
+    // lane % 8 < 8 - 2, and lane & -8 == 2 & -8 (L15-E306).
     // CHECK: %[[L8:.*]] = llvm.call @air.thread_index_in_simdgroup()
-    // CHECK: llvm.and %[[L8]]
-    // CHECK: %[[OK8:.*]] = llvm.icmp "slt"
+    // CHECK: %[[SEVEN:.*]] = llvm.mlir.constant(7 : i32) : i32
+    // CHECK: %[[P8:.*]] = llvm.and %[[L8]], %[[SEVEN]]
+    // CHECK: %[[SIX:.*]] = llvm.mlir.constant(6 : i32) : i32
+    // CHECK: %[[OK8:.*]] = llvm.icmp "ult" %[[P8]], %[[SIX]]
     // CHECK: %[[D8:.*]] = llvm.call @air.simd_shuffle_down.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
     // CHECK: llvm.select %[[OK8]], %[[D8]], %{{.*}} : i1, i32
     %d8, %okd8 = gpu.shuffle down %v, %c2, %c8 : i32
-    // CHECK: llvm.icmp "sge"
-    // CHECK: llvm.icmp "slt"
+    // CHECK: %[[S8:.*]] = llvm.and %{{.*}}, %{{.*}} : i32
+    // CHECK: %[[Z:.*]] = llvm.mlir.constant(0 : i32) : i32
+    // CHECK: %[[OKI:.*]] = llvm.icmp "eq" %[[S8]], %[[Z]]
     // CHECK: %[[I8:.*]] = llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
-    // CHECK: llvm.select %{{.*}}, %[[I8]], %{{.*}} : i1, i32
+    // CHECK: llvm.select %[[OKI]], %[[I8]], %{{.*}} : i1, i32
     %i8, %oki8 = gpu.shuffle idx %v, %c2, %c8 : i32
     // A uniform mask (a kernel argument): AIR's shuffle_xor of it, and the
     // own value where lane ^ mask leaves the segment (L15-E286).
