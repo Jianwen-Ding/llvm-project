@@ -2776,6 +2776,11 @@ static cl::opt<bool> ConstDivisorFold(
     cl::desc("a constant divisor's significand, reciprocal and exponent "
              "factor at compile time in the correctly rounded division"));
 
+static cl::opt<bool> HalfPow2Numerator(
+    "agx-half-pow2-numerator", cl::init(true), cl::Hidden,
+    cl::desc("a half quotient of a constant +-2^k without the correction "
+             "step"));
+
 SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   const MVT VT = MVT::f32;
@@ -2920,19 +2925,27 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
                       Y0, Y0);
     }
     SDValue Q1 = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y);
-    SDValue Q = DAG.getNode(
-        ISD::FMA, DL, MVT::f32,
-        DAG.getNode(ISD::FMA, DL, MVT::f32, NegB, Q1, A32), Y, Q1);
+    // A constant a = +-2^k: a y, exact (in [2^-40, 2^39]), is already the
+    // correctly rounded float quotient, and never zero (L15-E284).
+    auto *CA = dyn_cast<ConstantFPSDNode>(A);
+    bool Pow2 = HalfPow2Numerator && CA && CA->getValueAPF().isNormal() &&
+                CA->getValueAPF().getExactLog2Abs() != INT_MIN;
+    SDValue Q = Pow2 ? Q1
+                     : DAG.getNode(ISD::FMA, DL, MVT::f32,
+                                   DAG.getNode(ISD::FMA, DL, MVT::f32, NegB,
+                                               Q1, A32),
+                                   Y, Q1);
     SDValue Simple = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y0);
     EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(),
                                   MVT::f32);
     SDValue R = DAG.getSelect(DL, MVT::f32,
                               DAG.getSetCC(DL, CCVT, Q, Q, ISD::SETUO), Simple, Q);
-    R = DAG.getSelect(
-        DL, MVT::f32,
-        DAG.getSetCC(DL, CCVT, A, DAG.getConstantFP(0.0, DL, MVT::f16),
-                     ISD::SETOEQ),
-        Simple, R);
+    if (!Pow2)
+      R = DAG.getSelect(
+          DL, MVT::f32,
+          DAG.getSetCC(DL, CCVT, A, DAG.getConstantFP(0.0, DL, MVT::f16),
+                       ISD::SETOEQ),
+          Simple, R);
     return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, R,
                        DAG.getTargetConstant(0, DL, MVT::i32));
   }
