@@ -1229,28 +1229,78 @@ class Lifter:
         t = self.types_of(mods)[0]
         if is_float(t):
             return self.ffma(mods, ops, opc)
-        if "cc" in mods or "sat" in mods:
-            raise Unsupported(opc)
+        return self.imad(mods, ops, opc, False)
+
+    def i_madc(self, mods, ops, opc):
+        """madc{.hi,.lo}{.cc}.{u32,s32,u64,s64}: mad with the carry flag
+        added in."""
+        return self.imad(mods, ops, opc, True)
+
+    def imad(self, mods, ops, opc, use_cin):
+        """mad{.hi,.lo,.wide}{.cc}{.sat}: the PTX ISA's integer multiply-add.
+        .cc writes the carry out of the (unsigned) addition; madc adds the
+        carry in; .sat (.hi.s32 only) saturates the signed addition."""
+        t = self.types_of(mods)[0]
         bits = TBITS[t]
         ext = "sext" if is_signed(t) else "zext"
         a, b = self.get(ops[1], bits), self.get(ops[2], bits)
-        if "lo" in mods:
-            p = self.op("mul i%d %s, %s" % (bits, a, b))
-            c = self.get(ops[3], bits)
-            self.write(ops[0], self.op("add i%d %s, %s" % (bits, p, c)), bits)
-        elif "hi" in mods:
-            p = self.mulhi(a, b, bits, ext)
-            c = self.get(ops[3], bits)
-            self.write(ops[0], self.op("add i%d %s, %s" % (bits, p, c)), bits)
-        elif "wide" in mods:
+        if "wide" in mods:
+            if "cc" in mods or "sat" in mods or use_cin:
+                raise Unsupported(opc)
             w = bits * 2
             ea = self.op("%s i%d %s to i%d" % (ext, bits, a, w))
             eb = self.op("%s i%d %s to i%d" % (ext, bits, b, w))
             p = self.op("mul i%d %s, %s" % (w, ea, eb))
             c = self.get(ops[3], w)
             self.write(ops[0], self.op("add i%d %s, %s" % (w, p, c)), w)
+            return
+        if "lo" in mods:
+            p = self.op("mul i%d %s, %s" % (bits, a, b))
+        elif "hi" in mods:
+            p = self.mulhi(a, b, bits, ext)
         else:
             raise Unsupported(opc)
+        c = self.get(ops[3], bits)
+        if "sat" in mods:
+            if t != "s32" or "hi" not in mods or "cc" in mods or use_cin:
+                raise Unsupported(opc)
+            self.write(ops[0], self.call_intr("i32", "llvm.sadd.sat.i32",
+                                              ["i32 %s" % p, "i32 %s" % c]), bits)
+            return
+        if "cc" not in mods and not use_cin:
+            self.write(ops[0], self.op("add i%d %s, %s" % (bits, p, c)), bits)
+            return
+        w = bits + 1
+        r = self.op("add i%d %s, %s" % (w, self.op("zext i%d %s to i%d" % (bits, p, w)),
+                                          self.op("zext i%d %s to i%d" % (bits, c, w))))
+        if use_cin:
+            cin = self.op("load i1, ptr %s" % self.carry_slot())
+            r = self.op("add i%d %s, %s" % (w, r, self.op("zext i1 %s to i%d" % (cin, w))))
+        if "cc" in mods:
+            co = self.op("trunc i%d %s to i1" % (w, self.op("lshr i%d %s, %d" % (w, r, bits))))
+            self.emit("store i1 %s, ptr %s" % (co, self.carry_slot()))
+        self.write(ops[0], self.op("trunc i%d %s to i%d" % (w, r, bits)), bits)
+
+    def i_slct(self, mods, ops, opc):
+        """slct.dtype.s32 d, a, b, c: d = c >= 0 ? a : b; slct{.ftz}.dtype.f32:
+        the same with c as f32 (-0.0 >= 0; .ftz flushes a subnormal c to a
+        signed zero first, so a negative subnormal selects a).  The ISA leaves the result
+        for a NaN c unspecified: either a or b."""
+        ts = [m for m in mods if m in TBITS]
+        if len(ts) != 2 or ts[1] not in ("s32", "f32") or set(mods) - set(ts) - {"ftz"}:
+            raise Unsupported(opc)
+        bits = TBITS[ts[0]]
+        a, b = self.get(ops[1], bits), self.get(ops[2], bits)
+        if ts[1] == "s32":
+            cond = self.op("icmp sge i32 %s, 0" % self.get(ops[3], 32))
+        else:
+            c = self.op("bitcast i32 %s to float" % self.get(ops[3], 32))
+            c = self.ftz_in(c, "float", "ftz" in mods)
+            ge = self.op("fcmp oge float %s, 0.0" % c)
+            nan = self.op("fcmp uno float %s, 0.0" % c)
+            any_ = self.op("freeze i1 poison")
+            cond = self.op("select i1 %s, i1 %s, i1 %s" % (nan, any_, ge))
+        self.write(ops[0], self.op("select i1 %s, i%d %s, i%d %s" % (cond, bits, a, bits, b)), bits)
 
     def mul24(self, a, b, signed):
         ext = "sext" if signed else "zext"
@@ -1268,14 +1318,20 @@ class Lifter:
         self.write(ops[0], self.op("trunc i64 %s to i32" % p), 32)
 
     def i_mad24(self, mods, ops, opc):
+        """mad24{.hi,.lo}{.sat}: 24x24-bit product (48 bits), its low 32 or
+        bits 47..16, plus c; .sat (.hi.s32 only) saturates the addition."""
         t = self.types_of(mods)[0]
-        if "sat" in mods:
-            raise Unsupported(opc)
         p = self.mul24(self.get(ops[1], 32), self.get(ops[2], 32), is_signed(t))
         if "hi" in mods:
             p = self.op("lshr i64 %s, 16" % p)
         p = self.op("trunc i64 %s to i32" % p)
-        self.write(ops[0], self.op("add i32 %s, %s" % (p, self.get(ops[3], 32))), 32)
+        c = self.get(ops[3], 32)
+        if "sat" in mods:
+            if t != "s32" or "hi" not in mods:
+                raise Unsupported(opc)
+            self.write(ops[0], self.call_intr("i32", "llvm.sadd.sat.i32", ["i32 %s" % p, "i32 %s" % c]), 32)
+            return
+        self.write(ops[0], self.op("add i32 %s, %s" % (p, c)), 32)
 
     def divrem(self, mods, ops, opc, signed_op, unsigned_op):
         t = self.types_of(mods)[0]
