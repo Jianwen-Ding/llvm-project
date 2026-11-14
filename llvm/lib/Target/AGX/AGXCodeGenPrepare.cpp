@@ -3576,6 +3576,118 @@ static bool quadXorShuffles(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXQuadShifts(
+    "agx-quad-shifts", cl::init(true), cl::Hidden,
+    cl::desc("a SIMD-group shift by a constant within segments of 2 or 4 "
+             "lanes as the quad-group's"));
+
+/// select(lane + k < (lane & -w) + w, shuffle_down(v, k), v) and
+/// select(lane - k < (lane & -w), v, shuffle_up(v, k)), w 2 or 4 and k in
+/// [1, w) (convert-gpu-to-air's gpu.shuffle down / up within w lanes): where
+/// the select takes the shuffle, its source lane is in the lane's quad, so
+/// the shuffle is the quad-group's, which issues in half the cycles (the
+/// M2 Max coverage recordings, as quadXorShuffles). With w = 4 the select
+/// takes the own value exactly where the quad shift has no source lane,
+/// which the quad shift leaves its own value (the masked hardware
+/// recordings), so it goes (L15-E305).
+static bool quadShifts(Function &F) {
+  if (!AGXQuadShifts)
+    return false;
+  using namespace PatternMatch;
+  // (through the casts of a 16-bit or float value's shuffle as i32)
+  auto Peel = [](Value *V) {
+    while (isa<BitCastInst, TruncInst, ZExtInst, SExtInst>(V))
+      V = cast<Instruction>(V)->getOperand(0);
+    return V;
+  };
+  // The segment width w, the shift (> 0 down, < 0 up) and the lane of a
+  // condition lane + k < (lane & -w) + w (down: true where the shuffle is
+  // taken) or lane - k < (lane & -w) (up: true where the own value is).
+  auto Segment = [](Value *Cond, int64_t &W, int64_t &Shift) {
+    CmpPredicate P;
+    Value *A, *B, *L1, *L2;
+    const APInt *D, *M, *E = nullptr;
+    if (!match(Cond, m_ICmp(P, m_Value(A), m_Value(B))) ||
+        (P != ICmpInst::ICMP_SLT && P != ICmpInst::ICMP_ULT) ||
+        !match(A, m_Add(m_Value(L1), m_APInt(D))) ||
+        !match(L1, m_Intrinsic<Intrinsic::agx_thread_index_in_simdgroup>()))
+      return false;
+    if (!match(B, m_Add(m_And(m_Value(L2), m_APInt(M)), m_APInt(E))) &&
+        !match(B, m_And(m_Value(L2), m_APInt(M))))
+      return false;
+    if (L2 != L1 || (M->getSExtValue() != -2 && M->getSExtValue() != -4))
+      return false;
+    W = -M->getSExtValue();
+    int64_t d = D->getSExtValue(), e = E ? E->getSExtValue() : 0;
+    if (d > 0 && d < W && e == W)
+      Shift = d;
+    else if (d < 0 && -d < W && e == 0)
+      Shift = d;
+    else
+      return false;
+    return true;
+  };
+  bool Changed = false;
+  for (Instruction &Inst : instructions(F)) {
+    auto *Sh = dyn_cast<IntrinsicInst>(&Inst);
+    if (!Sh || (Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_down &&
+                Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_up))
+      continue;
+    bool Down = Sh->getIntrinsicID() == Intrinsic::agx_simd_shuffle_down;
+    const APInt *K;
+    Type *Ty = Sh->getType();
+    if (!match(Sh->getArgOperand(1), m_APInt(K)) || K->isZero() ||
+        K->ugt(3) || Ty->isVectorTy() ||
+        (Ty->getPrimitiveSizeInBits() != 16 &&
+         Ty->getPrimitiveSizeInBits() != 32))
+      continue;
+    int64_t k = K->getZExtValue();
+    Value *Own = Peel(Sh->getArgOperand(0));
+    // every use, through the casts, a select of the own value where the
+    // shift leaves the lane's segment of 2 or 4
+    SmallVector<Value *, 4> Work{Sh};
+    SmallVector<std::pair<SelectInst *, Value *>, 4> Fours;
+    bool OK = true;
+    while (OK && !Work.empty()) {
+      Value *V = Work.pop_back_val();
+      for (User *U : V->users()) {
+        if (isa<BitCastInst, TruncInst>(U)) {
+          Work.push_back(U);
+          continue;
+        }
+        auto *Sel = dyn_cast<SelectInst>(U);
+        int64_t W, Shift;
+        if (!Sel || !Segment(Sel->getCondition(), W, Shift) ||
+            Shift != (Down ? k : -k) || W <= k) {
+          OK = false;
+          break;
+        }
+        // down: the shuffle where true; up: the own value where true
+        Value *ShSide = Down ? Sel->getTrueValue() : Sel->getFalseValue();
+        Value *OwnSide = Down ? Sel->getFalseValue() : Sel->getTrueValue();
+        if (ShSide != V || OwnSide == V || Peel(OwnSide) != Own) {
+          OK = false;
+          break;
+        }
+        if (W == 4)
+          Fours.push_back({Sel, V});
+      }
+    }
+    if (!OK)
+      continue;
+    Sh->setCalledFunction(Intrinsic::getOrInsertDeclaration(
+        F.getParent(),
+        Down ? Intrinsic::agx_quad_shuffle_down : Intrinsic::agx_quad_shuffle_up,
+        {Ty}));
+    for (auto [Sel, V] : Fours) {
+      Sel->replaceAllUsesWith(V);
+      Sel->eraseFromParent();
+    }
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXConvertedMinMaxNum(
     "agx-converted-minmax-num", cl::init(true), cl::Hidden,
     cl::desc("maximum / minimum whose only use is a float-to-integer "
@@ -4187,6 +4299,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= floorModulos(F);
   // (last: the lane analyses above see the SIMD-group shuffles)
   Changed |= quadXorShuffles(F);
+  Changed |= quadShifts(F);
   Changed |= convertedMinMaxNum(F);
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);
