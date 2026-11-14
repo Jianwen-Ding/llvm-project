@@ -2934,6 +2934,74 @@ static cl::opt<bool> HalfPow2Numerator(
     cl::desc("a half quotient of a constant +-2^k without the correction "
              "step"));
 
+/// An upper bound on |v| (as a power of two, log2) where v is finite, from
+/// how v is computed: integer conversions, half extensions, square roots,
+/// constants, and |x|, -x, sums and products of such; v may also be +-0, an
+/// infinity or a NaN. None if unknown. (L15-E344)
+static std::optional<int> magnitudeLog2Bound(SDValue V, unsigned Depth = 0) {
+  if (Depth > 4)
+    return std::nullopt;
+  switch (V.getOpcode()) {
+  case ISD::ConstantFP: {
+    const APFloat &F = cast<ConstantFPSDNode>(V)->getValueAPF();
+    if (!F.isFinite())
+      return 0;
+    return F.isZero() ? 0 : ilogb(F) + 1;
+  }
+  case ISD::SINT_TO_FP:
+  case ISD::UINT_TO_FP:
+    if (V.getOperand(0).getValueType().getScalarSizeInBits() > 64)
+      return std::nullopt;
+    return int(V.getOperand(0).getValueType().getScalarSizeInBits());
+  case ISD::FP_EXTEND:
+    if (V.getOperand(0).getValueType().getScalarType() == MVT::f16)
+      return 16;
+    return std::nullopt;
+  case ISD::FSQRT:
+    return 64;
+  case ISD::FABS:
+  case ISD::FNEG:
+    return magnitudeLog2Bound(V.getOperand(0), Depth + 1);
+  case ISD::FADD:
+  case ISD::FSUB:
+  case ISD::FMUL: {
+    auto L = magnitudeLog2Bound(V.getOperand(0), Depth + 1);
+    auto R = L ? magnitudeLog2Bound(V.getOperand(1), Depth + 1) : L;
+    if (!L || !R)
+      return std::nullopt;
+    return V.getOpcode() == ISD::FMUL ? *L + *R : std::max(*L, *R) + 1;
+  }
+  default:
+    return std::nullopt;
+  }
+}
+
+/// Whether v is +-0 or at least 2^-124 in magnitude (or infinite or a NaN):
+/// integer conversions, half extensions (2^-24 at least), square roots of
+/// flushing floats (2^-63) and |x|, -x of such. (L15-E344)
+static bool zeroOrNotTiny(SDValue V, unsigned Depth = 0) {
+  if (Depth > 4)
+    return false;
+  switch (V.getOpcode()) {
+  case ISD::SINT_TO_FP:
+  case ISD::UINT_TO_FP:
+    return true;
+  case ISD::FP_EXTEND:
+    return V.getOperand(0).getValueType().getScalarType() == MVT::f16;
+  case ISD::FABS:
+  case ISD::FNEG:
+    return zeroOrNotTiny(V.getOperand(0), Depth + 1);
+  default:
+    return false;
+  }
+}
+
+static cl::opt<bool> BoundedDivisions(
+    "agx-fdiv-bounded-operands",
+    cl::desc("float division whose divisor is below 2^100 or dividend not "
+             "below 2^-124 by how they are computed: no size test"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> IntDivisorScale(
     "agx-fdiv-int-divisor",
     cl::desc("float division by an integer converted to float: the "
@@ -3015,8 +3083,15 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
                 (B.getOpcode() == ISD::SINT_TO_FP ||
                  B.getOpcode() == ISD::UINT_TO_FP) &&
                 B.getOperand(0).getValueType().getScalarSizeInBits() <= 64;
-    if (IntB) {
+    // More generally a b below 2^100 in magnitude (pb >= 2^-100), and a
+    // dividend that is +-0 or not below 2^-124, whose size test is known
+    // (L15-E344)
+    std::optional<int> BBound =
+        BoundedDivisions && !CB ? magnitudeLog2Bound(B) : std::nullopt;
+    if (IntB || (BBound && *BBound <= 100)) {
       R = Mul(Mul(Q, PB), PA);
+    } else if (BoundedDivisions && !CPB && zeroOrNotTiny(A)) {
+      R = Mul(Mul(Q, PA), PB);
     } else if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {
       // A constant b of moderate size: q (in [1/4, 1)) times pb is exact
       // (neither flushed nor infinite), so pb first is right for every a and
