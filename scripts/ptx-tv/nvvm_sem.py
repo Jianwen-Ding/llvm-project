@@ -17,6 +17,7 @@ import narrowcvt
 import mbar
 import probe
 import sparse
+import tcgen05ls
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -324,6 +325,42 @@ def expand(text, lifter_mod, llc_args=None):
                 and not re.match(r"\s*%", line):
             removed = True
             continue
+        tg = tcgen05ls.intrinsic(name)
+        if tg and not re.match(r"\s*$", line):
+            kind, shape, num = tg
+            n = tcgen05ls.nregs(shape, num)
+            has_off = shape == "16x32bx2"
+            want = 1 + has_off + (kind == "st") + 1
+            flag = args[-1][1] if len(args) == want else None
+            if flag in ("0", "1", "true", "false"):
+                packed = flag in ("1", "true")
+                kname = tcgen05ls.key(kind, shape, num, packed)
+                fname = "ptxtv_sem_tc_%s" % kname.replace(".", "_")
+                key_ = ("tcgen05", name, packed, args[0][0])
+                if key_ not in defs:
+                    vt = "<%d x i32>" % n
+                    # argument order as IntrinsicsNVVM.td defines it:
+                    # (tmem, [i64 offset], [<n x i32> data], i1 flag)
+                    ps = ["%s %%t" % args[0][0]]
+                    if has_off:
+                        ps.append("i64 %off")
+                    if kind == "st":
+                        ps.append("%s %%v" % vt)
+                    ps.append("i1 %flag")
+                    w = ["define internal %s @%s(%s) alwaysinline {" % (
+                        vt if kind == "ld" else "void", fname, ", ".join(ps)),
+                        "  %%a = ptrtoint %s %%t to i32" % args[0][0]]
+                    cargs = ["i32 %a"] + (["i64 %off"] if has_off else []) + \
+                        (["%s %%v" % vt] if kind == "st" else [])
+                    if kind == "ld":
+                        w += ["  %%r = call %s @%s(%s)" % (vt, kname, ", ".join(cargs)), "  ret %s %%r" % vt]
+                    else:
+                        w += ["  call void @%s(%s)" % (kname, ", ".join(cargs)), "  ret void"]
+                    w.append("}")
+                    defs[key_] = (fname, "\n".join(w), {kname: tcgen05ls.decl(kind, shape, num, packed)})
+                line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                out_lines.append(line)
+                continue
         if name.startswith("spdecompress."):
             ret = call_ret_type(line, m.start())
             sp = sparse.intrinsic_params(name, ret, args) if ret else None

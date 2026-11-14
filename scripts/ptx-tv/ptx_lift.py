@@ -1014,7 +1014,8 @@ class Lifter:
                     "spdecompress", "multimem") or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
-                (base == "st" and ("bulk" in mods or "async" in mods)):
+                (base == "st" and ("bulk" in mods or "async" in mods)) or \
+                (base == "tcgen05" and mods[:1] in (["ld"], ["st"]) and "red" not in mods):
             return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
@@ -2351,6 +2352,40 @@ class Lifter:
             raise Unsupported("opcode " + opc)
         p = self.address(ops[0], "global" if "global" in mods else "generic")
         self.emit(discard_ir(p))
+
+    def i_tcgen05(self, mods, ops, opc):
+        """tcgen05.ld/st as uninterpreted calls (see tcgen05ls.py); the
+        other tcgen05 instructions are probe-derived."""
+        import tcgen05ls
+        t = tcgen05ls.ptx(mods)
+        if t is None:
+            raise Unsupported("opcode " + opc)
+        kind, shape, num, packed = t
+        n = tcgen05ls.nregs(shape, num)
+        name = tcgen05ls.key(kind, shape, num, packed)
+        self.declare(name, tcgen05ls.decl(kind, shape, num, packed))
+        ops = [o.strip() for o in ops]
+        # ld {regs}, [a]{, off};   st [a]{, off}, {regs}
+        regs = self.vec_ops(ops[0] if kind == "ld" else ops[-1])
+        addr = ops[1] if kind == "ld" else ops[0]
+        m = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", addr)
+        if not m or regs is None or len(regs) != n:
+            raise Unsupported("operands " + opc)
+        args = ["i32 %s" % self.get(m.group(1), 32)]
+        if shape == "16x32bx2":
+            if len(ops) != 3:
+                raise Unsupported("operands " + opc)
+            args.append("i64 %s" % self.get(ops[2] if kind == "ld" else ops[1], 64))
+        vt = "<%d x i32>" % n
+        if kind == "ld":
+            v = self.op("call %s @%s(%s)" % (vt, name, ", ".join(args)))
+            for k, r in enumerate(regs):
+                self.write(r, self.op("extractelement %s %s, i32 %d" % (vt, v, k)), 32)
+        else:
+            acc = "poison"
+            for k, r in enumerate(regs):
+                acc = self.op("insertelement %s %s, i32 %s, i32 %d" % (vt, acc, self.get(r, 32), k))
+            self.emit("call void @%s(%s)" % (name, ", ".join(args + ["%s %s" % (vt, acc)])))
 
     def i_wgmma(self, mods, ops, opc):
         """wgmma.fence / commit_group / wait_group (.sync.aligned) only order

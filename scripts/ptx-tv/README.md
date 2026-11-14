@@ -123,6 +123,12 @@ single-thread semantics:
   complete-tx (of the store's size) on the mbarrier; the `.release.{sys,gpu}`
   (and `.mmio`) global forms, and `multimem.st.async`, are plain stores. `discard.L2` makes its
   128-byte line indeterminate (a store of poison, 128-byte aligned).
+* `tcgen05.ld`/`tcgen05.st` (not `.red`) are uninterpreted calls keyed by
+  shape, repeat factor and (un)packing, derived independently from the NVVM
+  intrinsic (as NVPTXUsage documents it, with the argument order of
+  `IntrinsicsNVVM.td`) and from the PTX opcode (`tcgen05ls.py`): tensor
+  memory stays opaque, but instruction selection, the register count and
+  the operands are checked, unlike with a probe-derived instruction.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in

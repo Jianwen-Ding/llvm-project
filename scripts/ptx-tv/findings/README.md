@@ -164,6 +164,28 @@ target-independent; it is observed here through NVPTX.
 Severity: low (signaling-NaN inputs only); either the lowering or the
 LangRef text should change.
 
+## 7. NVPTXUsage documents the wrong argument order for `tcgen05.st.16x32bx2`
+
+Reproducer: `tcgen05-st-doc-order.ll` (found while deriving the
+`tcgen05.st` model from the documentation)
+
+`llvm/docs/NVPTXUsage.md` gives
+
+```
+declare void @llvm.nvvm.tcgen05.st.16x32bx2.<num>(ptr addrspace(6) %tmem_addr,
+                                                  <n x i32> %args, i64 %offset, i1 %unpack)
+```
+
+but `IntrinsicsNVVM.td` (`NVVM_TCGEN05_ST`) defines the immediate offset
+before the data, `(ptr addrspace(6), i64, <n x i32>, i1)`, and the IR
+verifier rejects the documented form ("intrinsic argument 1 type expected
+i64"). The code generator and the tests use the defined order; only the
+documentation is wrong. (The `tcgen05.ld.16x32bx2` entry, whose offset
+precedes the flag, is consistent.)
+
+Severity: documentation only. Fix direction: swap `%args` and `%offset` in
+the documented signature.
+
 ## Lower-severity observations
 
 * `param-vectorize-device.ll` `callee_St4x3` / `callee_St4x7`: a 12-byte
@@ -216,10 +238,10 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4187 functions from 619
-test files; 3409 proved correct (496 through probe-derived opaque instructions,
+test files; 3409 proved correct (476 through probe-derived opaque instructions,
 50 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
-2/2b/3/4/5/6; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in
+2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in
 known modelling classes; 2 not lifted; 564 solver timeouts or inconclusive.
 
 Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
