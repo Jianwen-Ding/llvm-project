@@ -960,7 +960,11 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     with open(tgt_f) as f:
         t0 = f.read()
     t1 = drop_dead_param_loads(t0)
+    tgt_plain = None
     if t1 != t0:
+        tgt_plain = tgt_f + ".plain.ll"
+        with open(tgt_plain, "w") as f:
+            f.write(t0)
         with open(tgt_f, "w") as f:
             f.write(t1)
     nl = vector_ret_lanes(ext, fname) if LANES else 0
@@ -990,12 +994,19 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         else:
             _, out, err, rc = outs[-1]
     else:
-        try:
-            rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
-                                "--disable-undef-input", "--smt-to=%d" % smt_to] + ALIVE_EXTRA + [
-                                "--func=" + fname.strip('"')],
-                               timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
-        except subprocess.TimeoutExpired:
+        # the cleaned target first; if that does not decide, the equivalent
+        # uncleaned one (the cleanup occasionally makes a query harder)
+        for tf in [tgt_f] + ([tgt_plain] if tgt_plain else []):
+            try:
+                rc, out, err = run([ALIVE, src_f, tf, "--tgt-is-asm",
+                                    "--disable-undef-input", "--smt-to=%d" % smt_to] + ALIVE_EXTRA + [
+                                    "--func=" + fname.strip('"')],
+                                   timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+            except subprocess.TimeoutExpired:
+                rc, out, err = 1, "ERROR: Timeout (wall clock)", ""
+            if classify(out, err, rc) not in ("timeout", "inconclusive"):
+                break
+        if "wall clock" in out and classify(out, err, rc) == "timeout":
             res.update(status="timeout", detail="wall clock")
             return res
     # Loops: Alive2 only reasons about loop-free code unless asked to unroll.

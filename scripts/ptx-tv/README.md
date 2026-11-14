@@ -415,7 +415,12 @@ assembly mode is very slow on dead reloads of a stored pointer and the
 integer address arithmetic built on them (the lifter tracks pointer
 provenance separately). Regression re-runs of every counterexample, every
 timeout and 300 sampled proofs lost no proof and kept every `.param`
-counterexample; 32 former timeouts now prove.
+counterexample; 32 former timeouts now prove. The cleanup occasionally
+makes a query harder, so when the cleaned target does not decide, the
+equivalent uncleaned one is checked as well. A final re-check of all 3255
+suite functions proved without special flags, with the final lifter,
+proved all of them (12 needed 20 s per query under less load; two of
+those needed the uncleaned target).
 
 ## Coverage limits
 
