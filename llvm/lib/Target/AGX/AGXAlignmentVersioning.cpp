@@ -256,6 +256,10 @@ static bool versionLoop(Loop &L, Function &F, LoopInfo &LI, DominatorTree &DT,
   return true;
 }
 
+static cl::opt<bool> GuardVersioningMerge(
+    "agx-guard-versioning-merge", cl::init(true), cl::Hidden,
+    cl::desc("Merge the guard-free copy's blocks"));
+
 static cl::opt<unsigned> GuardVersioningMin(
     "agx-guard-versioning-min", cl::init(4), cl::Hidden,
     cl::desc("Loop-invariant guards of loads an innermost loop must have to "
@@ -344,6 +348,35 @@ static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
       P.removeIncomingValue(BB, /*DeletePHIIfEmpty=*/false);
     IRBuilder<>(Br).CreateBr(T);
     Br->eraseFromParent();
+  }
+  // Its blocks, a chain now, as one where they can be (the load/store
+  // vectorizer then merges the accesses of neighbouring taps: a
+  // convolution's nine weights in two 16-byte loads and one 4-byte one).
+  if (GuardVersioningMerge) {
+    auto *NewHeader = cast<BasicBlock>(VMap[L.getHeader()]);
+    SmallVector<WeakVH, 16> Blocks(NewBlocks.begin(), NewBlocks.end());
+    for (WeakVH &V : Blocks)
+      if (auto *BB = dyn_cast_or_null<BasicBlock>(V))
+        if (BB != NewHeader && BB != NewPH)
+          MergeBlockIntoPredecessor(BB, /*DTU=*/nullptr, &LI);
+    // The guarded blocks' own inttoptrs of one integer address (the PTX
+    // front end's) as one: the vectorizer takes each inttoptr for a base of
+    // its own.
+    for (WeakVH &V : Blocks)
+      if (auto *BB = dyn_cast_or_null<BasicBlock>(V)) {
+        DenseMap<std::pair<Value *, Type *>, Instruction *> Seen;
+        for (Instruction &I : make_early_inc_range(*BB)) {
+          auto *P = dyn_cast<IntToPtrInst>(&I);
+          if (!P)
+            continue;
+          auto [It, New] =
+              Seen.try_emplace({P->getOperand(0), P->getType()}, P);
+          if (New)
+            continue;
+          P->replaceAllUsesWith(It->second);
+          P->eraseFromParent();
+        }
+      }
   }
   DT.recalculate(F);
   SE.forgetLoop(&L);

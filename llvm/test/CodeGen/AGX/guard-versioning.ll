@@ -4,7 +4,10 @@
 ; A loop whose loads are each guarded by a loop-invariant test (a stencil's
 ; taps inside the image) gets a copy without the tests, run by SIMD-groups
 ; whose every active thread passes them all (a ballot): its loads issue
-; together; the others run the loop as it was (L15-E247).
+; together; the others run the loop as it was (L15-E247). The copy's blocks
+; are merged and its accesses' inttoptrs of one address made one, so the
+; load/store vectorizer joins neighbouring taps (L15-E268): here one load of
+; the four.
 
 ; CHECK-LABEL: taps:
 ; CHECK: icmp_ballot
@@ -13,13 +16,14 @@
 ; CHECK: Loop Header
 ; CHECK: if_icmp
 ; CHECK: jmp_exec_any
-; The copy (inside.preheader): four loads, then the waits, no test between.
+; The copy (inside.preheader): one load of the four taps, no test.
 ; CHECK: else_fcmp
 ; CHECK: inside.preheader
 ; CHECK: Loop Header
 ; CHECK-NOT: if_
-; CHECK-COUNT-4: device_load
+; CHECK: device_load 0, i32, xyzw,
 ; CHECK-NOT: if_
+; CHECK-NOT: device_load
 ; CHECK: jmp_exec_any
 ; OFF-LABEL: taps:
 ; OFF-NOT: icmp_ballot
