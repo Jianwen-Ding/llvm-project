@@ -43,6 +43,12 @@ static cl::opt<bool> FoldWidened16Sources(
              "the 16-bit register"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> FoldNaNOperandSelects(
+    "agx-fold-nan-operand-selects",
+    cl::desc("select(x is NaN, y, maximumnum / minimumnum(x, y)) as the "
+             "min / max, which gives y then"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 
 class AGXFoldOperands : public MachineFunctionPass {
@@ -332,6 +338,72 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
         MI.eraseFromParent();
         if (MRI.use_nodbg_empty(Def->getOperand(0).getReg()))
           Def->eraseFromParent();
+        Changed = true;
+      }
+  }
+  // select(x is NaN, y, maxnum / minnum(x, y)), the PTX front end's
+  // max(m, v) of a running maximum (L15-E367): fcmpsel eq, x, x, M, y where
+  // M is fcmpsel gtn / ltn, x, y, x, y (the "n" conditions take the other
+  // operand where one is a NaN, and y where both are: the second select
+  // operand, as the condition is false), possibly under the signed-zero fix
+  // fcmpsel eq, x, y, bits, M (false for a NaN x). Where x is a NaN, M is
+  // y's bits already; elsewhere the select gives M. So it is M.
+  if (FoldNaNOperandSelects) {
+    auto Mods0 = [](const MachineInstr &MI) {
+      for (unsigned I : {2u, 4u, 6u, 8u})
+        if (!MI.getOperand(I).isImm() || MI.getOperand(I).getImm())
+          return false;
+      return true;
+    };
+    auto VReg = [](const MachineOperand &O) {
+      return O.isReg() && O.getReg().isVirtual() && !O.getSubReg();
+    };
+    // (dst, cc, a_mods, a, b_mods, b, x_mods, x, y_mods, y)
+    auto IsSel = [&](const MachineInstr *MI, unsigned Opc) {
+      return MI && MI->getOpcode() == Opc && MI->getOperand(1).isImm() &&
+             Mods0(*MI) && VReg(MI->getOperand(3)) && VReg(MI->getOperand(5)) &&
+             VReg(MI->getOperand(7)) && VReg(MI->getOperand(9));
+    };
+    const unsigned FC_EQ = 0, FC_LTN = 3, FC_GTN = 7;
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : make_early_inc_range(MBB)) {
+        unsigned Opc = MI.getOpcode();
+        if ((Opc != AGX::FCMPSEL_F32 && Opc != AGX::FCMPSEL_F16) ||
+            !IsSel(&MI, Opc) || MI.getOperand(1).getImm() != FC_EQ)
+          continue;
+        Register X = MI.getOperand(3).getReg(), Y = MI.getOperand(9).getReg();
+        Register M = MI.getOperand(7).getReg();
+        if (MI.getOperand(5).getReg() != X || X == Y)
+          continue;
+        auto IsMinMax = [&](Register R) {
+          MachineInstr *D = MRI.getVRegDef(R);
+          if (!IsSel(D, Opc))
+            return false;
+          int64_t CC = D->getOperand(1).getImm();
+          return (CC == FC_GTN || CC == FC_LTN) &&
+                 D->getOperand(3).getReg() == X &&
+                 D->getOperand(5).getReg() == Y &&
+                 D->getOperand(7).getReg() == X &&
+                 D->getOperand(9).getReg() == Y;
+        };
+        bool Ok = IsMinMax(M);
+        if (!Ok) {
+          MachineInstr *Fix = MRI.getVRegDef(M);
+          Ok = IsSel(Fix, Opc) && Fix->getOperand(1).getImm() == FC_EQ &&
+               ((Fix->getOperand(3).getReg() == X &&
+                 Fix->getOperand(5).getReg() == Y) ||
+                (Fix->getOperand(3).getReg() == Y &&
+                 Fix->getOperand(5).getReg() == X)) &&
+               IsMinMax(Fix->getOperand(9).getReg());
+        }
+        if (!Ok)
+          continue;
+        Register D = MI.getOperand(0).getReg();
+        if (MRI.getRegClass(D) != MRI.getRegClass(M))
+          continue;
+        MRI.replaceRegWith(D, M);
+        MRI.clearKillFlags(M);
+        MI.eraseFromParent();
         Changed = true;
       }
   }

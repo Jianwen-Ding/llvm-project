@@ -168,11 +168,11 @@
   "waits": 1
  },
  "cuda_attn_decode.ll:attn_decode:agx-g13g": {
-  "bytes": 2678,
+  "bytes": 2622,
   "cycles": 26612.7,
   "gprs": 37,
   "groups": 44,
-  "instructions": 402,
+  "instructions": 395,
   "launch_inputs": true,
   "tg_bytes": 2080,
   "tput": 2323.0,
@@ -180,11 +180,11 @@
   "waits": 6
  },
  "cuda_attn_decode.ll:attn_decode:agx-g14c": {
-  "bytes": 2678,
+  "bytes": 2622,
   "cycles": 26612.7,
   "gprs": 37,
   "groups": 44,
-  "instructions": 402,
+  "instructions": 395,
   "launch_inputs": true,
   "tg_bytes": 2080,
   "tput": 2323.0,
