@@ -129,6 +129,13 @@ single-thread semantics:
   `IntrinsicsNVVM.td`) and from the PTX opcode (`tcgen05ls.py`): tensor
   memory stays opaque, but instruction selection, the register count and
   the operands are checked, unlike with a probe-derived instruction.
+* The other documented `tcgen05` operations (`alloc`, `dealloc`,
+  `relinquish_alloc_permit`, `commit` with its `smem.a.read` and multicast
+  forms, `cp` with its shapes and source formats, `shift`, `wait`, `fence`)
+  are uninterpreted calls named by a canonical token set derived
+  independently from the intrinsic and from the PTX opcode
+  (`tcgen05ops.py`, as `mbar.py`), operands as integers of their PTX
+  register width (shared pointers 32-bit only with `shortptr`).
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -237,8 +244,9 @@ intrinsics' `i16` operands/results.
 What remains opaque or unproved, and why:
 
 * Probe-derived opaque instructions are left for families without
-  single-thread semantics a TV check could use: `tcgen05` (warp/CTA
-  collective tensor-memory and tensor-core operations), TMA
+  single-thread semantics a TV check could use: `tcgen05.mma` and
+  `tcgen05.ld.red` (warp/CTA collective tensor-core operations; the other
+  `tcgen05` operations have documentation-derived models), TMA
   (`cp.async.bulk.tensor`, `cp.reduce.async.bulk.tensor`) and
   `tensormap.replace` (the tensor-map layout is not public), `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is

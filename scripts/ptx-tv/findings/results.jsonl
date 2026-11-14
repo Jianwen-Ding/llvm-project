@@ -3841,12 +3841,12 @@
 {"function": "test_multimem_st_async_release_gpu_b16", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
 {"function": "test_multimem_st_async_release_gpu_b32", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
 {"function": "test_multimem_st_async_release_gpu_b64", "status": "correct", "file": "st_async_release_multimem.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx93"}
-{"function": "test_tcgen05_alloc_exclusive_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
-{"function": "test_tcgen05_alloc_exclusive_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
-{"function": "test_tcgen05_alloc_exclusive_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
-{"function": "test_tcgen05_alloc_exclusive_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
-{"function": "test_tcgen05_dealloc_exclusive_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
-{"function": "test_tcgen05_dealloc_exclusive_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
+{"function": "test_tcgen05_alloc_exclusive_cg1", "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
+{"function": "test_tcgen05_alloc_exclusive_cg2", "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
+{"function": "test_tcgen05_alloc_exclusive_shared_cg1", "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
+{"function": "test_tcgen05_alloc_exclusive_shared_cg2", "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
+{"function": "test_tcgen05_dealloc_exclusive_cg1", "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
+{"function": "test_tcgen05_dealloc_exclusive_cg2", "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
 {"function": "test_st_async_release_sys_b8", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
 {"function": "test_st_async_release_sys_b16", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
 {"function": "test_st_async_release_sys_b32", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
@@ -3859,22 +3859,22 @@
 {"function": "test_st_async_mmio_release_sys_b16", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
 {"function": "test_st_async_mmio_release_sys_b32", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
 {"function": "test_st_async_mmio_release_sys_b64", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_tcgen05_alloc_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_alloc_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_alloc_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_alloc_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_dealloc_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_dealloc_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_relinquish_alloc_permit_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_relinquish_alloc_permit_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_mc_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_mc_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_mc_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_mc_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_alloc_cg1", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_alloc_cg2", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_alloc_shared_cg1", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_alloc_shared_cg2", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_dealloc_cg1", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_dealloc_cg2", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_relinquish_alloc_permit_cg1", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_relinquish_alloc_permit_cg2", "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_cg1", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_cg2", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_shared_cg1", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_shared_cg2", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_mc_cg1", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_mc_cg2", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_mc_shared_cg1", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_mc_shared_cg2", "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
@@ -3886,24 +3886,24 @@
 {"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_tcgen05_fence", "probe": true, "status": "correct", "file": "tcgen05-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_wait", "probe": true, "status": "correct", "file": "tcgen05-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_commit_smem_a_read_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_cg1_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_cg2_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg1_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg2_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_mc_cg1_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_mc_cg2_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_mc_shared_cg1_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_tcgen05_commit_mc_shared_cg2_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_fence", "status": "correct", "file": "tcgen05-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_wait", "status": "correct", "file": "tcgen05-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_commit_smem_a_read_cg1", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_cg2", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_shared_cg1", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_shared_cg2", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_cg1", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_cg2", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg1", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg2", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_cg1_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_cg2_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg1_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_smem_a_read_mc_shared_cg2_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_mc_cg1_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_mc_cg2_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_mc_shared_cg1_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
+{"function": "test_tcgen05_commit_mc_shared_cg2_i32", "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
 {"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
@@ -3924,30 +3924,30 @@
 {"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94", "smt_to": 10000}
-{"function": "test_tcgen05_cp_64x128_v1_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v2_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v2_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_32x128_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x128b_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x256b_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x256b_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x256b_b6x16_p32_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_4x256b_b6x16_p32_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_4x256b_b6x16_p32_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x128b_b6x16_p32_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v1_b6x16_p32_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v2_b6x16_p32_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x256b_b4x16_p64_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x256b_b4x16_p64_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_4x256b_b4x16_p64_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_4x256b_b4x16_p64_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x128b_b4x16_p64_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_128x128b_b4x16_p64_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v1_b4x16_p64_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v2_b4x16_p64_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_64x128_v2_b4x16_p64_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_32x128_b4x16_p64_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_cp_32x128_b4x16_p64_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v1_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v2_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v2_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_32x128_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x128b_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x256b_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x256b_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x256b_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_4x256b_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_4x256b_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x128b_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v1_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v2_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x256b_b4x16_p64_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x256b_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_4x256b_b4x16_p64_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_4x256b_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x128b_b4x16_p64_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x128b_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v1_b4x16_p64_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v2_b4x16_p64_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v2_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_32x128_b4x16_p64_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_32x128_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "nvvm_tcgen05_ld_16x64b", "status": "correct", "file": "tcgen05-ld.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "nvvm_tcgen05_ld_16x64b_pack", "status": "correct", "file": "tcgen05-ld.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "nvvm_tcgen05_ld_16x128b", "status": "correct", "file": "tcgen05-ld.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
@@ -4043,8 +4043,8 @@
 {"function": "tcgen05_mma_fp16_shared_scale_d_disable_output_lane_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_tf32_shared_scale_d_disable_output_lane_cg1", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
 {"function": "tcgen05_mma_tf32_shared_scale_d_disable_output_lane_cg2", "probe": true, "status": "correct", "file": "tcgen05-mma-scale-d.ll", "llc": "-mcpu=sm_100a -mtriple=nvptx64 -mattr=+ptx86"}
-{"function": "test_tcgen05_shift_cg1", "probe": true, "status": "correct", "file": "tcgen05-shift.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_tcgen05_shift_cg2", "probe": true, "status": "correct", "file": "tcgen05-shift.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_shift_cg1", "status": "correct", "file": "tcgen05-shift.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_shift_cg2", "status": "correct", "file": "tcgen05-shift.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "tcgen05_mma_disable_output_lane_collector_b_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_disable_output_lane_collector_b_f16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_disable_output_lane_collector_b_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
@@ -4264,3 +4264,15 @@
 {"function": "from_f8e4m3fn_v2f16", "known": "nan-payload", "status": "mismatch-known", "detail": "13 = #x00000007 (7)\ni16 %t214 = #x0007 (7)\ni16 %t215 = #x0380 (896)\ni16 %t216 = #x0380 (896)\ni32 %t218 = #x00000380 (896)\ni32 %t220 = #x00000000 (0)\ni32 %t221 = #x00000000 (0)\ni32 %t222 = #x00000380 (896)\ni32 %t225 = #x20005f80 (536895360)\ni16 %t227 = #x5f80 (24448)\ni32 %t228 = #x00002000 (8192)\ni16 %t229 = #x2000 (8192)\ni1 %t231 = #x0 (0)\ni16 %t235 = #x2000 (8192)\ni1 %t237 = #x1 (1)\ni16 %t241 = #x2000 (8192)\ni16 %t244 = #x0000 (0)\ni1 %t246 = #x1 (1)\ni16 %t250 = #x0000 (0)\ni1 %t252 = #x0 (0)\ni16 %t255 = #x0000 (0)\ni1 %t257 = #x0 (0)\ni16 %t261 = #x0000 (0)\ni1 %t263 = #x1 (1)\ni16 %t267 = #x2300 (8960)\ni1 %t269 = #x0 (0)\ni16 %t273 = #x5f80 (24448)\ni16 %t276 = #x000f (15)\ni1 %t278 = #x0 (0)\ni16 %t282 = #x5f80 (24448)\ni1 %t284 = #x1 (1)\ni16 %t287 = #x7e00 (32256)\ni1 %t289 = #x1 (1)\ni16 %t293 = #x7e00 (32256)\ni32 %t295 = #x00007e00 (32256)\ni32 %t297 = #x00000000 (0)\ni32 %t298 = #x00000000 (0)\ni32 %t299 = #x00007e00 (32256)\n<2 x half> %t300 = < #x7e00 (QNaN), #x0000 (+0.0) >\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 2\talloc type: 4\talive: true\nContents:\n*: #x0000\n\n\nLOCAL BLOCKS:\nBlock 2 >\tsize: 2\talign: 2\talloc type: 1\talive: true\taddress: #x8000000000000000\nBlock 3 >\tsize: 4\talign: 4\talloc type: 1\talive: true\taddress: #x8000000000000020\nSource value: < #x7f80 (QNaN), #x0000 (+0.0) >\nTarget value: < #x7e00 (QNaN), #x0000 (+0.0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n", "file": "arbitrary-fp-to-float.ll", "llc": "-mtriple=nvptx64-unknown-unknown"}
 {"function": "from_f8e5m2_v2bf16", "known": "nan-payload", "status": "mismatch-known", "detail": "225 = #x380047a0 (939542432)\ni16 %t227 = #x47a0 (18336)\ni32 %t228 = #x00003800 (14336)\ni16 %t229 = #x3800 (14336)\ni1 %t231 = #x0 (0)\ni16 %t235 = #x3800 (14336)\ni1 %t237 = #x1 (1)\ni16 %t241 = #x3800 (14336)\ni16 %t244 = #x0000 (0)\ni1 %t246 = #x1 (1)\ni16 %t250 = #x0000 (0)\ni32 %t252 = #x7f807f80 (2139127680)\ni16 %t254 = #x7f80 (32640)\ni32 %t255 = #x00007f80 (32640)\ni16 %t256 = #x7f80 (32640)\ni16 %t260 = #x7f80 (32640)\ni1 %t262 = #x0 (0)\ni16 %t266 = #x0000 (0)\ni16 %t269 = #x0000 (0)\ni16 %t273 = #x0000 (0)\ni1 %t275 = #x1 (1)\ni16 %t279 = #x3780 (14208)\ni1 %t281 = #x0 (0)\ni16 %t285 = #x47a0 (18336)\ni16 %t288 = #x001f (31)\ni1 %t290 = #x0 (0)\ni16 %t294 = #x47a0 (18336)\ni16 %t298 = #x47a0 (18336)\ni1 %t300 = #x1 (1)\ni16 %t304 = #x47a0 (18336)\ni16 %t307 = #x7fc0 (32704)\ni16 %t311 = #x7fc0 (32704)\ni32 %t313 = #x00007fc0 (32704)\ni32 %t315 = #x00000000 (0)\ni32 %t316 = #x00000000 (0)\ni32 %t317 = #x00007fc0 (32704)\n<2 x bfloat> %t318 = < #x7fc0 (QNaN), #x0000 (+0.0) >\n\nTARGET MEMORY STATE\n===================\nNON-LOCAL BLOCKS:\nBlock 0 >\tsize: 618682003241272164\talloc type: 2\talive: true\nContents:\n*: #x0000\n\n\nLOCAL BLOCKS:\nBlock 2 >\tsize: 2\talign: 2\talloc type: 1\talive: true\taddress: #x8000000000000000\nBlock 3 >\tsize: 4\talign: 4\talloc type: 1\talive: true\taddress: #x800000000000001c\nSource value: < #x7fa0 (SNaN), #x0000 (+0.0) >\nTarget value: < #x7fc0 (QNaN), #x0000 (+0.0) >\n\nSummary:\n  0 correct transformations\n  1 incorrect transformations\n  0 failed-to-prove transformations\n  0 Alive2 errors\n", "file": "arbitrary-fp-to-float.ll", "llc": "-mtriple=nvptx64-unknown-unknown"}
 {"function": "__nv_fast_tanf", "status": "correct", "file": "refl1.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_20"}
+{"function": "test_tcgen05_cp_64x128_v1_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_32x128_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x128b_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_4x256b_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_4x256b_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x256b_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_128x128b_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v1_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v2_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_32x128_b6x16_p32_cg1", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_32x128_b6x16_p32_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
+{"function": "test_tcgen05_cp_64x128_v1_b4x16_p64_cg2", "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}

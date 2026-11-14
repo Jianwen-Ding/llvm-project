@@ -1015,7 +1015,11 @@ class Lifter:
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
-                (base == "tcgen05" and mods[:1] in (["ld"], ["st"]) and "red" not in mods):
+                (base == "tcgen05" and mods[:1] in (["ld"], ["st"]) and "red" not in mods) or \
+                (base == "tcgen05" and mods[:1] in (["alloc"], ["dealloc"], ["relinquish_alloc_permit"],
+                                                   ["commit"], ["cp"], ["shift"], ["wait::ld"],
+                                                   ["wait::st"], ["fence::before_thread_sync"],
+                                                   ["fence::after_thread_sync"])):
             return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
@@ -2357,9 +2361,26 @@ class Lifter:
         """tcgen05.ld/st as uninterpreted calls (see tcgen05ls.py); the
         other tcgen05 instructions are probe-derived."""
         import tcgen05ls
+        import tcgen05ops
         t = tcgen05ls.ptx(mods)
         if t is None:
-            raise Unsupported("opcode " + opc)
+            toks = tcgen05ops.ptx(mods)
+            if toks is None:
+                raise Unsupported("opcode " + opc)
+            # operands as integers of their register width (addresses too)
+            vals, tys = [], []
+            for o in [o.strip() for o in ops]:
+                mm = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+                r = mm.group(1) if mm else o
+                if r not in self.regs or self.regs[r] == 1:
+                    raise Unsupported("operand " + opc)
+                w = self.regs[r]
+                vals.append("i%d %s" % (w, self.get(r, w)))
+                tys.append("i%d" % w)
+            kname = tcgen05ops.name_of(toks) + ("." + "_".join(tys) if tys else "")
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(tys)))
+            self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+            return
         kind, shape, num, packed = t
         n = tcgen05ls.nregs(shape, num)
         name = tcgen05ls.key(kind, shape, num, packed)
