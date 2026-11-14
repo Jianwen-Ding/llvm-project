@@ -762,6 +762,11 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            "Lower uniform gpu.all_reduce in kernels of a known threadgroup "
            "size that is a multiple of 32 to SIMD-group reductions and one "
            "round through threadgroup memory">,
+    Option<"approximateHalfFunctions", "approximate-half-functions", "bool",
+           /*default=*/"true",
+           "Compute f16 cbrt, acosh, atanh, asinh, expm1 and log1p with the "
+           "hardware's approximations of some of their f32 steps, where "
+           "every f16 input's result is the same">,
   ];
 }
 

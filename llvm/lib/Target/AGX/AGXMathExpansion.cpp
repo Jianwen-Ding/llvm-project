@@ -57,6 +57,16 @@ static cl::opt<bool> ExpNonNegative(
              "of at most 18, without the overflow select)"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> HalfFastHyperbolic(
+    "agx-half-fast-hyperbolic",
+    cl::desc("half tanh, sinh and cosh with the hardware's exponential"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> HalfFastDivision(
+    "agx-half-fast-division",
+    cl::desc("half math functions' divisions by the hardware's reciprocal"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
@@ -64,10 +74,24 @@ class MathBuilder {
   // No float operand is a denormal the expansion must keep: f32 arithmetic
   // flushes (no ieee-fp32), or the operands are widened halves.
   bool NoDenormals;
+  // The result is rounded to half (L15-E329).
+  bool HalfResult;
+  // Divisions correctly rounded even for a half result (atan2: with the
+  // reciprocal's, results near a tie between two halves were rounded the
+  // other way, on the functional model).
+  bool PreciseDivision = false;
 
 public:
-  MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false)
-      : B(B), Ty(Ty), NoDenormals(NoDenormals) {}
+  MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false,
+              bool HalfResult = false)
+      : B(B), Ty(Ty), NoDenormals(NoDenormals), HalfResult(HalfResult) {}
+
+  /// The hardware's approximation of \p ID (afn's).
+  Value *hw(Intrinsic::ID ID, Value *X) {
+    Value *V = B.CreateIntrinsic(ID, {Ty}, {X});
+    cast<Instruction>(V)->setHasApproxFunc(true);
+    return V;
+  }
 
   Value *k(double V) { return ConstantFP::get(Ty, V); }
   Value *call(Intrinsic::ID ID, ArrayRef<Value *> Args) {
@@ -128,7 +152,14 @@ public:
   Value *mul(Value *A, Value *X) { return B.CreateFMul(A, X); }
   Value *add(Value *A, Value *X) { return B.CreateFAdd(A, X); }
   Value *sub(Value *A, Value *X) { return B.CreateFSub(A, X); }
-  Value *div(Value *A, Value *X) { return B.CreateFDiv(A, X); }
+  Value *div(Value *A, Value *X) {
+    // A half result: a times the hardware's reciprocal (L15-E329; scalars:
+    // the reciprocal intrinsic does not split)
+    if (HalfResult && HalfFastDivision && !PreciseDivision &&
+        !Ty->isVectorTy())
+      return mul(A, B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {X}));
+    return B.CreateFDiv(A, X);
+  }
 
   /// atan of a value in [0, inf] or NaN: the argument reduced to
   /// [0, tan(pi / 8)] around 0, pi / 4 or pi / 2.
@@ -191,6 +222,7 @@ public:
     Value *Swap = B.CreateFCmpOGT(AY, AX);
     Value *Mn = sel(Swap, AX, AY), *Mx = sel(Swap, AY, AX);
     // 0 / 0 is 0 (atan2(+-0, +-0)) and inf / inf is 1 (the diagonals).
+    PreciseDivision = true;
     Value *T = div(Mn, Mx);
     T = sel(B.CreateFCmpOEQ(Mx, k(0.0)), k(0.0), T);
     T = sel(B.CreateFCmpOEQ(Mn, k(INFINITY)), k(1.0), T);
@@ -206,6 +238,10 @@ public:
 
   /// e^a / 2 for a >= 0, without overflow below the largest float.
   Value *halfExp(Value *A) {
+    // A half result: the hardware's 2^(a log2(e)), halved (from a = 88 an
+    // infinity, as is the half result from a = 11.8: L15-E329)
+    if (HalfResult && HalfFastHyperbolic)
+      return mul(k(0.5), hw(Intrinsic::exp2, mul(A, k(M_LOG2E))));
     // One exponential: e^a / 2, or e^(a - ln 2) from 88 on, a - ln 2 as
     // (a - 0.693359375) + 2.12194440e-4 (the first exact for a >= 88: a
     // rounded a - ln 2 put the result up to 24 ulp off near the overflow).
@@ -222,7 +258,12 @@ public:
   /// reciprocal step would be a NaN), without the general division.
   Value *quarterOver(Value *H) {
     Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {H});
-    Value *Y = fma(fma(B.CreateFNeg(H), Y0, k(1.0)), Y0, Y0);
+    Value *Y = HalfResult && HalfFastHyperbolic
+                   ? Y0
+                   : fma(fma(B.CreateFNeg(H), Y0, k(1.0)), Y0, Y0);
+    // (a half result is infinite from h = 2^16: no select)
+    if (HalfResult && HalfFastHyperbolic)
+      return mul(k(0.25), Y);
     return sel(gt(H, 0x1p124), k(0.0), mul(k(0.25), Y));
   }
 
@@ -257,9 +298,12 @@ public:
     // no clamp of the argument.
     // (Its n is in [0, 26]: e^r 2^n is a normal float, neither the +inf nor
     // the +0 of ldexp's selects (L15-E274).)
-    Value *S = expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
-                       /*Bounded=*/true, /*NoOverflow=*/ExpNonNegative,
-                       /*NonNegative=*/ExpNonNegative);
+    Value *S =
+        HalfResult && HalfFastHyperbolic
+            ? hw(Intrinsic::exp2, mul(k(2.0 * M_LOG2E), A))
+            : expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
+                      /*Bounded=*/true, /*NoOverflow=*/ExpNonNegative,
+                      /*NonNegative=*/ExpNonNegative);
     // 2 / d for d = s + 1 in [2, e^18 + 1] (or a NaN): twice the correctly
     // rounded reciprocal y0 + y0 (1 - d y0) (lowerFDIV32's, whose rcp and
     // fmas scale with d's exponent here, no result near the flushed or the
@@ -267,7 +311,9 @@ public:
     // special cases.
     Value *D = add(S, k(1.0));
     Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
-    Value *Y = fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
+    Value *Y = HalfResult && HalfFastHyperbolic
+                   ? Y0
+                   : fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
     Value *Big = copysign(sub(k(1.0), mul(k(2.0), Y)), X);
     return sel(lt(A, 0.625), Small, Big);
   }
@@ -551,7 +597,11 @@ public:
     R = fma(L.F, k(ELo), R);
     R = fma(L.Y, k(EHi), R);
     R = fma(L.F, k(EHi), R);
-    R = fma(L.E, k(L2Lo), R);
+    // (log2: no low part. e is a finite integer, so e 0 + r only turns an
+    // r = -0 into +0, which e + r does as well where e = +0 and leaves out
+    // otherwise: the same sum without it, L15-E328)
+    if (L2Lo != 0.0)
+      R = fma(L.E, k(L2Lo), R);
     R = fma(L.E, k(L2Hi), R);
     return logSpecial(X, R);
   }
@@ -659,7 +709,8 @@ static Value *inFloat(IRBuilderBase &B, Type *Ty, ArrayRef<Value *> Args,
   SmallVector<Value *, 2> Ext;
   for (Value *A : Args)
     Ext.push_back(Ty == F32 ? A : B.CreateFPExt(A, F32));
-  MathBuilder M(B, F32, FlushF32 || Ty != F32);
+  MathBuilder M(B, F32, FlushF32 || Ty != F32,
+                Ty->getScalarType()->isHalfTy());
   Value *R = Fn(M, Ext);
   return Ty == F32 ? R : B.CreateFPTrunc(R, Ty);
 }

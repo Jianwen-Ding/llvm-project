@@ -874,6 +874,51 @@ static Value accurateExpM1(OpBuilder &b, Location loc, Value x, Value u) {
       b, loc, small, arith::SelectOp::create(b, loc, isOne, x, q), um1);
 }
 
+/// The f32 operations of a half function's expansion that may take the
+/// hardware's approximations (fastmath afn: exp, log, square root, division
+/// by the reciprocal).
+enum HalfApprox : unsigned {
+  HalfApproxNone = 0,
+  HalfApproxExpLog = 1,
+  HalfApproxSqrt = 2,
+  HalfApproxDiv = 4,
+};
+
+/// Whether convert-gpu-to-air's approximate-half-functions is on (set by the
+/// pass for its patterns).
+static thread_local bool approximateHalfFunctions = true;
+
+/// For a half result computed in f32 from \p x: fastmath afn on the f32
+/// operations of the kinds in \p kinds computing \p r, the kinds for which
+/// every half input's result was checked to be the one the precise
+/// operations give, on the functional model (L15-E330).
+static void approximateForHalf(Value r, Value x, unsigned kinds) {
+  if (!approximateHalfFunctions)
+    return;
+  SmallVector<Value> work{r};
+  DenseSet<Operation *> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    Operation *op = v.getDefiningOp();
+    if (v == x || !op || !seen.insert(op).second)
+      continue;
+    auto fm = dyn_cast<arith::ArithFastMathInterface>(op);
+    unsigned kind =
+        isa<math::LogOp, math::ExpOp, math::Log2Op, math::Exp2Op>(op)
+            ? HalfApproxExpLog
+        : isa<math::SqrtOp>(op)  ? HalfApproxSqrt
+        : isa<arith::DivFOp>(op) ? HalfApproxDiv
+                                 : HalfApproxNone;
+    if (fm && (kind & kinds))
+      op->setAttr(fm.getFastMathAttrName(),
+                  arith::FastMathFlagsAttr::get(
+                      op->getContext(), fm.getFastMathFlagsAttr().getValue() |
+                                            arith::FastMathFlags::afn));
+    for (Value o : op->getOperands())
+      work.push_back(o);
+  }
+}
+
 template <typename OpTy>
 static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   auto type = dyn_cast<FloatType>(op.getType());
@@ -912,6 +957,10 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
         arith::SubFOp::create(rewriter, loc, u, one));
     r = sel(small, sel(eq(u, one), x, q), lu);
   }
+  // a half result: the division by the reciprocal (exp and log precise:
+  // with the hardware's, expm1 and log1p were up to 1.12 ulp off)
+  if (type.isF16())
+    approximateForHalf(r, x, HalfApproxDiv);
   if (!type.isF32() && !type.isF64())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
   rewriter.replaceOp(op, r);
@@ -1027,6 +1076,17 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
     r = sel(cmp(arith::CmpFPredicate::OLT, a, c(0x1p-126f)),
             math::CopySignOp::create(rewriter, loc, c(0.0f), x), r);
   }
+  // a half result: cbrt all approximate, acosh and atanh the divisions and
+  // square roots, asinh the square root (each half input's result as before;
+  // asinh's division by the reciprocal changed 4, 2 of them further off, and
+  // the hardware's log changed asinh's and atanh's small results)
+  if (type.isF16())
+    approximateForHalf(r, x,
+                       std::is_same_v<OpTy, math::CbrtOp>
+                           ? HalfApproxExpLog | HalfApproxSqrt | HalfApproxDiv
+                       : std::is_same_v<OpTy, math::AsinhOp>
+                           ? unsigned(HalfApproxSqrt)
+                           : HalfApproxSqrt | HalfApproxDiv);
   if (!type.isF32())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
   rewriter.replaceOp(op, r);
@@ -2547,6 +2607,7 @@ struct LowerGpuOpsToAIROpsPass final
       op.replaceAllUsesWith(v);
       op.erase();
     });
+    ::approximateHalfFunctions = approximateHalfFunctions;
     if (narrowLoops)
       ::narrowLoops(m);
     if (narrowIndices)

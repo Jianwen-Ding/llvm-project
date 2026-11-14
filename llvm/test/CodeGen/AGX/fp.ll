@@ -245,7 +245,6 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    fcmpsel gt, r5, r5, r16, r29, r17
 ; CHECK-NEXT:    mov_imm r17, 2143289344
 ; CHECK-NEXT:    fmadd32 r13, r13, 1.4375, r18
-; CHECK-NEXT:    fmadd32 r13, r5, 0.0, r13
 ; CHECK-NEXT:    fadd32 r5, r5, r13
 ; CHECK-NEXT:    mov_imm r13, -8388608
 ; CHECK-NEXT:    fcmpsel eq, r5, r1, r8, r1, r5

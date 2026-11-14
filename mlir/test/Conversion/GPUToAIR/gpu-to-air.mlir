@@ -1,5 +1,6 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0 simdgroup-all-reduce=0" --split-input-file | FileCheck %s --check-prefix=OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 approximate-half-functions=0" --split-input-file | FileCheck %s --check-prefix=HALFOFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -1236,6 +1237,33 @@ gpu.module @f64_sinh_tanh_one_division {
     %s = math.sinh %v : f64
     %t = math.tanh %s : f64
     memref.store %t, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f16 functions computed in f32 with the hardware's approximations of the
+// steps for which every f16 input's result is the same (L15-E330): cbrt all
+// of them, asinh its square root only; off with approximate-half-functions=0.
+gpu.module @half_approximations {
+  // CHECK-LABEL: llvm.func @k(
+  // HALFOFF-LABEL: gpu.module @half_approximations
+  // HALFOFF-NOT: fastmath<afn>
+  // HALFOFF: llvm.return
+  gpu.func @k(%a: memref<8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf16, 1>
+    // CHECK: llvm.intr.log2(%{{.*}}) fastmath<afn> : (f32) -> f32
+    // CHECK: llvm.intr.exp2(%{{.*}}) fastmath<afn> : (f32) -> f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    // CHECK: llvm.intr.sqrt(%{{.*}}) fastmath<afn> : (f32) -> f32
+    // CHECK-NOT: fastmath<afn>
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} : f32
+    // CHECK: llvm.return
+    %c = math.cbrt %v : f16
+    %s = math.asinh %c : f16
+    memref.store %s, %a[%c0] : memref<8xf16, 1>
     gpu.return
   }
 }
