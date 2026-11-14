@@ -101,7 +101,11 @@ zero high half and its single fence around a threadgroup barrier, `-agx-merge-ba
 
 `gpu.shuffle` by a constant offset within the SIMD-group is AIR's own `shuffle_xor` (within any power-of-two width),
 `shuffle_up` or `shuffle_down` (over the whole SIMD-group), whose source lanes are those and whose valid flag is
-known (xor) or one comparison of the lane; the other shuffles compute the source lane and use the index shuffle.
+known (xor) or one comparison of the lane. Within narrower segments (up, down), at a constant lane (idx), or by an
+offset that is the same in every thread (a constant, a kernel argument, a threadgroup-level id or size, a loop
+counter with such bounds, or arithmetic of those) they are the same AIR shuffles with that uniform offset (up and down
+by a uniform offset of either sign: the shift by it or the opposite shift by its negation), and the thread's own value
+where the source lane is outside its segment; the other shuffles compute the source lane and use the index shuffle.
 `gpu.rotate` is a shuffle down by the offset and up by width - offset (AIR has no rotate), selected by the lane's
 position in its segment; `gpu.subgroup_broadcast` is AIR's shuffle of the lane or its broadcast of the first active
 lane.
