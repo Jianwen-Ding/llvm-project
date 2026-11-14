@@ -197,6 +197,13 @@ def prepare_source(path, workdir):
     out, masked_expanded = masked.expand(out)   # also those created above
     expanded = expanded or asm_expanded or masked_expanded
     if expanded:
+        # inline only our helpers: the test's own alwaysinline functions may
+        # be called by name in the PTX
+        out = "\n".join(
+            re.sub(r"\balwaysinline\b\s*", "", l)
+            if (l.startswith("attributes #") or
+                (l.startswith("define ") and "@ptxtv_" not in l)) else l
+            for l in out.split("\n"))
         tmp = os.path.join(workdir, "src.sem.ll")
         with open(tmp, "w") as f:
             f.write(out)
@@ -233,6 +240,9 @@ def prepare_source(path, workdir):
                   r"alias\.scope|noalias|llvm\.access\.group|llvm\.loop|prof|annotation|"
                   r"srcloc|nvvm\.[\w.]+)\s+![\w.]+", "", text)
     text = rewrite_i1_fp(text)
+    # stack save/restore: opaque calls (the lifter emits the same)
+    text = re.sub(r"@llvm\.stacksave(\.p\d+)?\(", "@ptx.stacksave(", text)
+    text = re.sub(r"@llvm\.stackrestore(\.p\d+)?\(", "@ptx.stackrestore(", text)
     # alignstack(N) only constrains stack alignment (Alive2 rejects it)
     text = re.sub(r"\s*\balignstack\(\d+\)", "", text)
     src = os.path.join(workdir, "src.ll")
@@ -314,12 +324,60 @@ def ptx_name(n):
     return "".join(c if (c.isalnum() or c in "_$") else "_$_" for c in n)
 
 
+RENAMES = {}
+
+
+def nvptx_renames(text):
+    """LLVM name -> PTX name, emulating NVPTXAssignValidGlobalNames: local
+    globals (and external .shared ones), then local functions, in module
+    order, get NVPTX::getValidPTXIdentifier names; a collision makes the
+    name unique with the module's running counter (no separator), as
+    ValueSymbolTable::makeUniqueName does for global values."""
+    NAME = r'@("[^"]*"|[-a-zA-Z$._0-9]+)'
+    unq = lambda n: n[1:-1] if n.startswith('"') else n
+    allnames, gvars, funcs = set(), [], []
+    for l in text.split("\n"):
+        m = re.match(NAME + r"\s*=\s*(.*)$", l)
+        if m:
+            allnames.add(unq(m.group(1)))
+            rest = m.group(2)
+            if re.match(r"(\w+\s+)*(alias|ifunc)\b", rest):
+                continue
+            head = re.split(r"\b(global|constant)\b", rest)[0]
+            local = re.search(r"\b(private|internal)\b", head)
+            ext_shared = not re.search(r"\b(private|internal|linkonce\w*|weak\w*|common|"
+                                       r"available_externally|extern_weak)\b", head) and \
+                "addrspace(3)" in head
+            if local or ext_shared:
+                gvars.append(m.group(1))
+            continue
+        m = re.match(r"(define|declare)\b[^@]*" + NAME + r"\(", l)
+        if m:
+            allnames.add(unq(m.group(2)))
+            if m.group(1) == "define" and re.match(r"define\s+(private|internal)\b", l):
+                funcs.append(m.group(2))
+    counter, out = 0, {}
+    for n in gvars + funcs:
+        raw = unq(n)
+        valid = ptx_name(n)
+        if valid == raw:
+            continue
+        allnames.discard(raw)
+        name = valid
+        while name in allnames:
+            counter += 1
+            name = valid + str(counter)
+        allnames.add(name)
+        out[n] = name
+    return out
+
+
 def build_name_map(defines, decls, globals_):
     m = {}
     for n in list(decls) + list(globals_):
         raw = n[1:-1] if n.startswith('"') else n
         m[raw] = n
-        m[ptx_name(n)] = n
+        m[RENAMES.get(n, ptx_name(n))] = n
     return m
 
 
@@ -564,7 +622,7 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         if rc:
             res.update(status="extract-failed", detail=err[-300:])
             return res
-    ptxn = ptx_name(fname)
+    ptxn = RENAMES.get(fname, ptx_name(fname))
     try:
         L = ptx_lift.lift_function(ptx, sig, name_map, decls, globals_, ptxn,
                                    typedefs, indirect_call_sigs(ext, fname))
@@ -673,6 +731,8 @@ def process_file(path, args):
         defines, decls, globals_, typedefs = module_symbols(src_text)
     except Exception as e:
         return [dict(base, status="source-prep-failed", detail=str(e)[:300])]
+    RENAMES.clear()
+    RENAMES.update(nvptx_renames(src_text))
     name_map = build_name_map(defines, decls, globals_)
     names = list(defines)
     skip_here = SKIP.get(base["file"], set())

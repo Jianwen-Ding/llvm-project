@@ -276,6 +276,7 @@ class Lifter:
         self.indirect_sigs = indirect_sigs or []
         self.used_probe = False
         self.handle_params = {}      # .texref/.samplerref param -> LLVM arg
+        self.ptr_slots = set()       # param slots holding a pointer argument
         self.pf = pfunc
         self.sig = sig
         self.name_map = name_map     # PTX symbol -> LLVM global/function name
@@ -500,11 +501,10 @@ class Lifter:
         if not (s.startswith("[") and s.endswith("]")):
             raise Unsupported("address " + s)
         s = s[1:-1].strip()
+        if re.fullmatch(r"(-?\d+|0x[0-9a-fA-F]+)", s):      # absolute address
+            return "ptr " + self.op("inttoptr i64 %d to ptr" % self.imm(s))
         m = re.fullmatch(r"([%\w$.]+)\s*(?:\+\s*(-?\d+|0x[0-9a-fA-F]+))?", s)
         if not m:
-            m2 = re.fullmatch(r"(-?\d+|0x[0-9a-fA-F]+)", s)
-            if m2:
-                return "ptr " + self.op("inttoptr i64 %d to ptr" % self.imm(s))
             raise Unsupported("address " + s)
         base, off = m.group(1), m.group(2)
         off = self.imm(off) if off else 0
@@ -747,6 +747,8 @@ class Lifter:
                                 (slot, pp.size, pp.align))
             self.scopes[0][pp.name] = (slot, pp)
             self.store_value(arg.ty, arg.name, arg, slot, pp, is_ret=False)
+            if arg.ty.startswith("ptr") and pp.size == 8:
+                self.ptr_slots.add(slot)
         if pf.ret:
             if len(pf.ret) != 1:
                 raise Unsupported("multiple return params")
@@ -2198,7 +2200,12 @@ class Lifter:
             raise Unsupported("vector arity " + opc)
         total = eb * vec
         d0 = dsts[0].strip()
-        if vec == 1 and eb == 64 and self.base_of.get(d0) == ("dyn", d0):
+        if vec == 1 and eb == 64 and p.split(" ", 1)[1] in self.ptr_slots:
+            # a pointer argument: read it as a pointer (Alive2 does not give
+            # an integer load of a stored pointer its address)
+            pv = self.op("load ptr, %s, align 8" % p)
+            v = self.op("ptrtoint ptr %s to i64" % pv)
+        elif vec == 1 and eb == 64 and self.base_of.get(d0) == ("dyn", d0):
             # load as a pointer (keeping provenance); its integer value is
             # the address (Alive2's assembly mode makes this exact)
             pv = self.op("load ptr, %s, align 8" % p)
@@ -2372,6 +2379,24 @@ class Lifter:
         iv = self.op("bitcast <%d x i%d> %s to <%d x i32>" % (Y * num, E, v, D))
         for k, r in enumerate(bundles[0]):
             self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (D, iv, k)), 32)
+
+    # stacksave/stackrestore: opaque calls, matching the source's
+    # llvm.stacksave/llvm.stackrestore (renamed by tv.py)
+    def i_stacksave(self, mods, ops, opc):
+        if mods not in (["u64"], ["u32"]):
+            raise Unsupported("opcode " + opc)
+        self.declare("ptx.stacksave", "declare ptr @ptx.stacksave() nounwind")
+        p = self.op("call ptr @ptx.stacksave()")
+        bits = 64 if mods == ["u64"] else 32
+        v = self.op("ptrtoint ptr %s to i%d" % (p, bits))
+        self.write(ops[0], v, bits)
+
+    def i_stackrestore(self, mods, ops, opc):
+        if mods not in (["u64"], ["u32"]):
+            raise Unsupported("opcode " + opc)
+        self.declare("ptx.stackrestore", "declare void @ptx.stackrestore(ptr) nounwind")
+        p = self.address("[%s]" % ops[0].strip(), "local")
+        self.emit("call void @ptx.stackrestore(%s)" % p)
 
     def i_ldu(self, mods, ops, opc):
         self.i_ld(mods, ops, opc)
@@ -2563,12 +2588,25 @@ class Lifter:
         fixed = self.sized_args(csig.args)
         if len(args) != len(fixed) + 1:
             raise Unsupported("vararg call arity")
+        # the source call sites of fname, in order (all, including those
+        # without variable arguments)
         sites = [x for x in self.indirect_sigs if getattr(x, "callee", None) == fname
-                 and len(x.args) > len(csig.args)]
+                 and len(x.args) >= len(csig.args)]
         kinds = {tuple(a.ty for a in x.args) for x in sites}
-        if len(kinds) != 1:
+        if not hasattr(self, "vcall_idx"):
+            self.vcall_idx = {}
+        k = self.vcall_idx.get(fname, 0)
+        self.vcall_idx[fname] = k + 1
+        if len(kinds) == 1:
+            site = sites[0]
+        elif k < len(sites):
+            # different variable argument types at different call sites:
+            # match the k-th call in the PTX with the k-th in the source
+            # (calls have side effects, so their order is preserved; a wrong
+            # match gives a counterexample, not a proof)
+            site = sites[k]
+        else:
             raise Unsupported("vararg call with ambiguous source types")
-        site = sites[0]
         vtys = [a.ty for a in site.args[len(csig.args):]]
         vals = []
         for a, carg in zip(args, fixed):
@@ -2583,8 +2621,8 @@ class Lifter:
             vals.append("%s %s %s" % (carg.ty, carg.attrs, v))
         bslot, _ = self.lookup(args[-1])
         buf = self.ptr_from_slot("ptr", bslot)
-        st = layout.parse("{ %s }" % ", ".join(vtys), self.typedefs)
-        for t, off in zip(vtys, layout.offsets(st)):
+        st = layout.parse("{ %s }" % ", ".join(vtys), self.typedefs) if vtys else None
+        for t, off in zip(vtys, layout.offsets(st) if vtys else []):
             p = self.gep(buf, off)
             vals.append("%s %s" % (t, self.load_mem(layout.parse(t, self.typedefs), p, 0)))
         fty = "%s (%s)" % (csig.ret, ", ".join([a.ty for a in csig.args] + ["..."]))
