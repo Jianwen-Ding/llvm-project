@@ -357,7 +357,9 @@ mismatch.
   outside the mask from c; `.add` sums only the masked lanes)
   (`video_mask`, 96 functions), and `vmad` (`.po`, negated operands,
   `.shr7`/`.shr15`, `.sat`; the scale shift is taken as arithmetic for a
-  signed result, an assumption) (`video_vmad`). Source lane selectors of
+  signed result, an assumption) (`video_vmad`: 273 of 336 prove, none
+  mismatches; the other 63, all with operand selectors, time out even at
+  120 s, while every modifier combination proves without selectors). Source lane selectors of
   the SIMD forms are rejected.
 * `set` (`set.cmp{.boolop}.dtype.stype`: all ones, 1.0 or 0) (`set`), and
   `sqrt.rz/.rm/.rp` (LLVM's constrained square root in that mode; the

@@ -26,7 +26,7 @@ import tv  # noqa: E402
 LLC = ["-mtriple=nvptx64", "-mcpu=sm_90", "-mattr=+ptx80"]
 
 
-def case(name, smt_to=10000):
+def case(name, smt_to=10000, only=None):
     asm = os.path.join(HERE, "isa_tests", name + ".ll")
     ref = os.path.join(HERE, "isa_tests", name + ".ref.ll")
     wd = tempfile.mkdtemp(prefix="isa_")
@@ -42,6 +42,8 @@ def case(name, smt_to=10000):
     name_map = tv.build_name_map(defines, decls, globals_)
     out = []
     for n, (line, sig) in defines.items():
+        if only is not None and n not in only:
+            continue
         r = tv.check_function(n, line, sig, src_path, src_text, ptx, name_map, decls,
                               globals_, wd, smt_to, False, typedefs)
         r["case"] = name
@@ -58,9 +60,15 @@ def main():
     names = a.names or sorted(f[:-3] for f in os.listdir(os.path.join(HERE, "isa_tests"))
                               if f.endswith(".ll") and not f.endswith(".ref.ll")
                               and not f.startswith("slow_"))
+    jobs = []
+    for nm in names:
+        fs = re.findall(r"^define [^@]*@([\w.]+)\(", open(os.path.join(HERE, "isa_tests", nm + ".ref.ll")).read(), re.M)
+        for k in range(a.j):
+            if fs[k::a.j]:
+                jobs.append((nm, set(fs[k::a.j])))
     bad = 0
     with ProcessPoolExecutor(a.j) as ex:
-        for rs in ex.map(case, names, [a.smt_to] * len(names)):
+        for rs in ex.map(case, [j[0] for j in jobs], [a.smt_to] * len(jobs), [j[1] for j in jobs]):
             for r in rs:
                 bad += r["status"] != "correct"
                 print(json.dumps(r))
