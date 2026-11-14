@@ -767,6 +767,11 @@ def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
 def : Pat<(i16 (and (agx_srl_oneuse AGXIntSrc16:$a, (i16 imm:$s)),
                     agx_field_mask:$m)),
           (BFEIL_I16 0, (i16 0), 0, $a, 0, (i16 imm:$s), (AGXFieldWidth $m))>;
+// (x & (2^k - 1)) << n by a register amount: one bfi of the field into 0
+// (its masked register offset recorded: coverage alu/bfi_r14_r6_r7_r8_mask_*;
+// an amount from 32 is poison in the IR) (L15-E358).
+def : Pat<(i32 (shl (and AGXIntSrc32:$a, agx_field_mask:$m), i32:$s)),
+          (BFI_I32 0, (i32 0), 0, $a, 0, $s, (AGXFieldWidth $m))>;
 // By a register amount too: bfeil's register offset is read in 7 bits (an
 // amount from 32 leaves 0, where the IR shift is poison), with the field's
 // width (recorded: coverage alu/bfeil_r14_r6_r7_r8_mask_0x1 ... 0xFFFF):

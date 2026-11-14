@@ -38,3 +38,15 @@ define void @bittest(ptr addrspace(1) %p, i32 %x, i32 %n) {
   store i32 %r, ptr addrspace(1) %p
   ret void
 }
+
+; (x & 255) << n: one bfi of the field into 0 (L15-E358).
+; CHECK-LABEL: andshl:
+; CHECK: bfi {{r[0-9]+}}, 0, {{[ur][0-9]+}}, {{[ur][0-9]+}}, mask 0xFF
+; CHECK-NOT: and
+; CHECK: stop
+define void @andshl(ptr addrspace(1) %p, i32 %x, i32 %n) {
+  %a = and i32 %x, 255
+  %r = shl i32 %a, %n
+  store i32 %r, ptr addrspace(1) %p
+  ret void
+}
