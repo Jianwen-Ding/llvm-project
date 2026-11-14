@@ -49,6 +49,12 @@ def main(path, out, title, config):
         L.append("%d of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) "
                  "after the check with cp.async/st.bulk copy semantics timed out." % nop)
         L.append("")
+    nsc = sum(1 for r in fn if r["status"] == "correct" and r.get("scalarized"))
+    if nsc:
+        L.append("%d of the correct results were obtained with vector accesses split into "
+                 "element accesses on both sides (, PTXTV_SCALARIZE=1) after a "
+                 "timeout." % nsc)
+        L.append("")
     nun = sum(1 for r in fn if r["status"] == "correct" and r.get("unroll"))
     if nun:
         L.append("%d of the correct results involve loops and were checked with bounded "

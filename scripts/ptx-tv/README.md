@@ -175,6 +175,13 @@ single-thread semantics:
   `llvm.readsteadycounter` read `%clock64` and `%globaltimer` (an assumption
   taken from the backend). FP vector reductions are expanded into the
   sequential scalar operations LangRef defines.
+* `PTXTV_SCALARIZE=1` (used for timeouts; results tagged `scalarized`):
+  PTX `ld/st.vN` become one access per element (the first keeps the
+  vector's alignment) and the source's vector loads/stores of byte-sized
+  elements are split the same way (an exact equivalence). Alive2 times out
+  relating a vector access to differently shaped ones (even a 2 x i16 copy
+  split in two) but proves element-wise copies at once; it does not help
+  where the PTX uses another element width than the source.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
