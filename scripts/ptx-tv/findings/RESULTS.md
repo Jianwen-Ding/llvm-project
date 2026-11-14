@@ -1,22 +1,20 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160). Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4186.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3224 | 77.0% |
-| `timeout` | 652 | 15.6% |
-| `mismatch-known` | 137 | 3.3% |
+| `correct` | 3232 | 77.2% |
+| `timeout` | 662 | 15.8% |
+| `mismatch-known` | 138 | 3.3% |
 | `inconclusive` | 100 | 2.4% |
 | `mismatch-param-oob` | 32 | 0.8% |
-| `alive-error` | 17 | 0.4% |
-| `mismatch` | 11 | 0.3% |
 | `lift-unsupported` | 11 | 0.3% |
+| `mismatch` | 10 | 0.2% |
 | `src-inline-asm` | 1 | 0.0% |
-| `alive-unsupported` | 1 | 0.0% |
 
 20 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
 
@@ -24,7 +22,9 @@ Of the correct results, 505 rely on probe-derived opaque instructions (probe.py)
 
 6 of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) after the check with cp.async/st.bulk copy semantics timed out.
 
-Conclusive (proved correct or counterexample): 3404 (81.3%).
+1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
+
+Conclusive (proved correct or counterexample): 3412 (81.5%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -71,8 +71,8 @@ Triage (see `README.md`): `bf16-instructions.ll` `test_uitofp_i32`,
 `minimum_float_ftz`: finding 4; `math-intrins.ll`
 `minimumnum_float`/`maximumnum_float`/`maximumnum_double` and `fmax3.ll`
 `test_fminimumnum3`/`test_fmaximumnum3`: unresolved (PTX min/max signed
-zeros); `bf16-instructions.ll` `test_maxnum_v2`: NaN bits only (allowed for
-`maxnum`). Finding 5 (`lower-args-gridconstant.ll` kernels storing to an
+zeros); `bf16-instructions.ll` `test_maxnum_v2` (NaN bits only, allowed for
+`maxnum`) is now labelled `nan-payload` automatically. Finding 5 (`lower-args-gridconstant.ll` kernels storing to an
 undeclared `func_retval0`) is reported as `lift-unsupported`, since the PTX
 is invalid. The `nan-payload` entries of `arbitrary-fp-to-float.ll` are
 finding 6.
@@ -95,7 +95,7 @@ finding 6.
 |---|---:|
 | `partword-atomic-word-access` | 80 |
 | `approximation-permitted-by-flags` | 21 |
-| `nan-payload` | 17 |
+| `nan-payload` | 18 |
 | `indirect-call-asm-mode` | 4 |
 | `approx-substitution` | 4 |
 | `aligned-overread-widened-load` | 3 |
@@ -113,11 +113,4 @@ finding 6.
 | `vararg` | 2 |
 | `stacksave.u64` | 1 |
 | `stackrestore.u64` | 1 |
-
-## Alive2 could not handle the source
-
-* 8: ERROR: The target program doesn't reach a return instruction.
-* 6: ERROR: SMT Error: invalid extract application
-* 3: ERROR: The source program doesn't reach a return instruction.
-* 1: ERROR: Unsupported attribute: alignstack(32)
 

@@ -36,6 +36,7 @@ WALL_TIMEOUT = int(os.environ.get("PTXTV_WALL_TIMEOUT", "0"))
 LLC_FLAGS = {}   # pid -> llc flags of the file being processed
 # extra (weakening) Alive2 flags, e.g. --disable-poison-input; recorded per result
 ALIVE_EXTRA = os.environ.get("PTXTV_ALIVE_EXTRA", "").split()
+UNROLL = int(os.environ.get("PTXTV_UNROLL", "8"))
 SKIP = {}        # file -> functions to skip (--skip-from)
 PROBE_LLC = {}   # pid -> llc args used for intrinsic probes
 probe_mod = None
@@ -229,6 +230,9 @@ def prepare_source(path, workdir):
     text = re.sub(r",\s*!(mem\.cache_hint|nontemporal|invariant\.load|tbaa|tbaa\.struct|"
                   r"alias\.scope|noalias|llvm\.access\.group|llvm\.loop|prof|annotation|"
                   r"srcloc|nvvm\.[\w.]+)\s+![\w.]+", "", text)
+    text = rewrite_i1_fp(text)
+    # alignstack(N) only constrains stack alignment (Alive2 rejects it)
+    text = re.sub(r"\s*\balignstack\(\d+\)", "", text)
     src = os.path.join(workdir, "src.ll")
     with open(src, "w") as f:
         f.write(text)
@@ -236,6 +240,36 @@ def prepare_source(path, workdir):
     if rc:
         raise RuntimeError("renamed source does not verify: " + err[-300:])
     return src, text
+
+
+FP_ONE = {"half": ("0xH3C00", "0xHBC00"), "bfloat": ("0xR3F80", "0xRBF80"),
+          "float": ("1.0", "-1.0"), "double": ("1.0", "-1.0")}
+
+
+def rewrite_i1_fp(text):
+    """Scalar conversions between i1 and FP, which Alive2's SMT encoding
+    rejects ("invalid extract application"), as equivalent selects.  Done
+    after the last optimisation, so the poison arms stay."""
+    def itofp(m):
+        ind, r, op, x, t = m.groups()
+        one, mone = FP_ONE[t]
+        return "%s%s = select i1 %s, %s %s, %s 0.0" % (ind, r, x, t, one if op == "uitofp" else mone, t)
+    text = re.sub(r"^(\s*)(%[\w.$-]+) = (uitofp|sitofp) i1 (%[\w.$-]+|true|false) to "
+                  r"(half|bfloat|float|double)\s*$", itofp, text, flags=re.M)
+
+    def fptoi(m):
+        ind, r, op, t, x = m.groups()
+        lo, hi = (0, 1) if op == "fptoui" else (-1, 0)
+        w = "%s.w" % r
+        return ("%s%s = %s %s %s to i32\n"
+                "%s%s.lo = icmp sge i32 %s, %d\n%s%s.hi = icmp sle i32 %s, %d\n"
+                "%s%s.ok = and i1 %s.lo, %s.hi\n%s%s.t = trunc i32 %s to i1\n"
+                "%s%s = select i1 %s.ok, i1 %s.t, i1 poison") % (
+                    ind, w, op, t, x, ind, r, w, lo, ind, r, w, hi, ind, r, r, r,
+                    ind, r, w, ind, r, r, r)
+    text = re.sub(r"^(\s*)(%[\w.$-]+) = (fptoui|fptosi) (half|bfloat|float|double) (\S+) to i1\s*$",
+                  fptoi, text, flags=re.M)
+    return text
 
 
 def module_symbols(text):
@@ -561,6 +595,20 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     except subprocess.TimeoutExpired:
         res.update(status="timeout", detail="wall clock")
         return res
+    # Loops: Alive2 only reasons about loop-free code unless asked to unroll.
+    # Retry with bounded unrolling; such results only cover executions with
+    # at most UNROLL iterations per loop and are tagged.
+    if "doesn't reach a return instruction" in out and UNROLL:
+        try:
+            rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
+                                "--disable-undef-input", "--smt-to=%d" % smt_to,
+                                "--src-unroll=%d" % UNROLL, "--tgt-unroll=%d" % UNROLL] +
+                               ALIVE_EXTRA + ["--func=" + fname.strip('"')],
+                               timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+        except subprocess.TimeoutExpired:
+            res.update(status="timeout", detail="wall clock", unroll=UNROLL)
+            return res
+        res["unroll"] = UNROLL
     st = classify(out, err, rc)
     if ALIVE_EXTRA:
         res["alive_extra"] = " ".join(ALIVE_EXTRA)

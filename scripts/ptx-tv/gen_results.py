@@ -49,6 +49,11 @@ def main(path, out, title, config):
         L.append("%d of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) "
                  "after the check with cp.async/st.bulk copy semantics timed out." % nop)
         L.append("")
+    nun = sum(1 for r in fn if r["status"] == "correct" and r.get("unroll"))
+    if nun:
+        L.append("%d of the correct results involve loops and were checked with bounded "
+                 "unrolling (`unroll` field)." % nun)
+        L.append("")
     L.append("Conclusive (proved correct or counterexample): %d (%.1f%%)." % (concl, 100.0 * concl / n))
     L.append("")
     oob = [r for r in fn if r["status"] == "mismatch-param-oob"]

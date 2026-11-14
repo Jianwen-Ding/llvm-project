@@ -145,6 +145,17 @@ single-thread semantics:
   input's magnitude bits with exact rounding thresholds; NaN results may be
   any NaN encoding, and the LangRef's poison cases are `freeze poison` (a
   plain poison in a select would be folded away by the source's optimiser).
+* Source rewrites for Alive2 limitations, each an exact equivalence:
+  `sitofp`/`uitofp` from `i1` become selects of the two constants,
+  `fptosi`/`fptoui` to `i1` a range-checked `fptosi` to `i32` (poison
+  outside the range), done after the last optimisation; `alignstack` is
+  dropped.
+* Loops: when Alive2 reports that a side never reaches a return (it only
+  reasons about loop-free code by default), the check is repeated with
+  `--src-unroll`/`--tgt-unroll` = `PTXTV_UNROLL` (default 8). Such results
+  cover only executions with at most that many iterations per loop (exact
+  when every trip count is a constant within the bound) and record
+  `"unroll"`.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
