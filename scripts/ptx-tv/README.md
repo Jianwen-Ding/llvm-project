@@ -210,6 +210,11 @@ intrinsics' `i16` operands/results.
 
 * `partword-atomic-word-access`: sub-word atomics expanded into a CAS loop on
   the containing aligned 32-bit word read bytes outside the object.
+  `PTXTV_PARTWORD_ASSUME=1` instead adds a load of the containing aligned
+  word before each sub-word atomic in the source, so that the CAS loop
+  itself is checked under that assumption (results tagged `assume`); Alive2
+  times out on all of them tried so far (even at 120 s per query and with
+  `--disable-poison-input`), so it is off by default.
 * `byval-copy-to-local`: a kernel `byval` argument whose address escapes is
   copied to local memory; Alive2 treats the `byval` address as an input.
 * `approximation-permitted-by-flags`: `-nvptx-prec-divf32=0/1`,

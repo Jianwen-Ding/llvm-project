@@ -159,6 +159,38 @@ def flatten_address_spaces(text):
     return "\n".join(out)
 
 
+PARTWORD = os.environ.get("PTXTV_PARTWORD_ASSUME", "0") == "1"
+SUBWORD = r"(?:i8|i16|half|bfloat|<2 x i8>)"
+
+
+def partword_assume(text):
+    """NVPTX implements 8/16-bit atomics as a CAS loop on the containing
+    aligned 32-bit word, which also accesses the neighbouring bytes.  To
+    check that loop, the source gets a load of that word (derived from the
+    same pointer) before each sub-word atomic: executions where the word is
+    not accessible become undefined in the source.  Results that rely on
+    this are tagged `assume: partword-word-accessible`."""
+    if not PARTWORD:
+        return text
+    out, n = [], [0]
+    pat = re.compile(r"^(\s*)(?:%[\w.$-]+\s*=\s*)?(atomicrmw|cmpxchg)\s+(?:weak\s+)?(?:volatile\s+)?"
+                     r"(?:\w+\s+)?(ptr(?:\s+addrspace\(\d+\))?)\s+(%[\w.$-]+|@[\w.$-]+),\s*(" + SUBWORD + r")\b")
+    for line in text.split("\n"):
+        m = pat.match(line)
+        if m:
+            ind, _, pty, p, _ = m.groups()
+            pty = re.sub(r"\s+", " ", pty)
+            k = n[0]
+            n[0] += 1
+            out.append("%s%%ptxtv_pwi%d = ptrtoint %s %s to i64" % (ind, k, pty, p))
+            out.append("%s%%ptxtv_pwo%d = and i64 %%ptxtv_pwi%d, 3" % (ind, k, k))
+            out.append("%s%%ptxtv_pwn%d = sub i64 0, %%ptxtv_pwo%d" % (ind, k, k))
+            out.append("%s%%ptxtv_pwp%d = getelementptr i8, %s %s, i64 %%ptxtv_pwn%d" % (ind, k, pty, p, k))
+            out.append("%s%%ptxtv_pw%d = load i32, %s %%ptxtv_pwp%d, align 4" % (ind, k, pty, k))
+        out.append(line)
+    return "\n".join(out)
+
+
 def prepare_source(path, workdir):
     """Strip debug info and rename llvm.nvvm.* intrinsics to plain functions."""
     # Atomics are given single-thread semantics (as in the lifted code),
@@ -167,6 +199,7 @@ def prepare_source(path, workdir):
     # file's), which fixes the alignment of accesses written without one:
     # do the same here.
     raw = re.sub(r"^target datalayout\s*=.*$", "", open(path).read(), flags=re.M)
+    raw = partword_assume(raw)
     nodl = os.path.join(workdir, "nodl.ll")
     with open(nodl, "w") as f:
         f.write(raw)
@@ -791,6 +824,8 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     st = classify(out, err, rc)
     if ALIVE_EXTRA:
         res["alive_extra"] = " ".join(ALIVE_EXTRA)
+    if re.search(r"%ptxtv_pw\d", ext):
+        res["assume"] = "partword-word-accessible"
     if nvvm_sem.OPAQUE_COPIES:
         res["copy_model"] = "opaque"
     if L.used_probe:
