@@ -573,6 +573,50 @@ gpu.module @simdgroup_all_reduce {
     memref.store %s, %a[%c0] : memref<1024xf32, 1>
     gpu.return
   }
+  // Consecutive reductions whose results are used only after the last of
+  // them share one round: both partials stored under one lane-0 guard, one
+  // barrier, then both reductions of the partials.
+  // CHECK-LABEL: llvm.func @two_sums(
+  gpu.func @two_sums(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: %[[P:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK: %[[Q:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[P]], %{{.*}} : f32, !llvm.ptr<3>
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[Q]], %{{.*}} : f32, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: %[[S:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.fadd %[[R]], %[[S]]
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    %v2 = arith.mulf %v, %v : f32
+    %q = gpu.all_reduce add %v2 uniform {} : (f32) -> (f32)
+    %t = arith.addf %s, %q : f32
+    memref.store %t, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // A reduction whose result feeds the next one keeps its own round.
+  // CHECK-LABEL: llvm.func @dependent(
+  gpu.func @dependent(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    %d = arith.subf %v, %s : f32
+    %q = gpu.all_reduce add %d uniform {} : (f32) -> (f32)
+    memref.store %q, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
   // CHECK-LABEL: llvm.func @partial(
   gpu.func @partial(%a: memref<1024xf32, 1>) kernel
       attributes {known_block_size = array<i32: 48, 1, 1>} {
