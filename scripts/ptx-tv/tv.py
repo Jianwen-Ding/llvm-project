@@ -286,6 +286,11 @@ def prepare_source(path, workdir):
     # stack save/restore: opaque calls (the lifter emits the same)
     text = re.sub(r"@llvm\.stacksave(\.p\d+)?\(", "@ptx.stacksave(", text)
     text = re.sub(r"@llvm\.stackrestore(\.p\d+)?\(", "@ptx.stackrestore(", text)
+    # inline asm lifted by asm_sem may already declare them: keep one each
+    for fn in ("ptx.stacksave", "ptx.stackrestore"):
+        ds = list(re.finditer(r"^declare [^\n]*@%s\([^\n]*\n" % re.escape(fn), text, re.M))
+        for d in reversed(ds[1:]):
+            text = text[:d.start()] + text[d.end():]
     # alignstack(N) only constrains stack alignment (Alive2 rejects it)
     text = re.sub(r"\s*\balignstack\(\d+\)", "", text)
     src = os.path.join(workdir, "src.ll")

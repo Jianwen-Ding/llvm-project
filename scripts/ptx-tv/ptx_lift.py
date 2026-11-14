@@ -1016,6 +1016,7 @@ class Lifter:
                     "txq", "suq", "suld", "sust", "tex", "wmma", "mma", "ldmatrix", "stmatrix") or \
                 re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]?|vsh[lr]|vmad", base) or \
                 base in ("createpolicy", "istypeof", "tld4", "sured") or \
+                (base == "cvt" and "pack" in mods) or \
                 (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
@@ -1344,6 +1345,11 @@ class Lifter:
                 vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
             elif self.imm(x) is not None:
                 vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            elif re.fullmatch(r"[-+]?\d+\.\d*(e[-+]?\d+)?|0[fF][0-9a-fA-F]{8}", x):
+                import struct
+                fb = int(x[2:], 16) if x[:2] in ("0f", "0F") else \
+                    struct.unpack("<I", struct.pack("<f", float(x)))[0]
+                vals.append("i64 %d" % fb)        # f32 literal (createpolicy fraction)
             elif x in self.handle_params and self.handle_params[x].startswith("i64 "):
                 vals.append(self.handle_params[x])
             elif re.fullmatch(r"[A-Za-z_$][\w$.]*", x):
@@ -2425,7 +2431,34 @@ class Lifter:
         self.write(ops[0], r, 1)
 
     # ---- conversions -------------------------------------------------------
+    def cvt_pack(self, mods, ops, opc):
+        """cvt.pack.sat.{u16,s16}.s32 d, a, b: d = sat(a) << 16 | sat(b);
+        cvt.pack.sat.{u8,s8,u4,s4,u2,s2}.s32.b32 d, a, b, c: the two
+        saturated fields (w bits each, a above b) below c shifted left by 2w
+        (PTX ISA).  Saturation clamps the signed 32-bit inputs to the
+        destination type's range."""
+        rest = [m for m in mods if m not in ("pack", "sat")]
+        if "sat" not in mods or len(rest) not in (2, 3) or rest[1] != "s32" or \
+                not re.fullmatch(r"[us](16|8|4|2)", rest[0]) or \
+                (len(rest) == 3) != (rest[0][1:] != "16") or (len(rest) == 3 and rest[2] != "b32"):
+            raise Unsupported(opc)
+        w = int(rest[0][1:])
+        lo, hi = (-(1 << (w - 1)), (1 << (w - 1)) - 1) if rest[0][0] == "s" else (0, (1 << w) - 1)
+
+        def sat(o):
+            v = self.get(o, 32)
+            v = self.call_intr("i32", "llvm.smax.i32", ["i32 %s" % v, "i32 %d" % lo])
+            v = self.call_intr("i32", "llvm.smin.i32", ["i32 %s" % v, "i32 %d" % hi])
+            return self.op("and i32 %s, %d" % (v, (1 << w) - 1))
+        r = self.op("or i32 %s, %s" % (self.op("shl i32 %s, %d" % (sat(ops[1]), w)), sat(ops[2])))
+        if len(rest) == 3:
+            c = self.op("shl i32 %s, %d" % (self.get(ops[3], 32), 2 * w))
+            r = self.op("or i32 %s, %s" % (c, r))
+        self.write(ops[0], r, 32)
+
     def i_cvt(self, mods, ops, opc):
+        if "pack" in mods:
+            return self.cvt_pack(mods, ops, opc)
         ts = self.types_of(mods)
         if len(ts) != 2:
             raise Unsupported(opc)
@@ -3019,6 +3052,10 @@ class Lifter:
         return self.cluster_call("griddepcontrol", mods, ops, opc)
 
     def i_pmevent(self, mods, ops, opc):
+        if not mods:
+            # pmevent N: signal a performance-monitor event (no effect on
+            # program state; a keyed call keeps it in place)
+            return self.opaque_keyed("pmevent", mods, ops, opc, False)
         return self.cluster_call("pmevent", mods, ops, opc)
 
     def i_clusterlaunchcontrol(self, mods, ops, opc):
@@ -3261,11 +3298,25 @@ class Lifter:
             acc = x if acc is None else self.op("or i%d %s, %s" % (total, acc, x))
         self.emit("store i%d %s, %s, align %d" % (total, acc, p, total // 8))
 
+    def atomic_lane(self, kind, t, p, b, dst):
+        """One floating-point read-modify-write lane of a vector atom/red."""
+        bits = TBITS[t]
+        it = "i%d" % bits
+        fty = FPTY[t]
+        old = self.op("load %s, %s, align %d" % (it, p, bits // 8))
+        fo = self.op("bitcast %s %s to %s" % (it, old, fty))
+        fb = self.op("bitcast %s %s to %s" % (it, b, fty))
+        if kind == "add":
+            fr = self.op("fadd %s %s, %s" % (fty, fo, fb))
+        else:
+            fr = self.call_intr(fty, "llvm.%snum.%s" % (kind, intname(fty)), ["%s %s" % (fty, fo), "%s %s" % (fty, fb)])
+        self.emit("store %s %s, %s, align %d" % (it, self.op("bitcast %s %s to %s" % (fty, fr, it)), p, bits // 8))
+        if dst is not None:
+            self.write(dst, old, bits)
+
     def atomic_rmw(self, mods, ops, opc, has_result):
         self.check_mem_mods(mods, opc)
         t, vec, space = self.mem_info(mods)
-        if vec != 1:
-            raise Unsupported(opc)
         bits = TBITS[t]
         it = "i%d" % bits
         ops_ = ["add", "min", "max", "inc", "dec", "and", "or", "xor", "exch", "cas"]
@@ -3274,6 +3325,21 @@ class Lifter:
             raise Unsupported(opc)
         kind = kind[0]
         o = ops if has_result else ["_"] + ops
+        if vec != 1:
+            # vector atom/red (.v2/.v4/.v8 of f32, f16, bf16 or their x2
+            # packs; .add/.min/.max): under single-thread semantics one
+            # read-modify-write per lane on consecutive elements
+            if not is_float(t) or kind not in ("add", "min", "max"):
+                raise Unsupported(opc)
+            ds = self.vec_ops(o[0]) if has_result else None
+            bs = self.vec_ops(o[2])
+            if bs is None or len(bs) != vec or (has_result and (ds is None or len(ds) != vec)):
+                raise Unsupported(opc)
+            base = self.address(o[1], space)
+            for k in range(vec):
+                pk = base if k == 0 else "ptr " + self.op("getelementptr i8, %s, i64 %d" % (base, k * bits // 8))
+                self.atomic_lane(kind, t, pk, self.get(bs[k], bits), ds[k] if has_result else None)
+            return
         p = self.address(o[1], space)
         old = self.op("load %s, %s, align %d" % (it, p, bits // 8))
         b = self.get(o[2], bits)

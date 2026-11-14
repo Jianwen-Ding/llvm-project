@@ -365,10 +365,25 @@ mismatch.
   `sqrt.rz/.rm/.rp` (LLVM's constrained square root in that mode; the
   `slow_sqrt` references are not decided by Alive2 within 600 s, so that
   case is not in the default run).
+* `cvt.pack.sat` (16-bit pairs and the 8/4/2-bit forms with c) (`cvt_pack`,
+  8 functions).
+* Vector `atom`/`red` (`.v2/.v4/.v8` of f32, f16, bf16 and their x2 packs,
+  `.add/.min/.max`): one read-modify-write per lane on consecutive
+  elements. They lift, but Alive2 does not decide even the simplest
+  (`red.global.add.v2.f32`) within 120 s.
+* `pmevent N` is a keyed call (no effect on program state).
 * `createpolicy`, `istypeof`, `tld4` and `sured` depend on state outside
   the single-thread model and are keyed calls named by their modifiers;
   `isa_tests/inline/opaque.ll` checks them through the inline-asm path
-  (`tv.py`), where both sides lift the template the same way.
+  (`tv.py`), where both sides lift the template the same way (operands may
+  be f32 literals, such as a `createpolicy` fraction).
+
+Two batches of inline-PTX forms (264 in total: arithmetic, conversions,
+memory with cache and ordering qualifiers, atomics, mbarrier, special
+registers, fences, cross-thread operations, ...) were used to look for gaps
+through the inline-asm path; the remaining rejections are `cvt` narrowing
+without a rounding modifier (invalid PTX) and the SIMD video source lane
+selectors.
 
 ## Target cleanup
 
