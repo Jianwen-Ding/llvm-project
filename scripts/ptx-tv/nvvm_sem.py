@@ -16,6 +16,7 @@ from llvmsig import parse_sig, split_top
 import narrowcvt
 import mbar
 import probe
+import sparse
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -321,6 +322,96 @@ def expand(text, lifter_mod, llc_args=None):
         if re.fullmatch(r"cp\.async\.(commit\.group|wait\.group|wait\.all)", name) \
                 and not re.match(r"\s*%", line):
             removed = True
+            continue
+        if name.startswith("spdecompress."):
+            ret = call_ret_type(line, m.start())
+            sp = sparse.intrinsic_params(name, ret, args) if ret else None
+            if sp:
+                key = ("spdecompress", name, ret, tuple(args))
+                if key not in defs:
+                    fname = "ptxtv_sem_%d" % len(defs)
+                    E, I, X, Y, num = sp
+                    CR = sparse.regs(X * E * num)
+                    C = X * num
+                    MR = sparse.regs(X * I * num)
+                    w = ["define internal %s @%s(%s %%m, %s %%c, i32 %%i, i32 %%t) alwaysinline {"
+                         % (ret, fname, args[0][0], args[1][0])]
+                    if MR == 1:
+                        mregs = ["%m"]
+                    else:
+                        mregs = []
+                        for q in range(MR):
+                            w.append("  %%m%d = extractelement <%d x i32> %%m, i32 %d" % (q, MR, q))
+                            mregs.append("%%m%d" % q)
+                    # pad cdata with zero lanes to whole registers
+                    P = CR * 32 // E
+                    cv = "%c"
+                    if P != C:
+                        idx = ", ".join("i32 %d" % (q if q < C else C) for q in range(P))
+                        w.append("  %%cp = shufflevector <%d x i%d> %%c, <%d x i%d> zeroinitializer, <%d x i32> <%s>"
+                                 % (C, E, C, E, P, idx))
+                        cv = "%cp"
+                    w.append("  %%cr = bitcast <%d x i%d> %s to <%d x i32>" % (P, E, cv, CR))
+                    cregs = []
+                    for q in range(CR):
+                        w.append("  %%c%d = extractelement <%d x i32> %%cr, i32 %d" % (q, CR, q))
+                        cregs.append("%%c%d" % q)
+                    cnt = [0]
+
+                    def fresh():
+                        cnt[0] += 1
+                        return "%%s%d" % cnt[0]
+                    lines, v = sparse.spdecompress_ir(E, I, X, Y, num, mregs, cregs, fresh)
+                    w += ["  " + l for l in lines] + ["  ret %s %s\n}" % (ret, v)]
+                    defs[key] = (fname, "\n".join(w), {})
+                line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+                out_lines.append(line)
+                continue
+        sa = re.fullmatch(r"st\.async(\.sys|\.gpu|\.mmio\.sys)?\.i(8|16|32|64|128)", name)
+        if sa and not re.match(r"\s*%", line) and (
+                (sa.group(1) is None and len(args) == 3) or
+                (sa.group(1) in (".sys", ".gpu") and len(args) == 3 and args[2][1] in ("0", "false")) or
+                (sa.group(1) == ".mmio.sys" and len(args) == 2)):
+            key = ("st.async", name, tuple(t for t, _ in args))
+            if key not in defs:
+                fname = "ptxtv_sem_%d" % len(defs)
+                bits = int(sa.group(2))
+                w = ["define internal void @%s(%s) alwaysinline {" % (
+                    fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+                ps = {}
+                for k in ([0, 2] if sa.group(1) is None else [0]):
+                    t = args[k][0]
+                    if t != "ptr":
+                        w.append("  %%x%d = addrspacecast %s %%y%d to ptr" % (k, t, k))
+                        ps[k] = "%%x%d" % k
+                    else:
+                        ps[k] = "%%y%d" % k
+                w.append("  store i%d %%y1, ptr %s, align %d" % (bits, ps[0], bits // 8))
+                decls = {}
+                if sa.group(1) is None:
+                    w.append("  call void @ptx.cp.async.bulk.complete_tx(ptr %s, i32 %d)"
+                             % (ps[2], bits // 8))
+                    decls["ptx.cp.async.bulk.complete_tx"] = \
+                        "declare void @ptx.cp.async.bulk.complete_tx(ptr, i32) nounwind"
+                w.append("  ret void\n}")
+                defs[key] = (fname, "\n".join(w), decls)
+            line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+            out_lines.append(line)
+            continue
+        if re.fullmatch(r"discard(\.global)?\.L2", name) and len(args) == 2 and \
+                args[1][1] == "128" and not re.match(r"\s*%", line):
+            key = ("discard", name, args[0][0])
+            if key not in defs:
+                fname = "ptxtv_sem_%d" % len(defs)
+                w = ["define internal void @%s(%s %%y0, i64 %%y1) alwaysinline {" % (fname, args[0][0])]
+                p = "ptr %y0"
+                if args[0][0] != "ptr":
+                    w.append("  %%x0 = addrspacecast %s %%y0 to ptr" % args[0][0])
+                    p = "ptr %x0"
+                w += ["  " + lifter_mod.discard_ir(p), "  ret void\n}"]
+                defs[key] = (fname, "\n".join(w), {})
+            line = line[:m.start()] + "@" + defs[key][0] + line[j:]
+            out_lines.append(line)
             continue
         if re.fullmatch(r"cp\.async\.bulk\.(commit\.group|wait\.group(\.read)?|prefetch\.L2)", name) \
                 and not re.match(r"\s*%", line):

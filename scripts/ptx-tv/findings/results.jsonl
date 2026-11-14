@@ -3730,30 +3730,30 @@
 {"function": "cp_async_bulk_tensor_s2g_im2col_w_override_addr", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-s2g-override.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_s2g_tile_override_addr_dim_stride", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-s2g-override.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_s2g_tile_scatter4_2d", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-s2g-override.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_2", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_4", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_8", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_16", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_32", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b2_rpf_64", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b8_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_1", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_4", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_8", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_16", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_32", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b2_rpf_64", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to2_elmsz_b16_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp1to2.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "cp_async_bulk_tensor_reduce_tile_1d", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-reduce.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx80"}
 {"function": "cp_async_bulk_tensor_reduce_tile_2d", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-reduce.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx80"}
 {"function": "cp_async_bulk_tensor_reduce_tile_3d", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-reduce.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx80"}
@@ -3766,49 +3766,49 @@
 {"function": "cp_async_bulk_tensor_reduce_im2col_override_addr", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-reduce-override.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_reduce_im2col_w_override_addr", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-reduce-override.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
 {"function": "cp_async_bulk_tensor_reduce_tile_override_addr_dim_stride", "probe": true, "status": "correct", "file": "cp-async-bulk-tensor-reduce-override.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_107f"}
-{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_st_async_mbarrier_b32", "probe": true, "status": "correct", "file": "st_async_mbarrier.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx81"}
-{"function": "test_st_async_mbarrier_b64", "probe": true, "status": "correct", "file": "st_async_mbarrier.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx81"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to16_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to16_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp4to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_st_async_mbarrier_b32", "status": "correct", "file": "st_async_mbarrier.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx81"}
+{"function": "test_st_async_mbarrier_b64", "status": "correct", "file": "st_async_mbarrier.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx81"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_1", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_4", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_8", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_16", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b2_rpf_32", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b8_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_1", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_2", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_4", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_8", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_16", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_32", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b2_rpf_64", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to4_elmsz_b16_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spcompress_elmsz_b8_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spcompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spcompress_elmsz_b16_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spcompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_spcompress_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spcompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
@@ -3847,18 +3847,18 @@
 {"function": "test_tcgen05_alloc_exclusive_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
 {"function": "test_tcgen05_dealloc_exclusive_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
 {"function": "test_tcgen05_dealloc_exclusive_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc-dealloc-exclusive.ll", "llc": "-march=nvptx64 -mcpu=sm_100f -mattr=+ptx94"}
-{"function": "test_st_async_release_sys_b8", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_sys_b16", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_sys_b32", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_sys_b64", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_gpu_b8", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_gpu_b16", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_gpu_b32", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_release_gpu_b64", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_mmio_release_sys_b8", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_mmio_release_sys_b16", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_mmio_release_sys_b32", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
-{"function": "test_st_async_mmio_release_sys_b64", "probe": true, "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_sys_b8", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_sys_b16", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_sys_b32", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_sys_b64", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_gpu_b8", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_gpu_b16", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_gpu_b32", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_release_gpu_b64", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_mmio_release_sys_b8", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_mmio_release_sys_b16", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_mmio_release_sys_b32", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
+{"function": "test_st_async_mmio_release_sys_b64", "status": "correct", "file": "st_async_release.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_100 -mattr=+ptx87"}
 {"function": "test_tcgen05_alloc_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_alloc_cg2", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_alloc_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-alloc.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
@@ -3875,17 +3875,17 @@
 {"function": "test_tcgen05_commit_mc_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_commit_mc_shared_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_commit_mc_shared_cg2", "probe": true, "status": "correct", "file": "tcgen05-commit.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
-{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to16_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp2to16.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_tcgen05_fence", "probe": true, "status": "correct", "file": "tcgen05-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_wait", "probe": true, "status": "correct", "file": "tcgen05-fence.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_commit_smem_a_read_cg1", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
@@ -3904,26 +3904,26 @@
 {"function": "test_tcgen05_commit_mc_cg2_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
 {"function": "test_tcgen05_commit_mc_shared_cg1_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
 {"function": "test_tcgen05_commit_mc_shared_cg2_i32", "probe": true, "status": "correct", "file": "tcgen05-commit-sm107.ll", "llc": "-march=nvptx64 -mcpu=sm_107f"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b8_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp1to8_elmsz_b16_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp1to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp4to8_elmsz_b8_idxsz_b4_rpf_64", "status": "timeout", "detail": " %t2822 = or i128 %t2818, %t2821\n  store i128 %t2822, ptr %t2808, align 16\n  %t2823 = gep ptr %retval, 1 x i64 32\n  %t2825 = zext i32 %t2268 to i128\n  %t2827 = zext i32 %t2269 to i128\n  %t2828 = shl i128 %t2827, 32\n  %t2829 = or i128 %t2825, %t2828\n  %t2831 = zext i32 %t2270 to i128\n  %t2832 = shl i128 %t2831, 64\n  %t2833 = or i128 %t2829, %t2832\n  %t2835 = zext i32 %t2271 to i128\n  %t2836 = shl i128 %t2835, 96\n  %t2837 = or i128 %t2833, %t2836\n  store i128 %t2837, ptr %t2823, align 32\n  %t2838 = gep ptr %retval, 1 x i64 16\n  %t2840 = zext i32 %t2264 to i128\n  %t2842 = zext i32 %t2265 to i128\n  %t2843 = shl i128 %t2842, 32\n  %t2844 = or i128 %t2840, %t2843\n  %t2846 = zext i32 %t2266 to i128\n  %t2847 = shl i128 %t2846, 64\n  %t2848 = or i128 %t2844, %t2847\n  %t2850 = zext i32 %t2267 to i128\n  %t2851 = shl i128 %t2850, 96\n  %t2852 = or i128 %t2848, %t2851\n  store i128 %t2852, ptr %t2838, align 16\n  %t2854 = zext i32 %t2260 to i128\n  %t2856 = zext i32 %t2261 to i128\n  %t2857 = shl i128 %t2856, 32\n  %t2858 = or i128 %t2854, %t2857\n  %t2860 = zext i32 %t2262 to i128\n  %t2861 = shl i128 %t2860, 64\n  %t2862 = or i128 %t2858, %t2861\n  %t2864 = zext i32 %t2263 to i128\n  %t2865 = shl i128 %t2864, 96\n  %t2866 = or i128 %t2862, %t2865\n  store i128 %t2866, ptr %retval, align 128\n  %t2867 = load <512 x i8>, ptr %retval, align 128\n  ret <512 x i8> %t2867\n}\nERROR: Timeout\n\nSummary:\n  0 correct transformations\n  0 incorrect transformations\n  1 failed-to-prove transformations\n  0 Alive2 errors\n", "file": "spdecompress-sp4to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "test_tcgen05_cp_64x128_v1_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_cp_64x128_v2_cg1", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
 {"function": "test_tcgen05_cp_64x128_v2_cg2", "probe": true, "status": "correct", "file": "tcgen05-cp.ll", "llc": "-march=nvptx64 -mcpu=sm_100a -mattr=+ptx86"}
@@ -3958,43 +3958,43 @@
 {"function": "nvvm_tcgen05_ld_32x32b_pack", "probe": true, "status": "correct", "file": "tcgen05-ld.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "nvvm_tcgen05_ld_16x32bx2", "probe": true, "status": "correct", "file": "tcgen05-ld.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
 {"function": "nvvm_tcgen05_ld_16x32bx2_pack", "probe": true, "status": "correct", "file": "tcgen05-ld.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx86"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_1", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_32", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_2", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_4", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_8", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_16", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
-{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_64", "probe": true, "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b8_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to8_elmsz_b16_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp2to8.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_1", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_2", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_4", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_8", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_16", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_32", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b2_rpf_64", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_1", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b8_idxsz_b4_rpf_32", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_1", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_2", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_4", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_8", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_16", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_32", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b2_rpf_64", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_2", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_4", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_8", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_16", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
+{"function": "test_spdecompress_sp2to4_elmsz_b16_idxsz_b4_rpf_64", "status": "correct", "file": "spdecompress-sp2to4.ll", "llc": "-march=nvptx64 -mcpu=sm_107a -mattr=+ptx94"}
 {"function": "tcgen05_mma_sp_mxf4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale-ptx88-aa.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_mxf4_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale-ptx88-aa.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_mxf4nvf4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-block-scale-ptx88-aa.ll", "llc": "-mcpu=sm_100a -march=nvptx64 -mattr=+ptx88"}
@@ -4209,10 +4209,10 @@
 {"function": "test_param_count_mismatch", "status": "correct", "file": "convert-call-to-indirect.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90"}
 {"function": "test_param_type_mismatch_variadic", "status": "correct", "file": "convert-call-to-indirect.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90"}
 {"function": "test_param_count_mismatch_variadic", "status": "correct", "file": "convert-call-to-indirect.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90"}
-{"function": "discard_global_L2", "probe": true, "status": "correct", "file": "discard.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
-{"function": "discard_L2", "probe": true, "status": "correct", "file": "discard.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
+{"function": "discard_global_L2", "status": "correct", "file": "discard.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
+{"function": "discard_L2", "status": "correct", "file": "discard.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_80 -mattr=+ptx74"}
 {"function": "test_pm_event", "probe": true, "status": "correct", "file": "pm-event.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_20"}
-{"function": "test_st_async_mbarrier_b128", "probe": true, "status": "correct", "file": "st_async_mbarrier_b128.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx92"}
+{"function": "test_st_async_mbarrier_b128", "status": "correct", "file": "st_async_mbarrier_b128.ll", "llc": "-mtriple=nvptx64 -mcpu=sm_90 -mattr=+ptx92"}
 {"function": "tcgen05_mma_sp_mxf4_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-mxf4-mxf4nvf4-kind.ll", "llc": "-mcpu=sm_107a -march=nvptx64 -mattr=+ptx94"}
 {"function": "tcgen05_mma_sp_mxf4_block32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-mxf4-mxf4nvf4-kind.ll", "llc": "-mcpu=sm_107a -march=nvptx64 -mattr=+ptx94"}
 {"function": "tcgen05_mma_sp_mxf4nvf4_block16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-mxf4-mxf4nvf4-kind.ll", "llc": "-mcpu=sm_107a -march=nvptx64 -mattr=+ptx94"}

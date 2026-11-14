@@ -117,6 +117,19 @@ single-thread semantics:
   for the NVVM intrinsics. Alive2 often times out on symbolic-size copies;
   `PTXTV_OPAQUE_COPIES=1` falls back to probe-derived opaque instructions
   for these, and results record `"copy_model": "opaque"`.
+* `st.async` to `shared::cluster` is a store followed by the same opaque
+  complete-tx (of the store's size) on the mbarrier; the `.release.{sys,gpu}`
+  (and `.mmio`) global forms are plain stores. `discard.L2` makes its
+  128-byte line indeterminate (a store of poison, 128-byte aligned).
+* `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
+  cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
+  and the intrinsic (whose qualifiers are derived as documented in
+  `NVPTXUsage.md`). Assumed: elements and indices are packed from bit 0 of
+  the first register upwards; an out-of-group index (implementation-specific
+  in the ISA) is taken modulo the group size on both sides. `spcompress` is
+  left opaque: its tie-breaking and NaN selection are implementation-specific.
+  `applypriority` stays opaque too (as a no-op, the address and eviction
+  policy would go unchecked).
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
@@ -143,7 +156,8 @@ single-thread semantics:
 
 Assumptions taken from the open-source backend rather than an independent
 source (a bug there would not be caught): the lane order of packed
-`setp.f16x2 p|q` (p = low half), the `prmt` mode table, and that an `e2m1x2`
+`setp.f16x2 p|q` (p = low half), the `prmt` mode table, the register
+packing of `spdecompress` operands, and that an `e2m1x2`
 value and a single `ue8m0` scale (`.scale.n1`) occupy the low 8 bits of the
 intrinsics' `i16` operands/results.
 

@@ -1010,8 +1010,9 @@ class Lifter:
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
-        if base in ("fence", "membar", "prefetch", "prefetchu", "cp") or \
-                (base == "st" and "bulk" in mods):
+        if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
+                    "spdecompress") or \
+                (base == "st" and ("bulk" in mods or "async" in mods)):
             return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
@@ -2296,6 +2297,38 @@ class Lifter:
             self.emit(l)
         self.extra_decls.update(decls)
 
+    def st_async(self, mods, ops, opc):
+        """st.async.shared::cluster.mbarrier::complete_tx::bytes{.vN}.T [a], v,
+        [mbar]: a store, then an opaque complete-tx of its size on mbar (as
+        for cp.async.bulk); st.async{.mmio}.release.{sys,gpu}.global.T [a], v:
+        a store (single-thread semantics).  multimem forms are not modelled."""
+        ms = [m for m in mods if m != "async"]
+        rest = [m for m in ms if m in TBITS or m in ("v2", "v4")]
+        other = set(ms) - set(rest)
+        mb = "mbarrier::complete_tx::bytes"
+        if other == {"shared::cluster", mb} and len(ops) == 3:
+            self.i_st(["shared::cluster"] + rest, ops[:2], opc)
+            t, vec, _ = self.mem_info(rest)
+            mp = self.address(ops[2], "shared")
+            self.declare("ptx.cp.async.bulk.complete_tx",
+                         "declare void @ptx.cp.async.bulk.complete_tx(ptr, i32) nounwind")
+            self.emit("call void @ptx.cp.async.bulk.complete_tx(%s, i32 %d)"
+                      % (mp, TBITS[t] * vec // 8))
+            return
+        if other - {"mmio"} in ({"release", "sys", "global"}, {"release", "gpu", "global"}) \
+                and not ("mmio" in other and "gpu" in other) and len(ops) == 2:
+            return self.i_st(["global"] + rest, ops, opc)
+        raise Unsupported("opcode " + opc)
+
+    def i_discard(self, mods, ops, opc):
+        """discard{.global}.L2 [a], 128: the 128-byte line at a (128-byte
+        aligned) becomes indeterminate; modelled as a store of poison."""
+        if mods not in (["global", "L2"], ["L2"]) or len(ops) != 2 or \
+                self.imm(ops[1].strip()) != 128:
+            raise Unsupported("opcode " + opc)
+        p = self.address(ops[0], "global" if "global" in mods else "generic")
+        self.emit(discard_ir(p))
+
     def st_bulk(self, mods, ops, opc):
         """st.bulk{.weak}{.shared::cta} [a], size, 0: zero `size` bytes
         (size a multiple of 8, a 8-byte aligned; initval must be 0)."""
@@ -2313,12 +2346,41 @@ class Lifter:
             self.emit(l)
         self.extra_decls.update(decls)
 
+    def i_spdecompress(self, mods, ops, opc):
+        """spdecompress.elemsize.idxsize.sp::X:Y.xN {data}, {mdata}, {cdata}
+        (see sparse.py)."""
+        import sparse
+        if len(mods) != 4 or mods[0] not in ("b8", "b16") or mods[1] not in ("b2", "b4") \
+                or not sparse.SPF.fullmatch(mods[2]) or not re.fullmatch(r"x\d+", mods[3]):
+            raise Unsupported("opcode " + opc)
+        E, I = int(mods[0][1:]), int(mods[1][1:])
+        X, Y = map(int, sparse.SPF.fullmatch(mods[2]).groups())
+        num = int(mods[3][1:])
+        if not sparse.check(E, I, X, Y, num):
+            raise Unsupported("opcode " + opc)
+        bundles = [self.vec_ops(o) or [o.strip()] for o in ops[:3]]
+        if len(ops) != 3 or [len(b) for b in bundles] != [
+                sparse.regs(Y * E * num), sparse.regs(X * I * num), sparse.regs(X * E * num)]:
+            raise Unsupported("operand count " + opc)
+
+        m = [self.get(r, 32) for r in bundles[1]]
+        c = [self.get(r, 32) for r in bundles[2]]
+        lines, v = sparse.spdecompress_ir(E, I, X, Y, num, m, c, self.tmp)
+        for l in lines:
+            self.emit(l)
+        D = Y * E * num // 32
+        iv = self.op("bitcast <%d x i%d> %s to <%d x i32>" % (Y * num, E, v, D))
+        for k, r in enumerate(bundles[0]):
+            self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (D, iv, k)), 32)
+
     def i_ldu(self, mods, ops, opc):
         self.i_ld(mods, ops, opc)
 
     def i_st(self, mods, ops, opc):
         if "bulk" in mods:
             return self.st_bulk(mods, ops, opc)
+        if "async" in mods:
+            return self.st_async(mods, ops, opc)
         self.check_mem_mods(mods, opc)
         t, vec, space = self.mem_info(mods)
         eb = TBITS[t]
@@ -2844,6 +2906,11 @@ def bulk_copy_ir(d, s, n, mbar, fresh):
             "declare void @ptx.cp.async.bulk.complete_tx(ptr, i32) nounwind"
         L.append("call void @ptx.cp.async.bulk.complete_tx(%s, i32 %s)" % (mbar, n))
     return L, decls
+
+
+def discard_ir(p):
+    """discard.L2: 128 bytes at p (128-byte aligned) become indeterminate."""
+    return "store <128 x i8> poison, %s, align 128" % p
 
 
 def st_bulk_ir(p, n, fresh):
