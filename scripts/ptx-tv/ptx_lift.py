@@ -2254,6 +2254,23 @@ class Lifter:
         before cp.async.wait_* is a data race in PTX, so this only removes
         behaviours.  commit_group/wait_group/wait_all are then no-ops."""
         ms = set(mods)
+        import tma
+        tg = tma.ptx(mods, ops)
+        if tg is not None:
+            toks, canon = tg
+            vals, tys = [], []
+            for o in canon:
+                br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+                r = br.group(1) if br else o
+                if r not in self.regs:
+                    raise Unsupported("operand " + opc)
+                w = self.regs[r]
+                vals.append("i%d %s" % (w, self.get(r, w)))
+                tys.append("i%d" % w)
+            kname = tma.name_of(toks) + "." + "_".join(tys)
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(tys)))
+            self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+            return
         if "bulk" in ms and "tensor" not in ms:
             return self.cp_async_bulk(ms, ops, opc)
         if ms == {"async", "commit_group"} or ms == {"async", "wait_group"} or \

@@ -149,6 +149,15 @@ single-thread semantics:
   disable-output-lane (the lane mask as a vector operand) and `ws` (collector
   buffer `b0`-`b3`, zero-column mask) variants are modelled the same way;
   only the newer `decompress_b` forms remain probe-derived.
+* TMA global-to-shared copies (`cp.async.bulk.tensor.g2s.{tile,im2col,
+  tile.gather4,im2col.w,im2col.w.128}`, default data-validity pattern) are
+  uninterpreted calls named by mode, dimension, cta group, multicast (16-
+  or 32-bit mask) and cache hint, derived independently from the intrinsic
+  (NVPTXUsage's flag description) and from the PTX opcode (`tma.py`);
+  operands in a canonical order (destination, tensor map, coordinates,
+  mbarrier, im2col offsets, mask, hint). The tensor map and the copy stay
+  opaque. The `.cta`, `override` and data-validity forms and the other TMA
+  directions remain probe-derived.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
