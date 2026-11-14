@@ -50,6 +50,13 @@ static cl::opt<bool> IntegerLdexp(
              "flushes"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> ExpNonNegative(
+    "agx-exp-non-negative",
+    cl::desc("tanh's, sinh's and cosh's exponentials of a non-negative "
+             "argument without the underflow clamp and selects (and tanh's, "
+             "of at most 18, without the overflow select)"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
@@ -203,7 +210,8 @@ public:
     Value *Lt = lt(A, 88.0);
     return mul(sel(Lt, k(0.5), k(1.0)),
                expHiLo(sel(Lt, A, sub(A, k(0.693359375))),
-                       sel(Lt, k(0.0), k(2.12194440e-4))));
+                       sel(Lt, k(0.0), k(2.12194440e-4)), /*Bounded=*/false,
+                       /*NoOverflow=*/false, /*NonNegative=*/ExpNonNegative));
   }
 
   /// 0.25 / h for h = e^a / 2 >= 0.5 (or a NaN): 0.25 times the correctly
@@ -245,8 +253,11 @@ public:
     // 1 - 2 / (e^2a + 1), which is 1 in float from a = 9 on. 2a is in
     // [0, 18] (or a NaN, which the exponential keeps): its exponential needs
     // no clamp of the argument.
+    // (Its n is in [0, 26]: e^r 2^n is a normal float, neither the +inf nor
+    // the +0 of ldexp's selects (L15-E274).)
     Value *S = expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
-                       /*Bounded=*/true);
+                       /*Bounded=*/true, /*NoOverflow=*/ExpNonNegative,
+                       /*NonNegative=*/ExpNonNegative);
     // 2 / d for d = s + 1 in [2, e^18 + 1] (or a NaN): twice the correctly
     // rounded reciprocal y0 + y0 (1 - d y0) (lowerFDIV32's, whose rcp and
     // fmas scale with d's exponent here, no result near the flushed or the
@@ -369,7 +380,8 @@ public:
   }
   /// v * 2^n for an integral n in [-252, 254], in two steps. The split is
   /// done on the integer: i >> 1 and i - (i >> 1) are both in [-126, 127].
-  Value *ldexp(Value *V, Value *N, bool NoOverflow = false) {
+  Value *ldexp(Value *V, Value *N, bool NoOverflow = false,
+              bool NoUnderflow = false) {
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
     Value *I = B.CreateFreeze(B.CreateFPToSI(N, intTy()));
@@ -384,7 +396,8 @@ public:
       Value *R = B.CreateBitCast(S, Ty);
       if (!NoOverflow)
         R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
-      R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
+      if (!NoUnderflow)
+        R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
       return sel(B.CreateFCmpUNO(V, V), V, R);
     }
     Value *I1 = B.CreateAShr(I, ki(1));
@@ -405,8 +418,11 @@ public:
   /// \p Bounded: the caller clamped its argument so that hi is finite and
   /// its n within ldexp's range (exp2, exp10), and the result over- and
   /// underflows by itself: no clamp of hi here and no +inf / +0 selects.
+  /// \p NonNegative: hi is at least 0 (or a NaN) and lo, if any, at least 0:
+  /// n >= 0 and the result at least e^r >= 0.7, so neither the clamp at -104
+  /// nor ldexp's +0 select, nor (lo being one) the selects below (L15-E274).
   Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false,
-                 bool NoOverflow = false) {
+                 bool NoOverflow = false, bool NonNegative = false) {
     Value *C;
     Value *Y;
     if (NoOverflow && !Bounded && !Lo) {
@@ -420,18 +436,23 @@ public:
       C = B.CreateFNeg(sel(lt(Y, -89.0), k(-89.0),
                            sel(gt(Y, 104.0), k(104.0), Y)));
     } else {
-      C = Bounded ? Hi
-                  : sel(gt(Hi, 89.0), k(89.0),
-                        sel(lt(Hi, -104.0), k(-104.0), Hi));
+      C = Bounded       ? Hi
+          : NonNegative ? sel(gt(Hi, 89.0), k(89.0), Hi)
+                        : sel(gt(Hi, 89.0), k(89.0),
+                              sel(lt(Hi, -104.0), k(-104.0), Hi));
     }
     Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
-    Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N, NoOverflow && !Lo);
+    Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N,
+                     NoOverflow && !Lo, NonNegative);
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.
-    if (Lo && !Bounded)
+    // Non-negative: past 89, hi is clamped to 89, whose n = 128 and e^r >=
+    // e^0.277 make ldexp's exponent sum at least the infinite one, its +inf
+    // select: neither select here.
+    if (Lo && !Bounded && !NonNegative)
       E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
     // A NaN hi is a NaN r, which makes E a NaN (ldexp freezes its
     // conversion of the NaN n, which would be poison).
