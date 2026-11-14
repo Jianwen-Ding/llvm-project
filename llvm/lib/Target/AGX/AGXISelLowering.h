@@ -53,6 +53,9 @@ class AGXTargetLowering final : public TargetLowering {
   SDValue performBRCONDCombine(SDNode *N, DAGCombinerInfo &DCI) const;
 
 public:
+  /// Stack accesses at a constant offset from a frame index: the offset in
+  /// the frame-index operand's target flags (L15-E288).
+  void finalizeLowering(MachineFunction &MF) const override;
   // Negation and absolute value are source modifiers of the float operations
   // (.neg, .abs): free, so the DAG combiner keeps fneg / fabs of a bitcast
   // rather than making them integer xor / and on the bits (which a strict

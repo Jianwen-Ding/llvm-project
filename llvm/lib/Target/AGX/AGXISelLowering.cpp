@@ -2776,6 +2776,65 @@ static cl::opt<bool> ConstDivisorFold(
     cl::desc("a constant divisor's significand, reciprocal and exponent "
              "factor at compile time in the correctly rounded division"));
 
+static cl::opt<bool> StackOffsetFold(
+    "agx-stack-offset-fold", cl::init(true), cl::Hidden,
+    cl::desc("a stack access at a frame index plus a constant as an "
+             "immediate offset"));
+
+/// A stack load or store whose offset is FRAME_ADDR fi + c (an iadd of the
+/// frame address and an immediate, no modifiers, shift applied) takes the
+/// frame index itself, c in its target flags, which eliminateFrameIndex
+/// adds: an immediate offset instead of the frame address and the iadd per
+/// access (a private array's elements) (L15-E288).
+void AGXTargetLowering::finalizeLowering(MachineFunction &MF) const {
+  if (StackOffsetFold) {
+    MachineRegisterInfo &MRI = MF.getRegInfo();
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : MBB) {
+        switch (MI.getOpcode()) {
+        case AGX::STACK_LOAD_16:
+        case AGX::STACK_LOAD_32:
+        case AGX::STACK_LOAD_64:
+        case AGX::STACK_LOAD_96:
+        case AGX::STACK_LOAD_128:
+        case AGX::STACK_STORE_16:
+        case AGX::STACK_STORE_32:
+        case AGX::STACK_STORE_64:
+        case AGX::STACK_STORE_96:
+        case AGX::STACK_STORE_128:
+          break;
+        default:
+          continue;
+        }
+        // (the offset: the last operand)
+        MachineOperand *O = &MI.getOperand(MI.getNumExplicitOperands() - 1);
+        if (!O->isReg() || !O->getReg().isVirtual())
+          continue;
+        MachineInstr *Add = MRI.getUniqueVRegDef(O->getReg());
+        if (!Add || Add->getOpcode() != AGX::IADD_I32 ||
+            Add->getOperand(1).getImm() || Add->getOperand(3).getImm() ||
+            !Add->getOperand(2).isReg() || !Add->getOperand(4).isImm() ||
+            !Add->getOperand(5).isImm())
+          continue;
+        MachineInstr *FA = Add->getOperand(2).getReg().isVirtual()
+                               ? MRI.getUniqueVRegDef(Add->getOperand(2).getReg())
+                               : nullptr;
+        if (!FA || FA->getOpcode() != AGX::FRAME_ADDR ||
+            !FA->getOperand(1).isFI() || FA->getOperand(1).getTargetFlags())
+          continue;
+        int64_t Shift = Add->getOperand(5).getImm();
+        int64_t C = Add->getOperand(4).getImm();
+        if (Shift < 0 || Shift > 4 || C < 0)
+          continue;
+        C <<= Shift;
+        if (C >= (1 << 12))
+          continue;
+        O->ChangeToFrameIndex(FA->getOperand(1).getIndex(), unsigned(C));
+      }
+  }
+  TargetLowering::finalizeLowering(MF);
+}
+
 static cl::opt<bool> HalfPow2Numerator(
     "agx-half-pow2-numerator", cl::init(true), cl::Hidden,
     cl::desc("a half quotient of a constant +-2^k without the correction "

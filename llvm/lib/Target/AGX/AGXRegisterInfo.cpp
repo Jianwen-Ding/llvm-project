@@ -209,7 +209,9 @@ bool AGXRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   MachineFunction &MF = *MI.getMF();
   MachineOperand &FIOp = MI.getOperand(FIOperandNum);
   int FI = FIOp.getIndex();
-  int64_t Offset = MF.getFrameInfo().getObjectOffset(FI);
+  // (plus the constant AGXTargetLowering::finalizeLowering put in its flags)
+  int64_t Offset =
+      MF.getFrameInfo().getObjectOffset(FI) + FIOp.getTargetFlags();
   if (agxExperimentalLeafCallsEnabled() &&
       MF.getFunction().getCallingConv() != CallingConv::AGX_KERNEL) {
     // After the kernel's region, one per depth (depth 0: an entry point of a
@@ -218,6 +220,6 @@ bool AGXRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   }
   if (Offset < 0 || Offset > 0x7fff)
     report_fatal_error("AGX stack frame too large");
-  FIOp.ChangeToImmediate(Offset);
+  FIOp.ChangeToImmediate(Offset, /*TargetFlags=*/0);
   return false;
 }

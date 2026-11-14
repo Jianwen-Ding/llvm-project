@@ -165,17 +165,16 @@ define agx_kernel void @threadgroup(ptr addrspace(1) %out) {
 define agx_kernel void @stack(ptr addrspace(1) %out, i32 %i) {
 ; CHECK-LABEL: stack:
 ; CHECK:         // uniform registers: 12 x 16-bit (threadgroups_per_grid at u3)
-; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 112 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    mov_imm r2, 0
-; CHECK-NEXT:    bitop 0101, r1, u2, 0
-; CHECK-NEXT:    iadd r3, r2, u2, lsl 2
-; CHECK-NEXT:    iadd r2, r2, 12
+; CHECK-NEXT:    mov_imm r1, 0
+; CHECK-NEXT:    iadd r1, r1, u2, lsl 2
+; CHECK-NEXT:    bitop 0101, r2, u2, 0
 ; CHECK-NEXT:    stack_adjust 28
-; CHECK-NEXT:    stack_store 0, i32, x, r1, r3
-; CHECK-NEXT:    stack_load 0, i32, x, r1, r2
+; CHECK-NEXT:    stack_store 0, i32, x, r2, r1
+; CHECK-NEXT:    stack_load 0, i32, x, r1, 12
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

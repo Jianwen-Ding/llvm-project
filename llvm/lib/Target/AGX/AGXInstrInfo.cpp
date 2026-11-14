@@ -213,7 +213,8 @@ Register AGXInstrInfo::isLoadFromStackSlot(const MachineInstr &MI,
   if (!isStackLoad(MI.getOpcode()))
     return Register();
   const MachineOperand *O = getNamedOperand(MI, AGX::OpName::O);
-  if (!O || !O->isFI())
+  // (target flags: an offset into the slot, not the slot)
+  if (!O || !O->isFI() || O->getTargetFlags())
     return Register();
   FrameIndex = O->getIndex();
   return MI.getOperand(0).getReg();
@@ -224,7 +225,7 @@ Register AGXInstrInfo::isStoreToStackSlot(const MachineInstr &MI,
   if (!isStackStore(MI.getOpcode()))
     return Register();
   const MachineOperand *O = getNamedOperand(MI, AGX::OpName::O);
-  if (!O || !O->isFI())
+  if (!O || !O->isFI() || O->getTargetFlags())
     return Register();
   FrameIndex = O->getIndex();
   return getNamedOperand(MI, AGX::OpName::R)->getReg();
