@@ -162,6 +162,11 @@ single-thread semantics:
   form (alignment as a parameter attribute) as unknown calls. This also
   applies to the masked load in the `cp.async` model, whose earlier results
   only showed that both sides made the same unknown call.
+* Symbol names follow NVPTXAssignValidGlobalNames (`tv.py`
+  `nvptx_renames`): invalid characters become `_$_`, and a name that then
+  collides gets the module's next unique-name counter as a suffix.
+  `llvm.stacksave`/`llvm.stackrestore` and `stacksave`/`stackrestore` are
+  the same opaque calls on both sides.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such

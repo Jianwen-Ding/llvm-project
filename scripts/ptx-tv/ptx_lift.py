@@ -276,7 +276,6 @@ class Lifter:
         self.indirect_sigs = indirect_sigs or []
         self.used_probe = False
         self.handle_params = {}      # .texref/.samplerref param -> LLVM arg
-        self.ptr_slots = set()       # param slots holding a pointer argument
         self.pf = pfunc
         self.sig = sig
         self.name_map = name_map     # PTX symbol -> LLVM global/function name
@@ -747,8 +746,6 @@ class Lifter:
                                 (slot, pp.size, pp.align))
             self.scopes[0][pp.name] = (slot, pp)
             self.store_value(arg.ty, arg.name, arg, slot, pp, is_ret=False)
-            if arg.ty.startswith("ptr") and pp.size == 8:
-                self.ptr_slots.add(slot)
         if pf.ret:
             if len(pf.ret) != 1:
                 raise Unsupported("multiple return params")
@@ -2200,12 +2197,7 @@ class Lifter:
             raise Unsupported("vector arity " + opc)
         total = eb * vec
         d0 = dsts[0].strip()
-        if vec == 1 and eb == 64 and p.split(" ", 1)[1] in self.ptr_slots:
-            # a pointer argument: read it as a pointer (Alive2 does not give
-            # an integer load of a stored pointer its address)
-            pv = self.op("load ptr, %s, align 8" % p)
-            v = self.op("ptrtoint ptr %s to i64" % pv)
-        elif vec == 1 and eb == 64 and self.base_of.get(d0) == ("dyn", d0):
+        if vec == 1 and eb == 64 and self.base_of.get(d0) == ("dyn", d0):
             # load as a pointer (keeping provenance); its integer value is
             # the address (Alive2's assembly mode makes this exact)
             pv = self.op("load ptr, %s, align 8" % p)
@@ -2521,6 +2513,19 @@ class Lifter:
                      if getattr(x, "callee", None) == target and len(self.sized_args(x.args)) == len(args)
                      and (x.ret == "void" or self.zero_sized(x.ret)) == (not rets)]
             sigs = {(x.ret, tuple(a.ty for a in x.args), x.vararg): x for x in cands}
+            if not sigs and target is not None and target in self.decls and \
+                    self.decls[target].vararg:
+                # a variadic function called through a prototype: the PTX has
+                # the fixed arguments plus the buffer; use the call site's
+                # return type (it may differ from the declaration's)
+                import copy
+                dsig = self.decls[target]
+                rts = {x.ret for x in self.indirect_sigs if getattr(x, "callee", None) == target}
+                if len(rts) == 1:
+                    csig = copy.copy(dsig)
+                    csig.ret = next(iter(rts))
+                    csig.ret_attrs = ""
+                    return self.vararg_call(target, csig, rets, args)
             if len(sigs) != 1:
                 raise Unsupported("indirect call with ambiguous source signature")
             csig = next(iter(sigs.values()))

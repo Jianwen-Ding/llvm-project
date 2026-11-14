@@ -1,19 +1,19 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
-Functions checked: 4186.
+Functions checked: 4187.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3238 | 77.4% |
-| `timeout` | 676 | 16.1% |
+| `correct` | 3248 | 77.6% |
+| `timeout` | 675 | 16.1% |
 | `mismatch-known` | 148 | 3.5% |
 | `inconclusive` | 69 | 1.6% |
 | `mismatch-param-oob` | 33 | 0.8% |
-| `lift-unsupported` | 11 | 0.3% |
-| `mismatch` | 10 | 0.2% |
+| `mismatch` | 11 | 0.3% |
+| `lift-unsupported` | 2 | 0.0% |
 | `src-inline-asm` | 1 | 0.0% |
 
 20 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
@@ -24,7 +24,7 @@ Of the correct results, 507 rely on probe-derived opaque instructions (probe.py)
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 3429 (81.9%).
+Conclusive (proved correct or counterexample): 3440 (82.2%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -89,6 +89,10 @@ finding 6.
 * `math-intrins.ll` `maximumnum_float`
 * `math-intrins.ll` `minimum_float_ftz`
 * `math-intrins.ll` `minimumnum_float`
+`vaargs.ll` `foo`: not a defect; Alive2's assembly mode resolves the
+varargs pointer, stored to local memory as an integer and reloaded, to a
+different block than the source pointer (the PTX does the source's
+arithmetic exactly).
 
 ## Counterexamples of known modelling classes (not defects)
 
@@ -109,10 +113,5 @@ finding 6.
 
 | reason | functions |
 |---|---:|
-| `unknown` | 3 |
 | `kernel` | 2 |
-| `indirect` | 2 |
-| `vararg` | 2 |
-| `stacksave.u64` | 1 |
-| `stackrestore.u64` | 1 |
 

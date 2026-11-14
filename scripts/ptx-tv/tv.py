@@ -431,7 +431,8 @@ def indirect_call_sigs(module_text, fname):
     if not m:
         return []
     out = []
-    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+|@[\w.$\"-]+)\((.*)\)", m.group(0)):
+    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+|@[\w.$\"-]+|undef|poison|null)\((.*)\)",
+                          m.group(0)):
         if cm.group(2).startswith("@llvm.") or cm.group(2).startswith("@nvvm."):
             continue
         head = cm.group(1)

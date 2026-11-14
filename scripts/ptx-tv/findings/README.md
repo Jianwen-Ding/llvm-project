@@ -213,17 +213,19 @@ functions per test file, so files with up to 24 functions are fully
 covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
-`--disable-poison-input` check (tagged). In short: 4186 functions from 619
-test files; 3238 proved correct (507 through probe-derived opaque instructions,
+`--disable-poison-input` check (tagged). In short: 4187 functions from 619
+test files; 3248 proved correct (507 through probe-derived opaque instructions,
 20 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 148 in
-known modelling classes; 11 not lifted; 745 solver timeouts or inconclusive.
+known modelling classes; 2 not lifted; 744 solver timeouts or inconclusive.
 
-Not lifted (11): the two finding-5 kernels (invalid PTX), calls through
-`undef` or with ambiguous types, `stacksave`/`stackrestore` (unsupported by
-Alive2 in the source anyway), and calls to library functions the source
-does not declare. Variadic functions are compared after LLVM's
+Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
+functions are compared after LLVM's
+ExpandVariadics (which the backend runs; the pass itself is trusted). One
+function still has inline asm the model does not handle
+(`nvvm-reflect-arch-O0.ll` `baz`: `valid;` is not a PTX instruction).
+Variadic functions are compared after LLVM's
 ExpandVariadics (which the backend runs; the pass itself is trusted).
 
 The remaining timeouts: about three quarters involve floating point; the
