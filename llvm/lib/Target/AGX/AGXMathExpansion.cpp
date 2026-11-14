@@ -83,6 +83,12 @@ static cl::opt<bool> NarrowSinCosReduction(
     cl::desc("bfloat sin / cos: pi / 2 in two parts"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> BFloatShortPolys(
+    "agx-bfloat-short-polys",
+    cl::desc("bfloat tanh, sinh, cosh, asin, acos with their polynomials' "
+             "highest terms left out"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
@@ -98,6 +104,10 @@ class MathBuilder {
   // reciprocal's, results near a tie between two halves were rounded the
   // other way, on the functional model).
   bool PreciseDivision = false;
+  // Leading polynomial terms left out (a bfloat result, where every bfloat
+  // input's result was checked to be the same).
+  unsigned PolyDrop = 0;
+  bool bfloatResult() const { return NarrowResult && !HalfResult; }
 
 public:
   MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false,
@@ -121,6 +131,10 @@ public:
   }
   /// The polynomial with coefficients \p C, highest degree first, at \p Z.
   Value *poly(Value *Z, ArrayRef<double> C) {
+    // (a bfloat result: the highest-degree terms PolyDrop says, at most down
+    // to two, L15-E351)
+    if (PolyDrop && BFloatShortPolys)
+      C = C.drop_front(std::min<size_t>(PolyDrop, C.size() - 2));
     Value *P = k(C[0]);
     for (double V : C.drop_front())
       P = fma(P, Z, k(V));
@@ -213,6 +227,8 @@ public:
   }
 
   Value *asin(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     Value *A = abs(X);
     // Above 0.5: asin(a) = pi / 2 - 2 asin(sqrt((1 - a) / 2)).
     Value *Big = gt(A, 0.5);
@@ -226,6 +242,8 @@ public:
   }
 
   Value *acos(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     Value *A = abs(X);
     // |x| > 0.5: acos(|x|) = 2 asin(sqrt((1 - |x|) / 2)), and
     // acos(-|x|) = pi - acos(|x|); else pi / 2 - asin(x).
@@ -296,6 +314,8 @@ public:
   }
 
   Value *sinh(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 2;
     Value *A = abs(X);
     Value *Z = mul(X, X);
     Value *Small = fma(mul(poly(Z, {2.03721912945e-4, 8.33028376239e-3,
@@ -308,11 +328,15 @@ public:
   }
 
   Value *cosh(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 2;
     Value *H = halfExp(abs(X));
     return add(H, quarterOver(H));
   }
 
   Value *tanh(Value *X) {
+    if (bfloatResult())
+      PolyDrop = 1;
     Value *A = abs(X);
     Value *Z = mul(X, X);
     Value *Small =

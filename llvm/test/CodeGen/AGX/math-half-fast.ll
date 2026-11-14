@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-fast-hyperbolic=0 -agx-half-fast-division=0 -agx-narrow-fast-sqrt=0 -agx-narrow-sincos-reduction=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-fast-hyperbolic=0 -agx-half-fast-division=0 -agx-narrow-fast-sqrt=0 -agx-narrow-sincos-reduction=0 -agx-bfloat-short-polys=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; Half tanh, sinh and cosh with the hardware's exponential and reciprocal
 ; (no Newton step), and half atan's and tan's division by the hardware's
@@ -96,6 +96,19 @@ define void @asin_h(ptr addrspace(1) %p) {
 define void @sin_bf(ptr addrspace(1) %p) {
   %x = load bfloat, ptr addrspace(1) %p
   %r = call bfloat @llvm.sin.bf16(bfloat %x)
+  store bfloat %r, ptr addrspace(1) %p
+  ret void
+}
+
+; bfloat cosh: its exponential's polynomial two terms shorter (L15-E351)
+; CHECK-LABEL: cosh_bf:
+; CHECK-NOT: mov_imm {{r[0-9]+}}, 961571175
+; CHECK: stop
+; OFF-LABEL: cosh_bf:
+; OFF: mov_imm {{r[0-9]+}}, 961571175
+define void @cosh_bf(ptr addrspace(1) %p) {
+  %x = load bfloat, ptr addrspace(1) %p
+  %r = call bfloat @llvm.cosh.bf16(bfloat %x)
   store bfloat %r, ptr addrspace(1) %p
   ret void
 }
