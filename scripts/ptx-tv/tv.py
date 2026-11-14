@@ -192,6 +192,36 @@ def partword_assume(text):
     return "\n".join(out)
 
 
+def expand_masked_divrem(text):
+    """llvm.masked.{u,s}{div,rem} (LangRef: the plain operation on enabled
+    lanes; disabled lanes cannot be UB and are poison): divide by 1 in the
+    disabled lanes, then make them poison.  Alive2 does not know these
+    intrinsics."""
+    from llvmsig import split_top
+    n = [0]
+
+    def rep(m):
+        ind, dst, vt, cnt, et, op, argtext = m.groups()
+        args = [a.strip() for a in split_top(" ".join(argtext.split()))]
+        if len(args) != 3:
+            return m.group(0)
+        vals = []
+        for a in args:
+            am = re.match(r"(<\d+ x \w+>)\s+(.*)$", a)
+            if not am:
+                return m.group(0)
+            vals.append(am.group(2))
+        n[0] += 1
+        one = "<" + ", ".join(["%s 1" % et] * int(cnt)) + ">"
+        b1, q = "%%ptxtv_md%d.b" % n[0], "%%ptxtv_md%d.q" % n[0]
+        return "\n".join([
+            "%s%s = select <%s x i1> %s, %s %s, %s %s" % (ind, b1, cnt, vals[2], vt, vals[1], vt, one),
+            "%s%s = %s %s %s, %s" % (ind, q, op, vt, vals[0], b1),
+            "%s%s = select <%s x i1> %s, %s %s, %s poison" % (ind, dst, cnt, vals[2], vt, q, vt)])
+    return re.sub(r"^([ \t]*)(%[\w.]+) = (?:tail |notail )?call (<(\d+) x (i\d+)>) "
+                  r"@llvm\.masked\.(udiv|sdiv|urem|srem)\.[\w.]+\(([^()]*)\)", rep, text, flags=re.M)
+
+
 def prepare_source(path, workdir):
     """Strip debug info and rename llvm.nvvm.* intrinsics to plain functions."""
     # Atomics are given single-thread semantics (as in the lifted code),
@@ -201,6 +231,12 @@ def prepare_source(path, workdir):
     # do the same here.
     raw = re.sub(r"^target datalayout\s*=.*$", "", open(path).read(), flags=re.M)
     raw = partword_assume(raw)
+    raw = expand_masked_divrem(raw)
+    # llvm.debugtrap is what brkpt implements: the same opaque call as the
+    # lifter's (Alive2 does not know the intrinsic)
+    raw = re.sub(r"@llvm\.debugtrap\(", "@nvvm.brkpt(", raw)
+    if "@nvvm.brkpt(" in raw and not re.search(r"^declare [^\n]*@nvvm\.brkpt\(", raw, re.M):
+        raw += "\ndeclare void @nvvm.brkpt()\n"
     nodl = os.path.join(workdir, "nodl.ll")
     with open(nodl, "w") as f:
         f.write(raw)

@@ -383,6 +383,18 @@ registers, fences, cross-thread operations, ...) were used to look for gaps
 through the inline-asm path; the remaining rejection is `cvt` narrowing
 without a rounding modifier, which the ISA requires.
 
+## Source intrinsics Alive2 does not know
+
+* `llvm.masked.{u,s}{div,rem}` are expanded by their LangRef semantics (the
+  plain operation on enabled lanes; disabled lanes cannot be UB and are
+  poison): the divisor's disabled lanes become 1, the result's poison.
+* `llvm.debugtrap` (what `brkpt` implements) is the same opaque call as the
+  lifter's `brkpt`.
+* The remaining inconclusive results are Alive2 approximations it reports
+  itself: fast-math flags (`afn`, `contract`, `arcp`, `reassoc`) and math
+  intrinsics it does not interpret (`sin`, `cos`, `exp2`, `log2`, `tanh`),
+  which the backend lowers to the approximate PTX instructions.
+
 ## Target cleanup
 
 Before the check, `tv.drop_dead_param_loads` removes from the lifted target
