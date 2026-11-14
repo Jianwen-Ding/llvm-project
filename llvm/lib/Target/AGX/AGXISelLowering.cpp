@@ -119,7 +119,8 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
-                       ISD::MULHS, ISD::ADD, ISD::FREEZE});
+                       ISD::MULHS, ISD::ADD, ISD::FREEZE, ISD::SINT_TO_FP,
+                       ISD::UINT_TO_FP});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -1840,6 +1841,11 @@ static cl::opt<bool> FreezeTruthLogic(
              "into its operands"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> IntToHalfSources(
+    "agx-int-to-half-sources", cl::init(true), cl::Hidden,
+    cl::desc("a float of a small integer that float arithmetic uses, as a "
+             "half that its 16-bit sources widen"));
+
 static cl::opt<bool> NarrowTruthSelects(
     "agx-narrow-truth-selects", cl::init(true), cl::Hidden,
     cl::desc("a truth value of selects between compares and 0 / 1 that only "
@@ -2209,6 +2215,42 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
         DAG.getConstant(0, DL, C.getOperand(0).getValueType()), ISD::SETLT);
     return DAG.getSelect(DL, N->getValueType(0), Lt, N->getOperand(2),
                          N->getOperand(1));
+  }
+  case ISD::SINT_TO_FP:
+  case ISD::UINT_TO_FP: {
+    // A float of a small integer (an int8 weight, at most 11 significant
+    // bits) that only fused multiply-adds use: converted to half, which
+    // holds it exactly, and widened by their 16-bit sources (recorded:
+    // fmadd32 r6l, r7h, and fadd32 / fmul32 r6l), so that each reads one
+    // 32-bit register fewer (an fmadd32 of two 32-bit registers issues in
+    // one cycle, of three in two; L15-E370).
+    SDValue I = N->getOperand(0);
+    EVT IVT = I.getValueType();
+    if (!IntToHalfSources || N->getValueType(0) != MVT::f32 ||
+        (IVT != MVT::i32 && IVT != MVT::i16) || N->use_empty())
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    bool Signed = N->getOpcode() == ISD::SINT_TO_FP;
+    unsigned Bits =
+        Signed ? IVT.getSizeInBits() - DAG.ComputeNumSignBits(I) + 1
+               : DAG.computeKnownBits(I).countMaxActiveBits();
+    if (Bits > (Signed ? 12u : 11u))
+      return SDValue();
+    // Only fused multiply-adds whose other two operands are registers: the
+    // ones that read three 32-bit registers now (fadd and fmul read two at
+    // most; with a constant operand the change only moves the schedule:
+    // blur_rgba8's weights, 26% slower on one group).
+    for (SDNode *U : N->users()) {
+      if (U->getOpcode() != ISD::FMA)
+        return SDValue();
+      for (const SDValue &Op : U->op_values())
+        if (Op.getNode() != N &&
+            (isa<ConstantFPSDNode>(Op) || Op.getValueType() != MVT::f32))
+          return SDValue();
+    }
+    SDLoc DL(N);
+    SDValue H = DAG.getNode(N->getOpcode(), DL, MVT::f16, I);
+    return DAG.getNode(ISD::FP_EXTEND, DL, MVT::f32, H);
   }
   case ISD::FREEZE: {
     // freeze (and a, b) -> and (freeze a), (freeze b), likewise or, xor and
