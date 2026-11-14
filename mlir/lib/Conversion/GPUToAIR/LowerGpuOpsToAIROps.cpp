@@ -1160,6 +1160,19 @@ static LogicalResult rewriteErfc(math::ErfcOp op, PatternRewriter &rewriter) {
                               c(0.0f), r);
   r = arith::SelectOp::create(b, cmp(arith::CmpFPredicate::OLT, x, c(0.0f)),
                               arith::SubFOp::create(b, two, r), r);
+  // An f16 or bf16 erfc widened to this one (its argument extended, its
+  // result only rounded back): the two divisions by the reciprocal, every
+  // f16 and bf16 input's result the same (the exp approximate was not:
+  // L15-E337).
+  Type narrow;
+  if (auto ext = x.getDefiningOp<arith::ExtFOp>())
+    narrow = ext.getIn().getType();
+  if (narrow && (narrow.isF16() || narrow.isBF16()) && !op->use_empty() &&
+      llvm::all_of(op->getUsers(), [&](Operation *u) {
+        auto t = dyn_cast<arith::TruncFOp>(u);
+        return t && t.getType() == narrow;
+      }))
+    approximateForHalf(r, x, HalfApproxDiv);
   rewriter.replaceOp(op, r);
   return success();
 }

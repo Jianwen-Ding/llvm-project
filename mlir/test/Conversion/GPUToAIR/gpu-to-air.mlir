@@ -1267,3 +1267,27 @@ gpu.module @half_approximations {
     gpu.return
   }
 }
+
+// -----
+
+// f16 erfc (widened to f32): its two divisions by the reciprocal (afn);
+// f32 erfc keeps the correctly rounded ones (L15-E337).
+gpu.module @half_erfc {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf16, 1>, %b: memref<8xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf16, 1>
+    %w = memref.load %b[%c0] : memref<8xf32, 1>
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    // CHECK: llvm.fptrunc
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} : f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} : f32
+    // CHECK: llvm.return
+    %e = math.erfc %v : f16
+    %f = math.erfc %w : f32
+    memref.store %e, %a[%c0] : memref<8xf16, 1>
+    memref.store %f, %b[%c0] : memref<8xf32, 1>
+    gpu.return
+  }
+}
