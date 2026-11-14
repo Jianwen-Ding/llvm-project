@@ -377,6 +377,10 @@ public:
                          1.99782164500e-1, 3.33337300303e-1}),
                 Z),
             X, X);
+    // (bfloat: the correctly rounded division; the reciprocal of 1 - a
+    // underflows for a beyond 2^126, which gave +-inf, not a NaN. half: the
+    // same results either way, L15-E339)
+    PreciseDivision = !HalfResult;
     Value *Big = copysign(
         mul(k(0.5), log(div(add(k(1.0), A), sub(k(1.0), A)))), X);
     return sel(lt(A, 0.5), Small, Big);
@@ -425,7 +429,12 @@ public:
     return sel(Big, B.CreateFNeg(V), V);
   }
 
-  Value *tanpi(Value *X) { return div(sinpi(X), cospi(X)); }
+  Value *tanpi(Value *X) {
+    // (half: the correctly rounded division; with the reciprocal's, 2 half
+    // results were further off. bfloat: the same results either way)
+    PreciseDivision = HalfResult;
+    return div(sinpi(X), cospi(X));
+  }
 
   // Precise sin, cos, exp and log.
 
