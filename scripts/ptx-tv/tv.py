@@ -518,7 +518,8 @@ def classify(out, err, rc):
         return "mismatch"
     if "Timeout" in o or "timeout" in o:
         return "timeout"
-    if "Couldn't prove the correctness" in o or "approximated" in o:
+    if "Couldn't prove the correctness" in o or "approximated" in o or \
+            "incomplete quantifiers" in o:
         return "inconclusive"
     if "ERROR: Unsupported" in o or "Unsupported" in o:
         return "alive-unsupported"
