@@ -273,6 +273,7 @@ def prepare_source(path, workdir):
                   r"alias\.scope|noalias|llvm\.access\.group|llvm\.loop|prof|annotation|"
                   r"srcloc|nvvm\.[\w.]+)\s+![\w.]+", "", text)
     text = rewrite_i1_fp(text)
+    text = scalarize_vector_mem(text)
     text = resolve_nvvm_reflect(text, workdir)
     text = rewrite_counters(text)
     text = expand_fp_reductions(text)
@@ -390,6 +391,74 @@ def expand_fp_reductions(text):
             acc = dst
     have = set(re.findall(r"^declare [^@]*@([\w.$\"-]+)\(", text, re.M))
     out += [d for d in sorted(decls) if re.search(r"@([\w.]+)\(", d).group(1) not in have]
+    return "\n".join(out)
+
+
+ELT_BYTES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16, "half": 2,
+             "bfloat": 2, "float": 4, "double": 8, "ptr": 8}
+SCALARIZE = os.environ.get("PTXTV_SCALARIZE", "1") == "1"
+
+
+def _lane_align(A, off):
+    a = A
+    while off % a:
+        a //= 2
+    return a
+
+
+def scalarize_vector_mem(text):
+    """Vector loads/stores of byte-sized elements as one access per element
+    (in LLVM a vector access is UB exactly when one of its element accesses
+    is, and its lanes are independent).  The lifter does the same for PTX
+    vector accesses; Alive2 relates element accesses far more easily than
+    differently shaped wide ones.  The first element access carries the
+    vector's alignment."""
+    if not SCALARIZE:
+        return text
+    out = []
+    lp = re.compile(r"^(\s*)(%[\w.$-]+) = load <(\d+) x (\w+)>, (ptr(?: addrspace\(\d+\))?) "
+                    r"(%[\w.$-]+|@[\w.$-]+)(?:, align (\d+))?\s*$")
+    sp = re.compile(r"^(\s*)store <(\d+) x (\w+)> (.+), (ptr(?: addrspace\(\d+\))?) "
+                    r"(%[\w.$-]+|@[\w.$-]+)(?:, align (\d+))?\s*$")
+    cnt = [0]
+    for line in text.split("\n"):
+        m = lp.match(line)
+        if m and m.group(4) in ELT_BYTES:
+            ind, r, n, et, pty, p, A = m.groups()
+            n, es = int(n), ELT_BYTES[m.group(4)]
+            A = int(A or es)
+            vt = "<%d x %s>" % (n, et)
+            acc = "poison"
+            for k in range(n):
+                q = p
+                if k:
+                    q = "%s.sp%d" % (r, k)
+                    out.append("%s%s = getelementptr i8, %s %s, i64 %d" % (ind, q, pty, p, k * es))
+                al = A if k == 0 else _lane_align(A, k * es)
+                out.append("%s%s.se%d = load %s, %s %s, align %d" % (ind, r, k, et, pty, q, al))
+                dst = r if k == n - 1 else "%s.sv%d" % (r, k)
+                out.append("%s%s = insertelement %s %s, %s %s.se%d, i32 %d" % (ind, dst, vt, acc, et, r, k, k))
+                acc = dst
+            continue
+        m = sp.match(line)
+        if m and m.group(3) in ELT_BYTES and not m.group(4).strip().startswith("volatile"):
+            ind, n, et, val, pty, p, A = m.groups()
+            n, es = int(n), ELT_BYTES[et]
+            A = int(A or es)
+            vt = "<%d x %s>" % (n, et)
+            k0 = cnt[0]
+            cnt[0] += 1
+            for k in range(n):
+                e = "%%ptxtv_ss%d.%d" % (k0, k)
+                out.append("%s%s = extractelement %s %s, i32 %d" % (ind, e, vt, val, k))
+                q = p
+                if k:
+                    q = "%%ptxtv_sp%d.%d" % (k0, k)
+                    out.append("%s%s = getelementptr i8, %s %s, i64 %d" % (ind, q, pty, p, k * es))
+                al = A if k == 0 else _lane_align(A, k * es)
+                out.append("%sstore %s %s, %s %s, align %d" % (ind, et, e, pty, q, al))
+            continue
+        out.append(line)
     return "\n".join(out)
 
 

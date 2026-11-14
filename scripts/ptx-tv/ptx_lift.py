@@ -2206,6 +2206,17 @@ class Lifter:
             pv = self.op("load ptr, %s, align 8" % p)
             self.emit("store ptr %s, ptr %s" % (pv, self.dyn_slot(d0)))
             v = self.op("ptrtoint ptr %s to i64" % pv)
+        elif vec > 1 and eb >= 8:
+            # a vector access as one access per element (Alive2 relates these
+            # to the source's element accesses far more easily than a single
+            # wide integer); the first keeps the whole vector's alignment
+            for k, d in enumerate(dsts):
+                q = self.lane_ptr(p, k * eb // 8)
+                x = self.op("load i%d, %s, align %d" % (eb, q, total // 8 if k == 0 else
+                                                        lane_align(total // 8, k * eb // 8)))
+                if d != "_":
+                    self.write(d, x, eb, is_signed(t))
+            return
         else:
             v = self.op("load i%d, %s, align %d" % (total, p, total // 8))
         for k, d in enumerate(dsts):
@@ -2214,6 +2225,13 @@ class Lifter:
             x = self.op("lshr i%d %s, %d" % (total, v, eb * k)) if k else v
             x = self.resize(x, total, eb, False)
             self.write(d, x, eb, is_signed(t))
+
+    def lane_ptr(self, p, off):
+        """Typed pointer operand p ("ptr %x") advanced by off bytes."""
+        if not off:
+            return p
+        ty, v = p.rsplit(" ", 1)
+        return "%s %s" % (ty, self.op("getelementptr i8, %s, i64 %d" % (p, off)))
 
     # ---- non-bulk asynchronous copy (cp.async) ------------------------------
     CP_ASYNC_MODS = {"async", "ca", "cg", "shared", "shared::cta", "global",
@@ -2420,6 +2438,12 @@ class Lifter:
         if len(srcs) != vec:
             raise Unsupported("vector arity " + opc)
         total = eb * vec
+        if vec > 1 and eb >= 8:
+            for k, s_ in enumerate(srcs):
+                q = self.lane_ptr(p, k * eb // 8)
+                self.emit("store i%d %s, %s, align %d" % (
+                    eb, self.get(s_, eb), q, total // 8 if k == 0 else lane_align(total // 8, k * eb // 8)))
+            return
         acc = None
         for k, s in enumerate(srcs):
             x = self.resize(self.get(s, eb), eb, total, False)
@@ -2896,6 +2920,13 @@ class Lifter:
 
     def i_nanosleep(self, mods, ops, opc):
         self.ucall("void", "nanosleep", ["i32 " + self.get(ops[0], 32)])
+
+
+def lane_align(A, off):
+    a = A
+    while off % a:
+        a //= 2
+    return a
 
 
 def cp_async_ir(size, d, s, n, fresh):
