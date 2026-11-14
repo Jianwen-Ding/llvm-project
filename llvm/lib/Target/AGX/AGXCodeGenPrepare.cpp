@@ -514,6 +514,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool lowerDivergentShuffles(Function &F, const TargetTransformInfo &TTI);
   bool foldLaneIdentities(Function &F);
   bool simdScans(Function &F, const AGXSubtarget &ST);
+  bool simdReductions(Function &F, const AGXSubtarget &ST);
   bool mergeLoopExits(Function &F);
   bool forwardOwnSlots(Function &F);
   bool strideDivisions(Function &F);
@@ -1809,6 +1810,111 @@ static bool keepsLanesFrom(Value *Cond, bool ShuffleOnTrue, uint64_t D) {
   default:
     return false;
   }
+}
+
+static cl::opt<bool> AGXSIMDReductions(
+    "agx-simd-reductions", cl::init(true), cl::Hidden,
+    cl::desc("A SIMD-group's integer xor-butterfly reduction (shuffles xor 1, "
+             "2, 4, 8 and 16) as one simd reduction"));
+
+/// The xor butterfly over a SIMD-group's 32 lanes, x' = x op shuffle_xor(x,
+/// d) for d = 1, 2, 4, 8 and 16 in any order (quad shuffles for 1 and 2 as
+/// well), leaves every lane the reduction of all 32: for a 32-bit integer
+/// add, and, or, xor, or signed / unsigned min / max (exact, in any order) it
+/// is the hardware's simd reduction of x, one instruction for ten. A shuffle
+/// from an inactive lane is undefined (as in simdScans), so where some lanes
+/// are inactive the reduction of the active ones is one of the original's
+/// results (L15-E362).
+bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
+  if (!AGXSIMDReductions || !ST.hasSIMDReduce())
+    return false;
+  // The step v' = op(v, shuffle_xor(v, d)): its op code, v and d.
+  auto Step = [](Value *V, int &Op, Value *&Prev, unsigned &D) {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !I->getType()->isIntegerTy(32))
+      return false;
+    Value *A, *B;
+    int O = -1;
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      A = BO->getOperand(0);
+      B = BO->getOperand(1);
+      switch (BO->getOpcode()) {
+      case Instruction::Add: O = 16; break;
+      case Instruction::And: O = 0; break;
+      case Instruction::Or: O = 2; break;
+      case Instruction::Xor: O = 4; break;
+      default: return false;
+      }
+    } else if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::smin: O = 20; break;
+      case Intrinsic::smax: O = 22; break;
+      case Intrinsic::umin: O = 28; break;
+      case Intrinsic::umax: O = 30; break;
+      default: return false;
+      }
+      A = II->getArgOperand(0);
+      B = II->getArgOperand(1);
+    } else {
+      return false;
+    }
+    for (int K = 0; K < 2; ++K, std::swap(A, B)) {
+      auto *Sh = dyn_cast<IntrinsicInst>(B);
+      if (!Sh || (Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_xor &&
+                  Sh->getIntrinsicID() != Intrinsic::agx_quad_shuffle_xor) ||
+          Sh->getArgOperand(0) != A)
+        continue;
+      auto *C = dyn_cast<ConstantInt>(Sh->getArgOperand(1));
+      if (!C)
+        continue;
+      uint64_t Dist = C->getZExtValue();
+      bool Ok = (Sh->getIntrinsicID() == Intrinsic::agx_simd_shuffle_xor &&
+                 (Dist == 1 || Dist == 2 || Dist == 4 || Dist == 8 ||
+                  Dist == 16)) ||
+                (Sh->getIntrinsicID() == Intrinsic::agx_quad_shuffle_xor &&
+                 (Dist == 1 || Dist == 2));
+      if (!Ok)
+        continue;
+      Op = O;
+      Prev = A;
+      D = Dist;
+      return true;
+    }
+    return false;
+  };
+  // Value handles: a replaced chain's dead steps may be another chain's
+  // top or base (a longer butterfly), which is then skipped.
+  SmallVector<std::tuple<WeakVH, WeakVH, int>, 4> Found;
+  for (Instruction &I : instructions(F)) {
+    int Op = -1, StepOp;
+    unsigned Seen = 0, D;
+    Value *V = &I, *Prev;
+    int N = 0;
+    for (; N < 5 && Step(V, StepOp, Prev, D); ++N) {
+      if ((Op != -1 && StepOp != Op) || (Seen & D))
+        break;
+      Op = StepOp;
+      Seen |= D;
+      V = Prev;
+    }
+    if (N == 5 && Seen == 31)
+      Found.push_back({&I, V, Op});
+  }
+  bool Changed = false;
+  for (auto &[IH, XH, Op] : Found) {
+    auto *I = dyn_cast_or_null<Instruction>(IH);
+    Value *X = XH;
+    if (!I || !X)
+      continue;
+    Changed = true;
+    IRBuilder<> B(I);
+    Value *R = B.CreateIntrinsic(Intrinsic::agx_simd_reduce, {X->getType()},
+                                 {X, B.getInt32(Op)});
+    R->takeName(I);
+    I->replaceAllUsesWith(R);
+    RecursivelyDeleteTriviallyDeadInstructions(I);
+  }
+  return Changed;
 }
 
 /// The Hillis-Steele inclusive add scan of a SIMD-group's 32 lanes,
@@ -4660,6 +4766,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   // (before the scan recognition, which matches the folded segment tests)
   Changed |= rangedCompares(F);
   Changed |= simdScans(F, ST);
+  Changed |= simdReductions(F, ST);
   Changed |= ownValueShifts(F);
   Changed |= mergeLoopExits(F);
   Changed |= forwardOwnSlots(F);
