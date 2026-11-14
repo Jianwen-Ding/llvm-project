@@ -4380,11 +4380,79 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
   return true;
 }
 
+static cl::opt<bool> AGXReciprocalAboveOne(
+    "agx-reciprocal-above-one", cl::init(true), cl::Hidden,
+    cl::desc("1 / (e^x + c), c >= 1, as the reciprocal step without the "
+             "division's scaling and NaN select"));
+
+static cl::opt<bool> AGXReciprocalSqrt(
+    "agx-reciprocal-sqrt", cl::init(true), cl::Hidden,
+    cl::desc("1 / sqrt(v) as the reciprocal step without the division's "
+             "scaling"));
+
+/// 1 / d for d = e^x + c (exp, exp2 or exp10; c >= 1 a constant): d is at
+/// least 1 or a NaN, so the division's scaling of d's exponent (whose rcp and
+/// fmas scale with it while 1 / d is a normal float) and its NaN select
+/// (rcp's NaN goes through the fmas) are not needed: the correctly rounded
+/// reciprocal y0 + y0 (1 - d y0) (as in tanh), and +0 past 2^126 where the
+/// quotient flushes (+inf included) (L15-E282).
+///
+/// 1 / sqrt(v) (math.rsqrt) likewise: a square root is +-0, +inf, a NaN or a
+/// normal float in [2^-75, 2^64], whose reciprocal is normal; at +-0 and +inf
+/// the step's residual 1 - d y0 is a NaN, and rcp's own +-inf and +0 are the
+/// quotient (as for a NaN d): rcp, two fmas and a select (L15-E283).
+static bool reciprocalsAboveOne(Function &F) {
+  if (!AGXReciprocalAboveOne)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<std::pair<Instruction *, bool>, 4> Divs;
+  for (Instruction &I : instructions(F)) {
+    Value *D, *E;
+    const APFloat *C;
+    if (!I.getType()->isFloatTy() || !match(&I, m_FDiv(m_FPOne(), m_Value(D))) ||
+        cast<FPMathOperator>(I).getFastMathFlags().any())
+      continue;
+    if (AGXReciprocalSqrt && match(D, m_Intrinsic<Intrinsic::sqrt>(m_Value()))) {
+      Divs.push_back({&I, true});
+      continue;
+    }
+    if (!match(D, m_c_FAdd(m_Value(E), m_APFloat(C))) || !C->isFinite() ||
+        C->compare(APFloat(1.0f)) == APFloat::cmpLessThan)
+      continue;
+    auto *II = dyn_cast<IntrinsicInst>(E);
+    if (!II || (II->getIntrinsicID() != Intrinsic::exp &&
+                II->getIntrinsicID() != Intrinsic::exp2 &&
+                II->getIntrinsicID() != Intrinsic::exp10))
+      continue;
+    Divs.push_back({&I, false});
+  }
+  for (auto [I, Sqrt] : Divs) {
+    IRBuilder<> B(I);
+    Value *D = I->getOperand(1);
+    Type *Ty = D->getType();
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
+    Value *E = B.CreateIntrinsic(Intrinsic::fma, {Ty},
+                                 {B.CreateFNeg(D), Y0, ConstantFP::get(Ty, 1.0)});
+    Value *Y = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {E, Y0, Y0});
+    Value *R = Sqrt ? B.CreateSelect(B.CreateFCmpUNO(E, E), Y0, Y)
+                    : B.CreateSelect(
+                          B.CreateFCmpOGT(D, ConstantFP::get(Ty, 0x1p126)),
+                          ConstantFP::get(Ty, 0.0), Y);
+    R->takeName(I);
+    I->replaceAllUsesWith(R);
+    I->eraseFromParent();
+  }
+  return !Divs.empty();
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
   bool Changed = expandRoundToInt(F);
   Changed |= expandPowI(F);
   Changed |= expandFRem(F, ST);
   Changed |= convertIntsToBFloatOnce(F);
+  // (before exp is expanded, and with flushing f32: the quotient past 2^126)
+  if (!ST.hasIEEEFP32())
+    Changed |= reciprocalsAboveOne(F);
   // (before the expansions below: the analysis needs the loops and loads
   // as they are)
   SmallPtrSet<IntrinsicInst *, 4> ExpNoOverflow;
