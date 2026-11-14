@@ -6,7 +6,8 @@
 ; overflows; x - m is at most 0 (a denormal where max's comparison flushes)
 ; or a NaN, so both go (L15-E270). @xent: m an earlier loop's maximum of the
 ; values the loop with the exp loads again (agx-bench cross_entropy);
-; @local: m = maxnum(x, y) itself.
+; @local: m = maxnum(x, y) itself; @simd: m a SIMD-group's fmax of x (agx-bench
+; softmax_row).
 
 ; CHECK-LABEL: xent:
 ; CHECK:       // %l2
@@ -19,6 +20,11 @@
 ; CHECK-NOT:   icmpsel sgt
 ; CHECK:       stop
 ; OFF-LABEL:   local:
+; OFF:         icmpsel sgt
+; CHECK-LABEL: simd:
+; CHECK-NOT:   icmpsel sgt
+; CHECK:       stop
+; OFF-LABEL:   simd:
 ; OFF:         icmpsel sgt
 
 target triple = "agx"
@@ -103,5 +109,17 @@ define agx_kernel void @local(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addr
   %d = fsub float %x, %m
   %e = call float @llvm.exp.f32(float %d)
   store float %e, ptr addrspace(1) %po
+  ret void
+}
+
+declare float @llvm.agx.simd.reduce.f32(float, i32)
+define agx_kernel void @simd(ptr addrspace(1) %x) {
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %p = getelementptr float, ptr addrspace(1) %x, i32 %i
+  %v = load float, ptr addrspace(1) %p, align 4
+  %m = call float @llvm.agx.simd.reduce.f32(float %v, i32 7)
+  %d = fsub float %v, %m
+  %e = call float @llvm.exp.f32(float %d)
+  store float %e, ptr addrspace(1) %p, align 4
   ret void
 }

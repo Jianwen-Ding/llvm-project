@@ -23,6 +23,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
+#include "Utils/AGXBaseInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/CommandLine.h"
@@ -86,8 +87,8 @@ public:
                    (ExpMaxDifference && NoOverflow) || noExpOverflow(X));
   }
 
-  /// x = a - max(a, b) (maxnum, maximumnum or maximum, either order: a
-  /// softmax's exponent): at most 0, or a denormal where the maximum's
+  /// x = a - max(a, b) (maxnum, maximumnum or maximum, either order, or a
+  /// SIMD-group's fmax of a: a softmax's exponent): at most 0, or a denormal where the maximum's
   /// comparison flushes, or a NaN; e^x does not overflow, so the clamp above
   /// and the +inf select go (L15-E270).
   static bool noExpOverflow(Value *X) {
@@ -99,6 +100,11 @@ public:
     auto *II = dyn_cast<IntrinsicInst>(M);
     if (!II)
       return false;
+    // A SIMD-group's (or quad's) fmax of a itself: at least this lane's a.
+    if ((II->getIntrinsicID() == Intrinsic::agx_simd_reduce ||
+         II->getIntrinsicID() == Intrinsic::agx_quad_reduce) &&
+        match(II->getArgOperand(1), m_SpecificInt(AGX::SIMD_FMAX)))
+      return II->getArgOperand(0) == A;
     switch (II->getIntrinsicID()) {
     case Intrinsic::maxnum:
     case Intrinsic::maximumnum:
