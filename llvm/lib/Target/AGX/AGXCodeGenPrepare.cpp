@@ -3279,6 +3279,42 @@ static bool sinkMulExtensions(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNonNegXorDivisions(
+    "agx-nonneg-xor-divisions", cl::init(true), cl::Hidden,
+    cl::desc("sdiv of x ^ (x >>s (w - 1)) by a positive constant as the "
+             "udiv of its low w - 1 bits"));
+
+/// sdiv (x ^ (x >>s (w - 1))), c for c > 0 (a floor division's dividend,
+/// ~x for negative x, as opt makes MLIR's affine floordiv): the dividend's
+/// sign bit is 0, so it is udiv (v & (2^(w-1) - 1)), c, whose known zero top
+/// bit lets the unsigned magic multiply go without the signed quotient's
+/// rounding correction (one and against the correction's three) (L15-E292).
+static bool nonNegXorDivisions(Function &F) {
+  if (!AGXNonNegXorDivisions)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Value *V, *X;
+    const APInt *C, *Sh;
+    if (!match(&I, m_SDiv(m_Value(V), m_APInt(C))) || !C->isStrictlyPositive() ||
+        C->isPowerOf2() || !I.getType()->isIntegerTy(32))
+      continue;
+    unsigned W = I.getType()->getScalarSizeInBits();
+    if (!match(V, m_c_Xor(m_AShr(m_Value(X), m_APInt(Sh)), m_Deferred(X))) ||
+        *Sh != W - 1)
+      continue;
+    IRBuilder<> B(&I);
+    Value *M = B.CreateAnd(V, APInt::getSignedMaxValue(W));
+    Value *R = B.CreateUDiv(M, I.getOperand(1));
+    R->takeName(&I);
+    I.replaceAllUsesWith(R);
+    I.eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXConvertedMinMaxNum(
     "agx-converted-minmax-num", cl::init(true), cl::Hidden,
     cl::desc("maximum / minimum whose only use is a float-to-integer "
@@ -3883,6 +3919,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= permuteBytes(F);
   Changed |= loadBFloatsAsWords(F);
   Changed |= foldConditionChains(F, TTI);
+  Changed |= nonNegXorDivisions(F);
   Changed |= convertedMinMaxNum(F);
   Changed |= satConvertClamps(F);
   Changed |= loadBytesApart(F);

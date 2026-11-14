@@ -1253,8 +1253,7 @@ template <typename OpTy>
 static LogicalResult rewritePow2FloorCeilDiv(OpTy op, PatternRewriter &rewriter) {
   auto type = dyn_cast<IntegerType>(op.getType());
   std::optional<int64_t> d = getConstantIntValue(op.getRhs());
-  if (!type || !d || *d < 2 || !llvm::isPowerOf2_64(*d) ||
-      llvm::Log2_64(*d) >= type.getWidth() - 1)
+  if (!type || !d || *d < 2)
     return failure();
   Location loc = op.getLoc();
   auto c = [&](int64_t v) {
@@ -1262,6 +1261,25 @@ static LogicalResult rewritePow2FloorCeilDiv(OpTy op, PatternRewriter &rewriter)
                                      rewriter.getIntegerAttr(type, v));
   };
   Value x = op.getLhs();
+  if (!llvm::isPowerOf2_64(*d)) {
+    // floordivsi by another positive constant: s ^ ((x ^ s) / d), s the
+    // sign splat (~x for negative x, never negative, whose truncating
+    // quotient is floor((-x - 1) / d), complemented: floor(x / d), INT_MIN
+    // included); the backend divides the non-negative value unsigned
+    // (L15-E293).
+    if constexpr (!std::is_same_v<OpTy, arith::FloorDivSIOp>)
+      return failure();
+    if (*d >= (int64_t(1) << (type.getWidth() - 1)))
+      return failure();
+    Value sgn = arith::ShRSIOp::create(rewriter, loc, x,
+                                       c(type.getWidth() - 1));
+    Value q = arith::DivSIOp::create(
+        rewriter, loc, arith::XOrIOp::create(rewriter, loc, x, sgn), c(*d));
+    rewriter.replaceOpWithNewOp<arith::XOrIOp>(op, q, sgn);
+    return success();
+  }
+  if (llvm::Log2_64(*d) >= type.getWidth() - 1)
+    return failure();
   Value q = arith::ShRSIOp::create(rewriter, loc, x, c(llvm::Log2_64(*d)));
   if constexpr (std::is_same_v<OpTy, arith::CeilDivSIOp>) {
     Value low = arith::AndIOp::create(rewriter, loc, x, c(*d - 1));

@@ -1044,8 +1044,7 @@ gpu.module @more_f64_functions {
 // -----
 
 // arith.floordivsi by 2^k is the arithmetic shift by k; ceildivsi by 2^k that
-// shift plus 1 where a low bit is set (L15-E290). Other divisors keep arith's
-// expansion.
+// shift plus 1 where a low bit is set (L15-E290).
 gpu.module @pow2_floor_ceil_div {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%out: memref<8xi32, 1>, %v: i32) kernel {
@@ -1061,7 +1060,12 @@ gpu.module @pow2_floor_ceil_div {
     // CHECK: llvm.add %[[S]]
     // CHECK-NOT: llvm.sdiv
     %g = arith.ceildivsi %v, %c16 : i32
-    // CHECK: llvm.sdiv
+    // Another positive constant: s ^ ((x ^ s) / d), s the sign splat
+    // (L15-E293).
+    // CHECK: %[[SG:.*]] = llvm.ashr %{{.*}}, %{{.*}} : i32
+    // CHECK: %[[XS:.*]] = llvm.xor %{{.*}}, %[[SG]] : i32
+    // CHECK: %[[Q:.*]] = llvm.sdiv %[[XS]], %{{.*}} : i32
+    // CHECK: llvm.xor %[[Q]], %[[SG]] : i32
     %h = arith.floordivsi %v, %c6 : i32
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
