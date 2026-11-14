@@ -189,6 +189,11 @@ the `.i32` and the `.f32` forms, but `NVVM_TCGEN05_LD_RED` returns
 `{<n x T>, T}` (the loaded values and the reduction result, `T` = `float`
 for `.f32`), which is what the backend and its tests use.
 
+A smaller slip in the same document: the `tcgen05.mma.ws` syntax block lists
+`@llvm.nvvm.tcgen05.mma.ws.shared.zero_col_mask` twice, the second time with
+a tensor-memory A operand (`ptr addrspace(6) %atensor`), which is the
+`ws.tensor.zero_col_mask` form listed on the next line.
+
 Severity: documentation only. Fix direction: swap `%args` and `%offset` in
 the documented `tcgen05.st.16x32bx2` signature and give `tcgen05.ld.red`
 its two-element struct result.
@@ -245,7 +250,7 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4200 functions from 619
-test files; 3422 proved correct (350 through probe-derived opaque instructions,
+test files; 3422 proved correct (245 through probe-derived opaque instructions,
 50 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in

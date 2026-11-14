@@ -333,12 +333,16 @@ def expand(text, lifter_mod, llc_args=None):
             itys = []
             for i in keep:
                 t = args[i][0]
+                vm = re.fullmatch(r"<(\d+) x i32>", t)
                 itys.append("i32" if t.startswith("ptr addrspace(6)") else
-                            (t if re.fullmatch(r"i\d+", t) else None))
+                            ("v%si32" % vm.group(1) if vm else
+                             (t if re.fullmatch(r"i\d+", t) else None)))
             if None not in itys:
                 kname = tcgen05mma.name_of(toks).replace("::", "__") + "." + "_".join(itys)
-                fname = "ptxtv_sem_" + re.sub(r"[^\w]", "_", kname)
                 key_ = ("tcgen05mma", name, tuple(args))
+                fname = "ptxtv_sem_%d_" % len(defs) + re.sub(r"[^\w]", "_", kname)
+                if key_ in defs:
+                    fname = defs[key_][0]
                 if key_ not in defs:
                     w = ["define internal void @%s(%s) alwaysinline {" % (
                         fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
@@ -352,7 +356,9 @@ def expand(text, lifter_mod, llc_args=None):
                             cargs.append("%s %%y%d" % (t, i))
                     w += ["  call void @%s(%s)" % (kname, ", ".join(cargs)), "  ret void", "}"]
                     defs[key_] = (fname, "\n".join(w),
-                                  {kname: "declare void @%s(%s) nounwind" % (kname, ", ".join(itys))})
+                                  {kname: "declare void @%s(%s) nounwind" % (kname, ", ".join(
+                                      "<%s x i32>" % t[1:-3] if t.startswith("v") else t
+                                      for t in itys))})
                 line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
                 out_lines.append(line)
                 continue

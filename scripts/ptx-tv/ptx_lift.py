@@ -1016,8 +1016,7 @@ class Lifter:
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
                 (base == "tcgen05" and mods[:1] in (["ld"], ["st"])) or \
-                (base == "tcgen05" and mods[:1] == ["mma"] and not set(mods) & {
-                    "ws", "block_scale", "block16", "block32", "disable_output_lane"}) or \
+                (base == "tcgen05" and mods[:1] == ["mma"] and "decompress::lut::b" not in mods) or \
                 (base == "tcgen05" and mods[:1] in (["alloc"], ["dealloc"], ["relinquish_alloc_permit"],
                                                    ["commit"], ["cp"], ["shift"], ["wait::ld"],
                                                    ["wait::st"], ["fence::before_thread_sync"],
@@ -2370,6 +2369,15 @@ class Lifter:
             toks, canon = mm_
             vals, tys = [], []
             for o in canon:
+                if o.startswith("{"):
+                    rs = self.vec_ops(o)
+                    acc = "poison"
+                    for k, r in enumerate(rs):
+                        acc = self.op("insertelement <%d x i32> %s, i32 %s, i32 %d" % (
+                            len(rs), acc, self.get(r, 32), k))
+                    vals.append("<%d x i32> %s" % (len(rs), acc))
+                    tys.append("v%di32" % len(rs))
+                    continue
                 br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
                 r = br.group(1) if br else o
                 if r in self.regs:
@@ -2382,7 +2390,8 @@ class Lifter:
                 else:
                     raise Unsupported("operand " + opc)
             kname = tcgen05mma.name_of(toks).replace("::", "__") + "." + "_".join(tys)
-            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(tys)))
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(
+                "<%s x i32>" % t[1:-3] if t.startswith("v") else t for t in tys)))
             self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
             return
         rr = tcgen05ls.red_ptx(mods)

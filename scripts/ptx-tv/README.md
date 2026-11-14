@@ -143,8 +143,12 @@ single-thread semantics:
   the A operand's space, derived from the intrinsic (NVPTXUsage's flag
   tables; trailing flags default to 0 as `IntrinsicsNVVM.td` declares) and
   from the PTX opcode (`tcgen05mma.py`), operands in a canonical order (the
-  PTX places the sparse metadata before `idesc`). The `ws`, block-scale and
-  disable-output-lane variants remain probe-derived.
+  PTX places the sparse metadata before `idesc`). The block-scale
+  (`mxf8f6f4`/`mxf4`/`mxf4nvf4`; a missing scale-vector size is `.block32`
+  for `mxf4` and the only size for `mxf8f6f4`, per the PTX ISA),
+  disable-output-lane (the lane mask as a vector operand) and `ws` (collector
+  buffer `b0`-`b3`, zero-column mask) variants are modelled the same way;
+  only the newer `decompress_b` forms remain probe-derived.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -253,9 +257,9 @@ intrinsics' `i16` operands/results.
 What remains opaque or unproved, and why:
 
 * Probe-derived opaque instructions are left for families without
-  single-thread semantics a TV check could use: the `tcgen05.mma` `ws`,
-  block-scale and disable-output-lane variants (the other `tcgen05`
-  operations have documentation-derived models), TMA
+  single-thread semantics a TV check could use: the `tcgen05.mma`
+  `decompress_b` forms (not in NVPTXUsage; all other `tcgen05` operations
+  have documentation-derived models), TMA
   (`cp.async.bulk.tensor`, `cp.reduce.async.bulk.tensor`) and
   `tensormap.replace` (the tensor-map layout is not public), `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is
