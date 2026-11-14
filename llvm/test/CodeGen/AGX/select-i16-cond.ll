@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs -agx-select-bool16=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs -agx-select-bool16=0 -agx-narrow-truth-selects=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; Lane conditions shared by several comparisons of i1 values (a bitonic
 ; network's direction bits): type legalization keeps them as i16, and each
@@ -39,9 +39,13 @@ define agx_kernel void @shared_lane_bits(ptr addrspace(1) %p, ptr addrspace(1) %
 ; A boolean made by selects between comparisons and 0 / 1 (an argmax's
 ; "greater, or equal with a lower index") has its high 16 bits known zero:
 ; the selects on it compare its low half with 0, reading two 32-bit
-; registers instead of three (L15-E366).
+; registers instead of three (L15-E366), and the selects making it are
+; 16-bit, with the comparisons' 32-bit operands (L15-E369).
 ; CHECK-LABEL: and_or_flag:
-; CHECK: icmpsel ueq, {{r[0-9]+}}, [[F:r[0-9]+]]l, 0, {{r[0-9]+}}, {{r[0-9]+}}
+; CHECK: icmpsel slt, [[F:r[0-9]+]], {{r[0-9]+}}, {{r[0-9]+}}, 1, 0
+; CHECK-NEXT: fcmpsel eq, [[F]]l, {{r[0-9]+}}, {{r[0-9]+}}, [[F]]l, 0
+; CHECK-NEXT: fcmpsel lt, [[F]]l, {{r[0-9]+}}, {{r[0-9]+}}, 1, [[F]]l
+; CHECK: icmpsel ueq, {{r[0-9]+}}, [[F]]l, 0, {{r[0-9]+}}, {{r[0-9]+}}
 ; CHECK: icmpsel ueq, {{r[0-9]+}}, [[F]]l, 0, {{r[0-9]+}}, {{r[0-9]+}}
 ; OFF-LABEL: and_or_flag:
 ; OFF: icmpsel ueq, {{r[0-9]+}}, [[F:r[0-9]+]], 0, {{r[0-9]+}}, {{r[0-9]+}}

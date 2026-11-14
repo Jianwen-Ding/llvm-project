@@ -28,8 +28,8 @@ define agx_kernel void @loads(ptr addrspace(1) %v, ptr addrspace(1) %ix, ptr add
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    icmpsel slt, r6, r3, r2, 1, 0
 ; CHECK-NEXT:    wait 1
-; CHECK-NEXT:    fcmpsel eq, r6, r4, r5, r6, 0
-; CHECK-NEXT:    fcmpsel lt, r6, r4, r5, 1, r6
+; CHECK-NEXT:    fcmpsel eq, r6l, r4, r5, r6l, 0
+; CHECK-NEXT:    fcmpsel lt, r6l, r4, r5, 1, r6l
 ; CHECK-NEXT:    icmpsel ueq, r4, r6l, 0, r4, r5
 ; CHECK-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r3
 ; CHECK-NEXT:    device_store 0, i32, x, r4, u0_u1, r1, signed
@@ -90,8 +90,8 @@ define agx_kernel void @loads(ptr addrspace(1) %v, ptr addrspace(1) %ix, ptr add
 ; COPY-NEXT:    wait 0
 ; COPY-NEXT:    icmpsel slt, r6, r3, r2, 1, 0
 ; COPY-NEXT:    wait 1
-; COPY-NEXT:    fcmpsel eq, r6, r4, r5, r6, 0
-; COPY-NEXT:    fcmpsel lt, r6, r4, r5, 1, r6
+; COPY-NEXT:    fcmpsel eq, r6l, r4, r5, r6l, 0
+; COPY-NEXT:    fcmpsel lt, r6l, r4, r5, 1, r6l
 ; COPY-NEXT:    icmpsel ueq, r4, r6l, 0, r4, r5
 ; COPY-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r3
 ; COPY-NEXT:    device_store 0, i32, x, r4, u0_u1, r1, signed
@@ -142,8 +142,8 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    quad_shuffle_xor r5, r3, 1
 ; CHECK-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
-; CHECK-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
-; CHECK-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
+; CHECK-NEXT:    fcmpsel eq, r6l, r3, r5, r6l, 0
+; CHECK-NEXT:    fcmpsel lt, r6l, r3, r5, 1, r6l
 ; CHECK-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
 ; CHECK-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
 ; CHECK-NEXT:    iadd r2, r3, r2
@@ -206,8 +206,8 @@ define agx_kernel void @shuffles(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; COPY-NEXT:    wait 1
 ; COPY-NEXT:    quad_shuffle_xor r5, r3, 1
 ; COPY-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
-; COPY-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
-; COPY-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
+; COPY-NEXT:    fcmpsel eq, r6l, r3, r5, r6l, 0
+; COPY-NEXT:    fcmpsel lt, r6l, r3, r5, 1, r6l
 ; COPY-NEXT:    icmpsel ueq, r7, r6l, 0, r3, r5
 ; COPY-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
 ; COPY-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5

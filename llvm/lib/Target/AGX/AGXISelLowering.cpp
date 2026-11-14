@@ -1840,6 +1840,11 @@ static cl::opt<bool> FreezeTruthLogic(
              "into its operands"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> NarrowTruthSelects(
+    "agx-narrow-truth-selects", cl::init(true), cl::Hidden,
+    cl::desc("a truth value of selects between compares and 0 / 1 that only "
+             "selects test, in 16 bits"));
+
 static cl::opt<bool> SelectOfSelect(
     "agx-select-of-select",
     cl::desc("a select on an or / and of truth values as two nested "
@@ -2121,6 +2126,72 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
         return DAG.getSelect(DL, N->getValueType(0), CC,
                              DAG.getSelect(DL, N->getValueType(0), T, X, Y),
                              Y);
+    }
+    // A truth value made by selects between comparisons and 0 / 1 (the and
+    // / or of compares, e.g. an argmax's "greater, or equal with a lower
+    // index") that only selects test: computed in 16 bits, so that each
+    // compare-select of the chain and each select on it reads one 32-bit
+    // register fewer (two at most: the one-cycle issue, agx_cost
+    // PORT_BOUND; L15-E369). The arms become 16-bit (a compare's truth value
+    // through its low half; an inner such select is narrowed in turn, its
+    // only user then this truncation).
+    if (NarrowTruthSelects && DCI.isAfterLegalizeDAG() &&
+        N->getValueType(0) == MVT::i32) {
+      std::function<bool(SDValue, unsigned)> IsTruth = [&](SDValue V,
+                                                           unsigned Depth) {
+        if (auto *K = dyn_cast<ConstantSDNode>(V))
+          return K->getZExtValue() <= 1;
+        if (V.getValueType() != MVT::i32)
+          return false;
+        if (V.getOpcode() == ISD::SETCC)
+          return true;
+        return V.getOpcode() == ISD::SELECT && Depth < 4 &&
+               IsTruth(V.getOperand(1), Depth + 1) &&
+               IsTruth(V.getOperand(2), Depth + 1);
+      };
+      auto OnlyTested = [&](SDNode *S) {
+        for (SDUse &U : S->uses()) {
+          SDNode *User = U.getUser();
+          if (User->getOpcode() == ISD::SELECT && U.getOperandNo() == 0)
+            continue;
+          if (User->getOpcode() == ISD::TRUNCATE &&
+              User->getValueType(0) == MVT::i16)
+            continue;
+          return false;
+        }
+        return true;
+      };
+      // Only where the select reads three 32-bit registers now: a
+      // comparison of two non-constant 32-bit values and a register arm
+      // (otherwise it issues in one cycle already, and a 16-bit read of a
+      // just-written value is not forwarded: ddot and softmax_rows were
+      // slower).
+      auto Reg32 = [](SDValue V) {
+        return !isa<ConstantSDNode>(V) && !isa<ConstantFPSDNode>(V) &&
+               V.getValueSizeInBits() == 32;
+      };
+      bool ThreeReads = C.getOpcode() == ISD::SETCC &&
+                        Reg32(C.getOperand(0)) && Reg32(C.getOperand(1)) &&
+                        C.getOperand(0) != C.getOperand(1);
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      // (a truth value one select tests is two nested compare-selects
+      // instead, above, where its form allows)
+      bool OneSelect = N->hasOneUse() &&
+                       N->user_begin()->getOpcode() == ISD::SELECT;
+      if (ThreeReads && !OneSelect && IsTruth(X, 0) && IsTruth(Y, 0) &&
+          OnlyTested(N) &&
+          !(isa<ConstantSDNode>(X) && isa<ConstantSDNode>(Y))) {
+        SelectionDAG &DAG = DCI.DAG;
+        SDLoc DL(N);
+        auto Narrow = [&](SDValue V) {
+          if (auto *K = dyn_cast<ConstantSDNode>(V))
+            return DAG.getConstant(K->getZExtValue(), DL, MVT::i16);
+          return DAG.getNode(ISD::TRUNCATE, DL, MVT::i16, V);
+        };
+        SDValue S16 = DAG.getNode(AGXISD::TRUTH_SELECT, DL, MVT::i16, C,
+                                  Narrow(X), Narrow(Y));
+        return DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i32, S16);
+      }
     }
     // select (x > -1), a, b -> select (x < 0), b, a: icmpsel compares with
     // an immediate 0 but needs -1 in a register (a mov_imm). x >= 0 is

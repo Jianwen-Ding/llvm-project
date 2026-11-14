@@ -31,8 +31,8 @@ define agx_kernel void @step(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    quad_shuffle_xor r5, r3, 1
 ; CHECK-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
-; CHECK-NEXT:    fcmpsel eq, r6, r3, r5, r6, 0
-; CHECK-NEXT:    fcmpsel lt, r6, r3, r5, 1, r6
+; CHECK-NEXT:    fcmpsel eq, r6l, r3, r5, r6l, 0
+; CHECK-NEXT:    fcmpsel lt, r6l, r3, r5, 1, r6l
 ; CHECK-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
 ; CHECK-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
 ; CHECK-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed

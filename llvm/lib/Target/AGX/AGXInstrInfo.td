@@ -125,6 +125,10 @@ def AGXcvt_f_to_u8 : SDNode<"AGXISD::CVT_F_TO_U8", SDTAGXCvtF8>;
 def AGXcvt_f_to_s8 : SDNode<"AGXISD::CVT_F_TO_S8", SDTAGXCvtF8>;
 // Clamp to [0, 1], a NaN to +0 (the .sat output modifier).
 def AGXfsat : SDNode<"AGXISD::FSAT", SDTFPUnaryOp>;
+// A 16-bit truth value (0 / 1) selected on a comparison: a select between
+// compares and 0 / 1 narrowed to 16 bits (L15-E369), with its own patterns
+// so that 8-bit immediate arms do not change other 16-bit selects.
+def AGXtruthsel : SDNode<"AGXISD::TRUTH_SELECT", SDTSelect>;
 // The 64-bit product of two 32-bit values, unsigned or signed (one imadd).
 def SDT_AGXMulWide : SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i32>,
                                           SDTCisVT<2, i32>]>;

@@ -1107,6 +1107,26 @@ defm : SelectCCPats<ICMPSEL_I32, i32, f32, AGXIntSrc32, AGXIntConds, 0>;
 defm : SelectCCPats<ICMPSEL_I16_I32, i16, f32, AGXIntSrc16, AGXIntConds, 0>;
 defm : SelectCCPats<FCMPSEL_F32, f32, f32, AGXFPSrc32, AGXFPConds, 1>;
 defm : SelectCCPats<FCMPSEL_F16_I32, f16, f32, AGXFPSrc16, AGXFPConds, 1>;
+// 16-bit truth values selected on 32-bit comparisons, with 8-bit immediate
+// arms (the 0 / 1 of the and / or of comparisons, L15-E369).
+multiclass SelectCC16ImmPats<Instruction inst, ValueType cvt,
+                             ComplexPattern cpat, list<AGXCond> conds, bit fp> {
+  foreach C = conds in {
+    if fp then
+      def : Pat<(i16 (AGXtruthsel (i32 (setcc (cpat cvt:$a, i32:$am),
+                                              (cpat cvt:$b, i32:$bm), C.CC)),
+                                  AGXIntSrc16:$x, AGXIntSrc16:$y)),
+                !if(C.Swap, (inst C.HW, $am, $a, $bm, $b, 0, $y, 0, $x),
+                            (inst C.HW, $am, $a, $bm, $b, 0, $x, 0, $y))>;
+    else
+      def : Pat<(i16 (AGXtruthsel (i32 (setcc cpat:$a, cpat:$b, C.CC)),
+                                  AGXIntSrc16:$x, AGXIntSrc16:$y)),
+                !if(C.Swap, (inst C.HW, 0, $a, 0, $b, 0, $y, 0, $x),
+                            (inst C.HW, 0, $a, 0, $b, 0, $x, 0, $y))>;
+  }
+}
+defm : SelectCC16ImmPats<ICMPSEL_I32_I16, i32, AGXIntSrc32, AGXIntConds, 0>;
+defm : SelectCC16ImmPats<FCMPSEL_F32_I16, f32, AGXFPSrc32, AGXFPConds, 1>;
 foreach VT = [i16, f16, bf16] in {
 defm : SelectCCPats<ICMPSEL_I32_I16, i32, VT, AGXIntSrc32, AGXIntConds, 0>;
 defm : SelectCCPats<ICMPSEL_I16, i16, VT, AGXIntSrc16, AGXIntConds, 0>;
