@@ -19,6 +19,9 @@
 #include "AGXRegisterInfo.h"
 #include "AGXSubtarget.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -41,6 +44,12 @@ static cl::opt<bool> FoldWidened16Sources(
     "agx-fold-widened-16-sources",
     cl::desc("popcount / ffs / bitrev of a zero-extended 16-bit value read "
              "the 16-bit register"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> HalfConstantFMASources(
+    "agx-half-constant-fma-sources",
+    cl::desc("an fmadd32 of three 32-bit registers, one a constant that half "
+             "holds exactly, reads it from a 16-bit register"),
     cl::init(true), cl::Hidden);
 
 static cl::opt<bool> FoldNaNOperandSelects(
@@ -405,6 +414,93 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
         MRI.clearKillFlags(M);
         MI.eraseFromParent();
         Changed = true;
+      }
+  }
+  // An fmadd32 of three 32-bit registers where one is a constant that half
+  // holds exactly (a Cody-Waite ln2 split's high part, 0.693359375; small
+  // integers): that one from a 16-bit register, which the fmadd32 widens
+  // exactly (recorded: fmadd32_r14_r6l_r7h_r8), so that it reads two 32-bit
+  // registers, the one-cycle form, not three (L15-E371).
+  if (HalfConstantFMASources) {
+    DenseMap<MachineInstr *, Register> Half;
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : make_early_inc_range(MBB)) {
+        if (MI.getOpcode() != AGX::FMADD32_F32)
+          continue;
+        // (dst, a_mods, a, b_mods, b, c_mods, c)
+        SmallSet<Register, 3> Regs;
+        bool AllRegs = true;
+        for (unsigned I : {2u, 4u, 6u}) {
+          const MachineOperand &O = MI.getOperand(I);
+          if (!O.isReg() || !O.getReg().isVirtual() || O.getSubReg() ||
+              MRI.getRegClass(O.getReg()) != &AGX::GPR32RegClass)
+            AllRegs = false;
+          else
+            Regs.insert(O.getReg());
+        }
+        if (!AllRegs || Regs.size() != 3)
+          continue;
+        // An fmadd32 of three distinct 32-bit registers.
+        auto Converts = [&](const MachineInstr &U) {
+          if (U.getOpcode() != AGX::FMADD32_F32)
+            return false;
+          SmallSet<Register, 3> Rs;
+          for (unsigned I : {2u, 4u, 6u}) {
+            const MachineOperand &O = U.getOperand(I);
+            if (!O.isReg() || !O.getReg().isVirtual() || O.getSubReg() ||
+                MRI.getRegClass(O.getReg()) != &AGX::GPR32RegClass)
+              return false;
+            Rs.insert(O.getReg());
+          }
+          return Rs.size() == 3;
+        };
+        for (unsigned I : {2u, 4u, 6u}) {
+          Register R = MI.getOperand(I).getReg();
+          MachineInstr *Def = MRI.getVRegDef(R);
+          if (!Def || Def->getOpcode() != AGX::MOV_IMM32 ||
+              !Def->getOperand(1).isImm())
+            continue;
+          APFloat V(APFloat::IEEEsingle(),
+                    APInt(32, uint32_t(Def->getOperand(1).getImm())));
+          if (V.isNaN())
+            continue;
+          APFloat H = V;
+          bool Loses = false;
+          H.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven, &Loses);
+          if (Loses)
+            continue;
+          // The 32-bit constant goes (all its uses convert), or stays where
+          // it was hoisted to: a second mov_imm next to the fmadd would cost
+          // what the fmadd saves.
+          if (Def->getParent() == MI.getParent() &&
+              !all_of(MRI.use_nodbg_instructions(R),
+                      [&](const MachineInstr &U) { return Converts(U); }))
+            continue;
+          Register &R16 = Half[Def];
+          if (!R16) {
+            R16 = MRI.createVirtualRegister(&AGX::GPR16RegClass);
+            BuildMI(*Def->getParent(), std::next(Def->getIterator()),
+                    Def->getDebugLoc(), TII->get(AGX::MOV_IMM16), R16)
+                .addImm(H.bitcastToAPInt().getZExtValue());
+          }
+          static const unsigned Opc[3] = {AGX::FMADD32_M163232,
+                                          AGX::FMADD32_M321632,
+                                          AGX::FMADD32_M323216};
+          MachineInstrBuilder NewMI =
+              BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(Opc[(I - 2) / 2]),
+                      MI.getOperand(0).getReg());
+          for (unsigned J = 1; J < 7; ++J) {
+            if (J == I)
+              NewMI.addReg(R16);
+            else
+              NewMI.add(MI.getOperand(J));
+          }
+          MI.eraseFromParent();
+          if (MRI.use_nodbg_empty(R))
+            Def->eraseFromParent(), Half.erase(Def);
+          Changed = true;
+          break;
+        }
       }
   }
   return Changed;

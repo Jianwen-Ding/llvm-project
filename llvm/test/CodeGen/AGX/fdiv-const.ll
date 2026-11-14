@@ -135,12 +135,12 @@ define agx_kernel void @by255(ptr addrspace(1) %p) {
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
 ; CHECK-NEXT:    mov_imm r4, 1048608897
-; CHECK-NEXT:    mov_imm r6, -1065418752
+; CHECK-NEXT:    mov_imm r6l, 50168
 ; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    bfi r3, r2, 127, 23, mask 0xFF
 ; CHECK-NEXT:    fmul32 r5, r3, r4
-; CHECK-NEXT:    fmadd32 r3, r5, r6, r3
+; CHECK-NEXT:    fmadd32 r3, r5, r6l, r3
 ; CHECK-NEXT:    fmadd32 r3, r3, r4, r5
 ; CHECK-NEXT:    mov_imm r4, 2139095040
 ; CHECK-NEXT:    fmul32 r3, r3, 0.015625
