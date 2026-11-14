@@ -371,6 +371,13 @@ public:
   }
 
   Value *tan(Value *X) {
+    // A half or bfloat result: one sine-and-cosine expansion (its two-part
+    // reduction, E350), every half and bfloat input's tangent the same
+    // (L15-E353; the hardware's sin and cos were not)
+    if (NarrowResult && NarrowSinCosReduction) {
+      auto [S, C] = sinAndCos(X);
+      return div(S, C);
+    }
     return div(call(Intrinsic::sin, {X}), call(Intrinsic::cos, {X}));
   }
 
