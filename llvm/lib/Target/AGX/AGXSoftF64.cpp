@@ -1385,6 +1385,20 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
   case Instruction::FPExt: {
     Fmt In = formatOf(I.getOperand(0)->getType());
     Value *X = Bits(0);
+    // A half: the float conversion is exact for every finite half (its
+    // subnormals are normal floats), so the float's short path, with the
+    // general conversion of the half's bits for infinities and NaNs
+    // (L15-E313).
+    if (Fast && In.P == F16.P && In.Bias == F16.Bias &&
+        I.getOperand(0)->getType()->isHalfTy()) {
+      Value *H = B.CreateFPExt(I.getOperand(0), B.getFloatTy());
+      auto [FastBits, Valid] = SD.extFast(
+          B.CreateZExt(B.CreateBitCast(H, B.getInt32Ty()), I64));
+      R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+        return Slow.convert(X, In, F64);
+      }, Rounding, CanonicalNaN));
+      break;
+    }
     if (Fast && In.P == F32.P && In.Bias == F32.Bias) {
       auto [FastBits, Valid] = SD.extFast(X);
       R = Dbl(withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
