@@ -3513,6 +3513,14 @@ static bool isBF16Exact(SelectionDAG &DAG, SDValue V, unsigned Depth = 0) {
   case ISD::SELECT:
     return isBF16Exact(DAG, V.getOperand(1), Depth + 1) &&
            isBF16Exact(DAG, V.getOperand(2), Depth + 1);
+  // An integer of at most 8 significant bits (an i8's) converted: bfloat's
+  // 8-bit significand holds it, so the float's low half is zero (L15-E312).
+  case ISD::SINT_TO_FP: {
+    SDValue I = V.getOperand(0);
+    return I.getScalarValueSizeInBits() - DAG.ComputeNumSignBits(I) + 1 <= 8;
+  }
+  case ISD::UINT_TO_FP:
+    return DAG.computeKnownBits(V.getOperand(0)).countMaxActiveBits() <= 8;
   case ISD::SELECT_CC:
     return isBF16Exact(DAG, V.getOperand(2), Depth + 1) &&
            isBF16Exact(DAG, V.getOperand(3), Depth + 1);
@@ -3541,10 +3549,12 @@ SDValue AGXTargetLowering::lowerFP_TO_BF16(SDValue Op,
   // The f32 arithmetic's NaN is 0x7fc00000, which the rounding keeps a NaN:
   // a result of it needs no NaN test (unless NaNs follow PTX's canonical
   // form, whose 0x7fffffff the rounding would carry out of).
+  // An integer converted is never a NaN (L15-E312).
   unsigned SrcOp = Src.getOpcode();
-  if (!DAG.getSubtarget<AGXSubtarget>().hasCanonicalNaN() &&
-      (SrcOp == ISD::FADD || SrcOp == ISD::FSUB || SrcOp == ISD::FMUL ||
-       SrcOp == ISD::FMA || SrcOp == ISD::FMAD))
+  if ((!DAG.getSubtarget<AGXSubtarget>().hasCanonicalNaN() &&
+       (SrcOp == ISD::FADD || SrcOp == ISD::FSUB || SrcOp == ISD::FMUL ||
+        SrcOp == ISD::FMA || SrcOp == ISD::FMAD)) ||
+      SrcOp == ISD::SINT_TO_FP || SrcOp == ISD::UINT_TO_FP)
     return DAG.getNode(ISD::TRUNCATE, DL, Op.getValueType(),
                        DAG.getNode(ISD::SRL, DL, MVT::i32, R, C(16)));
   // A NaN keeps its top half, quieted; the test is a float compare of the
