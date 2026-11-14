@@ -1012,7 +1012,8 @@ class Lifter:
             raise Unsupported("opcode " + opcode)
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
                     "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
-                    "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa") or \
+                    "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa",
+                    "txq", "suq", "suld", "sust", "tex") or \
                 (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
@@ -2560,6 +2561,67 @@ class Lifter:
 
     def i_mapa(self, mods, ops, opc):
         return self.cluster_call("mapa", mods, ops, opc)
+
+    def texsurf_call(self, base, mods, ops, opc):
+        import texsurf
+        import tma
+        r = texsurf.ptx(base, mods)
+        if r is None:
+            raise Unsupported("opcode " + opc)
+        toks, res_first = r
+        flat = tma._flatten(ops)
+        res = []
+        if res_first:
+            o0 = ops[0].strip()
+            res = self.vec_ops(o0) or [o0]
+            flat = tma._flatten(ops[1:])
+        vals = []
+        for o in flat:
+            x = o.strip()
+            br = re.fullmatch(r"\[\s*([%\w$.]+)\s*\]", x)
+            if br:
+                x = br.group(1)
+            if x in self.regs and self.regs[x] > 1:
+                w = self.regs[x]
+                v = self.get(x, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(x) is not None:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            elif x in self.handle_params and self.handle_params[x].startswith("i64 "):
+                vals.append(self.handle_params[x])           # .texref/.surfref parameter
+            elif re.fullmatch(r"[\w$.]+", x):
+                vals.append("i64 %s" % self.get(x, 64))     # texture/surface symbol
+            else:
+                raise Unsupported("operand " + opc)
+        kname = texsurf.name_of(toks, len(res), len(vals))
+        rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
+        self.declare(kname, "declare %s @%s(%s) nounwind" % (rty, kname, ", ".join(["i64"] * len(vals))))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if not res:
+            self.emit(call)
+            return
+        v = self.op(call)
+        for k, d in enumerate(res):
+            if d == "_":
+                continue
+            e = self.op("extractvalue %s %s, %d" % (rty, v, k))
+            w = self.regs[d]
+            self.write(d, self.resize(e, 64, w, False) if w != 64 else e, w)
+
+    def i_txq(self, mods, ops, opc):
+        return self.texsurf_call("txq", mods, ops, opc)
+
+    def i_suq(self, mods, ops, opc):
+        return self.texsurf_call("suq", mods, ops, opc)
+
+    def i_suld(self, mods, ops, opc):
+        return self.texsurf_call("suld", mods, ops, opc)
+
+    def i_sust(self, mods, ops, opc):
+        return self.texsurf_call("sust", mods, ops, opc)
+
+    def i_tex(self, mods, ops, opc):
+        return self.texsurf_call("tex", mods, ops, opc)
 
     def i_tensormap(self, mods, ops, opc):
         import prio

@@ -18,7 +18,7 @@ Functions checked: 4204.
 
 55 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
 
-Of the correct results, 38 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
+Of the correct results, 28 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
 
 8 of these used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`) after the check with cp.async/st.bulk copy semantics timed out.
 

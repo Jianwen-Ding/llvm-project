@@ -22,6 +22,7 @@ import tcgen05ops
 import tcgen05mma
 import tma
 import prio
+import texsurf
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -329,6 +330,65 @@ def expand(text, lifter_mod, llc_args=None):
                 and not re.match(r"\s*%", line):
             removed = True
             continue
+        ts = texsurf.intrinsic(name)
+        if ts and (ts[1] == 0) == (not re.match(r"\s*%", line)):
+            toks, nres = ts
+            ret = call_ret_type(line, m.start()) if nres else "void"
+            rtys = []
+            if nres == 1:
+                rtys = [ret]
+            elif nres > 1 and ret and ret.startswith("{"):
+                from llvmsig import split_top as _st
+                rtys = [x.strip() for x in _st(ret.strip()[1:-1])]
+            if ret and len(rtys) == nres and all(t in ("i8", "i16", "i32", "i64", "float") for t in rtys) \
+                    and all(t in ("i8", "i16", "i32", "i64", "float") for t, _ in args):
+                kname = texsurf.name_of(toks, nres, len(args))
+                key_ = ("texsurf", name, ret, tuple(t for t, _ in args))
+                if key_ not in defs:
+                    fname = "ptxtv_sem_%d_ts" % len(defs)
+                    w = ["define internal %s @%s(%s) alwaysinline {" % (
+                        ret, fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args)))]
+                    cargs = []
+                    for k, (t, _) in enumerate(args):
+                        if t == "float":
+                            w.append("  %%b%d = bitcast float %%y%d to i32" % (k, k))
+                            w.append("  %%c%d = zext i32 %%b%d to i64" % (k, k))
+                        elif t == "i64":
+                            w.append("  %%c%d = add i64 %%y%d, 0" % (k, k))
+                        else:
+                            w.append("  %%c%d = zext %s %%y%d to i64" % (k, t, k))
+                        cargs.append("i64 %%c%d" % k)
+                    rty = "void" if not nres else "{ %s }" % ", ".join(["i64"] * nres)
+                    call = "call %s @%s(%s)" % (rty, kname, ", ".join(cargs))
+                    if not nres:
+                        w += ["  " + call, "  ret void"]
+                    else:
+                        w.append("  %r = " + call)
+                        outs = []
+                        for k, t in enumerate(rtys):
+                            w.append("  %%e%d = extractvalue %s %%r, %d" % (k, rty, k))
+                            if t == "float":
+                                w.append("  %%t%d = trunc i64 %%e%d to i32" % (k, k))
+                                w.append("  %%o%d = bitcast i32 %%t%d to float" % (k, k))
+                            elif t == "i64":
+                                w.append("  %%o%d = add i64 %%e%d, 0" % (k, k))
+                            else:
+                                w.append("  %%o%d = trunc i64 %%e%d to %s" % (k, k, t))
+                            outs.append("%%o%d" % k)
+                        if nres == 1:
+                            w.append("  ret %s %s" % (ret, outs[0]))
+                        else:
+                            acc = "poison"
+                            for k, (t, o) in enumerate(zip(rtys, outs)):
+                                w.append("  %%a%d = insertvalue %s %s, %s %s, %d" % (k, ret, acc, t, o, k))
+                                acc = "%%a%d" % k
+                            w.append("  ret %s %s" % (ret, acc))
+                    w.append("}")
+                    defs[key_] = (fname, "\n".join(w), {kname: "declare %s @%s(%s) nounwind" % (
+                        rty, kname, ", ".join(["i64"] * len(args)))})
+                line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                out_lines.append(line)
+                continue
         cl = prio._cluster(name, args)
         if cl:
             toks, keep, has_res = cl

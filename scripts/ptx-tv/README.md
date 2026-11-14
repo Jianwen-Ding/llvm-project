@@ -172,6 +172,13 @@ single-thread semantics:
   their documented modifiers (`prio.py`), operands as zero-extended i64
   (the 128-bit cluster-launch-control handle as i128), results returned as
   i64 and truncated to the destination.
+* Texture/surface instructions (`txq`/`suq` queries, `suld`/`sust.b` by
+  geometry, vector width, bit size and clamp mode, and the unified `tex`
+  fetches) are uninterpreted calls keyed by their modifiers, derived from
+  the intrinsic name and from the PTX opcode (`texsurf.py`); the image state
+  stays opaque. Handles are the `.texref`/`.surfref` parameter or the
+  symbol's address. The older non-unified `tex` form with a separate
+  sampler remains probe-derived.
 * `spdecompress` follows the ISA's semantics (`data[N][mdata[N][S]] =
   cdata[N][S]`, other positions zero; `sparse.py`), for both the instruction
   and the intrinsic (whose qualifiers are derived as documented in
@@ -285,7 +292,8 @@ What remains opaque or unproved, and why:
   `decompress_b` forms (not in NVPTXUsage; all other `tcgen05` operations
   have documentation-derived models),  `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is
-  modelled as a store, its single-memory meaning), texture/surface (opaque image state).
+  modelled as a store, its single-memory meaning) and the non-unified `tex`
+  form with a separate sampler.
  Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
   symbolic-size bulk copies (which already time out with copy semantics),
