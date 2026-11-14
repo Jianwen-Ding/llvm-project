@@ -2934,6 +2934,12 @@ static cl::opt<bool> HalfPow2Numerator(
     cl::desc("a half quotient of a constant +-2^k without the correction "
              "step"));
 
+static cl::opt<bool> IntDivisorScale(
+    "agx-fdiv-int-divisor",
+    cl::desc("float division by an integer converted to float: the "
+             "divisor's scale first, no test of the dividend's size"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   const MVT VT = MVT::f32;
@@ -3001,7 +3007,17 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
     }
     SDValue PA = Flt(And(AB, 0x7f800000));
     auto *CPB = dyn_cast<ConstantFPSDNode>(PB);
-    if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {
+    // b converted from an integer of at most 64 bits: +-0 (pb = +inf: q pb
+    // pa is +-inf, or a NaN for a = 0, as the select form gives) or of
+    // magnitude in [1, 2^64], pb in [2^-63, 2]: the same argument as for a
+    // moderate constant (L15-E343)
+    bool IntB = IntDivisorScale &&
+                (B.getOpcode() == ISD::SINT_TO_FP ||
+                 B.getOpcode() == ISD::UINT_TO_FP) &&
+                B.getOperand(0).getValueType().getScalarSizeInBits() <= 64;
+    if (IntB) {
+      R = Mul(Mul(Q, PB), PA);
+    } else if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {
       // A constant b of moderate size: q (in [1/4, 1)) times pb is exact
       // (neither flushed nor infinite), so pb first is right for every a and
       // the product with pa rounds once; no test of a's size.
