@@ -138,6 +138,13 @@ single-thread semantics:
   check covers operand binding and the use of results. Comment-only and
   empty templates are no-ops (their operands are then unchecked). Memory
   operands, predicate outputs and other operand modifiers are not handled.
+* `llvm.convert.from.arbitrary.fp` (`arbfp.py`) becomes a lookup in a
+  constant table of exact results (computed with rational arithmetic; NaNs
+  keep their sign and mantissa bits). `llvm.convert.to.arbitrary.fp` (round
+  to nearest even or toward zero, with or without saturation) compares the
+  input's magnitude bits with exact rounding thresholds; NaN results may be
+  any NaN encoding, and the LangRef's poison cases are `freeze poison` (a
+  plain poison in a select would be folded away by the source's optimiser).
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
@@ -179,8 +186,11 @@ intrinsics' `i16` operands/results.
   `-nvptx-prec-sqrtf32=0`, fast-math flags or attributes allow approximation.
 * `rsqrt-approx-opt-default-on`: `1/sqrt.approx(x)` to `rsqrt.approx(x)`
   (`-nvptx-rsqrt-approx-opt`, on by default).
-* `nan-payload`: both results are NaN and differ only in sign or payload
-  (not applied when the source uses `fabs`/`fneg`/`copysign`).
+* `nan-payload`: both results are NaN (for vectors: in every differing
+  lane) and differ only in sign or payload (not applied when the source uses
+  `fabs`/`fneg`/`copysign`). This includes quiet-bit changes, which are a
+  defect where LangRef requires them preserved (finding 6: the
+  `arbitrary-fp-to-float.ll` entries).
 * `dynamic-alloca-size-overflow`: needs allocation sizes near 2^63.
 * `approx-substitution`: one approximate instruction replaced by another
   (e.g. `div.full(1, x)` to `rcp.approx`); both are uninterpreted, so the

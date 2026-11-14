@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ptx_lift  # noqa: E402
 import nvvm_sem  # noqa: E402
 import asm_sem  # noqa: E402
+import arbfp  # noqa: E402
 import probe  # noqa: E402
 probe.LLC = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin") + "/llc"
 from llvmsig import parse_sig, TypeParseError  # noqa: E402
@@ -186,6 +187,10 @@ def prepare_source(path, workdir):
     # and become uninterpreted external functions (immarg is only valid on
     # intrinsics).
     out, asm_expanded = asm_sem.expand(out, ptx_lift)
+    out, arb_expanded = arbfp.expand(out)
+    out, arb_to = arbfp.expand_to(out)
+    arb_expanded = arb_expanded or arb_to
+    asm_expanded = asm_expanded or arb_expanded
     out, expanded = nvvm_sem.expand(out, ptx_lift, PROBE_LLC.get(os.getpid()))
     expanded = expanded or asm_expanded
     if expanded:
@@ -478,6 +483,16 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
         # fneg/fabs/copysign must preserve NaN bits exactly (LangRef), so a
         # NaN-only difference is still a real mismatch when they are involved
         if not re.search(r"@llvm\.(fabs|copysign)|\bfneg\b", src_text):
+            return "nan-payload"
+    # vectors: every lane equal or NaN on both sides
+    sv = re.search(r"^Source value: <(.*)>\s*$", alive_out, re.M)
+    tv_ = re.search(r"^Target value: <(.*)>\s*$", alive_out, re.M)
+    if sv and tv_ and not re.search(r"@llvm\.(fabs|copysign)|\bfneg\b", src_text):
+        sl = [x.strip() for x in sv.group(1).split(",")]
+        tl = [x.strip() for x in tv_.group(1).split(",")]
+        isnan = lambda x: x.endswith("(QNaN)") or x.endswith("(SNaN)")
+        if len(sl) == len(tl) and any(a != b for a, b in zip(sl, tl)) and \
+                all(a == b or (isnan(a) and isnan(b)) for a, b in zip(sl, tl)):
             return "nan-payload"
     if "partword" in body or (
             re.search(r"and\.b64\s+%rd\d+, %rd\d+, -4;", body) and

@@ -147,6 +147,23 @@ Severity: low (kernels returning values are unusual; the value is not
 observable). Fix direction: drop the store for kernels (or reject non-void
 kernels in the verifier).
 
+## 6. `llvm.convert.from.arbitrary.fp` quiets signaling NaNs
+
+Reproducer: `arbitrary-fp-snan.ll` (found in `arbitrary-fp-to-float.ll`
+`from_f8e5m2_nan` and the `*_dynamic`/vector variants)
+
+LangRef for this intrinsic: "the NaN representation is preserved (quiet
+NaNs remain quiet, signaling NaNs remain signaling)". `Float8E5M2` `0x7D`
+(`S.11111.01`) is a signaling NaN, but the result is the quiet f32 NaN
+`0x7FC00000`, both when the call is constant folded and in the expanded
+code for a dynamic input, which maps every NaN input to that constant (the
+NaN's sign is dropped as well; LangRef does not say whether the sign must be
+kept). The same holds for `half`/`bfloat` results. The lowering is
+target-independent; it is observed here through NVPTX.
+
+Severity: low (signaling-NaN inputs only); either the lowering or the
+LangRef text should change.
+
 ## Lower-severity observations
 
 * `param-vectorize-device.ll` `callee_St4x3` / `callee_St4x7`: a 12-byte
@@ -196,12 +213,12 @@ functions per test file, so files with up to 24 functions are fully
 covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
-`--disable-poison-input` check (tagged). In short: 4167 functions from 619
-test files; 3191 proved correct (505 through probe-derived opaque instructions,
-20 only with the weaker check); 30 counterexamples with out-of-bounds
+`--disable-poison-input` check (tagged). In short: 4186 functions from 619
+test files; 3224 proved correct (505 through probe-derived opaque instructions,
+20 only with the weaker check); 32 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
-2/2b/3/4/5; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 124 in
-known modelling classes; 11 not lifted; 745 solver timeouts or inconclusive.
+2/2b/3/4/5/6; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 137 in
+known modelling classes; 11 not lifted; 752 solver timeouts or inconclusive.
 
 Not lifted (11): the two finding-5 kernels (invalid PTX), calls through
 `undef` or with ambiguous types, `stacksave`/`stackrestore` (unsupported by
