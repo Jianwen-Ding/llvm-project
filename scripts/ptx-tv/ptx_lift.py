@@ -1014,7 +1014,7 @@ class Lifter:
                     "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
                     "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa",
                     "txq", "suq", "suld", "sust", "tex", "wmma", "mma", "ldmatrix", "stmatrix") or \
-                re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]", base) or \
+                re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]?", base) or \
                 base in ("createpolicy", "istypeof", "tld4", "sured") or \
                 (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
@@ -1388,6 +1388,81 @@ class Lifter:
         if not mods or mods[0] not in ("b", "p"):
             raise Unsupported(opc)
         return self.opaque_keyed("sured", mods, ops, opc, False)
+
+    def scalar_video(self, op, mods, ops, opc):
+        """vop.dtype.atype.btype{.sat}{.op2} d, a, b{, c} for vadd, vsub,
+        vabsdiff, vmin, vmax and vset.atype.btype.cmp{.op2} (PTX ISA
+        pseudo-code): a and b extended by their types, the operation done
+        exactly, .sat clamps to the dtype range (otherwise the low 32 bits),
+        then the optional secondary .add (wrapping) / .min / .max with c, in
+        the dtype's signedness (vset: unsigned; an assumption, the
+        pseudo-code does not say).  Default selectors only; no .dsel merge."""
+        if any("." in o.strip().split("%")[-1] for o in ops):
+            raise Unsupported("video operand selector in " + opc)
+        ts = [m for m in mods if m in ("u32", "s32")]
+        rest = [m for m in mods if m not in ("u32", "s32")]
+        cmp = None
+        if op == "vset":
+            if len(ts) != 2:
+                raise Unsupported(opc)
+            dt, (at, bt) = "u32", ts
+            cmps = [m for m in rest if m in ("eq", "ne", "lt", "le", "gt", "ge")]
+            if len(cmps) != 1:
+                raise Unsupported(opc)
+            cmp = cmps[0]
+            rest.remove(cmp)
+        else:
+            if len(ts) != 3:
+                raise Unsupported(opc)
+            dt, at, bt = ts
+        op2 = [m for m in rest if m in ("add", "min", "max")]
+        if set(rest) - {"sat", "add", "min", "max"} or len(op2) > 1 or \
+                (op == "vset" and "sat" in rest) or len(ops) != (4 if op2 else 3):
+            raise Unsupported(opc)
+        ext = lambda v, t: self.op("%s i32 %s to i64" % ("sext" if t == "s32" else "zext", v))
+        a, b = ext(self.get(ops[1], 32), at), ext(self.get(ops[2], 32), bt)
+        if op == "vadd":
+            t = self.op("add i64 %s, %s" % (a, b))
+        elif op == "vsub":
+            t = self.op("sub i64 %s, %s" % (a, b))
+        elif op == "vabsdiff":
+            t = self.call_intr("i64", "llvm.abs.i64", ["i64 %s" % self.op("sub i64 %s, %s" % (a, b)), "i1 false"])
+        elif op in ("vmin", "vmax"):
+            t = self.call_intr("i64", "llvm.s%s.i64" % op[1:], ["i64 %s" % a, "i64 %s" % b])
+        else:
+            pred = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}[cmp]
+            t = self.op("zext i1 %s to i64" % self.op("icmp %s i64 %s, %s" % (pred, a, b)))
+        if "sat" in rest:
+            lo, hi = (-(1 << 31), (1 << 31) - 1) if dt == "s32" else (0, (1 << 32) - 1)
+            t = self.call_intr("i64", "llvm.smax.i64", ["i64 %s" % t, "i64 %d" % lo])
+            t = self.call_intr("i64", "llvm.smin.i64", ["i64 %s" % t, "i64 %d" % hi])
+        r = self.op("trunc i64 %s to i32" % t)
+        if op2:
+            c = self.get(ops[3], 32)
+            if op2[0] == "add":
+                r = self.op("add i32 %s, %s" % (r, c))
+            else:
+                sg = "s" if dt == "s32" else "u"
+                r = self.call_intr("i32", "llvm.%s%s.i32" % (sg, op2[0]), ["i32 %s" % r, "i32 %s" % c])
+        self.write(ops[0], r, 32)
+
+    def i_vadd(self, mods, ops, opc):
+        return self.scalar_video("vadd", mods, ops, opc)
+
+    def i_vsub(self, mods, ops, opc):
+        return self.scalar_video("vsub", mods, ops, opc)
+
+    def i_vabsdiff(self, mods, ops, opc):
+        return self.scalar_video("vabsdiff", mods, ops, opc)
+
+    def i_vmin(self, mods, ops, opc):
+        return self.scalar_video("vmin", mods, ops, opc)
+
+    def i_vmax(self, mods, ops, opc):
+        return self.scalar_video("vmax", mods, ops, opc)
+
+    def i_vset(self, mods, ops, opc):
+        return self.scalar_video("vset", mods, ops, opc)
 
     # ---- SIMD video instructions -----------------------------------------
     VOP = {"vadd", "vsub", "vavrg", "vabsdiff", "vmin", "vmax", "vset"}

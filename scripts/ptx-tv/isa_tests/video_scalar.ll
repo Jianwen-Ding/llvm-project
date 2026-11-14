@@ -1,0 +1,1159 @@
+define i32 @vadd_s32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_u32_u32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.u32.u32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_s32_u32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.s32.u32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vadd_u32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vadd.u32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_u32_u32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.u32.u32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_s32_u32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.s32.u32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vsub_u32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vsub.u32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_u32_u32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.u32.u32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_s32_u32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.s32.u32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vabsdiff_u32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vabsdiff.u32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_u32_u32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.u32.u32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_s32_u32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.s32.u32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmin_u32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmin.u32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_u32_u32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.u32.u32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_s32_u32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.s32.u32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32 $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_sat(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.sat $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_sat_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.sat.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_sat_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.sat.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vmax_u32_s32_s32_sat_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vmax.u32.s32.s32.sat.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_eq(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.eq $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_eq_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.eq.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_eq_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.eq.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_eq_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.eq.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_eq(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.eq $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_eq_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.eq.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_eq_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.eq.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_eq_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.eq.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_eq(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.eq $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_eq_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.eq.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_eq_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.eq.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_eq_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.eq.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ne(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ne $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ne_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ne.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ne_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ne.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ne_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ne.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ne(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ne $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ne_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ne.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ne_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ne.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ne_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ne.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ne(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ne $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ne_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ne.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ne_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ne.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ne_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ne.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_lt(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.lt $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_lt_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.lt.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_lt_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.lt.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_lt_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.lt.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_lt(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.lt $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_lt_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.lt.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_lt_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.lt.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_lt_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.lt.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_lt(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.lt $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_lt_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.lt.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_lt_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.lt.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_lt_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.lt.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_le(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.le $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_le_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.le.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_le_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.le.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_le_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.le.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_le(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.le $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_le_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.le.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_le_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.le.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_le_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.le.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_le(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.le $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_le_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.le.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_le_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.le.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_le_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.le.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_gt(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.gt $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_gt_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.gt.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_gt_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.gt.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_gt_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.gt.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_gt(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.gt $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_gt_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.gt.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_gt_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.gt.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_gt_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.gt.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_gt(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.gt $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_gt_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.gt.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_gt_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.gt.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_gt_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.gt.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ge(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ge $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ge_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ge.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ge_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ge.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_s32_ge_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.s32.ge.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ge(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ge $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ge_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ge.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ge_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ge.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_u32_u32_ge_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.u32.u32.ge.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ge(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ge $0, $1, $2;", "=r,r,r"(i32 %a, i32 %b)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ge_add(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ge.add $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ge_min(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ge.min $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}
+
+define i32 @vset_s32_u32_ge_max(i32 %a, i32 %b, i32 %c) {
+  %d = call i32 asm "vset.s32.u32.ge.max $0, $1, $2, $3;", "=r,r,r,r"(i32 %a, i32 %b, i32 %c)
+  ret i32 %d
+}

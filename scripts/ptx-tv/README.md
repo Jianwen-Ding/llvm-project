@@ -335,9 +335,14 @@ mismatch.
 * SIMD video instructions `vadd2/4`, `vsub2/4`, `vavrg2/4`, `vabsdiff2/4`,
   `vmin2/4`, `vmax2/4` (u32/s32 lane types, mixed, `.sat`, `.add`) and
   `vset2/4` (all comparisons, `.add`), default lane selectors and mask
-  (`video_simd`, 180 functions; two need a 120 s budget). Lane selectors
-  and masks are rejected (`lift-unsupported`), as are the scalar video
-  instructions.
+  (`video_simd`, 180 functions; two need a 120 s budget).
+* Scalar video instructions `vadd`, `vsub`, `vabsdiff`, `vmin`, `vmax`
+  (u32/s32 and mixed operand types, `.sat`, secondary `.add`/`.min`/`.max`
+  with c) and `vset` (all comparisons, secondary operations)
+  (`video_scalar`, 232 functions). The pseudo-code does not say which
+  signedness the secondary min/max uses; the model takes the destination
+  type's (unsigned for `vset`). Lane selectors, masks, `.dsel` merges,
+  `vshl`/`vshr` and `vmad` are rejected (`lift-unsupported`).
 * `createpolicy`, `istypeof`, `tld4` and `sured` depend on state outside
   the single-thread model and are keyed calls named by their modifiers;
   `isa_tests/inline/opaque.ll` checks them through the inline-asm path
