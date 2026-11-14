@@ -1,14 +1,14 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query and 3 keyed texture/surface/mma functions at 120 s (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`, keyed calls); bulk-copy, tcgen05.mma decompress_b and texture files re-run with their keyed models; the lit-generated `wmma*.py` tests materialised by gen_py_tests.py (2130 distinct functions, each checked once in the newest PTX version that has it; listed under the `.py` name); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query, then with the weaker check, then with element-wise vector accesses, then per lane for vector results (also combined, and combined with the weaker check); flag-approximation inconclusives re-run against the source without those flags (also timeouts with such flags); remaining timeouts re-run with another solver seed; all timeouts and inconclusives re-run after removing dead `.param`-slot reloads and forwarding call-site return slots in the lifted target. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query and 3 keyed texture/surface/mma functions at 120 s (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`, keyed calls); bulk-copy, tcgen05.mma decompress_b and texture files re-run with their keyed models; the lit-generated `wmma*.py` tests materialised by gen_py_tests.py (2130 distinct functions, each checked once in the newest PTX version that has it; listed under the `.py` name); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics; all remaining timeouts re-run at 10 s per query, then with the weaker check, then with element-wise vector accesses, then per lane for vector results (also combined, and combined with the weaker check); flag-approximation inconclusives re-run against the source without those flags (also timeouts with such flags); remaining timeouts re-run with another solver seed; all timeouts and inconclusives re-run after removing dead `.param`-slot reloads and forwarding call-site return slots in the lifted target, and again after also removing dead side-effect-free arithmetic. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 623; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 6334.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 5581 | 88.1% |
-| `timeout` | 480 | 7.6% |
+| `correct` | 5593 | 88.3% |
+| `timeout` | 468 | 7.4% |
 | `mismatch-known` | 171 | 2.7% |
 | `inconclusive` | 59 | 0.9% |
 | `mismatch-param-oob` | 33 | 0.5% |
@@ -30,7 +30,7 @@ Of the correct results, 0 rely on probe-derived opaque instructions (probe.py): 
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 5792 (91.4%).
+Conclusive (proved correct or counterexample): 5804 (91.6%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 

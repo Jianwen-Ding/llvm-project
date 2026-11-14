@@ -386,12 +386,20 @@ without a rounding modifier, which the ISA requires.
 ## Target cleanup
 
 Before the check, `tv.drop_dead_param_loads` removes from the lifted target
-unused loads that read a `.param` slot at offset 0 within its size (they
-cannot be UB) and slots that are then only stored to, and forwards a
-call-site return slot's single store to its same-size loads in the same
-block (as a bitcast; `mem2reg` cannot when the types differ). Out-of-bounds
-`.param` reads (finding 1) are not of this form and are still checked.
-Alive2's assembly mode is very slow on such dead reloads of a stored pointer.
+dead code that cannot affect the result: unused side-effect-free,
+non-trapping instructions (casts, shifts, arithmetic other than division,
+compares, selects, GEPs, aggregate operations, freeze, phi) and unused loads
+that read a `.param` slot within its size (directly or at a constant
+offset; they cannot be UB), then slots that are only stored to. It also
+forwards a call-site return slot's single store to its same-size loads in
+the same block (as a bitcast; `mem2reg` cannot when the types differ).
+Other loads, divisions and calls are never removed, so out-of-bounds
+`.param` reads (finding 1) and other target UB are still checked. Alive2's
+assembly mode is very slow on dead reloads of a stored pointer and the
+integer address arithmetic built on them (the lifter tracks pointer
+provenance separately). Regression re-runs of every counterexample, every
+timeout and 300 sampled proofs lost no proof and kept every `.param`
+counterexample; 32 former timeouts now prove.
 
 ## Coverage limits
 

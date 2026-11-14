@@ -13,6 +13,7 @@ Writes one JSON object per function to --out (default: stdout).
 import argparse
 import json
 import os
+import collections
 import re
 import shlex
 import subprocess
@@ -1047,30 +1048,50 @@ _TBYTES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16, "ptr": 8, "half": 
 
 
 def drop_dead_param_loads(text):
-    """Remove unused loads that read a `%param.N` slot (an alloca of the
-    lifted `.param` space) at offset 0 within its size, then slots that are
-    only stored to.  Such loads cannot be UB and have no effect; out-of-
-    bounds .param reads (finding 1) are not of this form and are kept.
-    Alive2's asm mode is slow on dead reloads of a stored pointer."""
+    """Remove dead code that cannot affect the check from the lifted target:
+    unused side-effect-free, non-trapping instructions (casts, shifts,
+    arithmetic other than division, compares, selects, GEPs, aggregate
+    operations, freeze, phi), and unused loads that read a `%param.N` slot
+    (an alloca of the lifted `.param` space) within its size, directly or
+    at a constant offset; then slots that are only stored to.  Such loads
+    cannot be UB; out-of-bounds .param reads (finding 1) are kept, as are
+    all other loads, divisions and calls.  Alive2's asm mode is slow on dead
+    reloads of a stored pointer and the integer address arithmetic built on
+    them (the lifter tracks pointer provenance separately)."""
     text = _forward_cs_slots(text)
     sizes = {m.group(1): int(m.group(2)) for m in
              re.finditer(r"^\s*(%param\.\d+) = alloca \[(\d+) x i8\]", text, re.M)}
-    if not sizes:
-        return text
     lines = text.split("\n")
+    pure = re.compile(r"\s*(%[\w.]+) = (?:add|sub|mul|shl|lshr|ashr|and|or|xor|trunc|zext|sext|"
+                      r"bitcast|ptrtoint|inttoptr|icmp|select|getelementptr|extractvalue|"
+                      r"insertvalue|extractelement|insertelement|shufflevector|freeze|phi)\b")
+    geps = {}
+    for l in lines:
+        m = re.match(r"\s*(%[\w.]+) = getelementptr (?:inbounds )?i8, ptr (%param\.\d+), i64 (\d+)\s*$", l)
+        if m and m.group(2) in sizes:
+            geps[m.group(1)] = (m.group(2), int(m.group(3)))
     changed = True
     while changed:
         changed = False
-        body = "\n".join(lines)
+        body = "\n".join(l for l in lines if l is not None)
+        counts = collections.Counter(re.findall(r"%[\w.]+", body))
         for k, l in enumerate(lines):
-            m = re.match(r"\s*(%[\w.]+) = load (\w+), ptr (%param\.\d+)(?:, align \d+)?\s*$", l)
-            if not m or m.group(3) not in sizes or _TBYTES.get(m.group(2), 99) > sizes[m.group(3)]:
+            if l is None:
                 continue
-            if len(re.findall(re.escape(m.group(1)) + r"\b", body)) == 1:
+            m = pure.match(l)
+            dst = m.group(1) if m else None
+            if not m:
+                m = re.match(r"\s*(%[\w.]+) = load (\w+), ptr (%[\w.]+)(?:, align \d+)?\s*$", l)
+                if not m:
+                    continue
+                slot, off = (m.group(3), 0) if m.group(3) in sizes else geps.get(m.group(3), (None, 0))
+                if slot is None or off + _TBYTES.get(m.group(2), 1 << 30) > sizes[slot]:
+                    continue
+                dst = m.group(1)
+            if counts[dst] == 1:
                 lines[k] = None
                 changed = True
         lines = [l for l in lines if l is not None]
-    body = "\n".join(lines)
     for p in sizes:
         uses = [l for l in lines if re.search(re.escape(p) + r"\b", l)]
         defs = [l for l in uses if re.match(r"\s*" + re.escape(p) + r" = alloca", l)]
