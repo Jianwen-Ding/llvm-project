@@ -147,6 +147,8 @@ void AGXDAGToDAGISel::Select(SDNode *N) {
       case Intrinsic::agx_quad_shuffle_xor:
       case Intrinsic::agx_quad_shuffle_up:
       case Intrinsic::agx_quad_shuffle_down:
+      case Intrinsic::agx_simd_shuffle_rotate_up:
+      case Intrinsic::agx_quad_shuffle_rotate_up:
       case Intrinsic::agx_simd_ballot:
       case Intrinsic::agx_quad_ballot:
       case Intrinsic::agx_simd_reduce:

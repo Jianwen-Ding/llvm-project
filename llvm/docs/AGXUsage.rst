@@ -1037,7 +1037,17 @@ SIMD-group shuffles
 SIMD-group and ``llvm.agx.quad.shuffle(v, i)`` of thread ``i`` of the quad.
 The ``xor``, ``up`` and ``down`` variants read the thread at the current
 thread index xor, minus or plus ``i``; with ``up`` and ``down``, threads whose
-source is outside the SIMD-group (or quad) keep their own value.
+source is outside the SIMD-group (or quad) keep their own value. The
+``rotate.up`` variants read the thread at the current index minus ``i``
+modulo 32 (or 4).
+
+Before instruction selection, a tree of shuffles of one value (by constants,
+or by an index computed from the thread's index in the SIMD-group) and
+selects of them on conditions of that index is replaced by a single shuffle
+when, at each of the 32 lanes, the tree reads the same lane as that shuffle
+and the shuffle issues in fewer cycles: ``gpu.rotate``'s shuffle down, up and
+select become the rotate, an index shuffle of ``(lane + c) & 31`` the
+rotate, and one of ``lane ^ 1`` the quad xor.
 
 On G13 to G15 (``quad-shuffle-index-merge``) the shuffle instructions read
 the index of all four threads of a quad, including inactive threads, and use
@@ -1131,7 +1141,8 @@ Calls to AIR functions become LLVM intrinsics and instructions:
   ``air.simdgroup.barrier`` a workgroup-scope fence (SIMD-groups run in
   lockstep);
 * the SIMD-group and quad-group functions are AGX's: shuffles (and
-  ``broadcast``), ``shuffle_and_fill_up``/``down``, reductions and scans by
+  ``broadcast``), ``shuffle_rotate_up``/``down`` (down as up by the negated
+  delta), ``shuffle_and_fill_up``/``down``, reductions and scans by
   ``AGX::SIMDOp`` (an inclusive scan adds the element to the hardware's
   exclusive one), ballots widened to AIR's mask type, and ``vote_any`` /
   ``vote_all`` on the mask;

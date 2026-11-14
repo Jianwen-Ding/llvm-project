@@ -835,6 +835,18 @@ bool LowerAIR::lowerSIMD(IRBuilder<> &B, CallInst &CI, StringRef Name,
     Result = B.CreateIntrinsic(Shuffle, {Ty}, {CI.getArgOperand(0), Lane(1)});
     return true;
   }
+  // Rotates: lane i reads lane (i - delta) mod n (up) or (i + delta) mod n
+  // (down, the rotate up by n - delta).
+  if ((Op == "shuffle_rotate_up" || Op == "shuffle_rotate_down") &&
+      CI.arg_size() == 2) {
+    Value *Delta = Lane(1);
+    if (Op == "shuffle_rotate_down")
+      Delta = B.CreateAnd(B.CreateSub(B.getInt32(0), Delta), Quad ? 3 : 31);
+    Result = B.CreateIntrinsic(
+        Quad ? agx_quad_shuffle_rotate_up : agx_simd_shuffle_rotate_up, {Ty},
+        {CI.getArgOperand(0), Delta});
+    return true;
+  }
   if (Op == "broadcast_first" && CI.arg_size() == 1) {
     Value *First = B.CreateIntrinsic(Intrinsic::cttz, {B.getInt32Ty()},
                                      {Active(), B.getFalse()});

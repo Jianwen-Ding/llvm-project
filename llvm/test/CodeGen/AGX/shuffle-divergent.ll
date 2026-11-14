@@ -1,9 +1,10 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g13g -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g13g -verify-machineinstrs -agx-lane-permutations=0 < %s | FileCheck %s
 
 ; simd_shuffle ORs the low two index bits of the threads of each quad, and
 ; reads the index of inactive threads too. Divergent indices are split into
 ; the four quad positions, and register indices are passed in r0h, which is
-; zero whenever no shuffle is executing.
+; zero whenever no shuffle is executing. (Indices that are one shuffle's
+; source lanes become that shuffle, lane-permutations.ll; not here.)
 
 declare i32 @llvm.agx.thread.index.in.simdgroup()
 declare float @llvm.agx.simd.shuffle.f32(float, i32)
@@ -73,7 +74,7 @@ define agx_kernel void @relative(ptr addrspace(1) %out, float %x) {
 }
 
 ; Without the merge, divergent indices are used directly.
-; RUN: llc -mtriple=agx -mcpu=agx-g13g -mattr=-quad-shuffle-index-merge < %s | FileCheck %s --check-prefix=NOMERGE
+; RUN: llc -mtriple=agx -mcpu=agx-g13g -mattr=-quad-shuffle-index-merge -agx-lane-permutations=0 < %s | FileCheck %s --check-prefix=NOMERGE
 ; NOMERGE-LABEL: divergent:
 ; NOMERGE-COUNT-1: simd_shuffle
 ; NOMERGE-NOT:   simd_shuffle

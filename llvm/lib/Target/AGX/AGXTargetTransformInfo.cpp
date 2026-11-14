@@ -169,6 +169,8 @@ static bool isThreadVaryingIntrinsic(Intrinsic::ID ID) {
   case Intrinsic::agx_quad_shuffle_xor:
   case Intrinsic::agx_quad_shuffle_up:
   case Intrinsic::agx_quad_shuffle_down:
+  case Intrinsic::agx_simd_shuffle_rotate_up:
+  case Intrinsic::agx_quad_shuffle_rotate_up:
   case Intrinsic::agx_simd_prefix:
   case Intrinsic::agx_quad_prefix:
   case Intrinsic::agx_quad_reduce:
@@ -230,6 +232,8 @@ AGXTTIImpl::instCombineIntrinsic(InstCombiner &IC, IntrinsicInst &II) const {
   case Intrinsic::agx_quad_shuffle_xor:
   case Intrinsic::agx_quad_shuffle_up:
   case Intrinsic::agx_quad_shuffle_down:
+  case Intrinsic::agx_simd_shuffle_rotate_up:
+  case Intrinsic::agx_quad_shuffle_rotate_up:
     if (isa<Constant>(II.getArgOperand(0)))
       return IC.replaceInstUsesWith(II, II.getArgOperand(0));
     break;

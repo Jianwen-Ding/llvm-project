@@ -142,6 +142,9 @@ def int_agx_quad_shuffle : AGXSIMDShuffleIntrinsic;
 def int_agx_quad_shuffle_xor : AGXSIMDShuffleIntrinsic;
 def int_agx_quad_shuffle_up : AGXSIMDShuffleIntrinsic;
 def int_agx_quad_shuffle_down : AGXSIMDShuffleIntrinsic;
+// lane i reads lane (i - delta) mod 32 (mod 4 within the quad)
+def int_agx_simd_shuffle_rotate_up : AGXSIMDShuffleIntrinsic;
+def int_agx_quad_shuffle_rotate_up : AGXSIMDShuffleIntrinsic;
 
 class AGXBallotIntrinsic
     : DefaultAttrsIntrinsic<[llvm_i32_ty], [llvm_i1_ty],

@@ -2347,6 +2347,8 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
     case Intrinsic::agx_quad_shuffle_xor:
     case Intrinsic::agx_quad_shuffle_up:
     case Intrinsic::agx_quad_shuffle_down:
+    case Intrinsic::agx_simd_shuffle_rotate_up:
+    case Intrinsic::agx_quad_shuffle_rotate_up:
       if (!isa<Constant>(II->getArgOperand(1)))
         Worklist.push_back(II);
       break;
@@ -2388,7 +2390,8 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
     bool Quad = ID == Intrinsic::agx_quad_shuffle ||
                 ID == Intrinsic::agx_quad_shuffle_xor ||
                 ID == Intrinsic::agx_quad_shuffle_up ||
-                ID == Intrinsic::agx_quad_shuffle_down;
+                ID == Intrinsic::agx_quad_shuffle_down ||
+                ID == Intrinsic::agx_quad_shuffle_rotate_up;
     unsigned Size = Quad ? 4 : 32;
 
     // The thread to read, relative to the start of the quad for quad
@@ -2414,6 +2417,10 @@ bool AGXCodeGenPrepare::lowerDivergentShuffles(Function &F,
       Idx = B.CreateSelect(
           B.CreateICmpULT(Idx, B.CreateSub(B.getInt32(Size), Lane)),
           B.CreateAdd(Lane, Idx), Lane);
+      break;
+    case Intrinsic::agx_simd_shuffle_rotate_up:
+    case Intrinsic::agx_quad_shuffle_rotate_up:
+      Idx = B.CreateAnd(B.CreateSub(Lane, Idx), Size - 1);
       break;
     default:
       break;
@@ -3582,10 +3589,11 @@ static cl::opt<bool> AGXQuadShifts(
     cl::desc("a SIMD-group shift by a constant within segments of 2 or 4 "
              "lanes as the quad-group's"));
 
-/// The value of a condition of the SIMD lane alone at each of the 32 lanes
-/// (bit L: at lane L), through the constant folding of its instructions, or
-/// none where it reads anything else.
-static std::optional<uint32_t> laneTruth(Value *Cond, const DataLayout &DL) {
+/// The values of an integer expression of the SIMD lane alone at each of the
+/// 32 lanes, through the constant folding of its instructions, or none where
+/// it reads anything else.
+static std::optional<std::array<uint64_t, 32>>
+laneValues(Value *V, const DataLayout &DL) {
   using namespace PatternMatch;
   std::function<Constant *(Value *, unsigned, unsigned)> Eval =
       [&](Value *V, unsigned L, unsigned Depth) -> Constant * {
@@ -3606,14 +3614,26 @@ static std::optional<uint32_t> laneTruth(Value *Cond, const DataLayout &DL) {
     }
     return ConstantFoldInstOperands(I, Ops, DL);
   };
-  uint32_t Mask = 0;
+  std::array<uint64_t, 32> Values;
   for (unsigned L = 0; L < 32; ++L) {
-    auto *C = dyn_cast_or_null<ConstantInt>(Eval(Cond, L, 0));
-    if (!C)
+    auto *C = dyn_cast_or_null<ConstantInt>(Eval(V, L, 0));
+    if (!C || C->getBitWidth() > 64)
       return std::nullopt;
-    if (C->isOne())
-      Mask |= 1u << L;
+    Values[L] = C->getZExtValue();
   }
+  return Values;
+}
+
+/// The value of a condition of the SIMD lane alone at each of the 32 lanes
+/// (bit L: at lane L), or none.
+static std::optional<uint32_t> laneTruth(Value *Cond, const DataLayout &DL) {
+  std::optional<std::array<uint64_t, 32>> Values = laneValues(Cond, DL);
+  if (!Values)
+    return std::nullopt;
+  uint32_t Mask = 0;
+  for (unsigned L = 0; L < 32; ++L)
+    if ((*Values)[L] & 1)
+      Mask |= 1u << L;
   return Mask;
 }
 
@@ -3702,6 +3722,305 @@ static bool quadShifts(Function &F) {
       Sel->replaceAllUsesWith(V);
       Sel->eraseFromParent();
     }
+    Changed = true;
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXLanePermutations(
+    "agx-lane-permutations", cl::init(true), cl::Hidden,
+    cl::desc("a tree of shuffles of one value and selects on the lane as "
+             "the one shuffle whose source lanes it reads"));
+
+namespace {
+/// The source lane of each of the 32 lanes.
+using LaneTable = std::array<uint8_t, 32>;
+
+/// The shuffles of a value by a constant (or, for an index shuffle, an index
+/// of the lane), and the selects of them on conditions of the lane, as the
+/// lane each lane reads (L15-E307).
+struct LanePermutation {
+  const DataLayout &DL;
+  Value *Arg = nullptr;      // the shuffled value
+  Type *RootTy = nullptr;    // the selects' type
+  SmallVector<std::pair<unsigned, Type *>, 2> Chain; // the shuffles' casts
+  bool HasChain = false;
+  unsigned Cost = 0; // shuffles' issue (a SIMD-group's 2, a quad's 1) and
+                     // selects
+  SmallVector<Instruction *, 8> Nodes;
+
+  explicit LanePermutation(const DataLayout &DL) : DL(DL) {}
+
+  static bool isShuffle(Intrinsic::ID ID) {
+    switch (ID) {
+    case Intrinsic::agx_simd_shuffle:
+    case Intrinsic::agx_simd_shuffle_xor:
+    case Intrinsic::agx_simd_shuffle_up:
+    case Intrinsic::agx_simd_shuffle_down:
+    case Intrinsic::agx_simd_shuffle_rotate_up:
+    case Intrinsic::agx_quad_shuffle:
+    case Intrinsic::agx_quad_shuffle_xor:
+    case Intrinsic::agx_quad_shuffle_up:
+    case Intrinsic::agx_quad_shuffle_down:
+    case Intrinsic::agx_quad_shuffle_rotate_up:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  /// The lane read at lane L by shuffle ID with index K.
+  static unsigned source(Intrinsic::ID ID, unsigned L, uint64_t K) {
+    unsigned Q = L & ~3u, I = L & 3;
+    switch (ID) {
+    case Intrinsic::agx_simd_shuffle:
+      return K;
+    case Intrinsic::agx_simd_shuffle_xor:
+      return (L ^ K) < 32 ? L ^ K : L;
+    case Intrinsic::agx_simd_shuffle_up:
+      return L >= K ? L - K : L;
+    case Intrinsic::agx_simd_shuffle_down:
+      return L + K < 32 ? L + K : L;
+    case Intrinsic::agx_simd_shuffle_rotate_up:
+      return (L - K) & 31;
+    case Intrinsic::agx_quad_shuffle:
+      return K < 4 ? Q | K : L;
+    case Intrinsic::agx_quad_shuffle_xor:
+      return (I ^ K) < 4 ? Q | (I ^ K) : L;
+    case Intrinsic::agx_quad_shuffle_up:
+      return I >= K ? L - K : L;
+    case Intrinsic::agx_quad_shuffle_down:
+      return I + K < 4 ? L + K : L;
+    case Intrinsic::agx_quad_shuffle_rotate_up:
+      return Q | ((I - K) & 3);
+    default:
+      llvm_unreachable("not a shuffle");
+    }
+  }
+
+  static bool isQuad(Intrinsic::ID ID) {
+    return ID == Intrinsic::agx_quad_shuffle ||
+           ID == Intrinsic::agx_quad_shuffle_xor ||
+           ID == Intrinsic::agx_quad_shuffle_up ||
+           ID == Intrinsic::agx_quad_shuffle_down ||
+           ID == Intrinsic::agx_quad_shuffle_rotate_up;
+  }
+
+  /// The table of V, a node of the tree (its only use the tree's unless it
+  /// is the root).
+  /// The value the tree shuffles: its first shuffle's.
+  static Value *shuffled(Value *V, unsigned Depth = 0) {
+    if (Depth > 8)
+      return nullptr;
+    if (auto *Sel = dyn_cast<SelectInst>(V)) {
+      if (Value *A = shuffled(Sel->getTrueValue(), Depth + 1))
+        return A;
+      return shuffled(Sel->getFalseValue(), Depth + 1);
+    }
+    while (isa<BitCastInst, TruncInst>(V))
+      V = cast<Instruction>(V)->getOperand(0);
+    auto *Sh = dyn_cast<IntrinsicInst>(V);
+    if (!Sh || !isShuffle(Sh->getIntrinsicID()))
+      return nullptr;
+    return Sh->getArgOperand(0);
+  }
+
+  std::optional<LaneTable> table(Value *V, bool Root, BasicBlock *BB,
+                                 unsigned Depth = 0) {
+    if ((!Root && !V->hasOneUse()) || Depth > 8)
+      return std::nullopt;
+    // (all in the root's block: the lanes the shuffles read are active)
+    auto InBlock = [&](Value *X) {
+      auto *I = dyn_cast<Instruction>(X);
+      return I && I->getParent() == BB;
+    };
+    if (auto *Sel = dyn_cast<SelectInst>(V)) {
+      if (Sel->getType() != RootTy)
+        return std::nullopt;
+      std::optional<uint32_t> T = laneTruth(Sel->getCondition(), DL);
+      if (!T)
+        return std::nullopt;
+      if (!InBlock(Sel))
+        return std::nullopt;
+      std::optional<LaneTable> A =
+          table(Sel->getTrueValue(), false, BB, Depth + 1);
+      if (!A)
+        return std::nullopt;
+      std::optional<LaneTable> B =
+          table(Sel->getFalseValue(), false, BB, Depth + 1);
+      if (!B)
+        return std::nullopt;
+      LaneTable R;
+      for (unsigned L = 0; L < 32; ++L)
+        R[L] = (*T >> L) & 1 ? (*A)[L] : (*B)[L];
+      Nodes.push_back(Sel);
+      Cost += 1;
+      return R;
+    }
+    // a shuffle through its casts
+    SmallVector<std::pair<unsigned, Type *>, 2> Casts;
+    SmallVector<Instruction *, 2> CastInsts;
+    Value *P = V;
+    while (isa<BitCastInst, TruncInst>(P)) {
+      auto *CI = cast<Instruction>(P);
+      if (!InBlock(CI))
+        return std::nullopt;
+      Casts.push_back({CI->getOpcode(), CI->getType()});
+      CastInsts.push_back(CI);
+      P = CI->getOperand(0);
+      if (!P->hasOneUse())
+        return std::nullopt;
+    }
+    auto *Sh = dyn_cast<IntrinsicInst>(P);
+    if (!Sh || !isShuffle(Sh->getIntrinsicID())) {
+      // the own value: the shuffled value without its widening casts
+      if (Root || !Arg || V->getType() != RootTy)
+        return std::nullopt;
+      Value *A = Arg;
+      while (isa<BitCastInst, ZExtInst, SExtInst>(A) && A != V)
+        A = cast<Instruction>(A)->getOperand(0);
+      if (A != V)
+        return std::nullopt;
+      LaneTable R;
+      for (unsigned L = 0; L < 32; ++L)
+        R[L] = L;
+      return R;
+    }
+    std::reverse(Casts.begin(), Casts.end());
+    if (Sh->getArgOperand(0) != Arg || !InBlock(Sh))
+      return std::nullopt;
+    if (!HasChain) {
+      Chain = Casts;
+      HasChain = true;
+    } else if (Chain != Casts) {
+      return std::nullopt;
+    }
+    Intrinsic::ID ID = Sh->getIntrinsicID();
+    Value *Idx = Sh->getArgOperand(1);
+    LaneTable R;
+    if (auto *C = dyn_cast<ConstantInt>(Idx)) {
+      uint64_t K = C->getZExtValue();
+      if (K >= 32)
+        return std::nullopt;
+      for (unsigned L = 0; L < 32; ++L)
+        R[L] = source(ID, L, K);
+      Cost += isQuad(ID) ? 1 : 2;
+    } else if (ID == Intrinsic::agx_simd_shuffle ||
+               ID == Intrinsic::agx_quad_shuffle) {
+      // an index of the lane: a shuffle per position in the quad
+      std::optional<std::array<uint64_t, 32>> K = laneValues(Idx, DL);
+      if (!K)
+        return std::nullopt;
+      for (unsigned L = 0; L < 32; ++L) {
+        if ((*K)[L] >= 32)
+          return std::nullopt;
+        R[L] = source(ID, L, (*K)[L]);
+      }
+      Cost += isQuad(ID) ? 4 : 8;
+    } else {
+      return std::nullopt;
+    }
+    Nodes.push_back(Sh);
+    Nodes.append(CastInsts.begin(), CastInsts.end());
+    return R;
+  }
+};
+} // namespace
+
+/// A tree of shuffles of one value (by constants, or by an index of the
+/// lane) and selects of them on conditions of the lane reads, at each lane,
+/// a lane of the value given by a table of the 32 lanes. Where that table
+/// is one shuffle's (a quad-group's first: xor, shifts, rotate, a lane of
+/// the quad; then the SIMD-group's: a lane, xor, shifts, rotate) and the
+/// shuffle issues in fewer cycles than the tree, the tree is that shuffle:
+/// gpu.rotate's shuffle down and up and their select (L15-E298) are the
+/// SIMD-group or quad-group rotate, an index shuffle of (lane + c) & 31 the
+/// rotate, an index shuffle of lane ^ 1 the quad xor (L15-E307).
+static bool lanePermutations(Function &F) {
+  if (!AGXLanePermutations)
+    return false;
+  const DataLayout &DL = F.getDataLayout();
+  SmallVector<WeakTrackingVH, 16> Roots;
+  for (Instruction &I : instructions(F)) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (isa<SelectInst>(I) ||
+        (II && LanePermutation::isShuffle(II->getIntrinsicID())))
+      Roots.push_back(&I);
+  }
+  bool Changed = false;
+  // (the outermost first)
+  for (WeakTrackingVH &H : reverse(Roots)) {
+    auto *Root = dyn_cast_or_null<Instruction>(H);
+    if (!Root)
+      continue;
+    LanePermutation P(DL);
+    P.RootTy = Root->getType();
+    P.Arg = LanePermutation::shuffled(Root);
+    if (!P.Arg)
+      continue;
+    Type *Ty = P.Arg->getType();
+    if (Ty->isVectorTy() || (Ty->getPrimitiveSizeInBits() != 16 &&
+                             Ty->getPrimitiveSizeInBits() != 32))
+      continue;
+    std::optional<LaneTable> T = P.table(Root, true, Root->getParent());
+    if (!T)
+      continue;
+    // (one shuffle by a constant is quadXorShuffles' and quadShifts', but
+    // for one that reads the own lane)
+    auto *First = dyn_cast<IntrinsicInst>(P.Nodes.front());
+    bool Lone = P.Nodes.size() == P.Chain.size() + 1 && First &&
+                isa<ConstantInt>(First->getArgOperand(1));
+    // (the shuffle's casts lead to the root's type)
+    Type *OutTy = P.Chain.empty() ? Ty : P.Chain.back().second;
+    if (OutTy != Root->getType())
+      continue;
+    // the cheapest one shuffle with this table
+    struct Cand {
+      Intrinsic::ID ID;
+      unsigned K;
+    };
+    SmallVector<Cand, 8> Cands;
+    for (Intrinsic::ID ID :
+         {Intrinsic::agx_quad_shuffle_xor, Intrinsic::agx_quad_shuffle_down,
+          Intrinsic::agx_quad_shuffle_up,
+          Intrinsic::agx_quad_shuffle_rotate_up, Intrinsic::agx_quad_shuffle})
+      for (unsigned K = 0; K < 4; ++K)
+        Cands.push_back({ID, K});
+    for (Intrinsic::ID ID :
+         {Intrinsic::agx_simd_shuffle, Intrinsic::agx_simd_shuffle_xor,
+          Intrinsic::agx_simd_shuffle_down, Intrinsic::agx_simd_shuffle_up,
+          Intrinsic::agx_simd_shuffle_rotate_up})
+      for (unsigned K = 0; K < 32; ++K)
+        Cands.push_back({ID, K});
+    bool Identity = true;
+    for (unsigned L = 0; L < 32; ++L)
+      Identity &= (*T)[L] == L;
+    std::optional<Cand> Found;
+    if (!Identity)
+      for (const Cand &C : Cands) {
+        bool Same = true;
+        for (unsigned L = 0; L < 32 && Same; ++L)
+          Same = LanePermutation::source(C.ID, L, C.K) == (*T)[L];
+        if (Same) {
+          Found = C;
+          break;
+        }
+      }
+    if ((!Identity && !Found) || (Lone && !Identity))
+      continue;
+    unsigned NewCost =
+        Identity ? 0 : (LanePermutation::isQuad(Found->ID) ? 1 : 2);
+    if (NewCost >= P.Cost)
+      continue;
+    IRBuilder<> B(Root);
+    Value *New = P.Arg;
+    if (!Identity)
+      New = B.CreateIntrinsic(Found->ID, {Ty}, {P.Arg, B.getInt32(Found->K)});
+    for (auto [Op, CastTy] : P.Chain)
+      New = B.CreateCast(Instruction::CastOps(Op), New, CastTy);
+    New->takeName(Root);
+    Root->replaceAllUsesWith(New);
+    RecursivelyDeleteTriviallyDeadInstructions(Root);
     Changed = true;
   }
   return Changed;
@@ -4302,6 +4621,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= forwardOwnSlots(F);
   Changed |= strideDivisions(F);
   Changed |= lowerMatrixFMA(F, ST);
+  Changed |= lanePermutations(F);
   if (ST.hasQuadShuffleIndexMerge())
     Changed |= lowerDivergentShuffles(F, TTI);
   Changed |= combineUniformAtomics(F, TTI);

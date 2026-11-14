@@ -2210,6 +2210,10 @@ defm QUAD_SHUFFLE : ShufflePseudo<QUAD_SHUFFLE_g13, int_agx_quad_shuffle>;
 defm QUAD_SHUFFLE_XOR : ShufflePseudo<QUAD_SHUFFLE_XOR_g13, int_agx_quad_shuffle_xor>;
 defm QUAD_SHUFFLE_UP : ShufflePseudo<QUAD_SHUFFLE_UP_g13, int_agx_quad_shuffle_up>;
 defm QUAD_SHUFFLE_DOWN : ShufflePseudo<QUAD_SHUFFLE_DOWN_g13, int_agx_quad_shuffle_down>;
+defm SIMD_SHUFFLE_ROTATE_UP : ShufflePseudo<SIMD_SHUFFLE_ROTATE_UP_g13,
+                                           int_agx_simd_shuffle_rotate_up>;
+defm QUAD_SHUFFLE_ROTATE_UP : ShufflePseudo<QUAD_SHUFFLE_ROTATE_UP_g13,
+                                           int_agx_quad_shuffle_rotate_up>;
 
 let isConvergent = 1 in {
 def ICMP_BALLOT : AGXALUPseudo<ICMP_BALLOT_g13, (outs GPR32:$dst),
