@@ -1812,8 +1812,12 @@ static bool keepsLanesFrom(Value *Cond, bool ShuffleOnTrue, uint64_t D) {
   }
 }
 
+// Off by default: a simd reduction is 22.9 cycles of latency and of issue
+// interval (instruction-bench), the butterfly about 34 and 13 to 19; with
+// many SIMD-groups resident (agx-bench tput) the butterfly is as fast or
+// faster in every measured form (L15-E364).
 static cl::opt<bool> AGXSIMDReductions(
-    "agx-simd-reductions", cl::init(true), cl::Hidden,
+    "agx-simd-reductions", cl::init(false), cl::Hidden,
     cl::desc("A SIMD-group's xor-butterfly reduction (shuffles xor 1, 2, 4, "
              "8 and 16) as one simd reduction"));
 
@@ -1829,7 +1833,15 @@ static cl::opt<bool> AGXSIMDReductions(
 /// tree; the coverage recordings simd_fadd fail with the halves-first tree),
 /// rounding each step like fadd / fmul and flushing fp32 denormals like
 /// them; not with IEEE fp32 denormals in software, half denormal flushing or
-/// canonical NaNs (L15-E363). A shuffle from an inactive lane is undefined
+/// canonical NaNs (L15-E363). The halves-first order, d = 16, 8, 4, 2, 1,
+/// is that tree over the lanes in bit-reversed order (its level l joins the
+/// lanes whose low 5 - l index bits agree, which are the neighbours-first
+/// blocks of lanes bitreverse5(i)). The reversal swaps lane bits 0 and 4,
+/// and 1 and 3: y = bit 0 != bit 4 ? shuffle_xor(x, 17) : x, then the same
+/// with bits 1 and 3 and 10, and the reduction of y, five instructions for
+/// ten (one shuffle at the reversed index would read all four threads of a
+/// quad, which the quad index merge does not allow). A shuffle
+/// from an inactive lane is undefined
 /// (as in simdScans), so where some lanes are inactive the reduction of the
 /// active ones is one of the original's results.
 bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
@@ -1847,8 +1859,9 @@ bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
       return BC->getOperand(0);
     return V;
   };
-  // The step v' = op(v, shuffle_xor(v, d)): its op code, v and d.
-  auto Step = [&](Value *V, int &Op, Value *&Prev, unsigned &D) {
+  // The step v' = op(v, shuffle_xor(v, d)): its op code, v, d and shuffle.
+  auto Step = [&](Value *V, int &Op, Value *&Prev, unsigned &D,
+                  Instruction *&Shuffle) {
     auto *I = dyn_cast<Instruction>(V);
     if (!I)
       return false;
@@ -1908,50 +1921,81 @@ bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
       Op = O;
       Prev = A;
       D = Dist;
+      Shuffle = Sh;
       return true;
     }
     return false;
   };
   // Value handles: a replaced chain's dead steps may be another chain's
   // top or base (a longer butterfly), which is then skipped.
-  SmallVector<std::tuple<WeakVH, WeakVH, int>, 4> Found;
+  // The reduction goes after the last shuffle, which the active threads of
+  // the butterfly execute (the last op may have been sunk into a branch,
+  // e.g. under thread 0's atomic); all its shuffles are in that block.
+  SmallVector<std::tuple<WeakVH, WeakVH, int, bool, WeakVH>, 4> Found;
   for (Instruction &I : instructions(F)) {
     int Op = -1, StepOp;
     unsigned Seen = 0, D;
     Value *V = &I, *Prev;
-    Instruction *Bottom = nullptr;
-    // From the top: the hardware's float order is d = 16, 8, 4, 2, 1 here.
-    bool Ordered = true;
+    Instruction *Bottom = nullptr, *Sh, *Top = nullptr;
+    bool OneBlock = true;
+    // From the top: the hardware's float order is d = 16, 8, 4, 2, 1 here,
+    // the bit-reversed one d = 1, 2, 4, 8, 16.
+    bool Ordered = true, Reversed = true;
     int N = 0;
-    for (; N < 5 && Step(V, StepOp, Prev, D); ++N) {
+    for (; N < 5 && Step(V, StepOp, Prev, D, Sh); ++N) {
       if ((Op != -1 && StepOp != Op) || (Seen & D))
         break;
+      if (!Top)
+        Top = Sh;
+      OneBlock &= Sh->getParent() == Top->getParent();
       Ordered &= D == (16u >> N);
+      Reversed &= D == (1u << N);
       Op = StepOp;
       Seen |= D;
       Bottom = cast<Instruction>(V);
       V = Prev;
     }
-    if (N != 5 || Seen != 31)
+    if (N != 5 || Seen != 31 || !OneBlock)
       continue;
+    bool Permute = false;
     if (I.getType()->isFloatingPointTy()) {
-      if (!Ordered)
+      if (!Ordered && !Reversed)
         continue;
+      Permute = !Ordered;
       // A multiply the first add could fuse with: the old code may differ.
       if (Op == 1 && Bottom->hasAllowContract() && isa<FPMathOperator>(V) &&
           cast<Operator>(V)->getOpcode() == Instruction::FMul)
         continue;
     }
-    Found.push_back({&I, V, Op});
+    Found.push_back({&I, V, Op, Permute, Top});
   }
   bool Changed = false;
-  for (auto &[IH, XH, Op] : Found) {
+  Value *Swap04 = nullptr, *Swap13 = nullptr;
+  for (auto &[IH, XH, Op, Permute, TopH] : Found) {
     auto *I = dyn_cast_or_null<Instruction>(IH);
+    auto *Top = dyn_cast_or_null<Instruction>(TopH);
     Value *X = XH;
-    if (!I || !X)
+    if (!I || !X || !Top)
       continue;
     Changed = true;
-    IRBuilder<> B(I);
+    if (Permute && !Swap04) {
+      // Whether the thread's bits 0 and 4 (1 and 3) differ.
+      IRBuilder<> E(&*F.getEntryBlock().getFirstInsertionPt());
+      Value *Lane = E.CreateIntrinsic(Intrinsic::agx_thread_index_in_simdgroup,
+                                      ArrayRef<Type *>(), ArrayRef<Value *>());
+      Value *Mix = E.CreateXor(Lane, E.CreateLShr(Lane, 4));
+      Swap04 = E.CreateICmpNE(E.CreateAnd(Mix, 1), E.getInt32(0));
+      Value *Mix2 = E.CreateXor(Lane, E.CreateLShr(Lane, 2));
+      Swap13 = E.CreateICmpNE(E.CreateAnd(Mix2, 2), E.getInt32(0));
+    }
+    IRBuilder<> B(Top->getNextNode());
+    if (Permute)
+      for (auto [Swap, K] : {std::pair(Swap04, 17), std::pair(Swap13, 10)})
+        X = B.CreateSelect(
+            Swap,
+            B.CreateIntrinsic(Intrinsic::agx_simd_shuffle_xor, {X->getType()},
+                              {X, B.getInt32(K)}),
+            X);
     Value *R = B.CreateIntrinsic(Intrinsic::agx_simd_reduce, {X->getType()},
                                  {X, B.getInt32(Op)});
     R->takeName(I);
