@@ -2021,7 +2021,10 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
   // branch (e.g. under the last thread's store of the SIMD-group's total),
   // where a prefix would see only that branch's threads. All five shuffles
   // are in one block.
-  SmallVector<std::tuple<Instruction *, Value *, Instruction *>, 4> Scans;
+  // (value handles that follow replacement: a scan of another scan's result
+  // has that result as its base, which the first replacement replaces)
+  SmallVector<std::tuple<WeakTrackingVH, WeakTrackingVH, WeakTrackingVH>, 4>
+      Scans;
   for (Instruction &I : instructions(F)) {
     if (I.getOpcode() != Instruction::Add || !I.getType()->isIntegerTy(32))
       continue;
@@ -2066,7 +2069,14 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
     if (Ok)
       Scans.push_back({&I, X, Top});
   }
-  for (auto [End, V, Top] : Scans) {
+  bool Changed = false;
+  for (auto &[EndH, VH, TopH] : Scans) {
+    auto *End = dyn_cast_or_null<Instruction>(EndH);
+    auto *Top = dyn_cast_or_null<Instruction>(TopH);
+    Value *V = VH;
+    if (!End || !Top || !V)
+      continue;
+    Changed = true;
     IRBuilder<> B(Top->getNextNode());
     Value *Prefix = B.CreateIntrinsic(Intrinsic::agx_simd_prefix,
                                       {V->getType()},
@@ -2074,7 +2084,7 @@ bool AGXCodeGenPrepare::simdScans(Function &F, const AGXSubtarget &ST) {
     End->replaceAllUsesWith(B.CreateAdd(Prefix, V));
     RecursivelyDeleteTriviallyDeadInstructions(End);
   }
-  return !Scans.empty();
+  return Changed;
 }
 
 static cl::opt<unsigned> AGXMergeLoopExits(

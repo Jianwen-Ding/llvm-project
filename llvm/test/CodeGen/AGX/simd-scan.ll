@@ -143,3 +143,57 @@ st:
 done:
   ret void
 }
+
+; A scan of a scan: the second's base is the first's last add, which the
+; first replacement replaces (the second used it after it was deleted, an add
+; of itself; found by a SIMD-group fuzz, L15-E380).
+; CHECK-LABEL: scan_of_scan:
+; CHECK: simd_prefix_iadd
+; CHECK: simd_prefix_iadd
+; CHECK: stop
+define agx_kernel void @scan_of_scan(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %x = load i32, ptr addrspace(1) %p
+  %as0 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %x, i32 1)
+  %ac0 = icmp uge i32 %lane, 1
+  %az0 = select i1 %ac0, i32 %as0, i32 0
+  %av0 = add i32 %x, %az0
+  %as1 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %av0, i32 2)
+  %ac1 = icmp uge i32 %lane, 2
+  %az1 = select i1 %ac1, i32 %as1, i32 0
+  %av1 = add i32 %av0, %az1
+  %as2 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %av1, i32 4)
+  %ac2 = icmp uge i32 %lane, 4
+  %az2 = select i1 %ac2, i32 %as2, i32 0
+  %av2 = add i32 %av1, %az2
+  %as3 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %av2, i32 8)
+  %ac3 = icmp uge i32 %lane, 8
+  %az3 = select i1 %ac3, i32 %as3, i32 0
+  %av3 = add i32 %av2, %az3
+  %as4 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %av3, i32 16)
+  %ac4 = icmp uge i32 %lane, 16
+  %az4 = select i1 %ac4, i32 %as4, i32 0
+  %av4 = add i32 %av3, %az4
+  %bs0 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %av4, i32 1)
+  %bc0 = icmp uge i32 %lane, 1
+  %bz0 = select i1 %bc0, i32 %bs0, i32 0
+  %bv0 = add i32 %av4, %bz0
+  %bs1 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %bv0, i32 2)
+  %bc1 = icmp uge i32 %lane, 2
+  %bz1 = select i1 %bc1, i32 %bs1, i32 0
+  %bv1 = add i32 %bv0, %bz1
+  %bs2 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %bv1, i32 4)
+  %bc2 = icmp uge i32 %lane, 4
+  %bz2 = select i1 %bc2, i32 %bs2, i32 0
+  %bv2 = add i32 %bv1, %bz2
+  %bs3 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %bv2, i32 8)
+  %bc3 = icmp uge i32 %lane, 8
+  %bz3 = select i1 %bc3, i32 %bs3, i32 0
+  %bv3 = add i32 %bv2, %bz3
+  %bs4 = call i32 @llvm.agx.simd.shuffle.up.i32(i32 %bv3, i32 16)
+  %bc4 = icmp uge i32 %lane, 16
+  %bz4 = select i1 %bc4, i32 %bs4, i32 0
+  %bv4 = add i32 %bv3, %bz4
+  store i32 %bv4, ptr addrspace(1) %o
+  ret void
+}
