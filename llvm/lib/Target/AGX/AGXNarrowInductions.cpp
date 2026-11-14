@@ -663,12 +663,22 @@ static cl::opt<bool> AGXSignedCounterIndices(
              "signed index"));
 
 static cl::opt<bool> AGXIntegerAddressCounters(
-    "agx-integer-address-counters", cl::init(false), cl::Hidden,
+    "agx-integer-address-counters", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter also for i64 addresses (inttoptr users)"));
 static cl::opt<bool> AGXRelativeCounters(
     "agx-relative-counters", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter with the counter less its start, where the "
              "trip count bounds it"));
+static cl::opt<unsigned> AGXCounterBaseOffsets(
+    "agx-counter-base-offsets", cl::init(1), cl::Hidden,
+    cl::desc("pointerFromCounter for an i64 address only where its accesses "
+             "take at most this many constant offsets"));
+static cl::opt<bool> AGXRelativeCounterPhis(
+    "agx-relative-counter-phis", cl::init(true), cl::Hidden,
+    cl::desc("A relative counter as a recurrence of its own"));
+static cl::opt<bool> AGXRelativeCounters32(
+    "agx-relative-counters-32", cl::init(true), cl::Hidden,
+    cl::desc("A relative counter's index up to 2^32 (its unsigned range)"));
 static cl::opt<bool> AGXRuntimeCounterStarts(
     "agx-runtime-counter-starts", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter also for a counter whose start is not a "
@@ -715,6 +725,8 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
   // For an i64: each pointer an access takes, inttoptr(P) or a constant
   // GEP of bytes from it, with its offset (folded into a base of its own).
   SmallVector<std::pair<Instruction *, int64_t>, 4> Ptrs;
+  // the offsets the accesses take
+  SmallSet<int64_t, 4> Offsets;
   for (User *U : P.users()) {
     if (U == Inc)
       continue;
@@ -724,11 +736,15 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
       continue;
     }
     auto *I2P = dyn_cast<IntToPtrInst>(U);
-    if (!I2P || !L.contains(I2P) || I2P->use_empty())
+    // (device accesses: a threadgroup access takes no index register)
+    if (!I2P || !L.contains(I2P) || I2P->use_empty() ||
+        I2P->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
       return false;
     for (User *V : I2P->users()) {
-      if (Access(V, I2P))
+      if (Access(V, I2P)) {
+        Offsets.insert(0);
         continue;
+      }
       auto *G = dyn_cast<GetElementPtrInst>(V);
       const APInt *C;
       if (!G || G->getPointerOperand() != I2P || G->getNumIndices() != 1 ||
@@ -737,9 +753,16 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
           !all_of(G->users(), [&](User *W) { return Access(W, G); }))
         return false;
       Ptrs.push_back({G, C->getSExtValue()});
+      Offsets.insert(C->getSExtValue());
     }
     Ptrs.push_back({I2P, 0});
   }
+  // Each constant offset takes a base register pair of its own (an access
+  // with an index register has no immediate offset): one pointer with
+  // accesses at four offsets (an unrolled loop) kept its pointer and its
+  // immediate offsets, one 64-bit addition against four pairs.
+  if (IsInt && Offsets.size() > AGXCounterBaseOffsets)
+    return false;
   for (PHINode &J : L.getHeader()->phis()) {
     if (!J.getType()->isIntegerTy(32) || J.getNumIncomingValues() != 2)
       continue;
@@ -755,10 +778,16 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     uint64_t AbsT = T->abs().getZExtValue();
     auto *MaxBTC =
         dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
-    bool Bounded = AGXRelativeCounters && MaxBTC &&
-                   MaxBTC->getAPInt().getActiveBits() <= 31 &&
-                   (MaxBTC->getAPInt().getZExtValue() + 1) * AbsT <
-                       (uint64_t(1) << 31);
+    // (j - j0 is zero-extended to the 32-bit unsigned index: exact while
+    // the last iteration's, |t| times the maximum backedge-taken count, is
+    // below 2^32; -agx-relative-counters-32 = 0: below 2^31 after one more.)
+    bool Bounded =
+        AGXRelativeCounters && MaxBTC &&
+        MaxBTC->getAPInt().getActiveBits() <= 32 &&
+        (AGXRelativeCounters32
+             ? MaxBTC->getAPInt().getZExtValue() * AbsT < (uint64_t(1) << 32)
+             : (MaxBTC->getAPInt().getZExtValue() + 1) * AbsT <
+                   (uint64_t(1) << 31));
     bool Relative =
         Bounded && (T->isNegative() ||
                     (!isa<ConstantInt>(J0) && !SE.getUnsignedRange(SE.getSCEV(&J))
@@ -802,7 +831,42 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     Value *P0 = P.getIncomingValueForBlock(Pre);
     IRBuilder<> B(L.getHeader(), L.getHeader()->getFirstInsertionPt());
     Value *Z;
-    if (Relative)
+    if (Relative && AGXRelativeCounterPhis) {
+      // its own recurrence, 0 then +|t| at the latch (not j - j0 before the
+      // accesses, which an access then waits for)
+      // (one per step: the loop's other pointers share it)
+      PHINode *R = nullptr;
+      for (PHINode &Q : L.getHeader()->phis())
+        if (Q.getType() == J.getType() && Q.getNumIncomingValues() == 2 &&
+            match(Q.getIncomingValueForBlock(Pre), m_Zero()) &&
+            match(Q.getIncomingValueForBlock(Latch),
+                  m_Add(m_Specific(&Q), m_SpecificInt(AbsT))))
+          R = &Q;
+      if (!R) {
+        R = B.CreatePHI(J.getType(), 2, J.getName() + ".rel");
+        R->addIncoming(ConstantInt::get(J.getType(), 0), Pre);
+        // beside j's own add (which the exit test follows)
+        IRBuilder<> LB(JInc->getNextNode());
+        Value *RInc =
+            LB.CreateAdd(R, ConstantInt::get(J.getType(), AbsT));
+        R->addIncoming(RInc, Latch);
+        // The exit test j + t == x as r + |t| == x - j0 (j0 - x for a
+        // negative t), so that j and its add can go.
+        for (User *U : make_early_inc_range(JInc->users())) {
+          auto *Cmp = dyn_cast<ICmpInst>(U);
+          if (!Cmp || !Cmp->isEquality() || !L.contains(Cmp))
+            continue;
+          unsigned XI = Cmp->getOperand(0) == JInc ? 1 : 0;
+          Value *X = Cmp->getOperand(XI);
+          if (X == JInc || !L.isLoopInvariant(X))
+            continue;
+          Value *NX = T->isNegative() ? PB.CreateSub(J0, X) : PB.CreateSub(X, J0);
+          Cmp->setOperand(XI, NX);
+          Cmp->setOperand(1 - XI, RInc);
+        }
+      }
+      Z = B.CreateZExt(R, I64);
+    } else if (Relative)
       Z = B.CreateZExt(T->isNegative() ? B.CreateSub(J0, &J) : B.CreateSub(&J, J0),
                        I64);
     else
@@ -1197,8 +1261,20 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
       for (PHINode &Phi : L->getHeader()->phis())
         if (Phi.getType()->isPointerTy() || Phi.getType()->isIntegerTy(64))
           Ptrs.push_back(&Phi);
+      bool Rewritten = false;
       for (PHINode *Phi : Ptrs)
-        Changed |= pointerFromCounter(*Phi, *L, SE);
+        Rewritten |= pointerFromCounter(*Phi, *L, SE);
+      if (Rewritten) {
+        // counters whose exit test moved to a relative one (j, j + t)
+        SE.forgetLoop(L);
+        SmallVector<WeakTrackingVH, 4> Counters;
+        for (PHINode &Phi : L->getHeader()->phis())
+          Counters.push_back(&Phi);
+        for (WeakTrackingVH &V : Counters)
+          if (auto *Phi = dyn_cast_or_null<PHINode>(V))
+            RecursivelyDeleteDeadPHINode(Phi);
+      }
+      Changed |= Rewritten;
     }
     if (AGXMergeDownCounters && L->isInnermost()) {
       SmallVector<PHINode *, 4> Counters;

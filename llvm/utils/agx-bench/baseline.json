@@ -372,7 +372,7 @@
   "waits": 15
  },
  "cuda_index_add.ll:index_add:agx-g14c": {
-  "bytes": 580,
+  "bytes": 578,
   "cycles": 7894.0,
   "gprs": 26,
   "groups": 64,
@@ -744,26 +744,26 @@
   "waits": 2
  },
  "cuda_spmv_csr.ll:spmv_csr:agx-g13g": {
-  "bytes": 478,
-  "cycles": 882.2,
-  "gprs": 18,
-  "groups": 88,
-  "instructions": 75,
+  "bytes": 468,
+  "cycles": 882.3,
+  "gprs": 20,
+  "groups": 80,
+  "instructions": 74,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 56.6,
+  "tput": 50.2,
   "uniform_halves": 28,
   "waits": 6
  },
  "cuda_spmv_csr.ll:spmv_csr:agx-g14c": {
-  "bytes": 478,
-  "cycles": 882.2,
-  "gprs": 18,
-  "groups": 88,
-  "instructions": 75,
+  "bytes": 468,
+  "cycles": 882.3,
+  "gprs": 20,
+  "groups": 80,
+  "instructions": 74,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 56.6,
+  "tput": 50.2,
   "uniform_halves": 28,
   "waits": 6
  },

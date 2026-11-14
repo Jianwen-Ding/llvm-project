@@ -4,14 +4,15 @@
 ; x's pointer, stepped by 128 bytes beside a counter j from a runtime start
 ; by 32 whose range is not known (a kernel argument here): j less its start
 ; (32 k after k iterations, below 2^31 by the trip count's bound: j is i32
-; and the step 32) is the index register, one 32-bit isub instead of the
-; 64-bit add (L15-E203).
+; and the step 32) is the index register, one 32-bit addition instead of the
+; 64-bit one (L15-E203), a recurrence of its own from 0 (L15-E261: an isub
+; of j - j0 sat right before the load).
 
 ; CHECK-LABEL: from_arg:
 ; CHECK: Loop Header
-; CHECK: isub [[I:r[0-9]+]], r{{[0-9]+}}, {{[ru][0-9]+}}
 ; CHECK-NOT: iadd r{{[0-9]+}}_r{{[0-9]+}}
-; CHECK: device_load {{.*}}, [[I]], unsigned
+; CHECK: device_load {{.*}}, [[I:r[0-9]+]], unsigned
+; CHECK-NEXT: iadd [[I]], [[I]], 32
 ; CHECK: jmp_exec_any
 ; OFF-LABEL: from_arg:
 ; OFF: Loop Header
