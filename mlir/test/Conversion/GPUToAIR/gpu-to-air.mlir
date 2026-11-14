@@ -224,8 +224,19 @@ gpu.module @shuffles {
     // CHECK: %[[I8:.*]] = llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
     // CHECK: llvm.select %{{.*}}, %[[I8]], %{{.*}} : i1, i32
     %i8, %oki8 = gpu.shuffle idx %v, %c2, %c8 : i32
-    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // A uniform mask (a kernel argument): AIR's shuffle_xor of it, and the
+    // own value where lane ^ mask leaves the segment (L15-E286).
+    // CHECK: %[[M:.*]] = llvm.trunc %{{.*}} : i32 to i16
+    // CHECK: llvm.xor
+    // CHECK: %[[XO:.*]] = llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M]]) : (i32, i16) -> i32
+    // CHECK: llvm.select %{{.*}}, %[[XO]], %{{.*}} : i1, i32
     %xo, %okxo = gpu.shuffle xor %v, %o, %c32 : i32
+    // A per-thread mask: the general path, the lane it computes.
+    // CHECK: %[[LD:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %ln = gpu.lane_id
+    %lo = arith.index_cast %ln : index to i32
+    %xd, %okxd = gpu.shuffle xor %v, %lo, %c32 : i32
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2i = arith.constant 2 : index
@@ -238,6 +249,8 @@ gpu.module @shuffles {
     memref.store %xo, %out[%c4] : memref<8xi32, 1>
     %c5 = arith.constant 5 : index
     memref.store %i8, %out[%c5] : memref<8xi32, 1>
+    %c6 = arith.constant 6 : index
+    memref.store %xd, %out[%c6] : memref<8xi32, 1>
     gpu.return
   }
 }

@@ -164,6 +164,38 @@ static std::optional<int64_t> constantInt(Value converted, Value original) {
   return getConstantIntValue(original);
 }
 
+/// Whether \p v (an original, unconverted value) is the same in every thread
+/// of a threadgroup: a constant, a kernel argument, a threadgroup-level id or
+/// size, or pure arith of those (L15-E286).
+static bool isThreadgroupUniform(Value v, unsigned depth = 0) {
+  if (depth > 8)
+    return false;
+  if (getConstantIntValue(v))
+    return true;
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    auto func = dyn_cast<gpu::GPUFuncOp>(arg.getOwner()->getParentOp());
+    return func && arg.getOwner()->isEntryBlock() &&
+           arg.getArgNumber() < func.getNumArguments() &&
+           isa<IntegerType, IndexType>(arg.getType());
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<gpu::BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp, gpu::NumSubgroupsOp,
+          gpu::SubgroupSizeOp>(def))
+    return true;
+  if (def->getDialect()->getNamespace() != "arith" || def->getNumRegions() ||
+      !isMemoryEffectFree(def))
+    return false;
+  return llvm::all_of(def->getOperands(), [&](Value o) {
+    return isThreadgroupUniform(o, depth + 1);
+  });
+}
+
+/// Set before the conversion on a gpu.shuffle whose offset
+/// isThreadgroupUniform (whose original values the conversion replaces).
+static constexpr llvm::StringLiteral kUniformOffsetAttr = "air.uniform_offset";
+
 /// Extend or truncate an i32 to the index type.
 static Value toIndexBitwidth(ConversionPatternRewriter &rewriter, Location loc,
                              Value value, unsigned indexBitwidth) {
@@ -443,6 +475,20 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
     // per-thread lane, which would take a shuffle per quad position)
     // (L15-E285).
     bool ownOutside = false;
+    // A uniform lane (idx) or mask (xor) that is not a constant: AIR's shuffle
+    // or shuffle_xor of it, the source lane being the lane or lane ^ mask
+    // (past the SIMD-group: outside the segment), and the own value outside
+    // the segment, as for a constant (L15-E286).
+    bool uniformOffset = false;
+    if (!offset && width && *width <= 32 && llvm::isPowerOf2_64(*width) &&
+        (op.getMode() == gpu::ShuffleMode::IDX ||
+         op.getMode() == gpu::ShuffleMode::XOR) &&
+        op->hasAttr(kUniformOffsetAttr)) {
+      native = op.getMode() == gpu::ShuffleMode::IDX
+                   ? "air.simd_shuffle.u.i32"
+                   : "air.simd_shuffle_xor.u.i32";
+      ownOutside = uniformOffset = true;
+    }
     if (width && offset && *offset >= 0 && *width <= 32 &&
         llvm::isPowerOf2_64(*width) &&
         ((native.empty() && op.getMode() == gpu::ShuffleMode::IDX &&
@@ -457,7 +503,15 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
 
     Value valid, lane16;
     if (ownOutside) {
-      lane16 = LLVM::ConstantOp::create(rewriter, loc, i16, *offset);
+      Value off = uniformOffset ? adaptor.getOffset()
+                                : LLVM::ConstantOp::create(rewriter, loc, i32,
+                                                           *offset)
+                                      .getResult();
+      lane16 = uniformOffset ? LLVM::TruncOp::create(rewriter, loc, i16, off)
+                                   .getResult()
+                             : LLVM::ConstantOp::create(rewriter, loc, i16,
+                                                        *offset)
+                                   .getResult();
       Value lane = callAIR(rewriter, op, "air.thread_index_in_simdgroup", i32,
                            {}, AIREffects::None, laneRange);
       auto c = [&](int64_t v) {
@@ -467,13 +521,16 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
       Value srcLane;
       switch (op.getMode()) {
       case gpu::ShuffleMode::UP:
-        srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane, c(*offset));
+        srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane, off);
         break;
       case gpu::ShuffleMode::DOWN:
-        srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane, c(*offset));
+        srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane, off);
+        break;
+      case gpu::ShuffleMode::XOR:
+        srcLane = LLVM::XOrOp::create(rewriter, loc, i32, lane, off);
         break;
       default:
-        srcLane = c(*offset);
+        srcLane = off;
         break;
       }
       // (up's source is below the segment's end, down's not below its start)
@@ -2233,6 +2290,11 @@ struct LowerGpuOpsToAIROpsPass final
       narrowMemRefIndices(m, linearizeIndices);
     if (simdgroupAllReduce)
       lowerAllReducesToSimdgroups(m);
+    m.walk([](gpu::ShuffleOp op) {
+      if (!getConstantIntValue(op.getOffset()) &&
+          isThreadgroupUniform(op.getOffset()))
+        op->setAttr(kUniformOffsetAttr, UnitAttr::get(op.getContext()));
+    });
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);
