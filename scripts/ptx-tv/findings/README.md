@@ -195,15 +195,17 @@ LangRef text should change.
   (the source is UB): `forward-ld-param.ll` `test_ld_param_const`,
   `lower-byval-args.ll` `memcpy_from_param{,_noalign}`.
 
-## Unresolved
+## Resolved: `minimumnum`/`maximumnum` lowered to `min`/`max`
 
-* `llvm.minimumnum`/`llvm.maximumnum` lowered to plain `min.f32`/`max.f32`
-  (`math-intrins.ll` `minimumnum_float`, `maximumnum_float`; `fmax3.ll`
-  `test_fminimumnum3`, `test_fmaximumnum3`, the three-input forms). The
-  counterexamples are `min(+0.0, -0.0)` (must be -0.0) and signaling-NaN
-  inputs (must return the other operand). Correct only if PTX `min`/`max`
-  order -0.0 below +0.0 and treat signaling NaNs as missing; the lifter does
-  not assume either (it models them like `maxnum`), so this stays open.
+`llvm.minimumnum`/`llvm.maximumnum` are lowered to plain `min.f32`/`max.f32`
+(`math-intrins.ll` `minimumnum_float`, `maximumnum_float`,
+`maximumnum_double`; `fmax3.ll` `test_fminimumnum3`, `test_fmaximumnum3`;
+`reduction-intrinsics.ll` `reduce_fmaximumnum_float`). This was open while
+the lifter modelled PTX `min`/`max` like `minnum`/`maxnum`. The PTX ISA's
+semantics for `min`/`max` settle it: a NaN operand yields the other
+operand, two NaNs give NaN, and `-0.0 < +0.0`, which is exactly
+`minimumnum`/`maximumnum`. With that model all of these verify: not a
+defect.
 
 ## Test-suite run
 
@@ -214,11 +216,11 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4187 functions from 619
-test files; 3248 proved correct (507 through probe-derived opaque instructions,
+test files; 3257 proved correct (507 through probe-derived opaque instructions,
 20 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
-2/2b/3/4/5/6; 5 unresolved (min/max signed zeros) and 1 NaN-bits note; 148 in
-known modelling classes; 2 not lifted; 744 solver timeouts or inconclusive.
+2/2b/3/4/5/6; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 152 in
+known modelling classes; 2 not lifted; 735 solver timeouts or inconclusive.
 
 Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
 functions are compared after LLVM's

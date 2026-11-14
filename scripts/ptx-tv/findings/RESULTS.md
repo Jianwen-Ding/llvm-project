@@ -1,22 +1,22 @@
 # ptx-tv results: llvm/test/CodeGen/NVPTX
 
-Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
+Three passes over every test file (first plain nvptx64 `llc` RUN line of each): up to 6, then 8, then 10 further functions per file; every result re-checked with the final lifter. `alive-tv --tgt-is-asm --disable-undef-input --smt-to=5000`, 20 s per function; timeouts additionally re-run with larger budgets and the weaker `--disable-poison-input` (tagged); 28 functions re-run at 30 s per query (`smt_to`); files using cp.async/cp.async.bulk/st.bulk re-run with copy semantics, timeouts among them with the opaque copy model (`copy_model`); st.async, discard and spdecompress files re-run with their ISA semantics; functions with inline asm re-run with asm_sem; arbitrary-fp conversion tests re-run with arbfp (all functions); Alive2 errors re-run after the i1/FP rewrites, alignstack removal and bounded loop unrolling (up to 160); files with masked loads/stores re-run with their per-lane expansion; previously unlifted functions re-run after the naming, vararg, stacksave and call-site fixes; files with FP min/max re-run after modelling PTX min/max by their ISA semantics. Alive2 adacbd5, Z3 4.13.4, LLVM from this branch's base; all built with clang.
 
 Test files: 619; files with no usable nvptx64 llc RUN line or other file-level failure: 79 (no-llc-run 78, llc-failed 1).
 Functions checked: 4187.
 
 | status | functions | share |
 |---|---:|---:|
-| `correct` | 3248 | 77.6% |
-| `timeout` | 675 | 16.1% |
-| `mismatch-known` | 148 | 3.5% |
-| `inconclusive` | 69 | 1.6% |
+| `correct` | 3257 | 77.8% |
+| `timeout` | 676 | 16.1% |
+| `mismatch-known` | 152 | 3.6% |
+| `inconclusive` | 59 | 1.4% |
 | `mismatch-param-oob` | 33 | 0.8% |
-| `mismatch` | 11 | 0.3% |
+| `mismatch` | 7 | 0.2% |
 | `lift-unsupported` | 2 | 0.0% |
 | `src-inline-asm` | 1 | 0.0% |
 
-20 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
+17 of the correct results were obtained only with a weaker check (`--disable-poison-input`: inputs assumed not to be poison) after the full check timed out.
 
 Of the correct results, 507 rely on probe-derived opaque instructions (probe.py): they check the surrounding code and operand plumbing, not the instruction selection of the intrinsic itself.
 
@@ -24,7 +24,7 @@ Of the correct results, 507 rely on probe-derived opaque instructions (probe.py)
 
 1 of the correct results involve loops and were checked with bounded unrolling (`unroll` field).
 
-Conclusive (proved correct or counterexample): 3440 (82.2%).
+Conclusive (proved correct or counterexample): 3449 (82.4%).
 
 ## Counterexamples with out-of-bounds `.param` accesses
 
@@ -66,41 +66,30 @@ All are finding 1 (sub-byte vectors) except `param-vectorize-device.ll` `callee_
 
 ## Unclassified counterexamples
 
-Triage (see `README.md`): `bf16-instructions.ll` `test_uitofp_i32`,
-`test_uitofp_i64`: finding 3; `f16-abs.ll` `test_fabs`: finding 2;
-`math-intrins.ll` `abs_float_ftz`: finding 2b; `math-intrins.ll`
-`minimum_float_ftz`: finding 4; `math-intrins.ll`
-`minimumnum_float`/`maximumnum_float`/`maximumnum_double` and `fmax3.ll`
-`test_fminimumnum3`/`test_fmaximumnum3`: unresolved (PTX min/max signed
-zeros); `bf16-instructions.ll` `test_maxnum_v2` (NaN bits only, allowed for
-`maxnum`) is now labelled `nan-payload` automatically. Finding 5 (`lower-args-gridconstant.ll` kernels storing to an
-undeclared `func_retval0`) is reported as `lift-unsupported`, since the PTX
-is invalid. The `nan-payload` entries of `arbitrary-fp-to-float.ll` are
-finding 6.
+Triage (see `README.md`):
 
-* `bf16-instructions.ll` `test_maxnum_v2`
-* `bf16-instructions.ll` `test_uitofp_i32`
-* `bf16-instructions.ll` `test_uitofp_i64`
-* `f16-abs.ll` `test_fabs`
-* `fmax3.ll` `test_fmaximumnum3`
-* `fmax3.ll` `test_fminimumnum3`
-* `math-intrins.ll` `abs_float_ftz`
-* `math-intrins.ll` `maximumnum_double`
-* `math-intrins.ll` `maximumnum_float`
-* `math-intrins.ll` `minimum_float_ftz`
-* `math-intrins.ll` `minimumnum_float`
-`vaargs.ll` `foo`: not a defect; Alive2's assembly mode resolves the
-varargs pointer, stored to local memory as an integer and reloaded, to a
-different block than the source pointer (the PTX does the source's
-arithmetic exactly).
+* `bf16-instructions.ll` `test_uitofp_i32`, `test_uitofp_i64`: finding 3.
+* `f16-abs.ll` `test_fabs`: finding 2.
+* `math-intrins.ll` `abs_float_ftz`: finding 2b.
+* `math-intrins.ll` `minimum_float_ftz`: finding 4.
+* `atomicrmw-elementwise-sm60.ll` `fmin_acq_rel_v2bf16_global_cta`: NaN bits
+  only (bf16 `minnum` done in f32; allowed for `minnum`); the NaN-bits note.
+* `vaargs.ll` `foo`: not a defect; Alive2's assembly mode resolves the
+  varargs pointer, stored to local memory as an integer and reloaded, to a
+  different block than the source pointer (the PTX does the source's
+  arithmetic exactly).
+
+Finding 5 (`lower-args-gridconstant.ll` kernels storing to an undeclared
+`func_retval0`) is reported as `lift-unsupported`, since the PTX is invalid.
+The `nan-payload` entries of `arbitrary-fp-to-float.ll` are finding 6.
 
 ## Counterexamples of known modelling classes (not defects)
 
 | class | functions |
 |---|---:|
-| `partword-atomic-word-access` | 80 |
+| `partword-atomic-word-access` | 81 |
 | `approximation-permitted-by-flags` | 21 |
-| `nan-payload` | 18 |
+| `nan-payload` | 21 |
 | `masked-load-widened` | 10 |
 | `indirect-call-asm-mode` | 4 |
 | `approx-substitution` | 4 |

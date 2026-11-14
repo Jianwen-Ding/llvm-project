@@ -167,6 +167,14 @@ single-thread semantics:
   collides gets the module's next unique-name counter as a suffix.
   `llvm.stacksave`/`llvm.stackrestore` and `stacksave`/`stackrestore` are
   the same opaque calls on both sides.
+* PTX `min`/`max` follow the PTX ISA's semantics: LLVM's
+  `minimumnum`/`maximumnum` (`minimum`/`maximum` with `.NaN`).
+* `__nvvm_reflect` calls become the constants NVPTXUsage documents
+  (`__CUDA_FTZ` from the `nvvm-reflect-ftz` module flag, `__CUDA_ARCH` the
+  target's SM version times 10, others 0). `llvm.readcyclecounter` and
+  `llvm.readsteadycounter` read `%clock64` and `%globaltimer` (an assumption
+  taken from the backend). FP vector reductions are expanded into the
+  sequential scalar operations LangRef defines.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such
