@@ -17,7 +17,25 @@ def name_of(tokens):
 
 
 def intrinsic(name, args):
-    """(tokens, arg indices in PTX operand order, constant operands) or None."""
+    """(tokens, arg indices in PTX operand order) or None; tensor-map
+    override forms as in tma.intrinsic (operands after the tensor map)."""
+    m = re.fullmatch(r"(applypriority\.async\.bulk\.tensor\.evict\.priority\.[\w.]*?)"
+                     r"\.override\.(addr(?:\.dim(?:\.stride)?)?)(\.[1-5]d)", name)
+    if m:
+        ov = m.group(2)
+        nd = int(m.group(3)[1])
+        nov = {"addr": 1, "addr.dim": 1 + nd, "addr.dim.stride": 1 + nd + (nd - 1) + 1}[ov]
+        r = _intrinsic(m.group(1) + m.group(3), args[:1] + args[1 + nov:])
+        if r is None:
+            return None
+        t, keep = r
+        keep = [i if i == 0 else i + nov for i in keep]
+        keep = keep[:1] + list(range(1, 1 + nov)) + keep[1:]
+        return t | {"ov_" + x.split("::")[1] for x in tma.OVERRIDE[ov]}, keep
+    return _intrinsic(name, args)
+
+
+def _intrinsic(name, args):
     v = [x for _, x in args]
     m = re.fullmatch(r"applypriority(\.global)?\.L2\.evict\.normal", name)
     if m and len(args) == 2 and v[1] == "128":
@@ -58,9 +76,15 @@ def ptx(base, mods, ops):
             return None
         if mods == ["async", "bulk", "global", "bulk_group", "L2::evict_normal"]:
             return {"applyprio", "bulk"}, flat
-        if len(mods) == 8 and mods[:3] == ["async", "bulk", "tensor"] and re.fullmatch(r"[1-5]d", mods[3]) \
+        if len(mods) >= 8 and mods[:3] == ["async", "bulk", "tensor"] and re.fullmatch(r"[1-5]d", mods[3]) \
                 and mods[4:7] == ["global", "bulk_group", "L2::evict_normal"] and mods[7] in MODES.values():
-            return {"applyprio", "tensor", mods[3], "mode_" + mods[7]}, flat
+            t = {"applyprio", "tensor", mods[3], "mode_" + mods[7]}
+            for x in mods[8:]:
+                if x not in ("override::global_address", "override::global_dim",
+                             "override::global_dim_stride"):
+                    return None
+                t.add("ov_" + x.split("::")[1])
+            return t, flat
         return None
     if base == "cp":
         if mods[:3] == ["async", "mbarrier", "arrive"]:

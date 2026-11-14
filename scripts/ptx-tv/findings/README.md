@@ -164,7 +164,7 @@ target-independent; it is observed here through NVPTX.
 Severity: low (signaling-NaN inputs only); either the lowering or the
 LangRef text should change.
 
-## 7. NVPTXUsage documents wrong signatures for `tcgen05.st.16x32bx2` and `tcgen05.ld.red`
+## 7. NVPTXUsage documents wrong intrinsic signatures and names (tcgen05, TMA)
 
 Reproducer: `tcgen05-st-doc-order.ll` (found while deriving the
 `tcgen05.st` model from the documentation)
@@ -193,6 +193,13 @@ A smaller slip in the same document: the `tcgen05.mma.ws` syntax block lists
 `@llvm.nvvm.tcgen05.mma.ws.shared.zero_col_mask` twice, the second time with
 a tensor-memory A operand (`ptr addrspace(6) %atensor`), which is the
 `ws.tensor.zero_col_mask` form listed on the next line.
+
+A fourth (reproducer `tma-override-dim-doc-name.ll`): the documented names
+`@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.override.addr.dim.1d.i32` and
+`...override.addr.dim.stride.[2-5]d.i32` do not exist. These intrinsics
+support only a 32-bit multicast mask and are not overloaded, so their names
+have no `.i32` suffix; the documented name is rejected by the backend as an
+unknown intrinsic.
 
 Severity: documentation only. Fix direction: swap `%args` and `%offset` in
 the documented `tcgen05.st.16x32bx2` signature and give `tcgen05.ld.red`
@@ -250,7 +257,7 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4200 functions from 619
-test files; 3422 proved correct (132 through probe-derived opaque instructions,
+test files; 3422 proved correct (88 through probe-derived opaque instructions,
 50 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in

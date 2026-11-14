@@ -156,8 +156,9 @@ single-thread semantics:
   mask), reduction and cache hint, derived independently from the intrinsic
   (NVPTXUsage) and from the PTX opcode (`tma.py`; s2g/reduce `im2col` is
   PTX `im2col_no_offs`); operands in PTX order. The tensor map and the copy
-  stay opaque. The `override` forms (tensor-map field overrides) and the
-  non-default data-validity patterns remain probe-derived.
+  stay opaque. The data-validity patterns (NVPTXUsage's table) and the
+  tensor-map property-override forms (`override.addr[.dim[.stride]]`, override
+  operands after the tensor map) are modelled too.
 * `applypriority` (L2, async bulk and async bulk tensor), the bulk prefetch
   (`cp.async.bulk.prefetch.L2`, with cache hint or eviction priority; it was
   a no-op before) and `cp.async.mbarrier.arrive` are uninterpreted calls
@@ -272,9 +273,8 @@ What remains opaque or unproved, and why:
 * Probe-derived opaque instructions are left for families without
   single-thread semantics a TV check could use: the `tcgen05.mma`
   `decompress_b` forms (not in NVPTXUsage; all other `tcgen05` operations
-  have documentation-derived models), the TMA
-  `override` and data-validity forms and `tensormap.replace` (the tensor-map
-  layout is not public), `multimem`
+  have documentation-derived models), `tensormap.replace` (the tensor-map layout is not
+  public), `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is
   modelled as a store, its single-memory meaning), texture/surface (opaque image state), `spcompress`
   (implementation-specific selection), `barrier.cluster`, `mapa`,

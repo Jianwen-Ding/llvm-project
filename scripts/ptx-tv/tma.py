@@ -13,6 +13,13 @@ G2S_MODES = {"tile": "tile", "im2col": "im2col", "tile.gather4": "tile::gather4"
 S2G_MODES = {"tile": "tile", "im2col": "im2col_no_offs", "tile.scatter4": "tile::scatter4",
              "im2col.w": "im2col_no_offs::w", "im2col.w.128": "im2col_no_offs::w::128"}
 RED = ["add", "min", "max", "inc", "dec", "and", "or", "xor"]
+# flag_valid_pattern (NVPTXUsage "TMA Global-to-Shared Data-Validity Reporting")
+VALIDITY = {"1": "mbarrier::report::validity::per_16bytes::80000000",
+            "2": "mbarrier::report::validity::per_16bytes::8000",
+            "3": "mbarrier::report::validity::per_16bytes::80",
+            "4": "mbarrier::report::validity::per_16bytes::8",
+            "5": "mbarrier::report::validity::per_element::ff"}
+VALIDITY_TOK = {v: "valid" + k for k, v in VALIDITY.items()}
 
 
 def name_of(tokens):
@@ -29,8 +36,42 @@ def _flag(x):
     return {"1": True, "true": True, "0": False, "false": False}.get(x)
 
 
+OVERRIDE = {"addr": ["override::global_address"],
+            "addr.dim": ["override::global_address", "override::global_dim"],
+            "addr.dim.stride": ["override::global_address", "override::global_dim_stride"]}
+
+
 def intrinsic(name, args):
-    """(tokens, arg indices in PTX operand order) or None."""
+    """(tokens, arg indices in PTX operand order) or None.  The tensor-map
+    property-override forms (NVPTXUsage "Tensor-Map Property Overrides")
+    take the override operands right after the tensor map, in the order the
+    PTX lists them inside the tensor operand."""
+    m = re.fullmatch(r"(.*)\.override\.(addr(?:\.dim(?:\.stride)?)?)(\.[1-5]d(?:\.i16|\.i32)?)", name)
+    if not m:
+        return _intrinsic(name, args)
+    inner, ov, tail = m.group(1) + m.group(3), m.group(2), m.group(3)
+    # the dim / dim.stride g2s forms take only a 32-bit multicast mask and are
+    # not overloaded (no .i32 suffix, unlike what NVPTXUsage.md documents)
+    if ".g2s." in inner and ".g2s.cta." not in inner and "dim" in ov and not re.search(r"\.i(16|32)$", inner):
+        inner += ".i32"
+    nd = int(re.match(r"\.([1-5])d", tail).group(1))
+    nov = {"addr": 1, "addr.dim": 1 + nd, "addr.dim.stride": 1 + nd + (nd - 1) + 1}[ov]
+    # the tensor map is argument 2 for g2s (dst, bar, tmap), 1 for s2g/reduce
+    # (src, tmap), 0 for prefetch (tmap)
+    ti = 2 if ".g2s" in inner else (1 if re.search(r"\.(s2g|reduce)\.", inner) else 0)
+    rest = args[:ti + 1] + args[ti + 1 + nov:]
+    r = _intrinsic(inner, rest)
+    if r is None:
+        return None
+    t, keep = r
+    remap = lambda i: i if i <= ti else i + nov
+    keep = [remap(i) for i in keep]
+    p = keep.index(ti)
+    keep = keep[:p + 1] + list(range(ti + 1, ti + 1 + nov)) + keep[p + 1:]
+    return t | {"ov_" + x.split("::")[1] for x in OVERRIDE[ov]}, keep
+
+
+def _intrinsic(name, args):
     v = [x for _, x in args]
     modes = "tile|im2col|tile\\.gather4|tile\\.scatter4|im2col\\.w|im2col\\.w\\.128"
     m = re.fullmatch(r"cp\.async\.bulk\.tensor\.g2s(\.cta)?\.(%s)\.([1-5])d(?:\.(i16|i32))?" % modes, name)
@@ -43,17 +84,23 @@ def intrinsic(name, args):
         t = {"g2s", "%dd" % nd, "mode_" + G2S_MODES[mode]}
         if cta:
             # (dst, bar, tmap, coords, offs, ch, flag_ch, valid_pattern)
-            if len(args) != base + 3 or v[base + 2] != "0" or _flag(v[base + 1]) is None:
+            if len(args) != base + 3 or (v[base + 2] != "0" and v[base + 2] not in VALIDITY) \
+                    or _flag(v[base + 1]) is None:
                 return None
             t.add("dst_cta")
+            if v[base + 2] != "0":
+                t.add("valid" + v[base + 2])
             keep = [0, 2] + list(range(3, 3 + ncoord)) + [1] + list(range(3 + ncoord, base))
             if _flag(v[base + 1]):
                 t.add("ch")
                 keep.append(base)
             return t, keep
         # (dst, bar, tmap, coords, offs, mc, ch, flag_mc, flag_ch, cta_group, valid_pattern)
-        if mty is None or len(args) != base + 6 or v[base + 5] != "0" or v[base + 4] not in ("0", "1", "2"):
+        if mty is None or len(args) != base + 6 or v[base + 4] not in ("0", "1", "2") or \
+                (v[base + 5] != "0" and v[base + 5] not in VALIDITY):
             return None
+        if v[base + 5] != "0":
+            t.add("valid" + v[base + 5])
         fmc, fch = _flag(v[base + 2]), _flag(v[base + 3])
         if fmc is None or fch is None:
             return None
@@ -124,12 +171,16 @@ def intrinsic(name, args):
 def _flatten(ops):
     """Operand texts in PTX order with tensor coordinates / vectors flattened."""
     out = []
+    from llvmsig import split_top
     for o in ops:
         o = o.strip()
-        tm = re.fullmatch(r"\[\s*([%\w$]+)\s*,\s*\{([^}]*)\}\s*\]", o)
-        if tm:
-            out.append(tm.group(1))
-            out += [c.strip() for c in tm.group(2).split(",")]
+        if o.startswith("[") and "," in o:
+            for part in split_top(o[1:-1]):
+                part = part.strip()
+                if part.startswith("{"):
+                    out += [c.strip() for c in part[1:-1].split(",")]
+                else:
+                    out.append(part)
         elif o.startswith("{"):
             out += [c.strip() for c in o[1:-1].split(",")]
         else:
@@ -187,6 +238,10 @@ def ptx(mods, ops):
             t.add("ch")
         elif x == "L2::evict_last" and "prefetch" in t:
             t.add("evict_last")
+        elif x in VALIDITY_TOK and "g2s" in t:
+            t.add(VALIDITY_TOK[x])
+        elif x in ("override::global_address", "override::global_dim", "override::global_dim_stride"):
+            t.add("ov_" + x.split("::")[1])
         else:
             return None
     return t, _flatten(ops)
