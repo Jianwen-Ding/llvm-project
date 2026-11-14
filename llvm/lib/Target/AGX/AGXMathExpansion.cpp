@@ -73,6 +73,11 @@ static cl::opt<bool> NarrowFastSqrt(
              "hardware's approximation"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> Exp2DirectReduction(
+    "agx-exp2-direct-reduction",
+    cl::desc("precise exp2 reduced by n = roundeven(x) directly"),
+    cl::init(false), cl::Hidden);
+
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
@@ -552,6 +557,16 @@ public:
     // (Up to 128, where 2^x overflows: n = 128 at most, which the exponent
     // addition of ldexp needs.)
     X = clampArg(X, -151.0, 128.0);
+    if (Exp2DirectReduction) {
+      // n = roundeven(x), f = x - n exact in [-1/2, 1/2], e^(f ln 2) with
+      // f ln 2 as a rounded product and its error (L15-E340)
+      Value *N = call(Intrinsic::roundeven, {X});
+      Value *F = sub(X, N);
+      Value *H = mul(F, k(M_LN2));
+      Value *L = fma(F, k(M_LN2), B.CreateFNeg(H));
+      L = fma(F, k(M_LN2 - (double)(float)M_LN2), L);
+      return ldexp(expCore(add(H, L)), N);
+    }
     Value *Hi = mul(X, k(M_LN2));
     Value *Lo = fma(X, k(M_LN2), B.CreateFNeg(Hi));
     Lo = fma(X, k(M_LN2 - (double)(float)M_LN2), Lo);
