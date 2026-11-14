@@ -32,6 +32,11 @@ static cl::opt<bool> AGXSelectBool16(
     cl::desc("a select on a 32-bit boolean with high 16 bits known zero "
              "compares its low half with 0 (one 32-bit register read fewer)"));
 
+static cl::opt<bool> AGXSelectHalfTests(
+    "agx-select-half-tests", cl::init(true), cl::Hidden,
+    cl::desc("a select between two registers on x < 0, or on x == 0 with a "
+             "half of x known zero, compares one 16-bit half of x"));
+
 namespace {
 
 class AGXDAGToDAGISel : public SelectionDAGISel {

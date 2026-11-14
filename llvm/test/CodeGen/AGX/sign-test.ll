@@ -90,7 +90,7 @@ define agx_kernel void @f(ptr addrspace(1) %p, i32 %a, float %b, float %c) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    icmpsel slt, r1, u2, 0, u4, u3
+; CHECK-NEXT:    icmpsel slt, r1, u2h, 0, u4, u3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -113,7 +113,7 @@ define agx_kernel void @k(ptr addrspace(1) %p, i32 %a, i32 %b, i32 %c) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    icmpsel slt, r1, u2, 0, u4, u3
+; CHECK-NEXT:    icmpsel slt, r1, u2h, 0, u4, u3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -136,7 +136,7 @@ define agx_kernel void @k2(ptr addrspace(1) %p, i32 %a, i32 %b, i32 %c) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    icmpsel slt, r1, u2, 0, u4, u3
+; CHECK-NEXT:    icmpsel slt, r1, u2h, 0, u4, u3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -159,7 +159,7 @@ define agx_kernel void @k3(ptr addrspace(1) %p, i32 %a, i32 %b, i32 %c) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    icmpsel slt, r1, u2, 0, u3, u4
+; CHECK-NEXT:    icmpsel slt, r1, u2h, 0, u3, u4
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

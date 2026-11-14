@@ -8,7 +8,7 @@
 ; CHECK-LABEL: sdiv:
 ; CHECK: xor [[S:r[0-9]+]], u2, u3
 ; CHECK-NEXT: isub [[N:r[0-9]+]], 0, [[Q:r[0-9]+]]
-; CHECK-NEXT: icmpsel slt, {{r[0-9]+}}, [[S]], 0, [[N]], [[Q]]
+; CHECK-NEXT: icmpsel slt, {{r[0-9]+}}, [[S]]h, 0, [[N]], [[Q]]
 ; OFF-LABEL: sdiv:
 ; OFF-DAG: icmpsel slt, {{r[0-9]+}}, u3, 0, 1, 0
 ; OFF-DAG: icmpsel slt, {{r[0-9]+}}, u2, 0, 1, 0

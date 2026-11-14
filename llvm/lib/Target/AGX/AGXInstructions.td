@@ -1181,6 +1181,55 @@ def : Pat<(VT (agx_select_bool16 i32:$c, VT:$x, VT:$y)),
                        (i16 0), 0, $y, 0, $x)>;
 }
 
+// A select between two 32-bit registers on a sign test x < 0 (bit 31 only)
+// compares x's high half (a signed 16-bit compare with 0), and on x == 0 or
+// x != 0 the half that is not known zero: two 32-bit registers read, not
+// three, the one-cycle icmpsel (agx_cost PORT_BOUND; L15-E372). As
+// agx_select_bool16, only where the arms are two different registers.
+class AGXHalfTest<CondCode CC, string Half> : PatFrag<(ops node:$c, node:$x, node:$y),
+    (select (i32 (setcc node:$c, (i32 0), CC)), node:$x, node:$y), [{
+  if (!AGXSelectHalfTests)
+    return false;
+  SDValue C = N->getOperand(0).getOperand(0), X = N->getOperand(1),
+          Y = N->getOperand(2);
+  auto IsConst = [](SDValue V) {
+    return isa<ConstantSDNode>(V) || isa<ConstantFPSDNode>(V);
+  };
+  if (C.getValueType() != MVT::i32 || IsConst(X) || IsConst(Y) || X == Y ||
+      X.getValueSizeInBits() != 32 || C.getOpcode() == ISD::ZERO_EXTEND)
+    return false;
+  StringRef H = "}] # Half # [{";
+  if (H == "sign")
+    return true;
+  KnownBits K = CurDAG->computeKnownBits(C);
+  if (H == "lo")
+    return K.Zero.countl_one() >= 16;
+  return K.Zero.countl_one() < 16 && K.Zero.countr_one() >= 16;
+}]>;
+def agx_sel_sign : AGXHalfTest<SETLT, "sign">;
+def agx_sel_eq_lo : AGXHalfTest<SETEQ, "lo">;
+def agx_sel_ne_lo : AGXHalfTest<SETNE, "lo">;
+def agx_sel_eq_hi : AGXHalfTest<SETEQ, "hi">;
+def agx_sel_ne_hi : AGXHalfTest<SETNE, "hi">;
+let AddedComplexity = 2 in
+foreach VT = [i32, f32] in {
+def : Pat<(VT (agx_sel_sign i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_SLT, 0, (i16 (EXTRACT_SUBREG $c, hi16)), 0,
+                           (i16 0), 0, $x, 0, $y)>;
+def : Pat<(VT (agx_sel_eq_lo i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $x, 0, $y)>;
+def : Pat<(VT (agx_sel_ne_lo i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+def : Pat<(VT (agx_sel_eq_hi i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, hi16)), 0,
+                           (i16 0), 0, $x, 0, $y)>;
+def : Pat<(VT (agx_sel_ne_hi i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, hi16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+}
+
 // Select on a 16-bit value widened to 32 bits (booleans shared by several
 // i16 operations, which type legalization keeps as i16): the comparison of
 // its 16 bits with 0, without the widening copy.
