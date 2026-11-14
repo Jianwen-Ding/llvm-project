@@ -1987,7 +1987,8 @@ void LowerAIR::recoverDoubles() {
       continue;
     bool Directed = Name.consume_back("_r");
     if (!NativeF64 && !is_contained({"add", "sub", "mul", "fma", "div", "sqrt", "from_f32",
-                                     "to_f32", "to_i64", "to_u64", "from_i64", "from_u64"},
+                                     "to_f32", "to_f16", "to_bf16", "to_i64", "to_u64",
+                                     "from_i64", "from_u64"},
                                     Name))
       continue;
     for (User *U : make_early_inc_range(Lib.users())) {
@@ -2044,6 +2045,15 @@ void LowerAIR::recoverDoubles() {
                                F64));
       else if (Name == "to_f32" && NArgs == 1)
         R = B.CreateBitCast(B.CreateFPTrunc(D(0), F32), I32);
+      // (to half and bfloat: AGXSoftF64's short path for a normal result,
+      // L15-E314; the bits of the 16-bit format in the low half)
+      else if ((Name == "to_f16" || Name == "to_bf16") && NArgs == 1)
+        R = B.CreateZExt(
+            B.CreateBitCast(B.CreateFPTrunc(D(0), Name == "to_f16"
+                                                      ? B.getHalfTy()
+                                                      : B.getBFloatTy()),
+                            B.getInt16Ty()),
+            CI->getType());
       else if (Name == "to_i64" && NArgs == 1)
         R = B.CreateIntrinsic(Intrinsic::fptosi_sat, {I64, F64}, {D(0)});
       else if (Name == "to_u64" && NArgs == 1)

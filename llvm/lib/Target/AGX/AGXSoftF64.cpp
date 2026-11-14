@@ -554,6 +554,35 @@ public:
     Bits = B.CreateOr(Bits, B.CreateAnd(Hi, c32(int32_t(0x80000000u))));
     return {B.CreateZExt(Bits, I64), B.CreateOr(Valid, Zero)};
   }
+  /// A double rounded to nearest even to a 16-bit format Out (half or
+  /// bfloat; bits in an i64), where the double is zero or the result normal,
+  /// and whether it is: truncFast's steps with Out's fields (L15-E314).
+  std::pair<Value *, Value *> truncFastTo(Value *X, Fmt Out) {
+    unsigned K = Out.P - 1, D = 52 - K;
+    uint64_t OutExpAll = (uint64_t(1) << (Out.W - 1 - K)) - 1;
+    Value *E = B.CreateTrunc(
+        B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll())), I32);
+    Value *Frac = B.CreateAnd(X, c64(F64.fracMask()));
+    Value *M = B.CreateTrunc(B.CreateLShr(Frac, D), I32);
+    Value *Rest = B.CreateAnd(Frac, c64((uint64_t(1) << D) - 1));
+    Value *Half = c64(uint64_t(1) << (D - 1));
+    Value *Inc =
+        B.CreateOr(B.CreateICmpUGT(Rest, Half),
+                   B.CreateAnd(B.CreateICmpEQ(Rest, Half), B.CreateTrunc(M, I1)));
+    // the exponent field, and the rounding carry into it (out of range the
+    // sum may wrap, but the field check fails)
+    Value *EF = B.CreateSub(E, c32(F64.Bias - Out.Bias));
+    Value *Bits = B.CreateAdd(B.CreateAdd(B.CreateShl(EF, K), M),
+                              B.CreateZExt(Inc, I32));
+    Value *Valid = B.CreateAnd(
+        B.CreateICmpULT(B.CreateSub(EF, c32(1)), c32(OutExpAll - 1)),
+        B.CreateICmpULT(Bits, c32(OutExpAll << K)));
+    Value *Zero = isZero(X, F64);
+    Bits = B.CreateSelect(Zero, c32(0), Bits);
+    Value *Sign = B.CreateTrunc(B.CreateLShr(X, 63), I32);
+    Bits = B.CreateOr(Bits, B.CreateShl(Sign, Out.W - 1));
+    return {B.CreateZExt(Bits, I64), B.CreateOr(Valid, Zero)};
+  }
   /// A double truncated to an integer of type Ty where it fits (finite, of
   /// a magnitude below 2^(W - 1), or below 2^W and not negative unsigned),
   /// and whether it does; a negative value is 0 unsigned (saturating).
@@ -1413,6 +1442,14 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
     Type *Ty = I.getType();
     Fmt Out = formatOf(Ty);
     Value *X = Bits(0);
+    if (Fast && (Ty->isHalfTy() || Ty->isBFloatTy())) {
+      auto [FastBits, Valid] = SD.truncFastTo(X, Out);
+      Value *V = withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
+        return Slow.convert(X, F64, Out);
+      }, Rounding, CanonicalNaN);
+      R = B.CreateBitCast(B.CreateTrunc(V, B.getIntNTy(Out.W)), Ty);
+      break;
+    }
     if (Fast && Ty->isFloatTy()) {
       auto [FastBits, Valid] = SD.truncFast(X);
       Value *V = withSlowPath(I, B, FastBits, Valid, [&](SoftDouble &Slow) {
