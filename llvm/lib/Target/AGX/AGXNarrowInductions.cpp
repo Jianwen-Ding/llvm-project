@@ -108,6 +108,10 @@ static cl::opt<bool> AGXSignedNarrowing(
     cl::desc("Narrow 64-bit inductions whose signed range fits 32 bits, "
              "with sign-extended uses"));
 
+static cl::opt<bool> AGXLatchBoundNarrowing(
+    "agx-latch-bound-narrowing", cl::init(true), cl::Hidden,
+    cl::desc("Narrow an induction the latch's unsigned exit test bounds"));
+
 static bool fitsSigned32(ScalarEvolution &SE, Value *V) {
   return SE.getUnsignedRange(SE.getSCEV(V)).getUnsignedMax().ult(1u << 31);
 }
@@ -127,6 +131,34 @@ static bool narrow(PHINode &Phi, Loop &L, ScalarEvolution &SE) {
   // uses, the narrow add without unsigned wrap flags.
   bool Unsigned = fitsSigned32(SE, &Phi) && fitsSigned32(SE, Inc) &&
                   fitsSigned32(SE, Step);
+  // The latch's exit test bounds it more closely than scalar evolution's
+  // range (its maximum trip count times the step's maximum: a grid-stride
+  // loop's {0, +, umin(grid, 2^20)} below umin(n - i, 2^20) came out near
+  // 2^32): where the loop continues only while inc <u b, phi is at most
+  // max(start, b - 1), and inc (no unsigned wrap) at most that plus the step.
+  if (!Unsigned && AGXLatchBoundNarrowing && Inc->hasNoUnsignedWrap()) {
+    auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+    auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
+    if (Cmp && Cmp->getOperand(0) == Inc &&
+        L.isLoopInvariant(Cmp->getOperand(1)) &&
+        Br->getSuccessor(0) == L.getHeader() &&
+        !L.contains(Br->getSuccessor(1)) &&
+        (Cmp->getPredicate() == ICmpInst::ICMP_ULT ||
+         (Cmp->getPredicate() == ICmpInst::ICMP_SLT && Cmp->hasSameSign()))) {
+      auto UMax = [&](Value *V) {
+        return SE.getUnsignedRange(SE.getSCEV(V)).getUnsignedMax();
+      };
+      APInt BoundMax = UMax(Cmp->getOperand(1)), StartMax = UMax(Start),
+            StepMax = UMax(Step);
+      APInt Lim(64, uint64_t(1) << 31);
+      if (BoundMax.ult(Lim) && StartMax.ult(Lim) && StepMax.ult(Lim)) {
+        APInt PhiMax = APIntOps::umax(StartMax, BoundMax.isZero()
+                                                     ? BoundMax
+                                                     : BoundMax - 1);
+        Unsigned = (PhiMax + StepMax).ult(Lim);
+      }
+    }
+  }
   auto SignedFits = [&](Value *V) {
     ConstantRange R = SE.getSignedRange(SE.getSCEV(V));
     return R.getSignedMin().sge(APInt::getSignedMinValue(32).sext(64)) &&
