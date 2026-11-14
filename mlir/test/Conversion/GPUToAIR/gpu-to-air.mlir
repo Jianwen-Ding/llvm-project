@@ -1040,3 +1040,35 @@ gpu.module @more_f64_functions {
     gpu.return
   }
 }
+
+// -----
+
+// arith.floordivsi by 2^k is the arithmetic shift by k; ceildivsi by 2^k that
+// shift plus 1 where a low bit is set (L15-E290). Other divisors keep arith's
+// expansion.
+gpu.module @pow2_floor_ceil_div {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xi32, 1>, %v: i32) kernel {
+    %c8 = arith.constant 8 : i32
+    %c16 = arith.constant 16 : i32
+    %c6 = arith.constant 6 : i32
+    // CHECK: %[[F:.*]] = llvm.ashr %{{.*}}, %{{.*}} : i32
+    // CHECK-NOT: llvm.sdiv
+    %f = arith.floordivsi %v, %c8 : i32
+    // CHECK: %[[S:.*]] = llvm.ashr %{{.*}}, %{{.*}} : i32
+    // CHECK: %[[L:.*]] = llvm.and %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.icmp "ne" %[[L]]
+    // CHECK: llvm.add %[[S]]
+    // CHECK-NOT: llvm.sdiv
+    %g = arith.ceildivsi %v, %c16 : i32
+    // CHECK: llvm.sdiv
+    %h = arith.floordivsi %v, %c6 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    memref.store %f, %out[%c0] : memref<8xi32, 1>
+    memref.store %g, %out[%c1] : memref<8xi32, 1>
+    memref.store %h, %out[%c2] : memref<8xi32, 1>
+    gpu.return
+  }
+}

@@ -1245,6 +1245,36 @@ static LogicalResult rewriteIsInf(math::IsInfOp op, PatternRewriter &rewriter) {
 /// function, which a gpu.module cannot call into from outside), with
 /// MathToFuncs's semantics: for p >= 0, b^p by squaring (wrapping); for
 /// p < 0, 1 for b = 1, +-1 for b = -1 (p odd: -1), else 0.
+/// arith.floordivsi by 2^k (k >= 1, a positive constant) is the arithmetic
+/// shift by k, for every value (INT_MIN included); ceildivsi by 2^k that
+/// shift plus 1 where a low bit is set (no x + 2^k - 1 to overflow). The
+/// expansion's division and sign tests go (L15-E290).
+template <typename OpTy>
+static LogicalResult rewritePow2FloorCeilDiv(OpTy op, PatternRewriter &rewriter) {
+  auto type = dyn_cast<IntegerType>(op.getType());
+  std::optional<int64_t> d = getConstantIntValue(op.getRhs());
+  if (!type || !d || *d < 2 || !llvm::isPowerOf2_64(*d) ||
+      llvm::Log2_64(*d) >= type.getWidth() - 1)
+    return failure();
+  Location loc = op.getLoc();
+  auto c = [&](int64_t v) {
+    return arith::ConstantOp::create(rewriter, loc, type,
+                                     rewriter.getIntegerAttr(type, v));
+  };
+  Value x = op.getLhs();
+  Value q = arith::ShRSIOp::create(rewriter, loc, x, c(llvm::Log2_64(*d)));
+  if constexpr (std::is_same_v<OpTy, arith::CeilDivSIOp>) {
+    Value low = arith::AndIOp::create(rewriter, loc, x, c(*d - 1));
+    Value up = arith::ExtUIOp::create(
+        rewriter, loc, type,
+        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne, low,
+                              c(0)));
+    q = arith::AddIOp::create(rewriter, loc, q, up);
+  }
+  rewriter.replaceOp(op, q);
+  return success();
+}
+
 static LogicalResult rewriteIPowI(math::IPowIOp op, PatternRewriter &rewriter) {
   auto type = dyn_cast<IntegerType>(op.getType());
   if (!type)
@@ -2327,6 +2357,8 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteF64Function<math::SinhOp>);
       patterns.add(rewriteF64Function<math::TanhOp>);
       patterns.add(rewriteIPowI);
+      patterns.add(rewritePow2FloorCeilDiv<arith::FloorDivSIOp>);
+      patterns.add(rewritePow2FloorCeilDiv<arith::CeilDivSIOp>);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
