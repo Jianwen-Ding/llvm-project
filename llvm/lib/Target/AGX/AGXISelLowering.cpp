@@ -1841,6 +1841,11 @@ static cl::opt<bool> FreezeTruthLogic(
              "into its operands"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> HalfCompares(
+    "agx-half-compares", cl::init(true), cl::Hidden,
+    cl::desc("a select between two registers on a comparison of values with "
+             "a half known zero compares the other halves"));
+
 static cl::opt<bool> IntToHalfSources(
     "agx-int-to-half-sources", cl::init(true), cl::Hidden,
     cl::desc("a float of a small integer that float arithmetic uses, as a "
@@ -2197,6 +2202,55 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
         SDValue S16 = DAG.getNode(AGXISD::TRUTH_SELECT, DL, MVT::i16, C,
                                   Narrow(X), Narrow(Y));
         return DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i32, S16);
+      }
+    }
+    // A select between two registers on an integer comparison of two values
+    // whose high 16 bits are known zero (or a constant below 2^16): the low
+    // halves compared, unsigned (both are non-negative); of two values whose
+    // low 16 bits are known zero: the high halves, as compared. The select
+    // then reads two 32-bit registers, not three or four (L15-E373).
+    if (HalfCompares && DCI.isAfterLegalizeDAG() &&
+        C.getOpcode() == ISD::SETCC &&
+        C.getOperand(0).getValueType() == MVT::i32 &&
+        N->getValueType(0).getSizeInBits() == 32) {
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      auto IsConst = [](SDValue V) {
+        return isa<ConstantSDNode>(V) || isa<ConstantFPSDNode>(V);
+      };
+      SDValue A = C.getOperand(0), B = C.getOperand(1);
+      ISD::CondCode CC = cast<CondCodeSDNode>(C.getOperand(2))->get();
+      SelectionDAG &DAG = DCI.DAG;
+      if (!IsConst(X) && !IsConst(Y) && X != Y && !IsConst(A) &&
+          A.getOpcode() != ISD::ZERO_EXTEND && B.getOpcode() != ISD::ZERO_EXTEND &&
+          // (the sign and zero tests of E372 are patterns)
+          !(isNullConstant(B) && (CC == ISD::SETLT || CC == ISD::SETEQ ||
+                                  CC == ISD::SETNE))) {
+        KnownBits KA = DAG.computeKnownBits(A), KB = DAG.computeKnownBits(B);
+        SDLoc DL(N);
+        auto Lo = [&](SDValue V) {
+          return DAG.getNode(ISD::TRUNCATE, DL, MVT::i16, V);
+        };
+        auto Hi = [&](SDValue V) {
+          return DAG.getNode(ISD::TRUNCATE, DL, MVT::i16,
+                             DAG.getNode(ISD::SRL, DL, MVT::i32, V,
+                                         DAG.getConstant(16, DL, MVT::i32)));
+        };
+        SDValue NewC;
+        if (KA.Zero.countl_one() >= 16 && KB.Zero.countl_one() >= 16) {
+          ISD::CondCode U = CC;
+          switch (CC) {
+          case ISD::SETLT: U = ISD::SETULT; break;
+          case ISD::SETLE: U = ISD::SETULE; break;
+          case ISD::SETGT: U = ISD::SETUGT; break;
+          case ISD::SETGE: U = ISD::SETUGE; break;
+          default: break;
+          }
+          NewC = DAG.getSetCC(DL, C.getValueType(), Lo(A), Lo(B), U);
+        } else if (KA.Zero.countr_one() >= 16 && KB.Zero.countr_one() >= 16) {
+          NewC = DAG.getSetCC(DL, C.getValueType(), Hi(A), Hi(B), CC);
+        }
+        if (NewC)
+          return DAG.getSelect(DL, N->getValueType(0), NewC, X, Y);
       }
     }
     // select (x > -1), a, b -> select (x < 0), b, a: icmpsel compares with

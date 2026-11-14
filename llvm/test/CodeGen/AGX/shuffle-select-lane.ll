@@ -66,9 +66,9 @@ define agx_kernel void @other(ptr addrspace(1) %p, i32 %n, i32 %d) {
 ; CHECK-NEXT:    or r0h, r3l, 3
 ; CHECK-NEXT:    simd_shuffle r3, r1, r0h
 ; CHECK-NEXT:    mov_imm r0h, 0
-; CHECK-NEXT:    icmpsel ueq, r4, r7, 1, r5, r4
-; CHECK-NEXT:    icmpsel ueq, r4, r7, 2, r6, r4
-; CHECK-NEXT:    icmpsel ueq, r3, r7, 3, r3, r4
+; CHECK-NEXT:    icmpsel ueq, r4, r7l, 1, r5, r4
+; CHECK-NEXT:    icmpsel ueq, r4, r7l, 2, r6, r4
+; CHECK-NEXT:    icmpsel ueq, r3, r7l, 3, r3, r4
 ; CHECK-NEXT:    icmpsel ult, r1, r2, 32, r1, r3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
