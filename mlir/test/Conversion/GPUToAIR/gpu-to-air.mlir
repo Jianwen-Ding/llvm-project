@@ -1060,6 +1060,40 @@ gpu.module @more_f64_functions {
 
 // -----
 
+// f64 cosh and sinh: one exp, of |x| below 709 and of |x| / 2 from it
+// (sinh's expm1(|x|) from it too) (L15-E309).
+gpu.module @f64_cosh_sinh {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK: %[[A:.*]] = llvm.intr.fabs(%{{.*}}) : (f64) -> f64
+    // CHECK: %[[BELOW:.*]] = llvm.fcmp "olt" %[[A]], %{{.*}} : f64
+    // CHECK: %[[H:.*]] = llvm.fmul %[[A]], %{{.*}} : f64
+    // CHECK: llvm.select %[[BELOW]], %[[A]], %[[H]] : i1, f64
+    // CHECK-NOT: llvm.intr.fabs
+    // CHECK: llvm.select %[[BELOW]]
+    %e = math.cosh %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @s(
+  gpu.func @s(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK: %[[A:.*]] = llvm.intr.fabs(%{{.*}}) : (f64) -> f64
+    // CHECK: %[[BELOW:.*]] = llvm.fcmp "olt" %[[A]], %{{.*}} : f64
+    // CHECK: %[[H:.*]] = llvm.fmul %[[A]], %{{.*}} : f64
+    // CHECK: llvm.select %[[BELOW]], %[[A]], %[[H]] : i1, f64
+    // CHECK: llvm.select %[[BELOW]]
+    %e = math.sinh %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // arith.floordivsi by 2^k is the arithmetic shift by k; ceildivsi by 2^k that
 // shift plus 1 where a low bit is set (L15-E290).
 gpu.module @pow2_floor_ceil_div {

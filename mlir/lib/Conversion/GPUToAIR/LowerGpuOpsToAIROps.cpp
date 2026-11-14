@@ -855,6 +855,25 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
 /// from 1/2, u - 1 and log(u), which do not cancel there (1 + x is exact
 /// below -1/2), and whose products would overflow (expm1(88), log1p(3e38)).
 /// A NaN propagates; -0 gives -0; infinities as exp and log give them.
+/// expm1(x) from u = exp(x) by rewriteAccurateM1's form: x where u is 1 and
+/// (u - 1) x / log(u) for |x| < 1/2, else u - 1 (the caller's u may be the
+/// exp of another argument where it does not read the result: L15-E309).
+static Value accurateExpM1(OpBuilder &b, Location loc, Value x, Value u) {
+  Type t = x.getType();
+  Value one = arith::ConstantOp::create(b, loc, t, b.getFloatAttr(t, 1.0));
+  Value small = arith::CmpFOp::create(
+      b, loc, arith::CmpFPredicate::OLT, math::AbsFOp::create(b, loc, x),
+      arith::ConstantOp::create(b, loc, t, b.getFloatAttr(t, 0.5)));
+  Value um1 = arith::SubFOp::create(b, loc, u, one);
+  Value q = arith::DivFOp::create(b, loc,
+                                  arith::MulFOp::create(b, loc, um1, x),
+                                  math::LogOp::create(b, loc, u));
+  Value isOne =
+      arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OEQ, u, one);
+  return arith::SelectOp::create(
+      b, loc, small, arith::SelectOp::create(b, loc, isOne, x, q), um1);
+}
+
 template <typename OpTy>
 static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   auto type = dyn_cast<FloatType>(op.getType());
@@ -883,12 +902,8 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
       math::AbsFOp::create(rewriter, loc, x), c(0.5f));
   Value r;
   if constexpr (std::is_same_v<OpTy, math::ExpM1Op>) {
-    Value u = math::ExpOp::create(rewriter, loc, x);
-    Value um1 = arith::SubFOp::create(rewriter, loc, u, one);
-    Value q = arith::DivFOp::create(
-        rewriter, loc, arith::MulFOp::create(rewriter, loc, um1, x),
-        math::LogOp::create(rewriter, loc, u));
-    r = sel(small, sel(eq(u, one), x, q), um1);
+    (void)small;
+    r = accurateExpM1(rewriter, loc, x, math::ExpOp::create(rewriter, loc, x));
   } else {
     Value u = arith::AddFOp::create(rewriter, loc, one, x);
     Value lu = math::LogOp::create(rewriter, loc, u);
@@ -1226,7 +1241,8 @@ static LogicalResult rewriteLogF64(math::LogOp op, PatternRewriter &rewriter) {
 ///     of two; x clamped to [-1080, 1030] keeping a NaN);
 ///   log2 x = k + log(m) log2(e), log10 x = k log10(2) + log(m) log10(e),
 ///     x = 2^k m with m in [sqrt(2)/2, sqrt(2)) (exact for powers of two);
-///   cosh x = (e + 1/e) / 2, e = exp(|x|) (exp(|x| / 2)^2 / 2 from 709);
+///   cosh x = (e + 1/e) / 2, e = exp(|x|) (exp(|x| / 2)^2 / 2 from 709: one
+///     exp, of the argument the range picks);
 ///   sinh x = h (2t - t^2 / (t + 1)) (|x| < 1) or h (t + t / (t + 1))
 ///     (|x| < 22), t = expm1(|x|), h = +-1/2; then h exp(|x|) (exp(|x| /
 ///     2)^2 h 2 from 709);
@@ -1308,27 +1324,32 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
             c(std::numeric_limits<double>::quiet_NaN()), r);
   } else if constexpr (std::is_same_v<OpTy, math::CoshOp>) {
     Value a = math::AbsFOp::create(b, x);
-    Value e = math::ExpOp::create(b, a);
-    Value near = add(mul(c(0.5), e), div(c(0.5), e));
     // from 709 (where e^|x| overflows): e^(|x|/2) squared, halved; |x| - ln 2
-    // would round |x|'s last bits away (up to 500 ulp)
-    Value w = math::ExpOp::create(b, mul(c(0.5), a));
-    Value far = mul(mul(c(0.5), w), w);
-    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), near, far);
+    // would round |x|'s last bits away (up to 500 ulp). One exp, of |x| or
+    // |x| / 2 as the range picks (L15-E309).
+    Value below = fcmp(arith::CmpFPredicate::OLT, a, c(709.0));
+    Value e = math::ExpOp::create(b, sel(below, a, mul(c(0.5), a)));
+    Value near = add(mul(c(0.5), e), div(c(0.5), e));
+    Value far = mul(mul(c(0.5), e), e);
+    r = sel(below, near, far);
     r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
   } else if constexpr (std::is_same_v<OpTy, math::SinhOp>) {
     Value a = math::AbsFOp::create(b, x);
     Value h = math::CopySignOp::create(b, c(0.5), x);
-    Value t = math::ExpM1Op::create(b, a);
+    // One exp, of |x| below 709 and |x| / 2 from it: expm1(|x|) (read
+    // below 22) from it as math.expm1's rewrite would from exp(|x|), the
+    // large range's e^|x| and the huge range's e^(|x| / 2) (L15-E309).
+    Value below = fcmp(arith::CmpFPredicate::OLT, a, c(709.0));
+    Value w = math::ExpOp::create(b, sel(below, a, mul(c(0.5), a)));
+    Value t = accurateExpM1(b, b.getLoc(), a, w);
     Value tp1 = add(t, c(1.0));
     Value small = mul(h, sub(mul(c(2.0), t), div(mul(t, t), tp1)));
     Value mid = mul(h, add(t, div(t, tp1)));
-    Value large = mul(h, math::ExpOp::create(b, a));
-    Value w = math::ExpOp::create(b, mul(c(0.5), a));
+    Value large = mul(h, w);
     Value huge = mul(mul(mul(h, c(2.0)), w), mul(c(0.5), w));
     r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(1.0)), small,
             sel(fcmp(arith::CmpFPredicate::OLT, a, c(22.0)), mid,
-                sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), large, huge)));
+                sel(below, large, huge)));
     // tiny x: x itself (also -0)
     r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
     r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
