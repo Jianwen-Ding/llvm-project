@@ -50,7 +50,7 @@ function. Each result is one JSON line with a `status`:
 | `timeout` / `inconclusive` | solver limit hit / Alive2 approximated |
 | `lift-unsupported` | the PTX uses something the lifter does not model |
 | `alive-unsupported` / `alive-error` | Alive2 cannot handle the source |
-| `src-inline-asm` | the source has inline asm (opaque on one side only) |
+| `src-inline-asm` | the source has inline asm that `asm_sem.py` cannot model |
 
 ## The model
 
@@ -130,6 +130,14 @@ single-thread semantics:
   left opaque: its tie-breaking and NaN selection are implementation-specific.
   `applypriority` stays opaque too (as a no-op, the address and eviction
   policy would go unchecked).
+* Inline PTX assembly in the source (`asm_sem.py`) is replaced by an
+  inlined function lifted from the template with its operands bound to
+  parameters (outputs returned, tied operands and `i`/`n` immediates
+  substituted). llc copies the template into its output, where it is lifted
+  as ordinary PTX, so both sides get the same instruction semantics and the
+  check covers operand binding and the use of results. Comment-only and
+  empty templates are no-ops (their operands are then unchecked). Memory
+  operands, predicate outputs and other operand modifiers are not handled.
 * Probe-derived opaque instructions (`probe.py`) for intrinsic families the
   lifter does not model (tcgen05, cp.async.bulk/TMA, cp.reduce, sparse
   (de)compression, applypriority, st.bulk, texture/surface, ...): each such

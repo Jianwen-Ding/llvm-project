@@ -24,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ptx_lift  # noqa: E402
 import nvvm_sem  # noqa: E402
+import asm_sem  # noqa: E402
 import probe  # noqa: E402
 probe.LLC = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin") + "/llc"
 from llvmsig import parse_sig, TypeParseError  # noqa: E402
@@ -184,7 +185,9 @@ def prepare_source(path, workdir):
     # semantics (inlined); the rest have no LLVM-level semantics in Alive2
     # and become uninterpreted external functions (immarg is only valid on
     # intrinsics).
+    out, asm_expanded = asm_sem.expand(out, ptx_lift)
     out, expanded = nvvm_sem.expand(out, ptx_lift, PROBE_LLC.get(os.getpid()))
+    expanded = expanded or asm_expanded
     if expanded:
         tmp = os.path.join(workdir, "src.sem.ll")
         with open(tmp, "w") as f:
