@@ -1013,7 +1013,7 @@ class Lifter:
         if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
                     "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
                     "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa",
-                    "txq", "suq", "suld", "sust", "tex") or \
+                    "txq", "suq", "suld", "sust", "tex", "wmma", "mma", "ldmatrix", "stmatrix") or \
                 (base == "barrier" and mods[:1] == ["cluster"]) or \
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
@@ -3076,6 +3076,76 @@ class Lifter:
             self.write(ops[0], self.ucall("i32", name, args), 32)
         else:
             self.write(ops[0], self.ucall("i1", name, args), 1)
+
+    def wmma_call(self, base, mods, ops, opc):
+        """Keyed warp-level matrix instruction (wmmakey.py): fragments
+        register by register and addresses as zero-extended i64, results as
+        i64 truncated to the destination registers."""
+        import wmmakey
+        r = wmmakey.ptx(base, mods)
+        if r is None:
+            raise Unsupported("opcode " + opc)
+        toks, kind = r
+        ops = [o.strip() for o in ops]
+        if base == "wmma" and kind in ("load", "store") and len(ops) == 3:
+            toks = toks | {"stride"}        # the PTX names it by the extra operand
+        res, srcs = [], []
+        if kind == "mma":
+            # {d}, {a}, {b}, {c}[, e, selector][, scale operands]: the
+            # intrinsic's argument order
+            if len(ops) < 4:
+                raise Unsupported("operand " + opc)
+            res = self.vec_ops(ops[0]) or [ops[0]]
+            for o in ops[1:]:
+                srcs += self.vec_ops(o) or [o]
+        elif kind == "load":
+            res = self.vec_ops(ops[0]) or [ops[0]]
+            srcs = ops[1:]
+        else:
+            srcs = [ops[0]]
+            for o in ops[1:]:
+                srcs += self.vec_ops(o) or [o]
+        vals = []
+        for o in srcs:
+            am = re.fullmatch(r"\[\s*([%\w$]+)\s*(?:\+\s*(-?\d+))?\s*\]", o)
+            x = am.group(1) if am else o
+            if x in self.regs and self.regs[x] > 1:
+                w = self.regs[x]
+                v = self.get(x, w)
+                if am and am.group(2):
+                    v = self.op("add i%d %s, %d" % (w, v, int(am.group(2))))
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(x) is not None and not am:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            else:
+                raise Unsupported("operand " + opc)
+        kname = wmmakey.name_of(toks, len(res), len(vals))
+        rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
+        self.declare(kname, "declare %s @%s(%s) nounwind willreturn" % (
+            rty, kname, ", ".join(["i64"] * len(vals))))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if not res:
+            self.emit(call)
+            return
+        v = self.op(call)
+        for k, d in enumerate(res):
+            if d not in self.regs:
+                raise Unsupported("operand " + opc)
+            e = self.op("extractvalue %s %s, %d" % (rty, v, k))
+            w = self.regs[d]
+            self.write(d, self.resize(e, 64, w, False) if w != 64 else e, w)
+
+    def i_wmma(self, mods, ops, opc):
+        return self.wmma_call("wmma", mods, ops, opc)
+
+    def i_mma(self, mods, ops, opc):
+        return self.wmma_call("mma", mods, ops, opc)
+
+    def i_ldmatrix(self, mods, ops, opc):
+        return self.wmma_call("ldmatrix", mods, ops, opc)
+
+    def i_stmatrix(self, mods, ops, opc):
+        return self.wmma_call("stmatrix", mods, ops, opc)
 
     def i_movmatrix(self, mods, ops, opc):
         # movmatrix.sync.aligned.m8n8.trans.b16 d, a  (cross-lane data movement)

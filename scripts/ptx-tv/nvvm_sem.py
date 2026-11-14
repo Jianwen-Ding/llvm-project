@@ -24,6 +24,7 @@ import tma
 import prio
 import bulkkey
 import texsurf
+import wmmakey
 
 INT_OF = {"float": "i32", "half": "i16", "bfloat": "i16", "<2 x half>": "i32",
           "<2 x bfloat>": "i32", "i8": "i8", "i16": "i16", "i32": "i32",
@@ -358,6 +359,28 @@ def expand(text, lifter_mod, llc_args=None):
                 and not re.match(r"\s*%", line):
             removed = True
             continue
+        wk = wmmakey.intrinsic(name)
+        if wk:
+            toks, kind = wk
+            isres = bool(re.match(r"\s*%", line))
+            ret = call_ret_type(line, m.start()) if isres else "void"
+            rtys = []
+            if ret and ret.startswith("{"):
+                from llvmsig import split_top as _st
+                rtys = [x.strip() for x in _st(ret.strip()[1:-1])]
+            elif ret and ret != "void":
+                rtys = [ret]
+            if ret and (kind == "store") == (not isres) and \
+                    all(wmmakey.bits(t) for t in rtys) and \
+                    all(t.startswith("ptr") or wmmakey.bits(t) for t, _ in args):
+                short = llc_args is not None and any("short-ptr" in a or "shortptr" in a for a in llc_args)
+                kname = wmmakey.name_of(toks, len(rtys), len(args))
+                key_ = ("wmma", name, ret, tuple(t for t, _ in args))
+                if key_ not in defs:
+                    defs[key_] = wmmakey.helper("ptxtv_sem_%d_wm" % len(defs), ret, rtys, args, kname, short)
+                line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                out_lines.append(line)
+                continue
         ts = texsurf.intrinsic(name)
         if ts and (ts[1] == 0) == (not re.match(r"\s*%", line)):
             toks, nres = ts

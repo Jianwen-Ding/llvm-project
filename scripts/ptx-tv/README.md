@@ -35,6 +35,11 @@ python3 tv.py --root llvm/test/CodeGen/NVPTX --workdir /tmp/w -j4 \
 python3 summarize.py results.jsonl
 python3 param_oob_scan.py llvm/test/CodeGen/NVPTX/*.ll   # static check, no Alive2
 ./show.sh FILE.ll FUNCTION                               # one function, verbose
+# tests that lit generates from Python (wmma*.py): materialise them, then
+# check each distinct function once (newest PTX version that has it)
+python3 gen_py_tests.py /tmp/py
+python3 tv.py --root /tmp/py --workdir /tmp/w -j4 --smt-to 5000 \
+  --funcs-json /tmp/py/funcs.json --out py.jsonl /tmp/py/wmma-*.ll
 ```
 
 For each test file, `tv.py` takes the first plain `llc` RUN line that targets
@@ -185,6 +190,20 @@ single-thread semantics:
   their documented modifiers (`prio.py`), operands as zero-extended i64
   (the 128-bit cluster-launch-control handle as i128), results returned as
   i64 and truncated to the destination.
+* Warp-level matrix instructions (`wmma.load`/`store`/`mma`, `mma.sync`
+  including `.sp`, `.sp::ordered_metadata`, `kind::f8f6f4` and the
+  block-scale forms, `ldmatrix`, `stmatrix`) are uninterpreted calls keyed
+  by shape, layouts, fragment, the full (d, a, b, c) type tuple, rounding,
+  `satfinite`, the b1 operation, kind, scale-vector size and scale type,
+  stride and state space (`wmmakey.py`). NVPTXUsage does not describe these
+  intrinsics; their names follow `IntrinsicsNVVM.td`'s naming classes, whose
+  signature names only the identifying types, so the others are inferred by
+  the PTX ISA's type rules (f16 forms are named by d and c with f16 inputs;
+  integer inputs accumulate in s32, bf16/tf32 in f32, f64 in f64). The PTX
+  side reads the full tuple from the opcode (`wmma.mma` f16 forms list d and
+  c only); a strided load/store is recognised by its extra operand.
+  Fragments go register by register (packed `f16x2` as one 32-bit
+  register, element 0 low), results come back per register.
 * Texture/surface instructions (`txq`/`suq` queries, `suld`/`sust.b` by
   geometry, vector width, bit size and clamp mode, and the unified `tex`
   fetches) are uninterpreted calls keyed by their modifiers, derived from
@@ -307,8 +326,8 @@ What remains opaque or unproved, and why:
 * Probe-derived opaque instructions are left for families without
   single-thread semantics a TV check could use: `multimem` loads and
   reductions (they combine the replicas; `multimem.st.async` is modelled as
-  a store, its single-memory meaning), `st.bulk` under
-  `PTXTV_OPAQUE_COPIES=1`, and `mma.sync` forms the lifter does not model.
+  a store, its single-memory meaning) and `st.bulk` under
+  `PTXTV_OPAQUE_COPIES=1`.
 * Non-tensor `cp.reduce.async.bulk`
   has single-thread semantics but a runtime element count; like the
   symbolic-size bulk copies (which already time out with copy semantics),

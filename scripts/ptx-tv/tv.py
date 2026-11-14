@@ -1068,6 +1068,10 @@ def main():
                     help="skip functions already present in this results file")
     ap.add_argument("--resume", action="store_true",
                     help="skip files already present in --out")
+    ap.add_argument("--funcs-json", default=None,
+                    help="JSON {file basename: [functions]} (gen_py_tests.py); each file's "
+                         "functions are checked in parallel chunks of --chunk")
+    ap.add_argument("--chunk", type=int, default=25)
     args = ap.parse_args()
     if args.resume and args.out != "-" and os.path.exists(args.out):
         done = set()
@@ -1090,8 +1094,18 @@ def main():
                 out.write(json.dumps(r) + "\n")
                 out.flush()
         return
+    jobs = [(f, args) for f in args.files]
+    if args.funcs_json:
+        sel = json.load(open(args.funcs_json))
+        jobs = []
+        for f in args.files:
+            fs = sel.get(os.path.basename(f), [])
+            for k in range(0, len(fs), args.chunk):
+                a = argparse.Namespace(**vars(args))
+                a.func = fs[k:k + args.chunk]
+                jobs.append((f, a))
     with ProcessPoolExecutor(args.j) as ex:
-        futs = {ex.submit(process_file, f, args): f for f in args.files}
+        futs = {ex.submit(process_file, f, a): f for f, a in jobs}
         for fu in as_completed(futs):
             try:
                 rs = fu.result()
