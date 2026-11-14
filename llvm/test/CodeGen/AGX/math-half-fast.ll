@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-fast-hyperbolic=0 -agx-half-fast-division=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-fast-hyperbolic=0 -agx-half-fast-division=0 -agx-narrow-fast-sqrt=0 -agx-narrow-sincos-reduction=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; Half tanh, sinh and cosh with the hardware's exponential and reciprocal
 ; (no Newton step), and half atan's and tan's division by the hardware's
@@ -84,5 +84,18 @@ define void @asin_h(ptr addrspace(1) %p) {
   %x = load half, ptr addrspace(1) %p
   %r = call half @llvm.asin.f16(half %x)
   store half %r, ptr addrspace(1) %p
+  ret void
+}
+
+; bfloat sin: pi / 2 in two parts (L15-E350)
+; CHECK-LABEL: sin_bf:
+; CHECK-NOT: mov_imm {{r[0-9]+}}, 653733101
+; CHECK: stop
+; OFF-LABEL: sin_bf:
+; OFF: mov_imm {{r[0-9]+}}, 653733101
+define void @sin_bf(ptr addrspace(1) %p) {
+  %x = load bfloat, ptr addrspace(1) %p
+  %r = call bfloat @llvm.sin.bf16(bfloat %x)
+  store bfloat %r, ptr addrspace(1) %p
   ret void
 }

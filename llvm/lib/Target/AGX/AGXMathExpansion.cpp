@@ -78,6 +78,11 @@ static cl::opt<bool> Exp2DirectReduction(
     cl::desc("precise exp2 reduced by n = roundeven(x) directly"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> NarrowSinCosReduction(
+    "agx-narrow-sincos-reduction",
+    cl::desc("bfloat sin / cos: pi / 2 in two parts"),
+    cl::init(true), cl::Hidden);
+
 namespace {
 class MathBuilder {
   IRBuilderBase &B;
@@ -712,7 +717,10 @@ public:
     Value *NJ = B.CreateFNeg(J);
     Value *R = fma(NJ, k(1.57079637050628662109375), X);
     R = fma(NJ, k(-4.371139000189375e-8), R);
-    R = fma(NJ, k(-1.7151245100059780e-15), R);
+    // (a bfloat result: pi / 2 in two parts, every bfloat's sin and cos the
+    // same, L15-E350)
+    if (!(NarrowResult && NarrowSinCosReduction))
+      R = fma(NJ, k(-1.7151245100059780e-15), R);
     Value *Small = lt(abs(X), 4194304.0);
     Value *Q = B.CreateFPToSI(sel(Small, J, k(0.0)), intTy());
     auto [S, C] = sinCosPolys(R);
