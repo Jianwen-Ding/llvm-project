@@ -1814,24 +1814,47 @@ static bool keepsLanesFrom(Value *Cond, bool ShuffleOnTrue, uint64_t D) {
 
 static cl::opt<bool> AGXSIMDReductions(
     "agx-simd-reductions", cl::init(true), cl::Hidden,
-    cl::desc("A SIMD-group's integer xor-butterfly reduction (shuffles xor 1, "
-             "2, 4, 8 and 16) as one simd reduction"));
+    cl::desc("A SIMD-group's xor-butterfly reduction (shuffles xor 1, 2, 4, "
+             "8 and 16) as one simd reduction"));
 
 /// The xor butterfly over a SIMD-group's 32 lanes, x' = x op shuffle_xor(x,
 /// d) for d = 1, 2, 4, 8 and 16 in any order (quad shuffles for 1 and 2 as
-/// well), leaves every lane the reduction of all 32: for a 32-bit integer
-/// add, and, or, xor, or signed / unsigned min / max (exact, in any order) it
-/// is the hardware's simd reduction of x, one instruction for ten. A shuffle
-/// from an inactive lane is undefined (as in simdScans), so where some lanes
-/// are inactive the reduction of the active ones is one of the original's
-/// results (L15-E362).
+/// well), leaves every lane the reduction of all 32: for a 32- or 16-bit
+/// integer add, and, or, xor, or signed / unsigned min / max (exact, in any
+/// order) it is the hardware's simd reduction of x, one instruction for ten
+/// (L15-E362). A float add or multiply is the same where the butterfly's
+/// order is the hardware's: lanes 2k and 2k+1 first, then neighbouring pairs,
+/// i.e. d = 1, 2, 4, 8, 16 (in a butterfly a lane and its partner compute
+/// a op b and b op a, the same value, so every lane holds that one pairwise
+/// tree; the coverage recordings simd_fadd fail with the halves-first tree),
+/// rounding each step like fadd / fmul and flushing fp32 denormals like
+/// them; not with IEEE fp32 denormals in software, half denormal flushing or
+/// canonical NaNs (L15-E363). A shuffle from an inactive lane is undefined
+/// (as in simdScans), so where some lanes are inactive the reduction of the
+/// active ones is one of the original's results.
 bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
   if (!AGXSIMDReductions || !ST.hasSIMDReduce())
     return false;
+  bool Float32 = !ST.hasCanonicalNaN() &&
+                 !(ST.hasIEEEFP32() && F.getDenormalMode(APFloat::IEEEsingle()) ==
+                                           DenormalMode::getIEEE());
+  bool Float16 = !ST.hasCanonicalNaN() &&
+                 F.getDenormalMode(APFloat::IEEEhalf()) == DenormalMode::getIEEE();
+  // The value a shuffle moves, through the bitcasts around an integer shuffle
+  // of a float.
+  auto Strip = [](Value *V) {
+    if (auto *BC = dyn_cast<BitCastInst>(V))
+      return BC->getOperand(0);
+    return V;
+  };
   // The step v' = op(v, shuffle_xor(v, d)): its op code, v and d.
-  auto Step = [](Value *V, int &Op, Value *&Prev, unsigned &D) {
+  auto Step = [&](Value *V, int &Op, Value *&Prev, unsigned &D) {
     auto *I = dyn_cast<Instruction>(V);
-    if (!I || !I->getType()->isIntegerTy(32))
+    if (!I)
+      return false;
+    Type *Ty = I->getType();
+    bool Int = Ty->isIntegerTy(32) || Ty->isIntegerTy(16);
+    if (!Int && !(Ty->isFloatTy() && Float32) && !(Ty->isHalfTy() && Float16))
       return false;
     Value *A, *B;
     int O = -1;
@@ -1843,6 +1866,8 @@ bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
       case Instruction::And: O = 0; break;
       case Instruction::Or: O = 2; break;
       case Instruction::Xor: O = 4; break;
+      case Instruction::FAdd: O = 1; break;
+      case Instruction::FMul: O = 3; break;
       default: return false;
       }
     } else if (auto *II = dyn_cast<IntrinsicInst>(I)) {
@@ -1859,10 +1884,15 @@ bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
       return false;
     }
     for (int K = 0; K < 2; ++K, std::swap(A, B)) {
-      auto *Sh = dyn_cast<IntrinsicInst>(B);
+      auto *Sh = dyn_cast<IntrinsicInst>(Strip(B));
       if (!Sh || (Sh->getIntrinsicID() != Intrinsic::agx_simd_shuffle_xor &&
-                  Sh->getIntrinsicID() != Intrinsic::agx_quad_shuffle_xor) ||
-          Sh->getArgOperand(0) != A)
+                  Sh->getIntrinsicID() != Intrinsic::agx_quad_shuffle_xor))
+        continue;
+      Value *Src = Sh->getArgOperand(0);
+      if (Src != A && Strip(Src) != A)
+        continue;
+      if (Src->getType()->getPrimitiveSizeInBits() !=
+          Ty->getPrimitiveSizeInBits())
         continue;
       auto *C = dyn_cast<ConstantInt>(Sh->getArgOperand(1));
       if (!C)
@@ -1889,16 +1919,30 @@ bool AGXCodeGenPrepare::simdReductions(Function &F, const AGXSubtarget &ST) {
     int Op = -1, StepOp;
     unsigned Seen = 0, D;
     Value *V = &I, *Prev;
+    Instruction *Bottom = nullptr;
+    // From the top: the hardware's float order is d = 16, 8, 4, 2, 1 here.
+    bool Ordered = true;
     int N = 0;
     for (; N < 5 && Step(V, StepOp, Prev, D); ++N) {
       if ((Op != -1 && StepOp != Op) || (Seen & D))
         break;
+      Ordered &= D == (16u >> N);
       Op = StepOp;
       Seen |= D;
+      Bottom = cast<Instruction>(V);
       V = Prev;
     }
-    if (N == 5 && Seen == 31)
-      Found.push_back({&I, V, Op});
+    if (N != 5 || Seen != 31)
+      continue;
+    if (I.getType()->isFloatingPointTy()) {
+      if (!Ordered)
+        continue;
+      // A multiply the first add could fuse with: the old code may differ.
+      if (Op == 1 && Bottom->hasAllowContract() && isa<FPMathOperator>(V) &&
+          cast<Operator>(V)->getOpcode() == Instruction::FMul)
+        continue;
+    }
+    Found.push_back({&I, V, Op});
   }
   bool Changed = false;
   for (auto &[IH, XH, Op] : Found) {
