@@ -50,3 +50,58 @@ def ptx(mods):
     if rest != ["b32"]:
         return None
     return kind, shape, int(m.group(1)), packed
+
+
+# ---- tcgen05.ld.red -------------------------------------------------------
+# IntrinsicsNVVM.td (NVVM_TCGEN05_LD_RED): returns {<n x T>, T} (the loaded
+# values and the reduction result; T = i32 or float), arguments (tmem,
+# [i64 offset for 16x32bx2], i32 redOp (0 min, 1 max), [i1 abs, i1 nan for
+# f32]).  PTX: tcgen05.ld.red.sync.aligned.<shape>.x<num>.<min|max>[.abs]
+# [.NaN].<u32|f32> {regs}, red, [taddr]{, offset}.
+
+def red_key(shape, num, ty, op, ab, nan):
+    return "ptx.tcgen05.ld_red.%s.x%d.%s.%s%s%s" % (shape, num, ty, op, ".abs" if ab else "",
+                                                   ".nan" if nan else "")
+
+
+def red_decl(shape, num, ty, op, ab, nan):
+    n = nregs(shape, num)
+    args = ["i32"] + (["i64"] if shape == "16x32bx2" else [])
+    return "declare { <%d x i32>, i32 } @%s(%s) nounwind" % (
+        n, red_key(shape, num, ty, op, ab, nan), ", ".join(args))
+
+
+def red_intrinsic(name, args):
+    m = re.fullmatch(r"tcgen05\.ld\.red\.(16x32bx2|32x32b)\.x(\d+)\.(i32|f32)", name)
+    if not m or int(m.group(2)) not in NUMS:
+        return None
+    shape, num, t = m.group(1), int(m.group(2)), m.group(3)
+    v = [x for _, x in args]
+    k = 1 + (shape == "16x32bx2")
+    want = k + 1 + (2 if t == "f32" else 0)
+    if len(args) != want or v[k] not in ("0", "1"):
+        return None
+    op = "min" if v[k] == "0" else "max"
+    ab = nan = False
+    if t == "f32":
+        if v[k + 1] not in ("0", "1", "true", "false") or v[k + 2] not in ("0", "1", "true", "false"):
+            return None
+        ab, nan = v[k + 1] in ("1", "true"), v[k + 2] in ("1", "true")
+    return shape, num, ("f32" if t == "f32" else "u32"), op, ab, nan
+
+
+def red_ptx(mods):
+    if mods[:4] != ["ld", "red", "sync", "aligned"] or len(mods) < 8:
+        return None
+    shape = mods[4]
+    m = re.fullmatch(r"x(\d+)", mods[5])
+    if shape not in ("16x32bx2", "32x32b") or not m or int(m.group(1)) not in NUMS:
+        return None
+    rest = mods[6:]
+    if rest[0] not in ("min", "max") or rest[-1] not in ("u32", "f32"):
+        return None
+    mid = rest[1:-1]
+    ab, nan = "abs" in mid, "NaN" in mid
+    if [x for x in mid if x not in ("abs", "NaN")] or (rest[-1] == "u32" and mid):
+        return None
+    return shape, int(m.group(1)), rest[-1], rest[0], ab, nan

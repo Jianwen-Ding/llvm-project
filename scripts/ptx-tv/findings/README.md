@@ -164,7 +164,7 @@ target-independent; it is observed here through NVPTX.
 Severity: low (signaling-NaN inputs only); either the lowering or the
 LangRef text should change.
 
-## 7. NVPTXUsage documents the wrong argument order for `tcgen05.st.16x32bx2`
+## 7. NVPTXUsage documents wrong signatures for `tcgen05.st.16x32bx2` and `tcgen05.ld.red`
 
 Reproducer: `tcgen05-st-doc-order.ll` (found while deriving the
 `tcgen05.st` model from the documentation)
@@ -183,8 +183,15 @@ i64"). The code generator and the tests use the defined order; only the
 documentation is wrong. (The `tcgen05.ld.16x32bx2` entry, whose offset
 precedes the flag, is consistent.)
 
+The `tcgen05.ld.red` entry is wrong too (reproducer
+`tcgen05-ld-red-doc-type.ll`): it documents a `<n x i32>` result for both
+the `.i32` and the `.f32` forms, but `NVVM_TCGEN05_LD_RED` returns
+`{<n x T>, T}` (the loaded values and the reduction result, `T` = `float`
+for `.f32`), which is what the backend and its tests use.
+
 Severity: documentation only. Fix direction: swap `%args` and `%offset` in
-the documented signature.
+the documented `tcgen05.st.16x32bx2` signature and give `tcgen05.ld.red`
+its two-element struct result.
 
 ## Lower-severity observations
 
@@ -238,7 +245,7 @@ covered); every result was re-checked with the final lifter (including a
 regression re-run of all previously correct functions), and timeouts were
 re-run with larger budgets and, separately, the weaker
 `--disable-poison-input` check (tagged). In short: 4199 functions from 619
-test files; 3421 proved correct (410 through probe-derived opaque instructions,
+test files; 3421 proved correct (402 through probe-derived opaque instructions,
 50 only with the weaker check); 33 counterexamples with out-of-bounds
 `.param` accesses (finding 1, plus the padding over-reads); findings
 2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in

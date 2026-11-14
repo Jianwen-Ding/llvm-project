@@ -123,8 +123,9 @@ single-thread semantics:
   complete-tx (of the store's size) on the mbarrier; the `.release.{sys,gpu}`
   (and `.mmio`) global forms, and `multimem.st.async`, are plain stores. `discard.L2` makes its
   128-byte line indeterminate (a store of poison, 128-byte aligned).
-* `tcgen05.ld`/`tcgen05.st` (not `.red`) are uninterpreted calls keyed by
-  shape, repeat factor and (un)packing, derived independently from the NVVM
+* `tcgen05.ld`/`tcgen05.st` (and `tcgen05.ld.red`, keyed also by type,
+  min/max, `.abs`, `.NaN`) are uninterpreted calls keyed by shape, repeat
+  factor and (un)packing, derived independently from the NVVM
   intrinsic (as NVPTXUsage documents it, with the argument order of
   `IntrinsicsNVVM.td`) and from the PTX opcode (`tcgen05ls.py`): tensor
   memory stays opaque, but instruction selection, the register count and
@@ -244,9 +245,9 @@ intrinsics' `i16` operands/results.
 What remains opaque or unproved, and why:
 
 * Probe-derived opaque instructions are left for families without
-  single-thread semantics a TV check could use: `tcgen05.mma` and
-  `tcgen05.ld.red` (warp/CTA collective tensor-core operations; the other
-  `tcgen05` operations have documentation-derived models), TMA
+  single-thread semantics a TV check could use: `tcgen05.mma` (warp/CTA
+  collective tensor-core operations; the other `tcgen05` operations have
+  documentation-derived models), TMA
   (`cp.async.bulk.tensor`, `cp.reduce.async.bulk.tensor`) and
   `tensormap.replace` (the tensor-map layout is not public), `multimem`
   loads and reductions (they combine the replicas; `multimem.st.async` is

@@ -4057,14 +4057,14 @@
 {"function": "tcgen05_mma_disable_output_lane_collector_b_tf32_scale_d_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_disable_output_lane_collector_b_f16_scale_d_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_disable_output_lane_collector_b_tf32_scale_d_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
-{"function": "nvvm_tcgen05_ld_32x32b_min_i32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_32x32b_max_i32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_16x32bx2_min_i32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_16x32bx2_max_i32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_32x32b_min_f32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_32x32b_max_f32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_16x32bx2_min_f32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
-{"function": "nvvm_tcgen05_ld_16x32bx2_max_f32", "probe": true, "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_32x32b_min_i32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_32x32b_max_i32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_16x32bx2_min_i32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_16x32bx2_max_i32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_32x32b_min_f32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_32x32b_max_f32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_16x32bx2_min_f32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
+{"function": "nvvm_tcgen05_ld_16x32bx2_max_f32", "status": "correct", "file": "tcgen05-ld-red.ll", "llc": "-mcpu=sm_101a -march=nvptx64 -mattr=+ptx88"}
 {"function": "tcgen05_mma_sp_disable_output_lane_collector_b_f16_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_sp_disable_output_lane_collector_b_f16_cta2", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}
 {"function": "tcgen05_mma_sp_disable_output_lane_collector_b_tf32_cta1", "probe": true, "status": "correct", "file": "tcgen05-mma-sp-disable-output-lane-collector-b.ll", "llc": "-mcpu=sm_107f -mattr=+ptx94 -march=nvptx64"}

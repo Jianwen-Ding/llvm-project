@@ -1015,7 +1015,7 @@ class Lifter:
                 (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
                                                      "sync", "aligned"}) or \
                 (base == "st" and ("bulk" in mods or "async" in mods)) or \
-                (base == "tcgen05" and mods[:1] in (["ld"], ["st"]) and "red" not in mods) or \
+                (base == "tcgen05" and mods[:1] in (["ld"], ["st"])) or \
                 (base == "tcgen05" and mods[:1] in (["alloc"], ["dealloc"], ["relinquish_alloc_permit"],
                                                    ["commit"], ["cp"], ["shift"], ["wait::ld"],
                                                    ["wait::st"], ["fence::before_thread_sync"],
@@ -2362,6 +2362,29 @@ class Lifter:
         other tcgen05 instructions are probe-derived."""
         import tcgen05ls
         import tcgen05ops
+        rr = tcgen05ls.red_ptx(mods)
+        if rr is not None:
+            shape, num, ty, op, ab, nan = rr
+            n = tcgen05ls.nregs(shape, num)
+            kname = tcgen05ls.red_key(*rr)
+            self.declare(kname, tcgen05ls.red_decl(*rr))
+            ops_ = [o.strip() for o in ops]
+            regs = self.vec_ops(ops_[0])
+            mm = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", ops_[2]) if len(ops_) >= 3 else None
+            if regs is None or len(regs) != n or not mm:
+                raise Unsupported("operands " + opc)
+            args = ["i32 %s" % self.get(mm.group(1), 32)]
+            if shape == "16x32bx2":
+                if len(ops_) != 4:
+                    raise Unsupported("operands " + opc)
+                args.append("i64 %s" % self.get(ops_[3], 64))
+            st = "{ <%d x i32>, i32 }" % n
+            v = self.op("call %s @%s(%s)" % (st, kname, ", ".join(args)))
+            vec = self.op("extractvalue %s %s, 0" % (st, v))
+            for k, r in enumerate(regs):
+                self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (n, vec, k)), 32)
+            self.write(ops_[1], self.op("extractvalue %s %s, 1" % (st, v)), 32)
+            return
         t = tcgen05ls.ptx(mods)
         if t is None:
             toks = tcgen05ops.ptx(mods)

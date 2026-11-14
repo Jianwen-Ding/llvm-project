@@ -362,6 +362,40 @@ def expand(text, lifter_mod, llc_args=None):
                 line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
                 out_lines.append(line)
                 continue
+        rd = tcgen05ls.red_intrinsic(name, args)
+        if rd and not re.match(r"\s*$", line):
+            ret = call_ret_type(line, m.start())
+            shape, num, ty, op, ab, nan = rd
+            n = tcgen05ls.nregs(shape, num)
+            et = "float" if ty == "f32" else "i32"
+            if ret and ret.replace(" ", "") == "{<%dx%s>,%s}" % (n, et, et):
+                kname = tcgen05ls.red_key(*rd)
+                fname = "ptxtv_sem_" + kname.replace(".", "_")
+                key_ = ("tcgen05red", name, tuple(args))
+                if key_ not in defs:
+                    rt = "{ <%d x %s>, %s }" % (n, et, et)
+                    st = "{ <%d x i32>, i32 }" % n
+                    w = ["define internal %s @%s(%s) alwaysinline {" % (
+                        rt, fname, ", ".join("%s %%y%d" % (t, k) for k, (t, _) in enumerate(args))),
+                        "  %%a = ptrtoint %s %%y0 to i32" % args[0][0]]
+                    cargs = ["i32 %a"] + (["i64 %y1"] if shape == "16x32bx2" else [])
+                    w.append("  %%r = call %s @%s(%s)" % (st, kname, ", ".join(cargs)))
+                    w.append("  %%v = extractvalue %s %%r, 0" % st)
+                    w.append("  %%s = extractvalue %s %%r, 1" % st)
+                    if et == "float":
+                        w.append("  %%vf = bitcast <%d x i32> %%v to <%d x float>" % (n, n))
+                        w.append("  %sf = bitcast i32 %s to float")
+                        vv, sv = "%vf", "%sf"
+                    else:
+                        vv, sv = "%v", "%s"
+                    w.append("  %%o1 = insertvalue %s poison, <%d x %s> %s, 0" % (rt, n, et, vv))
+                    w.append("  %%o2 = insertvalue %s %%o1, %s %s, 1" % (rt, et, sv))
+                    w.append("  ret %s %%o2" % rt)
+                    w.append("}")
+                    defs[key_] = (fname, "\n".join(w), {kname: tcgen05ls.red_decl(*rd)})
+                line = line[:m.start()] + "@" + defs[key_][0] + line[j:]
+                out_lines.append(line)
+                continue
         tg = tcgen05ls.intrinsic(name)
         if tg and not re.match(r"\s*$", line):
             kind, shape, num = tg
