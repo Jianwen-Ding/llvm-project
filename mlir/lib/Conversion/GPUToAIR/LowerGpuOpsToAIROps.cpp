@@ -1950,6 +1950,14 @@ static std::optional<SimdgroupReduce> simdgroupReduce(gpu::AllReduceOp op) {
   case gpu::AllReduceOperation::AND:
   case gpu::AllReduceOperation::OR:
     break;
+  // f32: subgroup_reduce's ordered-key maximum (minimum) and NaN or
+  // (reduceOrderedFloat), idempotent like maxnum for the lanes past the
+  // SIMD-group count (L15-E275).
+  case gpu::AllReduceOperation::MAXIMUMF:
+  case gpu::AllReduceOperation::MINIMUMF:
+    if (!type.isF32())
+      return std::nullopt;
+    break;
   default:
     return std::nullopt;
   }

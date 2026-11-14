@@ -601,6 +601,26 @@ gpu.module @simdgroup_all_reduce {
     memref.store %t, %a[%c0] : memref<1024xf32, 1>
     gpu.return
   }
+  // maximumf of f32: the SIMD-group reductions are subgroup_reduce's
+  // (ordered keys' signed maximum and an or of "is NaN"), no shuffles.
+  // CHECK-LABEL: llvm.func @maximum(
+  gpu.func @maximum(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 256, 1, 1>} {
+    // CHECK-NOT: llvm.call @air.simd_shuffle
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.call @air.simd_or.s.i32
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK-NOT: llvm.call @air.simd_shuffle
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.call @air.simd_or.s.i32
+    // CHECK-NOT: llvm.call @air.simd_shuffle
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce maximumf %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
   // A reduction whose result feeds the next one keeps its own round.
   // CHECK-LABEL: llvm.func @dependent(
   gpu.func @dependent(%a: memref<1024xf32, 1>) kernel
