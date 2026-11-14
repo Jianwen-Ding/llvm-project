@@ -22,10 +22,9 @@ define agx_kernel void @sub_shl(ptr addrspace(1) %out, i32 %a, i32 %b) {
   ret void
 }
 
-; A shift by more than 4 is a separate instruction.
+; A shift by more than 4 (up to 7) is a multiply-add by 2^s (L15-E318).
 ; CHECK-LABEL: add_shl5:
-; CHECK:         bfi
-; CHECK-NEXT:    iadd r{{[0-9]+}}, r{{[0-9]+}}, u3{{$}}
+; CHECK:         imadd r{{[0-9]+}}, u2, 32, u3{{$}}
 define agx_kernel void @add_shl5(ptr addrspace(1) %out, i32 %a, i32 %b) {
   %s = shl i32 %a, 5
   %r = add i32 %s, %b
