@@ -12,7 +12,9 @@ buffer with a Python model of the kernel:
   generic        a load through a generic pointer that may name threadgroup or device memory;
   generic3       the same with private memory as a third choice;
   sunk-scan      a SIMD-group add scan by shuffles up whose last add only feeds the last thread's store of the total
-                 (sunk into that branch: the recognized scan must stay with its shuffles, L15-E365).
+                 (sunk into that branch: the recognized scan must stay with its shuffles, L15-E365);
+  fuzz-*         the differential fuzzers beside this script (agx-int / fp / half / f64 / mem / simd / cf-fuzz.py),
+                 --fuzz-seeds seeds of each (default 100; 0 skips them).
 
   agx-stress.py --llc build/bin/llc --run path/to/agx_run [--objcopy build/bin/llvm-objcopy] [--only NAME]
 
@@ -269,6 +271,7 @@ def main():
     ap.add_argument("--run", required=True, help="agx_run from the AGX Performance Simulator")
     ap.add_argument("--objcopy", default=None)
     ap.add_argument("--only", default=None)
+    ap.add_argument("--fuzz-seeds", type=int, default=100)
     a = ap.parse_args()
     a.objcopy = a.objcopy or os.path.join(os.path.dirname(a.llc), "llvm-objcopy")
     failed = 0
@@ -285,6 +288,20 @@ def main():
                     bad, status = True, "FAILED: " + (e.stderr or "")[-300:].strip()
                 failed += bool(bad)
                 print("%-24s %-9s %s" % (name, chip, status))
+    here = os.path.dirname(os.path.abspath(__file__))
+    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf"):
+        name = "fuzz-" + fz
+        if a.fuzz_seeds <= 0 or (a.only and a.only != name):
+            continue
+        for chip in CHIPS:
+            tool = [sys.executable, "-W", "ignore", os.path.join(here, "agx-%s-fuzz.py" % fz)]
+            tool += (["--bin", os.path.dirname(a.llc)] if fz == "cf" else ["--llc", a.llc, "--objcopy", a.objcopy])
+            r = subprocess.run(tool + ["--run", a.run, "--mcpu", chip, "--seeds", "0:%d" % a.fuzz_seeds],
+                               capture_output=True, text=True)
+            ok = r.returncode == 0
+            failed += not ok
+            last = (r.stdout.strip().splitlines() or ["?"])[-1]
+            print("%-24s %-9s %s" % (name, chip, "ok" if ok else "FAILED: " + (r.stdout + r.stderr)[-300:].strip()))
     return 1 if failed else 0
 
 
