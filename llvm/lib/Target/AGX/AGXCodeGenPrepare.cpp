@@ -4906,6 +4906,11 @@ static cl::opt<bool> AGXIntToBFloatOnce(
     cl::desc("Convert integers of more than 24 bits to bfloat with one "
              "rounding (rounded to odd at 24 bits first)"));
 
+static cl::opt<bool> AGXIntToBFloatRTZ(
+    "agx-int-to-bf16-rtz", cl::init(true), cl::Hidden,
+    cl::desc("A 32-bit integer to bfloat rounded to odd through the float "
+             "conversion toward zero"));
+
 /// sitofp / uitofp of an integer of more than 24 bits to bfloat, rounded once:
 /// instruction selection converts to float (rounded) and rounds that to
 /// bfloat again, which is wrong where the first rounding lands on a bfloat
@@ -4930,6 +4935,27 @@ static bool convertIntsToBFloatOnce(Function &F) {
     unsigned W = Ty->getBitWidth();
     bool Signed = isa<SIToFPInst>(C);
     auto K = [&](uint64_t V) { return ConstantInt::get(Ty, V); };
+    // 32 bits: the float conversion toward zero, made odd where it was
+    // inexact (the conversion back differs), is x rounded to odd at 24 bits,
+    // signed or not (toward zero rounds the magnitude); then its bits
+    // rounded to nearest bfloat (never a NaN) (L15-E316).
+    if (W == 32 && AGXIntToBFloatRTZ) {
+      Value *F = B.CreateIntrinsic(Signed ? Intrinsic::agx_sitofp_rtz
+                                          : Intrinsic::agx_uitofp_rtz,
+                                   {}, {X});
+      Value *Back = Signed ? B.CreateFPToSI(F, Ty) : B.CreateFPToUI(F, Ty);
+      Value *Bits = B.CreateBitCast(F, Ty);
+      Value *Odd = B.CreateOr(Bits, B.CreateZExt(B.CreateICmpNE(Back, X), Ty));
+      Value *Lsb = B.CreateAnd(B.CreateLShr(Odd, 16), K(1));
+      Value *R16 = B.CreateTrunc(
+          B.CreateLShr(B.CreateAdd(Odd, B.CreateAdd(Lsb, K(0x7fff))), 16),
+          B.getInt16Ty());
+      Value *R = B.CreateBitCast(R16, C->getType());
+      R->takeName(C);
+      C->replaceAllUsesWith(R);
+      C->eraseFromParent();
+      continue;
+    }
     Value *A = Signed ? B.CreateBinaryIntrinsic(Intrinsic::abs, X, B.getFalse())
                       : X;
     // bits below the 24 significant ones: max(W - ctlz(a) - 24, 0)

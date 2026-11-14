@@ -215,6 +215,12 @@ class AGXFloatUnaryIntrinsic
 // Hardware approximations, without any special case handling beyond what
 // the instruction does.
 def int_agx_rcp : AGXFloatUnaryIntrinsic;
+// A 32-bit integer converted to float rounded toward zero (the convert
+// instruction's truncating integer-to-float modes).
+def int_agx_uitofp_rtz : DefaultAttrsIntrinsic<[llvm_float_ty], [llvm_i32_ty],
+                                               [IntrNoMem, IntrSpeculatable]>;
+def int_agx_sitofp_rtz : DefaultAttrsIntrinsic<[llvm_float_ty], [llvm_i32_ty],
+                                               [IntrNoMem, IntrSpeculatable]>;
 def int_agx_rsqrt : AGXFloatUnaryIntrinsic;
 // rsqrt with special cases chosen so that rsqrt_special(x) * x == sqrt(x).
 def int_agx_rsqrt_special : AGXFloatUnaryIntrinsic;

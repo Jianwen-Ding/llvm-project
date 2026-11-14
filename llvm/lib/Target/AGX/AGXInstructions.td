@@ -1542,6 +1542,11 @@ def : Pat<(i16 (AGXcvt_f_to_s8 (f16 (RN8 f16:$a)))), (CONVERT_16_16 CVT_F_TO_S8_
 }
 def : Pat<(f32 (sint_to_fp i32:$a)), (CONVERT_32_32 CVT_S32_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (uint_to_fp i32:$a)), (CONVERT_32_32 CVT_U32_TO_F, 0, $a, ROUND_RTE)>;
+// Toward zero: the modes without the round-to-nearest bit (mode bit 1; the
+// "round" operand is the direction, integer to float), 8 unsigned and 9
+// signed 32-bit (the coverage recordings' mode8_round1 / mode9_round1).
+def : Pat<(f32 (int_agx_uitofp_rtz i32:$a)), (CONVERT_32_32 8, 0, $a, ROUND_RTE)>;
+def : Pat<(f32 (int_agx_sitofp_rtz i32:$a)), (CONVERT_32_32 9, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (sint_to_fp i16:$a)), (CONVERT_32_16 CVT_S16_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (uint_to_fp i16:$a)), (CONVERT_32_16 CVT_U16_TO_F, 0, $a, ROUND_RTE)>;
 // Zero-extended bytes often arrive as i16 after vector load legalization.
