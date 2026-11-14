@@ -766,6 +766,21 @@ gpu.module @shuffle_reduce {
     memref.store %r, %a[%c0] : memref<64xf16, 1>
     gpu.return
   }
+  // maximumf / minimumf of f16: the f32 ordered-key reduction of the values
+  // extended, truncated; no shuffles.
+  // CHECK-LABEL: llvm.func @f16maximum(
+  gpu.func @f16maximum(%a: memref<64xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf16, 1>
+    // CHECK-NOT: simd_shuffle
+    // CHECK: llvm.fpext %{{.*}} : f16 to f32
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.fptrunc %{{.*}} : f32 to f16
+    // CHECK-NOT: simd_shuffle
+    %r = gpu.subgroup_reduce maximumf %v : (f16) -> f16
+    memref.store %r, %a[%c0] : memref<64xf16, 1>
+    gpu.return
+  }
   // i8 and i16: AIR's i32 reduction of the values extended (signed for a
   // signed minimum or maximum), truncated; no shuffles.
   // CHECK-LABEL: llvm.func @narrow(

@@ -1998,7 +1998,8 @@ static std::optional<SimdgroupReduce> simdgroupReduce(gpu::AllReduceOp op) {
   // SIMD-group count (L15-E275).
   case gpu::AllReduceOperation::MAXIMUMF:
   case gpu::AllReduceOperation::MINIMUMF:
-    if (!type.isF32())
+    // (f16: its subgroup_reduce is the f32 one, L15-E280.)
+    if (!type.isF32() && !type.isF16())
       return std::nullopt;
     break;
   default:
@@ -2216,8 +2217,8 @@ struct LowerGpuOpsToAIROpsPass final
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
-    // has quad-group and SIMD-group ones; of i64, i8 and i16 being widened
-    // first; maximumf of f16): xor shuffles at 1, 2, 4, ... within each
+    // has quad-group and SIMD-group ones; of i64, i8 and i16 and f16's
+    // maximumf being widened first): xor shuffles at 1, 2, 4, ... within each
     // cluster (the order AIR's reductions add in), which the shuffle lowering
     // takes to AIR.
     {
@@ -2225,16 +2226,33 @@ struct LowerGpuOpsToAIROpsPass final
       // for a signed minimum or maximum), truncated, the same value (the
       // others are exact modulo 2^n), and AIR's 32-bit reduction instead of
       // shuffles (L15-E279).
+      // f16 and bf16 maximumf / minimumf likewise in f32 (exact both ways:
+      // the result is one of the values, or a NaN), its ordered-key
+      // reduction instead of shuffles (L15-E280).
       SmallVector<gpu::SubgroupReduceOp> narrow;
       m.walk([&](gpu::SubgroupReduceOp op) {
         Type type = op.getType();
-        if (type.isInteger(8) || type.isInteger(16))
+        if (type.isInteger(8) || type.isInteger(16) ||
+            ((type.isF16() || type.isBF16()) &&
+             (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+              op.getOp() == gpu::AllReduceOperation::MINIMUMF)))
           narrow.push_back(op);
       });
       IRRewriter rewriter(ctx);
       for (gpu::SubgroupReduceOp op : narrow) {
         rewriter.setInsertionPoint(op);
         Location loc = op.getLoc();
+        if (isa<FloatType>(op.getType())) {
+          Value wide = arith::ExtFOp::create(rewriter, loc,
+                                             rewriter.getF32Type(),
+                                             op.getValue());
+          auto reduced = gpu::SubgroupReduceOp::create(
+              rewriter, loc, wide, op.getOp(), op.getUniform(),
+              op.getClusterSize(), op.getClusterStride());
+          rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, op.getType(),
+                                                       reduced.getResult());
+          continue;
+        }
         Type i32 = rewriter.getI32Type();
         bool isSigned = op.getOp() == gpu::AllReduceOperation::MINSI ||
                         op.getOp() == gpu::AllReduceOperation::MAXSI;
