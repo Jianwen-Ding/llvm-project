@@ -2086,6 +2086,17 @@ bool AGXTargetLowering::isLoadBitCastBeneficial(
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
+  case AGXISD::TRUTH_SELECT: {
+    // Its patterns take a comparison of two 32-bit values; a condition that
+    // later combines made something else (a compare folded to a constant)
+    // goes back to an ordinary 16-bit select, which takes any condition.
+    SDValue C = N->getOperand(0);
+    if (C.getOpcode() == ISD::SETCC &&
+        C.getOperand(0).getValueSizeInBits() == 32)
+      return SDValue();
+    return DCI.DAG.getSelect(SDLoc(N), MVT::i16, C, N->getOperand(1),
+                             N->getOperand(2));
+  }
   case ISD::ADD:
     return performOffsetIndexCombine(N, DCI);
   case ISD::SHL: {
