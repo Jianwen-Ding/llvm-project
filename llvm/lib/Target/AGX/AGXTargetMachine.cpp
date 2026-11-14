@@ -251,6 +251,11 @@ static cl::opt<bool> AGXSchedCoreOccupancy(
              "device loads where its schedule would cut the SIMD-groups its "
              "registers let reside on a core by 1.8 times or more"));
 
+static cl::opt<bool> AGXSchedKnownGrid(
+    "agx-sched-known-grid", cl::init(true), cl::Hidden,
+    cl::desc("Keep a schedule whose registers still let every SIMD-group of "
+             "a known grid reside on one core"));
+
 namespace {
 /// Picks the region's instructions in their order before the first
 /// scheduling (top-down; that order is a topological one of the DAG).
@@ -349,6 +354,35 @@ public:
                    AGXSubtarget::maxThreadsForHalves(Before);
     bool Core = AGXSchedCoreOccupancy && DeviceLoads < 4 &&
                 9 * CoreGroups(After) < 5 * CoreGroups(Before);
+    // A known grid whose SIMD-groups all reside on one core with the new
+    // registers (and whose threadgroups still fit) loses no occupancy
+    // anywhere: the new order stays, its loads' latencies hidden behind each
+    // other (L15-E319).
+    if (AGXSchedKnownGrid && (Threads || Core)) {
+      const Function &Fn = MF.getFunction();
+      unsigned TG =
+          Fn.getFnAttributeAsParsedInteger("agx-max-threads-per-threadgroup", 0);
+      uint64_t GridThreads = 0;
+      if (Attribute A = Fn.getFnAttribute("agx-threads-per-grid");
+          A.isStringAttribute()) {
+        GridThreads = 1;
+        SmallVector<StringRef, 3> Dims;
+        A.getValueAsString().split(Dims, ',');
+        for (StringRef D : Dims) {
+          uint64_t V = 0;
+          if (D.trim().getAsInteger(10, V) || V == 0) {
+            GridThreads = 0;
+            break;
+          }
+          GridThreads *= V;
+        }
+      }
+      if (TG && GridThreads &&
+          AGXSubtarget::maxThreadsForHalves(After) >= TG &&
+          divideCeil(GridThreads, TG) * divideCeil(TG, 32) <=
+              CoreGroups(After))
+        Threads = Core = false;
+    }
     if (After <= Before || (!Threads && !Core))
       return;
     // the original order again, through the scheduler's own moves
