@@ -676,12 +676,17 @@ defm BFI_I32 : BitfieldPseudo<BFI_g13, GPR32, Src32Op>;
 defm BFEIL_I16 : BitfieldPseudo<BFEIL_g13, GPR16, Src16Op>;
 defm BFEIL_I32 : BitfieldPseudo<BFEIL_g13, GPR32, Src32Op>;
 defm EXTR_I32 : BitfieldPseudo<EXTR_g13, GPR32, Src32Op>;
+defm SHLHI_I32 : BitfieldPseudo<SHLHI_g13, GPR32, Src32Op>;
 
 def ASR_I16 : AGXALUPseudo<ASR_g13, (outs GPR16:$dst),
                            (ins SrcMods:$src0_mods, Src16Op:$src0,
                                 SrcMods:$src1_mods, Src16Op:$src1), [],
                            [WriteIMul]>;
 def ASR_I32 : AGXALUPseudo<ASR_g13, (outs GPR32:$dst),
+                           (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                SrcMods:$src1_mods, Src32Op:$src1), [],
+                           [WriteIMul]>;
+def ASRH_I32 : AGXALUPseudo<ASRH_g13, (outs GPR32:$dst),
                            (ins SrcMods:$src0_mods, Src32Op:$src0,
                                 SrcMods:$src1_mods, Src32Op:$src1), [],
                            [WriteIMul]>;
@@ -830,8 +835,12 @@ def : Pat<(i32 (AGXbfi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
           (BFI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXextr7 AGXIntSrc32:$lo, AGXIntSrc32:$hi, AGXIntSrc32:$s)),
           (EXTR_I32 0, $lo, 0, $hi, 0, $s, 0)>;
+def : Pat<(i32 (AGXshlhi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
+          (SHLHI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXsra7 AGXIntSrc32:$a, AGXIntSrc32:$s)),
           (ASR_I32 0, $a, 0, $s)>;
+def : Pat<(i32 (AGXasrh7 AGXIntSrc32:$a, AGXIntSrc32:$s)),
+          (ASRH_I32 0, $a, 0, $s)>;
 def : Pat<(i16 (shl AGXIntSrc16:$a, AGXIntSrc16:$s)),
           (BFI_I16 0, (i16 0), 0, $a, 0, $s, 0)>;
 def : Pat<(i16 (srl AGXIntSrc16:$a, AGXIntSrc16:$s)),

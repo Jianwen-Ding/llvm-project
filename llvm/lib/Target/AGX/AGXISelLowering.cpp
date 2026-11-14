@@ -2532,6 +2532,7 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   }
   case AGXISD::BFI7:
   case AGXISD::EXTR7:
+  case AGXISD::SHLHI7:
   case AGXISD::SRA7:
     // Shifts of zero.
     if (all_of(drop_end(N->ops()), [](const SDUse &U) { return isNullConstant(U.get()); }))
@@ -2649,6 +2650,11 @@ SDValue AGXTargetLowering::lowerSETCC64(SDValue Op, SelectionDAG &DAG) const {
   return DAG.getSelect(DL, VT, HiEq, LoCmp, HiCmp);
 }
 
+static cl::opt<bool> AGXShlhiShift(
+    "agx-shlhi-shift", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit left shift by a variable amount takes the bits that "
+             "move into the high word with shlhi"));
+
 SDValue AGXTargetLowering::lowerShift64(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   unsigned Opc = Op.getOpcode();
@@ -2702,11 +2708,25 @@ SDValue AGXTargetLowering::lowerShift64(SDValue Op, SelectionDAG &DAG) const {
     NewHi = DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Hi, Zero, Amt);
   } else if (Opc == ISD::SHL) {
     NewLo = DAG.getNode(AGXISD::BFI7, DL, MVT::i32, Zero, Lo, Amt);
-    SDValue Up = DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Zero, Lo,
-                             DAG.getNode(ISD::SUB, DL, MVT::i32, C32(64), Amt));
+    // (shlhi 0, lo, s: the same bits without the 64 - s, L15-E321; the
+    // coverage recordings of shlhi by registers and 0..127)
+    SDValue Up =
+        AGXShlhiShift
+            ? DAG.getNode(AGXISD::SHLHI7, DL, MVT::i32, Zero, Lo, Amt)
+            : DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Zero, Lo,
+                          DAG.getNode(ISD::SUB, DL, MVT::i32, C32(64), Amt));
     NewHi = DAG.getNode(AGXISD::BFI7, DL, MVT::i32, Up, Hi, Amt);
   } else {
     NewHi = DAG.getNode(AGXISD::SRA7, DL, MVT::i32, Hi, Amt);
+    // asrh hi, s is hi's part of the low word for every s (hi << (32 - s)
+    // below 32, hi >> (s - 32) with its sign from 32), and extr lo, 0, s
+    // lo's (0 from 32): their or, without the select (L15-E321).
+    if (AGXShlhiShift) {
+      NewLo = DAG.getNode(
+          ISD::OR, DL, MVT::i32, DAG.getNode(AGXISD::ASRH7, DL, MVT::i32, Hi, Amt),
+          DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Lo, Zero, Amt));
+      return join64(DAG, DL, NewLo, NewHi);
+    }
     SDValue Big = DAG.getSetCC(DL, MVT::i32, Amt, C32(31), ISD::SETUGT);
     NewLo = DAG.getSelect(
         DL, MVT::i32, Big,

@@ -138,7 +138,13 @@ def SDT_AGXBitfield : SDTypeProfile<1, 3, [SDTCisVT<0, i32>, SDTCisVT<1, i32>,
                                            SDTCisVT<2, i32>, SDTCisVT<3, i32>]>;
 def AGXbfi7 : SDNode<"AGXISD::BFI7", SDT_AGXBitfield>;
 def AGXextr7 : SDNode<"AGXISD::EXTR7", SDT_AGXBitfield>;
+// shlhi a, b, s: the bits of b that a left shift by s moves into the high
+// word, b >> (32 - s) below 32 and b << (s - 32) from it, over a.
+def AGXshlhi7 : SDNode<"AGXISD::SHLHI7", SDT_AGXBitfield>;
 def AGXsra7 : SDNode<"AGXISD::SRA7", SDTIntBinOp>;
+// asrh x, s: the low word of (sext(x) << 32) >> s (x's bits that an
+// arithmetic right shift of x:lo by s moves into the low word).
+def AGXasrh7 : SDNode<"AGXISD::ASRH7", SDTIntBinOp>;
 
 def AGXballot : SDNode<"AGXISD::BALLOT", SDTIntUnaryOp>;
 def AGXquad_ballot : SDNode<"AGXISD::QUAD_BALLOT", SDTIntUnaryOp>;
