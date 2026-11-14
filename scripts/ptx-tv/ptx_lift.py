@@ -1971,6 +1971,24 @@ class Lifter:
         self.write(dsts[0], self.op("extractelement <2 x i1> %s, i32 0" % c), 1)
         self.write(dsts[1], self.op("extractelement <2 x i1> %s, i32 1" % c), 1)
 
+    def i_set(self, mods, ops, opc):
+        """set.cmp{.boolop}{.ftz}.dtype.stype d, a, b{, {!}c}: like setp, then
+        d = all ones (u32/s32) or 1.0 (f32) if true, else 0."""
+        ts = self.types_of(mods)
+        if len(ts) != 2 or ts[0] not in ("u32", "s32", "f32"):
+            raise Unsupported(opc)
+        dt, st = ts
+        boolop = [m for m in mods if m in ("and", "or", "xor")]
+        r = self.compare(mods[0], st, ops[1:3], "ftz" in mods)
+        if boolop:
+            c = ops[3].strip()
+            cv = self.get(c.lstrip("!"), 1)
+            if c.startswith("!"):
+                cv = self.op("xor i1 %s, true" % cv)
+            r = self.op("%s i1 %s, %s" % (boolop[0], r, cv))
+        one = 0x3F800000 if dt == "f32" else 0xFFFFFFFF
+        self.write(ops[0], self.op("select i1 %s, i32 %d, i32 0" % (r, one - (1 << 32) if one >> 31 else one)), 32)
+
     def i_setp(self, mods, ops, opc):
         cmp = mods[0]
         t = self.types_of(mods)[0]
@@ -1992,9 +2010,6 @@ class Lifter:
         self.write(dsts[0].strip(), r, 1)
         if len(dsts) > 1:
             self.write(dsts[1].strip(), nr, 1)
-
-    def i_set(self, mods, ops, opc):
-        raise Unsupported(opc)
 
     # ---- floating point ----------------------------------------------------
     def ftz_in(self, v, fty, ftz):
@@ -2228,9 +2243,14 @@ class Lifter:
         fty = FPTY[t]
         a = self.ftz_in(self.getf(ops[1], t), fty, "ftz" in mods)
         rm = self.rounding(mods)
-        if rm != "rn":
-            raise Unsupported(opc)
-        r = self.call_intr(fty, "llvm.sqrt.%s" % intname(fty), ["%s %s" % (fty, a)])
+        if rm == "rn":
+            r = self.call_intr(fty, "llvm.sqrt.%s" % intname(fty), ["%s %s" % (fty, a)])
+        else:
+            # directed rounding: the correctly rounded square root in that mode
+            name = "llvm.experimental.constrained.sqrt.%s" % intname(fty)
+            self.declare(name, "declare %s @%s(%s, metadata, metadata)" % (fty, name, fty))
+            r = self.op('call %s @%s(%s %s, metadata !"%s", metadata !"fpexcept.ignore") strictfp'
+                        % (fty, name, fty, a, MODES[rm]))
         self.writef(ops[0], self.post(r, fty, mods), t)
 
     def i_rcp(self, mods, ops, opc):

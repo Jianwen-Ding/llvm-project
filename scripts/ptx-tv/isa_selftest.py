@@ -8,7 +8,8 @@ llc copies into its output) and isa_tests/NAME.ref.ll (the same functions as
 plain IR following the ISA's description).  The PTX from the first is lifted
 and Alive2 checks that it refines the second, as tv.py does for the suite.
 
-Usage: isa_selftest.py [-j N] [NAME ...]   (prints one JSON line per function)
+Usage: isa_selftest.py [-j N] [--smt-to MS] [NAME ...]   (one JSON line per
+function; without names, every case except the slow_* ones)
 """
 import argparse
 import json
@@ -55,7 +56,8 @@ def main():
     ap.add_argument("--smt-to", type=int, default=10000)
     a = ap.parse_args()
     names = a.names or sorted(f[:-3] for f in os.listdir(os.path.join(HERE, "isa_tests"))
-                              if f.endswith(".ll") and not f.endswith(".ref.ll"))
+                              if f.endswith(".ll") and not f.endswith(".ref.ll")
+                              and not f.startswith("slow_"))
     bad = 0
     with ProcessPoolExecutor(a.j) as ex:
         for rs in ex.map(case, names, [a.smt_to] * len(names)):

@@ -83,7 +83,15 @@ single-thread semantics:
   precision are modelled exactly (constrained intrinsics for directed
   rounding). Instructions without a rounding modifier are modelled as
   round-to-nearest; PTX lets ptxas contract such mul/add pairs, which is not
-  modelled.
+  modelled. Alive2, following LangRef, makes a constrained operation with a
+  static rounding mode poison unless the (free) dynamic rounding mode
+  matches, so a directed-rounding operation is checked in the environment
+  of its mode; a function using two different directed modes on one path
+  would be poison everywhere on both sides and its proof vacuous. An audit
+  of the suite (each proved function's PTX, all directed modes on
+  floating-point results) finds 112 proved functions with directed
+  rounding, each using a single mode (92 `.rz`, 14 `.rp`, 4 `.rm`, 2
+  `.rna`), so none is vacuous.
 * Approximate instructions (`ex2.approx`, `rsqrt.approx`, `div.full`, ...)
   are uninterpreted pure functions; cross-thread operations (`shfl`, `vote`,
   `bar`, `redux`, `match`, `elect`, special registers) are uninterpreted calls
@@ -343,6 +351,10 @@ mismatch.
   signedness the secondary min/max uses; the model takes the destination
   type's (unsigned for `vset`). Lane selectors, masks, `.dsel` merges,
   `vshl`/`vshr` and `vmad` are rejected (`lift-unsupported`).
+* `set` (`set.cmp{.boolop}.dtype.stype`: all ones, 1.0 or 0) (`set`), and
+  `sqrt.rz/.rm/.rp` (LLVM's constrained square root in that mode; the
+  `slow_sqrt` references are not decided by Alive2 within 600 s, so that
+  case is not in the default run).
 * `createpolicy`, `istypeof`, `tld4` and `sured` depend on state outside
   the single-thread model and are keyed calls named by their modifiers;
   `isa_tests/inline/opaque.ll` checks them through the inline-asm path
