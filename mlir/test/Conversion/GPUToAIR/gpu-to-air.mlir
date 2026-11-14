@@ -1138,3 +1138,28 @@ gpu.module @rotate_broadcast {
     gpu.return
   }
 }
+
+// -----
+
+// A shuffle offset a loop carries from a uniform start through uniform
+// updates (a scan's doubling offset) is uniform too (L15-E299).
+gpu.module @loop_carried_offset {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xi32, 1>, %v: i32) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c5 = arith.constant 5 : index
+    %one = arith.constant 1 : i32
+    %w = arith.constant 32 : i32
+    // CHECK: llvm.call @air.simd_shuffle_up.u.i32
+    // CHECK-NOT: llvm.call @air.simd_shuffle.u.i32
+    %r:2 = scf.for %k = %c0 to %c5 step %c1 iter_args(%x = %v, %off = %one) -> (i32, i32) {
+      %u, %ok = gpu.shuffle up %x, %off, %w : i32
+      %x2 = arith.addi %x, %u : i32
+      %off2 = arith.shli %off, %one : i32
+      scf.yield %x2, %off2 : i32, i32
+    }
+    memref.store %r#0, %out[%c0] : memref<8xi32, 1>
+    gpu.return
+  }
+}

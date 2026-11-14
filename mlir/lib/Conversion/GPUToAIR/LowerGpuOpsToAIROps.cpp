@@ -168,19 +168,33 @@ static std::optional<int64_t> constantInt(Value converted, Value original) {
 /// of a threadgroup: a constant, a kernel argument, a threadgroup-level id or
 /// size, the induction variable of a loop with uniform bounds, or pure arith
 /// of those (L15-E286).
-static bool isThreadgroupUniform(Value v, unsigned depth = 0) {
-  if (depth > 8)
+static bool isThreadgroupUniform(Value v, unsigned depth,
+                                 SmallPtrSetImpl<Value> &assumed) {
+  if (depth > 12)
     return false;
   if (getConstantIntValue(v))
     return true;
+  auto uniform = [&](Value o) {
+    return isThreadgroupUniform(o, depth + 1, assumed);
+  };
   if (auto arg = dyn_cast<BlockArgument>(v)) {
     // The induction variable of a loop whose bounds and step are uniform
-    // (every thread runs the same iterations) (L15-E297).
-    if (auto loop = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp()))
-      return arg == loop.getInductionVar() &&
-             isThreadgroupUniform(loop.getLowerBound(), depth + 1) &&
-             isThreadgroupUniform(loop.getUpperBound(), depth + 1) &&
-             isThreadgroupUniform(loop.getStep(), depth + 1);
+    // (every thread runs the same iterations) (L15-E297), and a value it
+    // carries from a uniform start through uniform updates, the carried
+    // value assumed uniform in its own update (L15-E299).
+    if (auto loop =
+            dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp())) {
+      if (!uniform(loop.getLowerBound()) || !uniform(loop.getUpperBound()) ||
+          !uniform(loop.getStep()))
+        return false;
+      if (arg == loop.getInductionVar())
+        return true;
+      if (!assumed.insert(v).second)
+        return true;
+      unsigned n = arg.getArgNumber() - loop.getNumInductionVars();
+      auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+      return uniform(loop.getInitArgs()[n]) && uniform(yield.getOperand(n));
+    }
     auto func = dyn_cast<gpu::GPUFuncOp>(arg.getOwner()->getParentOp());
     return func && arg.getOwner()->isEntryBlock() &&
            arg.getArgNumber() < func.getNumArguments() &&
@@ -195,9 +209,12 @@ static bool isThreadgroupUniform(Value v, unsigned depth = 0) {
   if (def->getDialect()->getNamespace() != "arith" || def->getNumRegions() ||
       !isMemoryEffectFree(def))
     return false;
-  return llvm::all_of(def->getOperands(), [&](Value o) {
-    return isThreadgroupUniform(o, depth + 1);
-  });
+  return llvm::all_of(def->getOperands(), uniform);
+}
+
+static bool isThreadgroupUniform(Value v) {
+  SmallPtrSet<Value, 8> assumed;
+  return isThreadgroupUniform(v, 0, assumed);
 }
 
 /// Set before the conversion on a gpu.shuffle whose offset
