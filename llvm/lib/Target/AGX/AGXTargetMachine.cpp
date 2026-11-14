@@ -405,6 +405,11 @@ namespace {
 /// instructions. Their scalar evolution of a kernel with millions of
 /// instructions (Blender Cycles' shade_shadow, everything inlined) took
 /// gigabytes, for address arithmetic sharing meant for unrolled tiles.
+static cl::opt<bool> AGXMergedIndexChains(
+    "agx-merged-index-chains", cl::init(true), cl::Hidden,
+    cl::desc("a device access at a chain of geps whose indices sum below "
+             "2^32 as one 32-bit index"));
+
 static cl::opt<bool> AGXFarOffsetIndices(
     "agx-far-offset-indices", cl::init(true), cl::Hidden,
     cl::desc("a device address's constant offset past the immediate index as "
@@ -474,9 +479,134 @@ public:
     }
     if (AGXFarOffsetIndices)
       Changed |= farOffsetIndices(F);
+    if (AGXMergedIndexChains)
+      Changed |= mergedIndexChains(F);
     for (WeakVH &V : Ranged)
       if (auto *CI = dyn_cast_or_null<CallBase>(V))
         CI->removeRetAttr(Attribute::Range);
+    return Changed;
+  }
+
+  /// A device load or store at a chain of geps gep T, (gep T, B, x1), x2 ...
+  /// (and constant byte offsets a multiple of sizeof(T)), its indices known
+  /// non-negative and their sum below 2^32 by the thread bounds (a memref
+  /// subview's offset, then the element's index, as expand-strided-metadata
+  /// lowers it): gep T, B, zext(the 32-bit sum), so that the access takes the
+  /// uniform base and an index register instead of 64-bit adds (L15-E303).
+  static bool mergedIndexChains(Function &F) {
+    using namespace PatternMatch;
+    const DataLayout &DL = F.getDataLayout();
+    bool Changed = false;
+    for (Instruction &I : instructions(F)) {
+      Value *Ptr = getLoadStorePointerOperand(&I);
+      if (!Ptr || Ptr->getType()->getPointerAddressSpace() != 1)
+        continue;
+      // (index, scale in elements of T) along the chain
+      SmallVector<std::pair<Value *, uint64_t>, 4> Terms;
+      Type *T = nullptr;
+      uint64_t S = 0;
+      int64_t ConstElems = 0;
+      Value *P = Ptr;
+      unsigned Geps = 0;
+      bool Ok = true;
+      while (auto *G = dyn_cast<GetElementPtrInst>(P)) {
+        if (G->getNumIndices() != 1) {
+          Ok = false;
+          break;
+        }
+        Value *X = G->getOperand(1);
+        TypeSize GS = DL.getTypeAllocSize(G->getSourceElementType());
+        if (GS.isScalable()) {
+          Ok = false;
+          break;
+        }
+        if (auto *C = dyn_cast<ConstantInt>(X)) {
+          // a constant offset in bytes (or elements of another size)
+          int64_t Bytes = C->getSExtValue() * int64_t(GS.getFixedValue());
+          if (!T) {
+            // (the element type: from the next non-constant gep)
+            ConstElems += Bytes; // bytes until T is known
+          } else {
+            if (Bytes % int64_t(S)) {
+              Ok = false;
+              break;
+            }
+            ConstElems += Bytes / int64_t(S);
+          }
+        } else {
+          if (!T) {
+            T = G->getSourceElementType();
+            S = GS.getFixedValue();
+            if (!S || ConstElems % int64_t(S)) {
+              Ok = false;
+              break;
+            }
+            ConstElems /= int64_t(S);
+          } else if (GS.getFixedValue() != S) {
+            Ok = false;
+            break;
+          }
+          Terms.push_back({X, 1});
+        }
+        ++Geps;
+        P = G->getPointerOperand();
+      }
+      if (!Ok || !T || Geps < 2 || Terms.size() < 2 || ConstElems < 0)
+        continue;
+      // every term non-negative, their sum below 2^32
+      SimplifyQuery SQ(DL, &I);
+      uint64_t Max = uint64_t(ConstElems);
+      for (auto &[X, Sc] : Terms) {
+        // (known bits: through the shifts and additions of the bounded
+        // thread positions)
+        KnownBits K = computeKnownBits(X, SQ);
+        APInt KMax = K.getMaxValue();
+        if (KMax.ugt(UINT32_MAX))
+          Ok = false;
+        else
+          Max += KMax.getZExtValue();
+        if (!Ok || Max > UINT32_MAX)
+          break;
+      }
+      if (!Ok || Max > UINT32_MAX)
+        continue;
+      IRBuilder<> B(&I);
+      // The low 32 bits of a term, through the operations whose low bits
+      // are those of their operands' (exact modulo 2^32), to a zext's i32.
+      std::function<Value *(Value *, unsigned)> Low = [&](Value *X,
+                                                         unsigned D) -> Value * {
+        Value *Y;
+        if (match(X, m_ZExt(m_Value(Y))) && Y->getType()->isIntegerTy(32))
+          return Y;
+        if (auto *C = dyn_cast<ConstantInt>(X))
+          return B.getInt32(uint32_t(C->getZExtValue()));
+        auto *BO = dyn_cast<BinaryOperator>(X);
+        if (D < 6 && BO &&
+            (BO->getOpcode() == Instruction::Add ||
+             BO->getOpcode() == Instruction::Sub ||
+             BO->getOpcode() == Instruction::Mul ||
+             BO->getOpcode() == Instruction::Shl ||
+             BO->getOpcode() == Instruction::And ||
+             BO->getOpcode() == Instruction::Or ||
+             BO->getOpcode() == Instruction::Xor) &&
+            (BO->getOpcode() != Instruction::Shl ||
+             (isa<ConstantInt>(BO->getOperand(1)) &&
+              cast<ConstantInt>(BO->getOperand(1))->getZExtValue() < 32)))
+          return B.CreateBinOp(BO->getOpcode(), Low(BO->getOperand(0), D + 1),
+                               Low(BO->getOperand(1), D + 1));
+        return B.CreateTrunc(X, B.getInt32Ty());
+      };
+      Value *Sum = nullptr;
+      for (auto &[X, Sc] : Terms) {
+        Value *X32 = Low(X, 0);
+        Sum = Sum ? B.CreateAdd(Sum, X32, "", /*HasNUW=*/true) : X32;
+      }
+      if (ConstElems)
+        Sum = B.CreateAdd(Sum, B.getInt32(uint32_t(ConstElems)), "", true);
+      Value *NP = B.CreateGEP(T, P, B.CreateZExt(Sum, B.getInt64Ty()));
+      I.setOperand(isa<LoadInst>(I) ? 0 : 1, NP);
+      Changed = true;
+    }
     return Changed;
   }
 
