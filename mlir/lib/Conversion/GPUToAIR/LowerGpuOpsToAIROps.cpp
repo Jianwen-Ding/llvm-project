@@ -903,8 +903,14 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   return success();
 }
 
-/// log1p of an f32 x, accurate (rewriteAccurateM1's form).
-static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) {
+/// log1p of an f32 x, accurate (rewriteAccurateM1's form). With \p far and
+/// \p near, the one log is of 1 + x where near holds and of far elsewhere,
+/// and is returned in \p farLog: a caller that selects this log1p where
+/// near holds and something of log(far) elsewhere takes one log, not two,
+/// each lane's selected value the same (L15-E308).
+static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x,
+                              Value far = {}, Value near = {},
+                              Value *farLog = nullptr) {
   Type f32 = rewriter.getF32Type();
   auto c = [&](float v) {
     return arith::ConstantOp::create(rewriter, loc, f32,
@@ -912,7 +918,12 @@ static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) 
   };
   Value one = c(1.0f);
   Value u = arith::AddFOp::create(rewriter, loc, one, x);
-  Value lu = math::LogOp::create(rewriter, loc, u);
+  Value lu = math::LogOp::create(
+      rewriter, loc,
+      far ? arith::SelectOp::create(rewriter, loc, near, u, far).getResult()
+          : u);
+  if (farLog)
+    *farLog = lu;
   Value q = arith::DivFOp::create(
       rewriter, loc, arith::MulFOp::create(rewriter, loc, lu, x),
       arith::SubFOp::create(rewriter, loc, u, one));
@@ -933,6 +944,7 @@ static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) 
 ///   asinh = log1p(a + a^2 / (1 + sqrt(1 + a^2))), from 2^12 log(a) + ln 2;
 ///   acosh = log1p(t + sqrt(2 t + t^2)), t = x - 1, from 2^12 log(x) + ln 2
 ///           (NaN below 1);
+///   (each one log, of the argument the range picks);
 ///   atanh = log1p(2 a / (1 - a)) / 2 (inf at 1, NaN beyond);
 ///   cbrt  = exp2(log2(a) / 3) and a Newton step y - (y^3 - a) / (3 y^2)
 ///           (inf and NaN themselves, a signed zero below 2^-126: a
@@ -968,16 +980,20 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
   if constexpr (std::is_same_v<OpTy, math::AsinhOp>) {
     Value a2 = mul(a, a);
     Value s = math::SqrtOp::create(rewriter, loc, add(one, a2));
-    Value nearV = accurateLog1pF32(rewriter, loc, add(a, div(a2, add(one, s))));
-    Value farV = add(math::LogOp::create(rewriter, loc, a), ln2);
-    r = sel(cmp(arith::CmpFPredicate::OLT, a, c(4096.0f)), nearV, farV);
+    Value near = cmp(arith::CmpFPredicate::OLT, a, c(4096.0f));
+    Value logA;
+    Value nearV = accurateLog1pF32(rewriter, loc, add(a, div(a2, add(one, s))),
+                                   a, near, &logA);
+    r = sel(near, nearV, add(logA, ln2));
     r = math::CopySignOp::create(rewriter, loc, r, x);
   } else if constexpr (std::is_same_v<OpTy, math::AcoshOp>) {
     Value t = sub(x, one);
     Value s = math::SqrtOp::create(rewriter, loc, add(add(t, t), mul(t, t)));
-    Value nearV = accurateLog1pF32(rewriter, loc, add(t, s));
-    Value farV = add(math::LogOp::create(rewriter, loc, x), ln2);
-    r = sel(cmp(arith::CmpFPredicate::OLT, x, c(4096.0f)), nearV, farV);
+    Value near = cmp(arith::CmpFPredicate::OLT, x, c(4096.0f));
+    Value logX;
+    Value nearV =
+        accurateLog1pF32(rewriter, loc, add(t, s), x, near, &logX);
+    r = sel(near, nearV, add(logX, ln2));
     // below 1 a NaN (t + sqrt(2 t + t^2) is -1 for large negative x)
     r = sel(cmp(arith::CmpFPredicate::OLT, x, one), c(NAN), r);
   } else if constexpr (std::is_same_v<OpTy, math::AtanhOp>) {

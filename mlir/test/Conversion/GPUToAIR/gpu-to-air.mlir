@@ -878,14 +878,19 @@ gpu.module @accurate_m1 {
 // asinh, acosh, atanh, cbrt and erf, which MathToLLVM does not lower: the
 // first three through an accurate log1p (no log(x + sqrt(x^2 +- 1))), cbrt
 // as exp2(log2|x| / 3) and a Newton step, erf by the f32 polynomial; half in
-// float.
+// float. asinh and acosh take one log, of 1 + t below 4096 and of |x| (x)
+// above, for log1p's and log |x| + ln 2's two (L15-E308).
 gpu.module @inverse_hyperbolic {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<8xf32, 1>
     // CHECK-NOT: math.
-    // CHECK: llvm.intr.log
+    // CHECK: %[[NEAR:.*]] = llvm.fcmp "olt" %[[ABS:.*]], %{{.*}} : f32
+    // CHECK: %[[ARG:.*]] = llvm.select %[[NEAR]], %{{.*}}, %[[ABS]] : i1, f32
+    // CHECK: %[[LOG:.*]] = llvm.intr.log(%[[ARG]]) : (f32) -> f32
+    // CHECK-NOT: llvm.intr.log(
+    // CHECK: llvm.select %[[NEAR]], %{{.*}}, %{{.*}} : i1, f32
     // CHECK: llvm.intr.log2
     // CHECK: llvm.intr.exp2
     %s = math.asinh %v : f32
