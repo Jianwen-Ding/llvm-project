@@ -840,17 +840,17 @@ gpu.module @clustered_reduce {
 
 // -----
 
-// Reductions AIR has no op for: an i64 sum (64-bit xor shuffles at 1 .. 16,
-// the shuffle lowering splitting each; an i64 minimum / maximum is two i32
-// reductions, L15-E442), and over clusters of 8 of f16 (AIR's quad-group
-// reduction, then a shuffle at 4).
+// Reductions AIR has no op for: an i64 product (64-bit xor shuffles at 1 ..
+// 16, the shuffle lowering splitting each; i64 minima, maxima, sums and
+// bitwise reductions are i32 reductions, L15-E442 / E443), and over clusters
+// of 8 of f16 (AIR's quad-group reduction, then a shuffle at 4).
 gpu.module @shuffle_reduce {
-  // CHECK-LABEL: llvm.func @i64add(
-  gpu.func @i64add(%a: memref<64xi64, 1>) kernel {
+  // CHECK-LABEL: llvm.func @i64mul(
+  gpu.func @i64mul(%a: memref<64xi64, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<64xi64, 1>
     // CHECK-COUNT-10: llvm.call @air.simd_shuffle_xor.u.i32
-    %r = gpu.subgroup_reduce add %v : (i64) -> i64
+    %r = gpu.subgroup_reduce mul %v : (i64) -> i64
     memref.store %r, %a[%c0] : memref<64xi64, 1>
     gpu.return
   }
@@ -1405,8 +1405,19 @@ gpu.module @k {
     // CHECK: llvm.call @air.quad_min.u.i32
     // CHECK-NOT: shuffle
     %n = gpu.subgroup_reduce minui %w cluster(size = 4) : (i64) -> i64
+    // A sum: the high words', and the low words' two 16-bit halves' (no
+    // carry lost: below 2^21 over 32 lanes); xor: each word's (L15-E443).
+    // CHECK-COUNT-3: llvm.call @air.simd_sum.s.i32
+    // CHECK-COUNT-2: llvm.call @air.simd_xor.s.i32
+    // CHECK-NOT: shuffle
+    %s = gpu.subgroup_reduce add %w : (i64) -> i64
+    %x = gpu.subgroup_reduce xor %w : (i64) -> i64
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
     memref.store %m, %o[%c0] : memref<64xi64, 1>
     memref.store %n, %o[%c1] : memref<64xi64, 1>
+    memref.store %s, %o[%c2] : memref<64xi64, 1>
+    memref.store %x, %o[%c3] : memref<64xi64, 1>
     gpu.return
   }
 }

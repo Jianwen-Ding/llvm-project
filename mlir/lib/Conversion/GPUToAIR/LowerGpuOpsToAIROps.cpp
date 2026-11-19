@@ -2870,6 +2870,7 @@ struct LowerGpuOpsToAIROpsPass final
       // words' (unsigned) of the lanes whose high word is that one, the
       // others giving the identity (0 for a maximum, ~0 for a minimum):
       // instead of a shuffle butterfly of 64-bit compares (L15-E442).
+      // i64 and / or / xor and sums likewise (L15-E443).
       SmallVector<gpu::SubgroupReduceOp> wide;
       m.walk([&](gpu::SubgroupReduceOp op) {
         std::optional<uint32_t> cluster = op.getClusterSize();
@@ -2879,13 +2880,72 @@ struct LowerGpuOpsToAIROpsPass final
             (op.getOp() == gpu::AllReduceOperation::MAXUI ||
              op.getOp() == gpu::AllReduceOperation::MINUI ||
              op.getOp() == gpu::AllReduceOperation::MAXSI ||
-             op.getOp() == gpu::AllReduceOperation::MINSI))
+             op.getOp() == gpu::AllReduceOperation::MINSI ||
+             op.getOp() == gpu::AllReduceOperation::AND ||
+             op.getOp() == gpu::AllReduceOperation::OR ||
+             op.getOp() == gpu::AllReduceOperation::XOR ||
+             op.getOp() == gpu::AllReduceOperation::ADD))
           wide.push_back(op);
       });
       for (gpu::SubgroupReduceOp op : wide) {
         rewriter.setInsertionPoint(op);
         Location loc = op.getLoc();
         Type i32 = rewriter.getI32Type(), i64 = rewriter.getI64Type();
+        auto reduce32 = [&](Value x, gpu::AllReduceOperation kind) -> Value {
+          return gpu::SubgroupReduceOp::create(rewriter, loc, x, kind,
+                                               op.getUniform(),
+                                               op.getClusterSize(),
+                                               op.getClusterStride());
+        };
+        auto c64 = [&](int64_t c) -> Value {
+          return arith::ConstantIntOp::create(rewriter, loc, i64, c);
+        };
+        auto words = [&](Value x) -> std::pair<Value, Value> {
+          return {arith::TruncIOp::create(
+                      rewriter, loc, i32,
+                      arith::ShRUIOp::create(rewriter, loc, x, c64(32))),
+                  arith::TruncIOp::create(rewriter, loc, i32, x)};
+        };
+        auto join = [&](Value h, Value l) -> Value {
+          Value h64 = arith::ShLIOp::create(
+              rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, h),
+              c64(32));
+          return arith::OrIOp::create(
+              rewriter, loc, h64, arith::ExtUIOp::create(rewriter, loc, i64, l));
+        };
+        // and / or / xor: each word on its own. add: the high words modulo
+        // 2^32 and the low words as two 16-bit halves, whose sums over 32
+        // lanes stay below 2^21, recombined in 64 bits.
+        if (op.getOp() == gpu::AllReduceOperation::AND ||
+            op.getOp() == gpu::AllReduceOperation::OR ||
+            op.getOp() == gpu::AllReduceOperation::XOR) {
+          auto [h, l] = words(op.getValue());
+          rewriter.replaceOp(op, join(reduce32(h, op.getOp()),
+                                      reduce32(l, op.getOp())));
+          continue;
+        }
+        if (op.getOp() == gpu::AllReduceOperation::ADD) {
+          auto [h, l] = words(op.getValue());
+          Value c16 = arith::ConstantIntOp::create(rewriter, loc, i32, 16);
+          Value m16 = arith::ConstantIntOp::create(rewriter, loc, i32, 0xffff);
+          Value sh = reduce32(h, gpu::AllReduceOperation::ADD);
+          Value sm = reduce32(arith::ShRUIOp::create(rewriter, loc, l, c16),
+                              gpu::AllReduceOperation::ADD);
+          Value sl = reduce32(arith::AndIOp::create(rewriter, loc, l, m16),
+                              gpu::AllReduceOperation::ADD);
+          Value r = arith::ShLIOp::create(
+              rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, sh),
+              c64(32));
+          r = arith::AddIOp::create(
+              rewriter, loc, r,
+              arith::ShLIOp::create(
+                  rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, sm),
+                  c64(16)));
+          r = arith::AddIOp::create(rewriter, loc, r,
+                                    arith::ExtUIOp::create(rewriter, loc, i64, sl));
+          rewriter.replaceOp(op, r);
+          continue;
+        }
         bool isMax = op.getOp() == gpu::AllReduceOperation::MAXUI ||
                      op.getOp() == gpu::AllReduceOperation::MAXSI;
         Value v = op.getValue();
