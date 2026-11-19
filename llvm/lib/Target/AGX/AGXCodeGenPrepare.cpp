@@ -6001,6 +6001,11 @@ struct ThreadgroupAccesses {
   }
 };
 
+static cl::opt<bool> AGXZeroSignFreeSums(
+    "agx-zero-sign-free-sums", cl::init(true), cl::Hidden,
+    cl::desc("A sum whose other operand is never the zero that would tell "
+             "the signs apart keeps no zero sign of the operand"));
+
 struct ZeroSignFree {
   SmallPtrSet<Instruction *, 16> Assumed;
   unsigned Budget = 256;
@@ -6101,6 +6106,21 @@ struct ZeroSignFree {
              !BC->getType()->isVectorTy() && movedBits(BC);
     if (auto *Sel = dyn_cast<SelectInst>(I))
       return U.getOperandNo() != 0 && value(Sel);
+    // a + b, a's zero either sign: (+-0) + b is b's value then unless b is
+    // -0, and b - (+-0) likewise; (+-0) - b unless b is +0. A log-sum-exp's
+    // m + log(s), s >= 1 (L15-E475).
+    if (AGXZeroSignFreeSums &&
+        (I->getOpcode() == Instruction::FAdd ||
+         I->getOpcode() == Instruction::FSub)) {
+      Value *Other = I->getOperand(1 - U.getOperandNo());
+      FPClassTest Never = I->getOpcode() == Instruction::FSub &&
+                                  U.getOperandNo() == 0
+                              ? fcPosZero
+                              : fcNegZero;
+      if (computeKnownFPClass(Other, I->getDataLayout(), Never)
+              .isKnownNever(Never))
+        return true;
+    }
     switch (I->getOpcode()) {
     case Instruction::FNeg:
     case Instruction::FAdd:
