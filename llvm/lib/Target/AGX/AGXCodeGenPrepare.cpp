@@ -6326,6 +6326,77 @@ static bool narrowSignedCompares(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNarrowTruncatedOps(
+    "agx-narrow-truncated-ops", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit add, sub, mul, and, or, xor or shl whose every user "
+             "truncates it to 32 bits as the 32-bit operation"));
+
+/// Rebuilds a 64-bit operation whose users all truncate it to i32 (as
+/// narrowSignedCompares leaves them, the compares in other blocks than the
+/// operations: instruction selection sees no trunc of them) as the 32-bit
+/// operation of its operands' low words, which are exact modulo 2^32. Its
+/// operands' truncations may in turn make them such operations.
+static bool narrowTruncatedOps(Function &F) {
+  if (!AGXNarrowTruncatedOps)
+    return false;
+  using namespace PatternMatch;
+  auto Narrowable = [](Instruction &I) {
+    if (!I.getType()->isIntegerTy(64) || I.use_empty())
+      return false;
+    auto *B = dyn_cast<BinaryOperator>(&I);
+    if (!B)
+      return false;
+    switch (B->getOpcode()) {
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Mul:
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+      break;
+    case Instruction::Shl: {
+      const APInt *C;
+      if (!match(B->getOperand(1), m_APInt(C)) || C->uge(32))
+        return false;
+      break;
+    }
+    default:
+      return false;
+    }
+    return llvm::all_of(I.users(), [](User *U) {
+      return isa<TruncInst>(U) && U->getType()->isIntegerTy(32);
+    });
+  };
+  bool Changed = false, Again = true;
+  while (Again) {
+    Again = false;
+    SmallVector<BinaryOperator *, 8> Ops;
+    for (Instruction &I : instructions(F))
+      if (Narrowable(I))
+        Ops.push_back(cast<BinaryOperator>(&I));
+    for (BinaryOperator *B : Ops) {
+      IRBuilder<> IRB(B);
+      Type *I32 = IRB.getInt32Ty();
+      auto Low = [&](Value *V) -> Value * {
+        Value *X;
+        if ((match(V, m_ZExt(m_Value(X))) || match(V, m_SExt(m_Value(X)))) &&
+            X->getType()->isIntegerTy(32))
+          return X;
+        return IRB.CreateTrunc(V, I32);
+      };
+      Value *N = IRB.CreateBinOp(B->getOpcode(), Low(B->getOperand(0)),
+                                 Low(B->getOperand(1)), B->getName());
+      for (User *U : make_early_inc_range(B->users())) {
+        U->replaceAllUsesWith(N);
+        cast<Instruction>(U)->eraseFromParent();
+      }
+      B->eraseFromParent();
+      Changed = Again = true;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSpeculateThreadgroupLoads(
     "agx-speculate-threadgroup-loads", cl::init(true), cl::Hidden,
     cl::desc("Run a guarded threadgroup load that stays within its global "
@@ -6438,6 +6509,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= exactDyadicSums(F);
   Changed |= AGX::narrowBoundedI64(F);
   Changed |= narrowSignedCompares(F);
+  Changed |= narrowTruncatedOps(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)
