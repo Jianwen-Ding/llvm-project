@@ -6686,6 +6686,11 @@ static cl::opt<bool> AGXDeferredMinMaxNum(
              "minimumnum from a number, its zero-sign-free uses in the loop "
              "taking the deferred value"));
 
+static cl::opt<bool> AGXDeferredNaNSideUses(
+    "agx-deferred-minmax-side-uses", cl::init(true), cl::Hidden,
+    cl::desc("agx-deferred-minmax-nan-in-m's running maximum / minimum "
+             "also with zero-sign-free uses in the loop"));
+
 static cl::opt<bool> AGXDeferredHalf(
     "agx-deferred-minmax-half", cl::init(true), cl::Hidden,
     cl::desc("agx-deferred-minmax-reductions of extended halves in half"));
@@ -6762,7 +6767,11 @@ static bool deferredMinMaxReductions(Function &F) {
             C = II;
             continue;
           }
-          if (Num && L->contains(UI) && UI != P && ZSF.use(Us)) {
+          // (also maximum's, whose deferred value carries its NaN: the
+          // same value but for a zero's sign, or a denormal for the zero
+          // a compare of it flushes to, L15-E463)
+          if ((Num || (NaNInM && AGXDeferredNaNSideUses)) && L->contains(UI) &&
+              UI != P && ZSF.use(Us)) {
             Side.push_back({&Us, unsigned(Chain.size())});
             continue;
           }
@@ -6796,7 +6805,7 @@ static bool deferredMinMaxReductions(Function &F) {
         auto *I = cast<Instruction>(Us.getUser());
         if (I == P || !L->contains(I))
           continue;
-        if (Num && ZSF.use(Us))
+        if ((Num || (NaNInM && AGXDeferredNaNSideUses)) && ZSF.use(Us))
           Side.push_back({&Us, unsigned(Chain.size())});
         else
           OK = false;

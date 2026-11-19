@@ -187,3 +187,35 @@ done:
   store float %mn, ptr addrspace(1) %o, align 4
   ret void
 }
+
+; The same with maximum (MLIR's arith.maximumf): its NaN-carrying deferred
+; value also feeds the zero-sign-free uses in the loop (L15-E463).
+; CHECK-LABEL: @online_maximum(
+; CHECK:       loop:
+; CHECK:       %m.m.next = call nsz float @llvm.maximum.f32(float %m.m, float %v)
+; CHECK:       fsub float %m.m, %m.m.next
+; CHECK:       done:
+; CHECK:       icmp sge i32
+; CHECK:       ret void
+define agx_kernel void @online_maximum(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %in, %loop ]
+  %m = phi float [ 0xFFF0000000000000, %entry ], [ %mn, %loop ]
+  %s = phi float [ 0.0, %entry ], [ %sn, %loop ]
+  %p = getelementptr inbounds float, ptr addrspace(1) %x, i32 %i
+  %v = load float, ptr addrspace(1) %p, align 4
+  %mn = call float @llvm.maximum.f32(float %m, float %v)
+  %d = fsub float %m, %mn
+  %e = call float @llvm.exp2.f32(float %d)
+  %sn = fmul float %s, %e
+  %in = add nuw i32 %i, 1
+  %c = icmp ult i32 %in, %n
+  br i1 %c, label %loop, label %done
+done:
+  store float %mn, ptr addrspace(1) %o, align 4
+  %o1 = getelementptr inbounds float, ptr addrspace(1) %o, i32 1
+  store float %sn, ptr addrspace(1) %o1, align 4
+  ret void
+}
