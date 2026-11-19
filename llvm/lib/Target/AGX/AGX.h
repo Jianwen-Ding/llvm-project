@@ -64,8 +64,11 @@ FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
 /// Gives the special register reads of F their range return attributes (see
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
+/// With ForAnalysis (ranges the caller takes off again), also the kernel's
+/// upper bounds and the known grid's, which codegen itself leaves out.
 bool addSpecialRegisterRanges(Function &F,
-                              SmallVectorImpl<WeakVH> *Added = nullptr);
+                              SmallVectorImpl<WeakVH> *Added = nullptr,
+                              bool ForAnalysis = false);
 /// The extent of the grid position an intrinsic reads that the kernel's known
 /// grid gives (agx-threads-per-grid, agx-threadgroups-per-grid), if any.
 std::optional<uint64_t> knownGridExtent(const Function &F, unsigned IntrinsicID);

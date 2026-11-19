@@ -3575,6 +3575,9 @@ static bool storeBytesTogether(Function &F) {
       }
       ByOff[Off / 8] = P;
     }
+    // (two pieces of one byte: an or of them, not a byte each)
+    if (!OK)
+      continue;
     // Separate values only (conversions' results, say): bytes of the same
     // word (a byte permute, PTX prmt) are built from its halves already
     // (bit-field inserts), which the halves of a byte store would only move.
@@ -6212,6 +6215,117 @@ static bool mergePhiOperations(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNarrowSignedCompares(
+    "agx-narrow-signed-compares", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit compare of values within 32 signed bits as the "
+             "compare of their 32-bit truncations"));
+
+/// An i64 compare of two values in [-2^31, 2^31) is the same compare of
+/// their truncations to i32: on that range x -> x mod 2^32 keeps equality,
+/// the signed order, and the unsigned one (both put [0, 2^31) first, then
+/// the negatives in their order). A value is in range if it is a sext of an
+/// i32, a constant in range, an and / or / xor of such values (bitwise
+/// operations of sign extensions are sign extensions), or a value whose
+/// signed range (known bits, the special registers' bounds, dominating
+/// conditions) is. MLIR's 64-bit bounds checks of a padded stencil's indices,
+/// x + d - 1 in [0, W) for x a bounded position, which InstCombine makes
+/// (x' | y') <u W: 32-bit compares, and the DAG narrows the truncated
+/// arithmetic (L15-E427).
+static bool narrowSignedCompares(Function &F) {
+  if (!AGXNarrowSignedCompares)
+    return false;
+  SmallVector<ICmpInst *, 8> Cmps;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<ICmpInst>(&I))
+      if (C->getOperand(0)->getType()->isIntegerTy(64) &&
+          !(isa<Constant>(C->getOperand(0)) && isa<Constant>(C->getOperand(1))))
+        Cmps.push_back(C);
+  if (Cmps.empty())
+    return false;
+  SmallVector<WeakVH, 8> Ranged;
+  AGX::addSpecialRegisterRanges(F, &Ranged, /*ForAnalysis=*/true);
+  scope_exit Unrange([&] {
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<CallBase>(V))
+        CI->removeRetAttr(Attribute::Range);
+  });
+  DominatorTree DT(F);
+  DomConditionCache DC;
+  for (BasicBlock &BB : F)
+    if (auto *Br = dyn_cast<CondBrInst>(BB.getTerminator()))
+      DC.registerBranch(Br);
+  const DataLayout &DL = F.getDataLayout();
+  ConstantRange S32(APInt::getSignedMinValue(32).sext(64),
+                    APInt::getSignedMinValue(32).sext(64).abs());
+  std::function<bool(Value *, Instruction *, unsigned)> Fits =
+      [&](Value *V, Instruction *At, unsigned Depth) -> bool {
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      return C->getValue().isSignedIntN(32);
+    if (auto *E = dyn_cast<SExtInst>(V))
+      return E->getSrcTy()->getScalarSizeInBits() <= 32;
+    if (auto *B = dyn_cast<BinaryOperator>(V);
+        B && Depth < 8 &&
+        (B->getOpcode() == Instruction::And || B->getOpcode() == Instruction::Or ||
+         B->getOpcode() == Instruction::Xor) &&
+        Fits(B->getOperand(0), At, Depth + 1) &&
+        Fits(B->getOperand(1), At, Depth + 1))
+      return true;
+    SimplifyQuery Q(DL, /*TLI=*/nullptr, &DT, /*AC=*/nullptr, At,
+                    /*UseInstrInfo=*/true, /*CanUseUndef=*/true, &DC);
+    // (ranges through additions, subtractions, multiplications and casts,
+    // which known bits alone lose: x - 1 for x in [0, 1024))
+    std::function<ConstantRange(Value *, unsigned)> Range =
+        [&](Value *X, unsigned D) -> ConstantRange {
+      unsigned W = X->getType()->getScalarSizeInBits();
+      ConstantRange KB =
+          computeConstantRangeIncludingKnownBits(X, /*ForSigned=*/true, Q);
+      if (D > 8)
+        return KB;
+      ConstantRange R = ConstantRange::getFull(W);
+      if (auto *Z = dyn_cast<ZExtInst>(X))
+        R = Range(Z->getOperand(0), D + 1).zeroExtend(W);
+      else if (auto *E = dyn_cast<SExtInst>(X))
+        R = Range(E->getOperand(0), D + 1).signExtend(W);
+      else if (auto *O = dyn_cast<BinaryOperator>(X)) {
+        ConstantRange A = Range(O->getOperand(0), D + 1);
+        ConstantRange C = Range(O->getOperand(1), D + 1);
+        switch (O->getOpcode()) {
+        case Instruction::Add:
+          R = A.add(C);
+          break;
+        case Instruction::Sub:
+          R = A.sub(C);
+          break;
+        case Instruction::Mul:
+          R = A.multiply(C);
+          break;
+        case Instruction::Shl:
+          R = A.shl(C);
+          break;
+        default:
+          break;
+        }
+      }
+      return R.intersectWith(KB, ConstantRange::Signed);
+    };
+    return S32.contains(Range(V, Depth));
+  };
+  bool Changed = false;
+  for (ICmpInst *C : Cmps) {
+    if (!Fits(C->getOperand(0), C, 0) || !Fits(C->getOperand(1), C, 0))
+      continue;
+    IRBuilder<> B(C);
+    Type *I32 = B.getInt32Ty();
+    Value *N = B.CreateICmp(C->getPredicate(),
+                            B.CreateTrunc(C->getOperand(0), I32),
+                            B.CreateTrunc(C->getOperand(1), I32), C->getName());
+    C->replaceAllUsesWith(N);
+    C->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSpeculateThreadgroupLoads(
     "agx-speculate-threadgroup-loads", cl::init(true), cl::Hidden,
     cl::desc("Run a guarded threadgroup load that stays within its global "
@@ -6323,6 +6437,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
   Changed |= AGX::narrowBoundedI64(F);
+  Changed |= narrowSignedCompares(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)

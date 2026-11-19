@@ -123,3 +123,16 @@ define agx_kernel void @byte_stores(ptr addrspace(1) %p, ptr addrspace(1) %q, i3
   store <2 x i8> %w1, ptr addrspace(1) %q, align 2
   ret void
 }
+
+; Two pieces of one byte (an or of a bit and a value below 5 with a 0xff
+; byte) are not a byte each: the word store stays a word store.
+; CHECK-LABEL: byte_overlap:
+; CHECK: device_store 0, i32, x,
+define agx_kernel void @byte_overlap(i32 %v1, ptr addrspace(1) %o) {
+  %v6 = and i32 %v1, 1
+  %v5 = urem i32 %v1, 5
+  %v13 = or i32 %v5, 32767
+  %v39 = or i32 %v6, %v13
+  store i32 %v39, ptr addrspace(1) %o, align 4
+  ret void
+}

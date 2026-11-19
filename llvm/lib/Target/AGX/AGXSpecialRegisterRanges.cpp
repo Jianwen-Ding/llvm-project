@@ -253,13 +253,16 @@ std::optional<uint64_t> AGX::knownGridExtent(const Function &F,
 }
 
 bool AGX::addSpecialRegisterRanges(Function &F,
-                                   SmallVectorImpl<WeakVH> *Added) {
+                                   SmallVectorImpl<WeakVH> *Added,
+                                   bool ForAnalysis) {
   bool Changed = false;
   // The known grid's bounds only in a kernel without loops: in a loop, the
   // offsets they let the DAG fold into addresses become immediates of a
-  // 64-bit base recomputed each iteration (L15-E191).
-  bool GridRanges = AGXKnownGridRanges == cl::boolOrDefault::BOU_TRUE;
-  if (AGXKnownGridRanges == cl::boolOrDefault::BOU_UNSET) {
+  // 64-bit base recomputed each iteration (L15-E191). (For an analysis whose
+  // ranges are taken off again, the grid's and the upper bounds always.)
+  bool GridRanges =
+      ForAnalysis || AGXKnownGridRanges == cl::boolOrDefault::BOU_TRUE;
+  if (!ForAnalysis && AGXKnownGridRanges == cl::boolOrDefault::BOU_UNSET) {
     SmallVector<std::pair<const BasicBlock *, const BasicBlock *>, 4> Edges;
     FindFunctionBackedges(F, Edges);
     GridRanges = Edges.empty();
@@ -291,7 +294,7 @@ bool AGX::addSpecialRegisterRanges(Function &F,
       if (auto G = gridBounds(F, II->getIntrinsicID()))
         if (!B || G->second - G->first < B->second - B->first)
           B = G;
-    if (AGXUpperBoundRanges >= 2)
+    if (AGXUpperBoundRanges >= 2 || (ForAnalysis && AGXUpperBoundRanges))
       if (auto U = upperBounds(F, II->getIntrinsicID()))
         if (!B || U->second - U->first < B->second - B->first)
           B = U;

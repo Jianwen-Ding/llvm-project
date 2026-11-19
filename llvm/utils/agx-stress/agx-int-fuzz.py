@@ -5,7 +5,7 @@ Each seed generates a random kernel of 10-28 integer operations on i8 / i16 / i3
 and, or, xor with registers and constants; shifts by constants and masked registers; icmp of every predicate
 into selects; smin / smax / umin / umax; udiv / urem / sdiv / srem by constants; ctpop / ctlz / cttz /
 bitreverse / bswap / abs; fshl / fshr; the four saturating adds; trunc / zext / sext; runs of additions of wide
-constants K + i d to one value), compiles it with llc,
+constants K + i d to one value; 64-bit compares of masked, offset values), compiles it with llc,
 runs it with agx_run on 1024 threads of random words (40% boundary values) and compares every output word with
 the model's (EXPERIMENTS.md L15-E376).
 
@@ -89,11 +89,39 @@ def gen(seed):
       b=pick(w); op=R.choice(['udiv','urem','sdiv','srem']); dm=nv(); d=nv()
       body+=[f'  {dm} = and {T} {b[0]}, {(1<<(w-2))-1}', f'  {d} = or {T} {dm}, 1', f'  {r} = {op} {T} {a[0]}, {d}']
       ops+=[(dm,w,('and',b[0],(1<<(w-2))-1)),(d,w,('or',dm,1)),(r,w,(op,a[0],d))]
-    elif k<0.96 and w==32:
+    elif k<0.945 and w==32:
       # the high word of a 64-bit product (signed or unsigned)
       b=pick(32); e=R.choice(['zext','sext']); x=nv(); y=nv(); p_=nv(); h=nv()
       body+=[f'  {x} = {e} i32 {a[0]} to i64', f'  {y} = {e} i32 {b[0]} to i64', f'  {p_} = mul i64 {x}, {y}', f'  {h} = lshr i64 {p_}, 32', f'  {r} = trunc i64 {h} to i32']
       ops+=[(x,64,(e,a[0],32)),(y,64,(e,b[0],32)),(p_,64,('mul',x,y)),(h,64,('lshr',p_,32)),(r,32,('trunc',h))]
+    elif k<0.965 and w==32:
+      # a 64-bit compare of masked, offset values (MLIR's index bounds
+      # checks, x + d - 1 against W; sometimes or-combined, as InstCombine
+      # makes (x' | y') <u W), which fit 32 signed bits or not (L15-E427)
+      b=pick(32); m1=R.choice([255,4095,0x7fffffff,0xffffffff]); m2=R.choice([255,1023,0x7fffffff])
+      k1=R.choice([1,-1,-3,1024,-(1<<31),(1<<31)]); k2=R.choice([1,-2,7,-4096])
+      ma=nv(); mb=nv(); za=nv(); zb=nv(); xa=nv(); xb=nv(); c=nv()
+      e1=R.choice(['zext','sext'])
+      # (half the time the thread position, bounded only by the kernel's
+      # upper-bounds attribute, which the DAG does not see)
+      src=('%t' if R.random()<0.5 else a[0])
+      if src=='%t' and not any(o[0]=='%t' for o in ops):
+        ops.insert(0,('%t',32,('tid',)))
+      body+=[f'  {ma} = and i32 {src}, {m1-(1<<32) if m1>>31 else m1}', f'  {mb} = and i32 {b[0]}, {m2}',
+             f'  {za} = {e1} i32 {ma} to i64', f'  {zb} = zext i32 {mb} to i64',
+             f'  {xa} = add i64 {za}, {k1}', f'  {xb} = sub i64 {zb}, {k2}']
+      ops+=[(ma,32,('and',src,m1-(1<<32) if m1>>31 else m1)),(mb,32,('and',b[0],m2)),(za,64,(e1,ma,32)),(zb,64,('zext',mb,32)),
+            (xa,64,('add',za,k1)),(xb,64,('sub',zb,k2))]
+      lhs=xa
+      if R.random()<0.4:
+        o=nv(); body.append(f'  {o} = or i64 {xa}, {xb}'); ops.append((o,64,('or',xa,xb))); lhs=o; rhs=R.choice([1024,4096,-1,0])
+        rs=str(rhs)
+      else:
+        rs=xb
+      p=R.choice(['eq','ne','slt','sle','sgt','sge','ult','ule','ugt','uge'])
+      x=pick(32); y=pick(32)
+      body+=[f'  {c} = icmp {p} i64 {lhs}, {rs}', f'  {r} = select i1 {c}, i32 {x[0]}, i32 {y[0]}']
+      ops.append((r,32,('sel64',p,lhs,int(rs) if not rs.startswith('%') else rs,x[0],y[0])))
     elif k<0.97 and w==32:
       # additions of wide constants K + i d to one value (chained by their
       # differences, L15-E420), each an output
@@ -131,7 +159,8 @@ def gen(seed):
     o=v if w==32 else nv()
     if w!=32: body.append(f'  {o} = zext i{w} {v} to i32')
     body+=[f'  %o{i} = getelementptr i32, ptr addrspace(1) %q, i32 {i*65536}', f'  %o{i}b = getelementptr i32, ptr addrspace(1) %o{i}, i32 %t', f'  store i32 {o}, ptr addrspace(1) %o{i}b']
-  L+=sorted(decl)+['define agx_kernel void @k(ptr addrspace(1) %p, ptr addrspace(1) %q) {']+body+['  ret void','}']
+  L+=sorted(decl)+['define agx_kernel void @k(ptr addrspace(1) %p, ptr addrspace(1) %q) #0 {']+body+['  ret void','}',
+     'attributes #0 = { "agx-upper-bounds:air.thread_position_in_grid"="%d,0,0" }' % N]
   return '\n'.join(L)+'\n', ops, outs
 
 def evaluate(ops, outs, inputs):
@@ -146,6 +175,7 @@ def evaluate(ops, outs, inputs):
       m=M[w]; g=lambda x: e[x] if isinstance(x,str) else x&m
       k=op[0]
       if k=='in': v=int(inputs[op[1]][lane])
+      elif k=='tid': v=lane
       elif k in ('add','sub','mul','and','or','xor'):
         a,b=g(op[1]),g(op[2]); v={'add':a+b,'sub':a-b,'mul':a*b,'and':a&b,'or':a|b,'xor':a^b}[k]
       elif k in ('shl','lshr','ashr'):
@@ -154,6 +184,11 @@ def evaluate(ops, outs, inputs):
       elif k=='sel':
         p,a,b=op[1],g(op[2]),g(op[3]); sa,sb=sx(a,w),sx(b,w)
         c={'eq':a==b,'ne':a!=b,'slt':sa<sb,'sle':sa<=sb,'sgt':sa>sb,'sge':sa>=sb,'ult':a<b,'ule':a<=b,'ugt':a>b,'uge':a>=b}[p]
+        v=g(op[4]) if c else g(op[5])
+      elif k=='sel64':
+        # (a compare of 64-bit values selecting 32-bit ones)
+        a=e[op[2]]; b=e[op[3]] if isinstance(op[3],str) else op[3]&M[64]; sa,sb=sx(a,64),sx(b,64)
+        c={'eq':a==b,'ne':a!=b,'slt':sa<sb,'sle':sa<=sb,'sgt':sa>sb,'sge':sa>=sb,'ult':a<b,'ule':a<=b,'ugt':a>b,'uge':a>=b}[op[1]]
         v=g(op[4]) if c else g(op[5])
       elif k=='sel2':
         def cmp(p,a,b):
