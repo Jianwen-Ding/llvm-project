@@ -41,6 +41,7 @@
 #include "AGXMachineFunctionInfo.h"
 #include "AGXSubtarget.h"
 #include "llvm/ADT/GenericUniformityImpl.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -52,6 +53,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CycleAnalysis.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/DomConditionCache.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -5806,9 +5808,224 @@ namespace {
 /// zeros of two signs in an operand, differs at most in its result's zero
 /// sign). A phi or select is assumed while its own uses are checked (the
 /// differences then circulate only among such values).
+/// The threadgroup memory accesses of a function, each with the
+/// threadgroup global it stays within (or none: it may access any), when no
+/// other instruction can read or write threadgroup memory (no calls but
+/// intrinsics that do not access memory, no generic accesses, no atomics).
+struct ThreadgroupAccesses {
+  bool Valid = false;
+  SmallVector<std::pair<LoadInst *, GlobalVariable *>, 8> Loads;
+  std::optional<DominatorTree> DT;
+  DomConditionCache DC;
+  std::optional<LoopInfo> LI;
+  std::optional<TargetLibraryInfoImpl> TLII;
+  std::optional<TargetLibraryInfo> TLI;
+  std::optional<AssumptionCache> AC;
+  std::optional<ScalarEvolution> SE;
+  SmallVector<GlobalVariable *, 4> Globals;
+
+  /// The query for an access at I: known bits from the conditions of the
+  /// branches that dominate it (a store under lane == 0 at (tid >> 5) * 4).
+  SimplifyQuery query(Instruction *I) {
+    return SimplifyQuery(I->getDataLayout(), /*TLI=*/nullptr, &*DT,
+                         /*AC=*/nullptr, I, /*UseInstrInfo=*/true,
+                         /*CanUseUndef=*/true, &DC);
+  }
+
+  /// The global a threadgroup pointer accessed by Size bytes stays within:
+  /// G + c (constant GEPs), or inttoptr(X + ptrtoint G) + c with X's known
+  /// unsigned range in bounds.
+  static bool inBounds(GlobalVariable *G, const ConstantRange &R,
+                       uint64_t Size, const DataLayout &DL) {
+    if (G->getAddressSpace() != 3 || !G->getValueType()->isSized())
+      return false;
+    uint64_t GSize = DL.getTypeAllocSize(G->getValueType());
+    return GSize >= Size && !R.isWrappedSet() &&
+           R.getUnsignedMax().ule(GSize - Size);
+  }
+
+  /// The global a threadgroup pointer accessed by Size bytes at At stays
+  /// within: G + c (constant GEPs), or inttoptr(X) + c where X is
+  /// X' + ptrtoint G with X''s known unsigned range in bounds, or where X's
+  /// evolution less ptrtoint G is bounded in bounds (a loop's pointer).
+  GlobalVariable *within(Value *P, uint64_t Size, Instruction *At) {
+    SimplifyQuery SQ = query(At);
+    const DataLayout &DL = SQ.DL;
+    // The offsets of GEPs, constant or by indices of known signed ranges.
+    ConstantRange R(APInt(64, 0));
+    for (unsigned Depth = 0; Depth < 8; ++Depth) {
+      APInt Off(DL.getIndexTypeSizeInBits(P->getType()), 0);
+      P = P->stripAndAccumulateConstantOffsets(DL, Off,
+                                               /*AllowNonInbounds=*/true);
+      R = R.add(ConstantRange(Off.sextOrTrunc(64)));
+      auto *GEP = dyn_cast<GEPOperator>(P);
+      if (!GEP)
+        break;
+      unsigned W = DL.getIndexTypeSizeInBits(GEP->getType());
+      SmallMapVector<Value *, APInt, 4> Vars;
+      APInt C(W, 0);
+      if (!GEP->collectOffset(DL, W, Vars, C))
+        return nullptr;
+      R = R.add(ConstantRange(C.sextOrTrunc(64)));
+      for (auto &[V, Scale] : Vars) {
+        if (!V->getType()->isIntegerTy())
+          return nullptr;
+        ConstantRange VR = computeConstantRangeIncludingKnownBits(
+                               V, /*ForSigned=*/true, SQ)
+                               .sextOrTrunc(W)
+                               .sextOrTrunc(64);
+        R = R.add(VR.multiply(ConstantRange(Scale.sextOrTrunc(64))));
+      }
+      P = GEP->getPointerOperand();
+    }
+    if (auto *G = dyn_cast<GlobalVariable>(P))
+      return inBounds(G, R, Size, DL) ? G : nullptr;
+    auto *I2P = dyn_cast<IntToPtrInst>(P);
+    if (!I2P || !I2P->getSrcTy()->isIntegerTy(64))
+      return nullptr;
+    using namespace PatternMatch;
+    Value *X, *GP;
+    if (match(I2P->getOperand(0), m_c_Add(m_Value(X), m_PtrToInt(m_Value(GP)))))
+      if (auto *G = dyn_cast<GlobalVariable>(GP->stripPointerCasts()))
+        if (inBounds(G,
+                     R.add(computeConstantRangeIncludingKnownBits(
+                         X, /*ForSigned=*/false, SQ)),
+                     Size, DL))
+          return G;
+    const SCEV *S = SE->getSCEV(I2P->getOperand(0));
+    for (GlobalVariable *G : Globals) {
+      // (G's address as the IR's ptrtoint gives it)
+      const SCEV *D = SE->getMinusSCEV(
+          S, SE->getSCEV(ConstantExpr::getPtrToInt(G, S->getType())));
+      if (SCEVExprContains(D, [](const SCEV *E) {
+            return isa<SCEVCastExpr>(E) &&
+                       !isa<SCEVIntegralCastExpr>(E) ||
+                   isa<SCEVUnknown>(E) &&
+                       !isa<Instruction>(cast<SCEVUnknown>(E)->getValue()) &&
+                       !isa<Argument>(cast<SCEVUnknown>(E)->getValue());
+          }))
+        continue;
+      std::optional<APInt> Hi = AGX::scevUpperBound(D, *SE, *At->getFunction());
+      APInt Lo = SE->getUnsignedRange(D).getUnsignedMin();
+      if (!Hi || Hi->getActiveBits() > 63 || Lo.zext(128).ugt(*Hi))
+        continue;
+      ConstantRange DR(Lo.zextOrTrunc(64), Hi->trunc(64) + 1);
+      if (inBounds(G, R.add(DR), Size, DL))
+        return G;
+    }
+    return nullptr;
+  }
+
+  void build(Function &F) {
+    const DataLayout &DL = F.getDataLayout();
+    DT.emplace(F);
+    for (BasicBlock &BB : F)
+      if (auto *Br = dyn_cast<CondBrInst>(BB.getTerminator()))
+        DC.registerBranch(Br);
+    LI.emplace(*DT);
+    TLII.emplace(F.getParent()->getTargetTriple());
+    TLI.emplace(*TLII, &F);
+    AC.emplace(F);
+    SE.emplace(F, *TLI, *AC, *DT, *LI);
+    for (GlobalVariable &G : F.getParent()->globals())
+      if (G.getAddressSpace() == 3)
+        Globals.push_back(&G);
+    for (Instruction &I : instructions(F)) {
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        auto *II = dyn_cast<IntrinsicInst>(CB);
+        if (!II || isa<MemIntrinsic>(II) || II->mayReadOrWriteMemory())
+          if (!II || II->getIntrinsicID() != Intrinsic::agx_threadgroup_barrier)
+            return;
+        continue;
+      }
+      if (!I.mayReadOrWriteMemory())
+        continue;
+      if (isa<FenceInst>(I))
+        continue;
+      Value *Ptr = getLoadStorePointerOperand(&I);
+      if (!Ptr)
+        return; // atomics and the like
+      unsigned AS = Ptr->getType()->getPointerAddressSpace();
+      if (AS == 3) {
+        if (auto *L = dyn_cast<LoadInst>(&I))
+          Loads.push_back(
+              {L, within(Ptr, DL.getTypeStoreSize(L->getType()), L)});
+      } else if (AS != 1 && AS != 2 && AS != 4 && AS != 5) {
+        return; // a generic access may reach threadgroup memory
+      }
+    }
+    Valid = true;
+  }
+};
+
 struct ZeroSignFree {
   SmallPtrSet<Instruction *, 16> Assumed;
   unsigned Budget = 256;
+  /// The function's threadgroup accesses, built at the first threadgroup
+  /// store (shared by the min / max of a function: setting nsz changes none).
+  std::optional<ThreadgroupAccesses> &TG;
+  explicit ZeroSignFree(std::optional<ThreadgroupAccesses> &TG) : TG(TG) {}
+
+  /// A threadgroup store of the value: every load that may read it (one in
+  /// a global the store may write) has a value free of zero signs.
+  bool storedValue(StoreInst *S) {
+    if (S->getPointerAddressSpace() != 3 || S->isVolatile() || !S->isSimple())
+      return false;
+    Function &F = *S->getFunction();
+    if (!TG) {
+      TG.emplace();
+      TG->build(F);
+    }
+    if (!TG->Valid)
+      return false;
+    const DataLayout &DL = F.getDataLayout();
+    GlobalVariable *G = TG->within(
+        S->getPointerOperand(),
+        DL.getTypeStoreSize(S->getValueOperand()->getType()), S);
+    for (auto [L, LG] : TG->Loads)
+      if (!G || !LG || G == LG)
+        if (!value(L))
+          return false;
+    return true;
+  }
+
+  static bool isShuffle(Intrinsic::ID ID) {
+    switch (ID) {
+    case Intrinsic::agx_simd_shuffle:
+    case Intrinsic::agx_simd_shuffle_xor:
+    case Intrinsic::agx_simd_shuffle_up:
+    case Intrinsic::agx_simd_shuffle_down:
+    case Intrinsic::agx_simd_shuffle_rotate_up:
+    case Intrinsic::agx_quad_shuffle:
+    case Intrinsic::agx_quad_shuffle_xor:
+    case Intrinsic::agx_quad_shuffle_up:
+    case Intrinsic::agx_quad_shuffle_down:
+    case Intrinsic::agx_quad_shuffle_rotate_up:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  /// The bits of a float as an integer that only moves between lanes
+  /// (shuffles) and becomes a float again: those floats' values.
+  bool movedBits(Instruction *I, unsigned Depth = 0) {
+    if (Depth > 4)
+      return false;
+    for (User *U : I->users()) {
+      auto *UI = cast<Instruction>(U);
+      if (auto *BC = dyn_cast<BitCastInst>(UI)) {
+        if (!BC->getType()->isFloatingPointTy() || !value(BC))
+          return false;
+        continue;
+      }
+      auto *II = dyn_cast<IntrinsicInst>(UI);
+      if (!II || !isShuffle(II->getIntrinsicID()) || II->getArgOperand(0) != I ||
+          II->getArgOperand(1) == I || !movedBits(II, Depth + 1))
+        return false;
+    }
+    return true;
+  }
 
   bool value(Instruction *I) {
     if (Assumed.contains(I))
@@ -5829,8 +6046,16 @@ struct ZeroSignFree {
     auto *I = cast<Instruction>(U.getUser());
     if (isa<FCmpInst>(I))
       return true;
-    if (isa<PHINode>(I))
-      return value(I);
+    if (isa<PHINode>(I) || isa<ExtractElementInst>(I))
+      return isa<PHINode>(I) || U.getOperandNo() == 0 ? value(I) : false;
+    if (auto *S = dyn_cast<StoreInst>(I))
+      return U.getOperandNo() == 0 && storedValue(S);
+    if (auto *BC = dyn_cast<BitCastInst>(I))
+      return BC->getType()->isIntegerTy() &&
+             BC->getSrcTy()->isFloatingPointTy() &&
+             BC->getType()->getScalarSizeInBits() ==
+                 BC->getSrcTy()->getScalarSizeInBits() &&
+             !BC->getType()->isVectorTy() && movedBits(BC);
     if (auto *Sel = dyn_cast<SelectInst>(I))
       return U.getOperandNo() != 0 && value(Sel);
     switch (I->getOpcode()) {
@@ -5854,6 +6079,18 @@ struct ZeroSignFree {
       return true;
     case Intrinsic::copysign:
       return U.getOperandNo() == 0;
+    case Intrinsic::agx_simd_shuffle:
+    case Intrinsic::agx_simd_shuffle_xor:
+    case Intrinsic::agx_simd_shuffle_up:
+    case Intrinsic::agx_simd_shuffle_down:
+    case Intrinsic::agx_simd_shuffle_rotate_up:
+    case Intrinsic::agx_quad_shuffle:
+    case Intrinsic::agx_quad_shuffle_xor:
+    case Intrinsic::agx_quad_shuffle_up:
+    case Intrinsic::agx_quad_shuffle_down:
+    case Intrinsic::agx_quad_shuffle_rotate_up:
+      // The value moved to another lane (a float shuffle).
+      return U.getOperandNo() == 0 && value(II);
     case Intrinsic::fma:
     case Intrinsic::fmuladd:
     case Intrinsic::canonicalize:
@@ -5879,6 +6116,16 @@ struct ZeroSignFree {
 static bool zeroSignFreeMinMax(Function &F) {
   if (!AGXZeroSignFreeMinMax)
     return false;
+  // The special registers' ranges for the analysis only (threadgroup
+  // offsets within their globals, rangedCompares'), taken off again.
+  SmallVector<WeakVH, 8> Ranged;
+  AGX::addSpecialRegisterRanges(F, &Ranged);
+  scope_exit Unrange([&] {
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<CallBase>(V))
+        CI->removeRetAttr(Attribute::Range);
+  });
+  std::optional<ThreadgroupAccesses> TG;
   bool Changed = false;
   for (Instruction &I : instructions(F)) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
@@ -5896,7 +6143,7 @@ static bool zeroSignFreeMinMax(Function &F) {
     default:
       continue;
     }
-    ZeroSignFree Z;
+    ZeroSignFree Z(TG);
     if (!Z.value(II))
       continue;
     II->setHasNoSignedZeros(true);
