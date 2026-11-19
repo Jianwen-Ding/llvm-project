@@ -74,3 +74,38 @@ done:
   store float %mn, ptr addrspace(1) %o, align 4
   ret void
 }
+
+; A running maximumnum from a number (never a NaN) whose old and new values
+; also feed the loop's e^(m - m') (no zero's sign reaches it): those uses take
+; the deferred value, the store after the loop the exact one (L15-E446).
+declare float @llvm.maximumnum.f32(float, float)
+declare float @llvm.exp2.f32(float)
+; CHECK-LABEL: @online(
+; CHECK:       loop:
+; CHECK-NOT:   @llvm.maximumnum
+; CHECK:       fcmp oge float
+; CHECK:       icmp sgt i32
+; CHECK:       fsub float %{{.*}}.m,
+; CHECK:       ret void
+define agx_kernel void @online(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %in, %loop ]
+  %m = phi float [ -3.0e+38, %entry ], [ %mn, %loop ]
+  %s = phi float [ 0.0, %entry ], [ %sn, %loop ]
+  %p = getelementptr inbounds float, ptr addrspace(1) %x, i32 %i
+  %v = load float, ptr addrspace(1) %p, align 4
+  %mn = call float @llvm.maximumnum.f32(float %m, float %v)
+  %d = fsub float %m, %mn
+  %e = call float @llvm.exp2.f32(float %d)
+  %sn = fmul float %s, %e
+  %in = add nuw i32 %i, 1
+  %c = icmp ult i32 %in, %n
+  br i1 %c, label %loop, label %done
+done:
+  store float %mn, ptr addrspace(1) %o, align 4
+  %o1 = getelementptr inbounds float, ptr addrspace(1) %o, i32 1
+  store float %sn, ptr addrspace(1) %o1, align 4
+  ret void
+}

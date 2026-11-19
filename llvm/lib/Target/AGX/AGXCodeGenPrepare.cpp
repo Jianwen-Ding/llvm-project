@@ -6504,6 +6504,12 @@ static cl::opt<bool> AGXDeferredMinMax(
 /// zero or a denormal, which the compares flush: a clear sign among their
 /// bits, z >= 0, is a +0 or positive denormal, and maximum gives +0 or
 /// that denormal either way). MLIR's maximumf row maxima (torch-mlir's softmax).
+static cl::opt<bool> AGXDeferredMinMaxNum(
+    "agx-deferred-minmaxnum-reductions", cl::init(true), cl::Hidden,
+    cl::desc("agx-deferred-minmax-reductions also for maximumnum / "
+             "minimumnum from a number, its zero-sign-free uses in the loop "
+             "taking the deferred value"));
+
 static bool deferredMinMaxReductions(Function &F) {
   if (!AGXDeferredMinMax)
     return false;
@@ -6523,11 +6529,27 @@ static bool deferredMinMaxReductions(Function &F) {
         Phis.push_back(&P);
     for (PHINode *P : Phis) {
       auto *U = dyn_cast<IntrinsicInst>(P->getIncomingValueForBlock(Latch));
-      if (!U || (U->getIntrinsicID() != Intrinsic::maximum &&
-                 U->getIntrinsicID() != Intrinsic::minimum) ||
-          !L->contains(U) || !DT.dominates(U->getParent(), Latch))
+      if (!U || !L->contains(U) || !DT.dominates(U->getParent(), Latch))
         continue;
-      bool Max = U->getIntrinsicID() == Intrinsic::maximum;
+      Intrinsic::ID ID = U->getIntrinsicID();
+      // maximumnum / minimumnum from a number (never a NaN, so no NaN is
+      // carried), whose running values may also have uses in the loop that
+      // no zero's sign reaches (ZeroSignFree: an online softmax's rescale
+      // e^(m - m')), which take the deferred value (L15-E446)
+      bool Num = ID == Intrinsic::maximumnum || ID == Intrinsic::minimumnum;
+      if (ID != Intrinsic::maximum && ID != Intrinsic::minimum &&
+          !(Num && AGXDeferredMinMaxNum))
+        continue;
+      if (Num) {
+        auto *C0 = dyn_cast<ConstantFP>(P->getIncomingValueForBlock(Pre));
+        if (!C0 || C0->isNaN())
+          continue;
+      }
+      bool Max = ID == Intrinsic::maximum || ID == Intrinsic::maximumnum;
+      // (the uses in the loop besides the chain, for Num: zero-sign free)
+      std::optional<ThreadgroupAccesses> TGA;
+      ZeroSignFree ZSF(TGA);
+      SmallVector<std::pair<Use *, unsigned>, 4> Side;
       // the chain P -> m1 = op(P, v1) -> ... -> U = op(m_k-1, v_k), each
       // link's only user the next (an unrolled loop's running maximum)
       SmallVector<IntrinsicInst *, 4> Chain;
@@ -6535,12 +6557,27 @@ static bool deferredMinMaxReductions(Function &F) {
       Value *X = P;
       bool Bad = false;
       while (true) {
-        if (X != U && !X->hasOneUse()) {
+        if (X == U)
+          break;
+        // the next link: X's one user of the chain's kind; for Num, X's
+        // other users in the loop zero-sign free (link K's value, K = the
+        // chain's length so far: 0 is the phi's)
+        IntrinsicInst *C = nullptr;
+        for (Use &Us : X->uses()) {
+          auto *UI = cast<Instruction>(Us.getUser());
+          auto *II = dyn_cast<IntrinsicInst>(UI);
+          if (!C && II && II->getIntrinsicID() == ID && L->contains(II)) {
+            C = II;
+            continue;
+          }
+          if (Num && L->contains(UI) && UI != P && ZSF.use(Us)) {
+            Side.push_back({&Us, unsigned(Chain.size())});
+            continue;
+          }
           Bad = true;
           break;
         }
-        auto *C = X == U ? nullptr : dyn_cast<IntrinsicInst>(X->user_back());
-        if (X == U)
+        if (Bad)
           break;
         if (!C || C->getIntrinsicID() != U->getIntrinsicID() ||
             !L->contains(C) || Chain.size() > 16 ||
@@ -6563,9 +6600,13 @@ static bool deferredMinMaxReductions(Function &F) {
       // U's other users: the phi, and instructions outside the loop (phis,
       // the result then on the edges that bring U, or plain users)
       bool OK = true;
-      for (User *Us : U->users()) {
-        auto *I = cast<Instruction>(Us);
-        if (I != P && L->contains(I))
+      for (Use &Us : U->uses()) {
+        auto *I = cast<Instruction>(Us.getUser());
+        if (I == P || !L->contains(I))
+          continue;
+        if (Num && ZSF.use(Us))
+          Side.push_back({&Us, unsigned(Chain.size())});
+        else
           OK = false;
       }
       if (!OK)
@@ -6584,9 +6625,23 @@ static bool deferredMinMaxReductions(Function &F) {
       PHINode *N = PHINode::Create(Ty, 2, P->getName() + ".nan", P->getIterator());
       PHINode *Z = PHINode::Create(ITy, 2, P->getName() + ".z", P->getIterator());
       Value *M2 = M, *N2 = N, *Z2 = Z;
+      // the deferred value before each link and after the last
+      SmallVector<Value *, 4> MK{M};
       for (unsigned K = 0; K < Chain.size(); ++K) {
         IRBuilder<> B(Chain[K]);
         Value *V = Vs[K];
+        if (Num) {
+          // m' = v >= m ? v : m (a NaN v leaves m; a +0 meeting -0 is
+          // taken), z' = smax(z, bits(m')), never a NaN's bits
+          Value *Cmp = Max ? B.CreateFCmpOGE(V, M2) : B.CreateFCmpOLE(V, M2);
+          M2 = B.CreateSelect(Cmp, V, M2, P->getName() + ".m.next");
+          Value *MB = Bits(B, M2);
+          Z2 = B.CreateSelect(Max ? B.CreateICmpSGT(MB, Z2)
+                                  : B.CreateICmpSLT(MB, Z2),
+                              MB, Z2, P->getName() + ".z.next");
+          MK.push_back(M2);
+          continue;
+        }
         Value *Cmp = Max ? B.CreateFCmpOGT(V, M2) : B.CreateFCmpOLT(V, M2);
         M2 = B.CreateSelect(Cmp, V, M2, P->getName() + ".m.next");
         N2 = B.CreateSelect(B.CreateFCmpUNO(V, V), V, N2,
@@ -6594,6 +6649,7 @@ static bool deferredMinMaxReductions(Function &F) {
         Value *VB = Bits(B, V);
         Z2 = B.CreateSelect(Max ? B.CreateICmpSGT(VB, Z2) : B.CreateICmpSLT(VB, Z2),
                             VB, Z2, P->getName() + ".z.next");
+        MK.push_back(M2);
       }
       M->addIncoming(Init, Pre);
       M->addIncoming(M2, Latch);
@@ -6609,12 +6665,18 @@ static bool deferredMinMaxReductions(Function &F) {
         Value *Seen = Max ? RB.CreateICmpSGE(ZV, Constant::getNullValue(ITy))
                           : RB.CreateICmpSLT(ZV, Constant::getNullValue(ITy));
         Value *R = RB.CreateSelect(RB.CreateAnd(IsZero, Seen), Zero, MV);
+        if (Num)
+          return R;
         return RB.CreateSelect(RB.CreateFCmpUNO(NV, NV), NV, R,
                                U->getName() + ".r");
       };
+      // the zero-sign-free uses in the loop: the deferred value (the same
+      // but for a zero's sign)
+      for (auto [Us, K] : Side)
+        Us->set(MK[K]);
       SmallVector<Instruction *, 4> Users;
       for (User *Us : U->users())
-        if (Us != P)
+        if (Us != P && !llvm::is_contained(Users, cast<Instruction>(Us)))
           Users.push_back(cast<Instruction>(Us));
       for (Instruction *I : Users) {
         if (auto *LP = dyn_cast<PHINode>(I)) {
@@ -6646,6 +6708,10 @@ static bool deferredMinMaxReductions(Function &F) {
       }
       P->replaceAllUsesWith(PoisonValue::get(Ty));
       P->eraseFromParent();
+      if (Num) {
+        N->replaceAllUsesWith(PoisonValue::get(Ty));
+        N->eraseFromParent();
+      }
       Changed = true;
     }
   }

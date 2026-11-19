@@ -69,10 +69,16 @@ def gen(seed):
             # the running maximum's kind: maximumnum, or maximum / minimum
             # (NaN-propagating, -0 below +0: E444's deferred NaN and zeros)
             fop=R.choice(['maximumnum', 'maximumnum', 'maximum', 'minimum']),
+            # the running maximum also used in the loop: compared with the
+            # value (no zero's sign reaches the hash: E446 gives it the
+            # deferred value) or its bits hashed (a zero's sign does)
+            fuse=R.choice([None, None, 'cmp', 'bits']),
         ))
     for p in loops:
         if p['ctrip']:
             p.update(step=1, exact=False, vstep=False)
+        if not p['fmax'] or (p['fuse'] == 'bits' and p['fop'] != 'maximumnum'):
+            p['fuse'] = None   # (bits only of default NaNs)
     return loops
 
 
@@ -244,20 +250,32 @@ def emit(loops):
             L += ['  %%%sh7 = xor i32 %s, %%%sd' % (q, h, q),
                   '  %%%sdn = add i32 %%%sd, %d' % (q, q, twin_step(p))]
             h = '%%%sh7' % q
-        L += ['  %%%san = add i32 %s, %%%sv' % (q, h, q),
-              '  %%%scn = add nuw %s %s, %s' % (q, ty, c,
-                                                (('%%%ssv64' % q) if p['wide'] else s) if p.get('vstep') else str(s))]
-        if p['fmax']:
-            L += sanitize(q + 'fv', '%%%sv' % q) + ['  %%%sff = bitcast i32 %%%sfv to float' % (q, q)]
+        def fmax_ops():
+            F = sanitize(q + 'fv', '%%%sv' % q) + ['  %%%sff = bitcast i32 %%%sfv to float' % (q, q)]
             if p.get('fop', 'maximumnum') == 'maximumnum':
                 # (the PTX front end's default NaN after each step)
-                L += ['  %%%sft = call float @llvm.maximumnum.f32(float %s, float %%%sff)' % (q, fm, q),
+                F += ['  %%%sft = call float @llvm.maximumnum.f32(float %s, float %%%sff)' % (q, fm, q),
                       '  %%%sfu = fcmp uno float %%%sft, 0.000000e+00' % (q, q),
                       '  %%%sfn = select i1 %%%sfu, float 0x7FFFFFFFE0000000, float %%%sft' % (q, q, q)]
             else:
                 # (maximum / minimum bare in the loop, as MLIR's maximumf: the
                 # default NaN only for the store)
-                L.append('  %%%sfn = call float @llvm.%s.f32(float %s, float %%%sff)' % (q, p['fop'], fm, q))
+                F.append('  %%%sfn = call float @llvm.%s.f32(float %s, float %%%sff)' % (q, p['fop'], fm, q))
+            return F
+        if p['fmax'] and p.get('fuse'):
+            L += fmax_ops()
+            if p['fuse'] == 'cmp':
+                L += ['  %%%sfc = fcmp ogt float %%%sfn, %%%sff' % (q, q, q),
+                      '  %%%sfz = zext i1 %%%sfc to i32' % (q, q)]
+            else:
+                L.append('  %%%sfz = bitcast float %%%sfn to i32' % (q, q))
+            L.append('  %%%sh8 = xor i32 %s, %%%sfz' % (q, h, q))
+            h = '%%%sh8' % q
+        L += ['  %%%san = add i32 %s, %%%sv' % (q, h, q),
+              '  %%%scn = add nuw %s %s, %s' % (q, ty, c,
+                                                (('%%%ssv64' % q) if p['wide'] else s) if p.get('vstep') else str(s))]
+        if p['fmax'] and not p.get('fuse'):
+            L += fmax_ops()
         if p['guarded']:
             L += ['  %%%sgo = icmp %s %s %%%scn, %s' % (q, pred, ty, q, tripv),
                   '  br i1 %%%sgo, label %%%sbody, label %%%sexit' % (q, q, q)]
@@ -324,8 +342,17 @@ def model(loops, tid, a, b, inp):
             if p.get('twin'):
                 h ^= d
                 d = (d + twin_step(p)) & M
+            fmop = {'maximumnum': maximumnum, 'maximum': maximum, 'minimum': minimum}[p.get('fop', 'maximumnum')]
+            if p.get('fuse'):
+                fm = fmop(fm, san(v))
+                if p['fuse'] == 'cmp':
+                    ffm, ffv = (struct.unpack('<f', struct.pack('<I', x))[0] for x in (fm, san(v)))
+                    h ^= 1 if (not isnan(fm) and not isnan(san(v)) and ffm > ffv) else 0
+                else:
+                    h ^= fm
             acc = (h + v) & M
-            fm = {'maximumnum': maximumnum, 'maximum': maximum, 'minimum': minimum}[p.get('fop', 'maximumnum')](fm, san(v))
+            if not p.get('fuse'):
+                fm = fmop(fm, san(v))
             c += s
             if p['guarded']:
                 if not ((c != t) if p['exact'] else (c < t)):
