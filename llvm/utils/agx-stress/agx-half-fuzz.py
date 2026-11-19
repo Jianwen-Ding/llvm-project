@@ -172,6 +172,13 @@ def fpext(h):
   return round_frac_f32(Fraction(x))
 
 fadd32, fmul32 = fadd, fmul
+
+
+def fmax32_0(s):
+  """maximumnum(s, +0) of a float's bits: +0 for a NaN, -0 or anything below."""
+  if (s & 0x7f800000) == 0x7f800000 and s & 0x7fffff: return 0
+  if s >> 31: return 0
+  return s
 PRED=['oeq','ogt','oge','olt','ole','one','ord','ueq','ugt','uge','ult','ule','une','uno']
 def hcmp(p,a,b):
   x,y=h2f(a),h2f(b); un=math.isnan(x) or math.isnan(y)
@@ -214,6 +221,18 @@ def gen(seed):
       ea=nv(); eb=nv(); s=nv(); op=R.choice(['fadd','fmul'])
       body+=[f'  {ea} = fpext half {a} to float', f'  {eb} = fpext half {b} to float', f'  {s} = {op} float {ea}, {eb}', f'  {r} = fptrunc float {s} to half']
       ops.append((r,'ext32',op,a,b)); hv.append(r)
+    elif k<0.78:
+      # two f32 operations before the narrowing (its float intermediate is
+      # not a half: no half operations for it, L15-E440), or one under a
+      # maximumnum with 0
+      c=R.choice(hv); ea=nv(); eb=nv(); ec=nv(); s=nv(); t=nv(); op=R.choice(['fadd','fmul']); op2=R.choice(['fadd','fmul','max0'])
+      body+=[f'  {ea} = fpext half {a} to float', f'  {eb} = fpext half {b} to float', f'  {ec} = fpext half {c} to float', f'  {s} = {op} float {ea}, {eb}']
+      if op2=='max0':
+        decl.add('declare float @llvm.maximumnum.f32(float, float)'); body.append(f'  {t} = call float @llvm.maximumnum.f32(float {s}, float 0.000000e+00)')
+      else:
+        body.append(f'  {t} = {op2} float {s}, {ec}')
+      body.append(f'  {r} = fptrunc float {t} to half')
+      ops.append((r,'ext32b',op,op2,a,b,c)); hv.append(r)
     elif k<0.82:
       fn=R.choice(['fneg','fabs'])
       if fn=='fneg': body.append(f'  {r} = fneg half {a}')
@@ -255,6 +274,11 @@ def evaluate(ops,outs,hv,ins,N):
       elif k in ('maximumnum','minimumnum'): v=hmax(e[op[2]],e[op[3]],k=='maximumnum',op[2]==op[3])
       elif k=='ext32':
         x,y=fpext(e[op[3]]),fpext(e[op[4]]); s=fadd32(x,y) if op[2]=='fadd' else fmul32(x,y); v=fptrunc(s)
+      elif k=='ext32b':
+        x,y,z=fpext(e[op[4]]),fpext(e[op[5]]),fpext(e[op[6]]); s=fadd32(x,y) if op[2]=='fadd' else fmul32(x,y)
+        if op[3]=='max0': t=fmax32_0(s)
+        else: t=fadd32(s,z) if op[3]=='fadd' else fmul32(s,z)
+        v=fptrunc(t)
       elif k=='fneg': v=e[op[2]]^0x8000
       elif k=='fabs': v=e[op[2]]&0x7fff
       elif k in ('sitofp','uitofp'): v=i2h(e[op[2]],k=='sitofp')

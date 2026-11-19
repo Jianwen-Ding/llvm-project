@@ -6362,6 +6362,128 @@ static bool narrowSignedCompares(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXHalfFromFloat(
+    "agx-half-from-float", cl::init(true), cl::Hidden,
+    cl::desc("fptrunc to half of one float add, sub, mul or div of halves "
+             "(and min / max, fneg, fabs and selects of such) in half"));
+
+/// fptrunc(op(fpext a, fpext b)) to half is op on the halves: the float
+/// result rounded to half is the half result for + - * / (float has 24 >=
+/// 2 * 11 + 2 bits: a second rounding never differs, Figueroa), and no such
+/// result is a float denormal (the least, 2^-24 * 2^-24, is far above). min
+/// / max (every kind), fneg, fabs and selects of values so narrowed commute
+/// with the rounding, which is monotonic and keeps signs and NaNs: MLIR's
+/// mixed precision truncf(maximumf(addf(extf a, extf b), 0)) is a half add
+/// and a half max (L15-E440). An operation of two operations' results is
+/// not: its float operands are not halves.
+static bool halfFromFloat(Function &F) {
+  if (!AGXHalfFromFloat)
+    return false;
+  using namespace PatternMatch;
+  Type *H = Type::getHalfTy(F.getContext());
+  // a half equal to V (an exact one: an extension or a constant)
+  auto Exact = [&](Value *V, IRBuilder<> &B) -> Value * {
+    Value *X;
+    if (match(V, m_FPExt(m_Value(X))) && X->getType()->isHalfTy())
+      return X;
+    if (auto *C = dyn_cast<ConstantFP>(V)) {
+      APFloat A = C->getValueAPF();
+      bool Lost;
+      if (A.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven, &Lost) ==
+              APFloat::opOK &&
+          !Lost)
+        return ConstantFP::get(H, A);
+    }
+    return nullptr;
+  };
+  std::function<bool(Value *, unsigned)> Can = [&](Value *V,
+                                                   unsigned D) -> bool {
+    if (!V->getType()->isFloatTy() || D > 6)
+      return false;
+    IRBuilder<> B(F.getContext());
+    if (Exact(V, B))
+      return true;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !I->hasOneUse())
+      return false;
+    switch (I->getOpcode()) {
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+    case Instruction::FDiv:
+      return Exact(I->getOperand(0), B) && Exact(I->getOperand(1), B);
+    case Instruction::FNeg:
+      return Can(I->getOperand(0), D + 1);
+    case Instruction::Select:
+      return Can(I->getOperand(1), D + 1) && Can(I->getOperand(2), D + 1);
+    default:
+      break;
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::fabs:
+        return Can(II->getArgOperand(0), D + 1);
+      case Intrinsic::minnum:
+      case Intrinsic::maxnum:
+      case Intrinsic::minimum:
+      case Intrinsic::maximum:
+      case Intrinsic::minimumnum:
+      case Intrinsic::maximumnum:
+        return Can(II->getArgOperand(0), D + 1) &&
+               Can(II->getArgOperand(1), D + 1);
+      default:
+        break;
+      }
+    }
+    return false;
+  };
+  std::function<Value *(Value *, IRBuilder<> &)> Build =
+      [&](Value *V, IRBuilder<> &B) -> Value * {
+    if (Value *X = Exact(V, B))
+      return X;
+    auto *I = cast<Instruction>(V);
+    Value *R;
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      R = B.CreateBinOp(BO->getOpcode(), Exact(BO->getOperand(0), B),
+                        Exact(BO->getOperand(1), B));
+    } else if (I->getOpcode() == Instruction::FNeg) {
+      R = B.CreateFNeg(Build(I->getOperand(0), B));
+    } else if (auto *S = dyn_cast<SelectInst>(I)) {
+      R = B.CreateSelect(S->getCondition(), Build(S->getTrueValue(), B),
+                         Build(S->getFalseValue(), B));
+    } else {
+      auto *II = cast<IntrinsicInst>(I);
+      if (II->getIntrinsicID() == Intrinsic::fabs)
+        R = B.CreateUnaryIntrinsic(Intrinsic::fabs,
+                                   Build(II->getArgOperand(0), B));
+      else
+        R = B.CreateBinaryIntrinsic(II->getIntrinsicID(),
+                                    Build(II->getArgOperand(0), B),
+                                    Build(II->getArgOperand(1), B));
+    }
+    if (auto *RI = dyn_cast<Instruction>(R))
+      if (isa<FPMathOperator>(RI) && isa<FPMathOperator>(I))
+        RI->copyFastMathFlags(I);
+    return R;
+  };
+  SmallVector<FPTruncInst *, 8> Roots;
+  for (Instruction &I : instructions(F))
+    if (auto *T = dyn_cast<FPTruncInst>(&I);
+        T && T->getType()->isHalfTy() && T->getSrcTy()->isFloatTy() &&
+        !isa<ConstantFP>(T->getOperand(0)) && Can(T->getOperand(0), 0) &&
+        !isa<FPExtInst>(T->getOperand(0)))
+      Roots.push_back(T);
+  for (FPTruncInst *T : Roots) {
+    IRBuilder<> B(T);
+    Value *N = Build(T->getOperand(0), B);
+    Value *Old = T->getOperand(0);
+    T->replaceAllUsesWith(N);
+    T->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+  }
+  return !Roots.empty();
+}
+
 static cl::opt<bool> AGXNarrowTruncatedOps(
     "agx-narrow-truncated-ops", cl::init(true), cl::Hidden,
     cl::desc("A 64-bit add, sub, mul, and, or, xor or shl whose every user "
@@ -6566,6 +6688,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= AGX::narrowBoundedI64(F);
   Changed |= narrowSignedCompares(F);
   Changed |= narrowTruncatedOps(F);
+  Changed |= halfFromFloat(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)
