@@ -39,6 +39,10 @@ static cl::opt<bool> ExpMagicRound(
     cl::desc("exp's n = round(x / ln 2) by adding and subtracting 1.5 2^23, "
              "its integer the sum's low bits (no rint or convert)"));
 
+static cl::opt<bool> TanhDoubledClamp(
+    "agx-tanh-doubled-clamp", cl::init(true), cl::Hidden,
+    cl::desc("tanh's 2 min(|x|, 9) as min(|x| + |x|, 18)"));
+
 static cl::opt<bool> SinCosMagicRound(
     "agx-sincos-magic-round", cl::init(true), cl::Hidden,
     cl::desc("sin / cos's j = round(2 x / pi) likewise, the quadrant the "
@@ -363,7 +367,13 @@ public:
     Value *S =
         HalfResult && HalfFastHyperbolic
             ? hw(Intrinsic::exp2, mul(k(2.0 * M_LOG2E), A))
-            : expHiLo(mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)), nullptr,
+            : expHiLo(TanhDoubledClamp
+                          // 2 min(a, 9) as min(a + a, 18): the doubling
+                          // reads x with the abs modifier, no select of |x|
+                          // (an and with 0x7fffffff) (L15-E471)
+                          ? sel(gt(A, 9.0), k(18.0), add(A, A))
+                          : mul(k(2.0), sel(gt(A, 9.0), k(9.0), A)),
+                      nullptr,
                       /*Bounded=*/true, /*NoOverflow=*/ExpNonNegative,
                       /*NonNegative=*/ExpNonNegative);
     // 2 / d for d = s + 1 in [2, e^18 + 1] (or a NaN): twice the correctly
