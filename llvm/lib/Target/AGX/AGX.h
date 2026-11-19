@@ -14,6 +14,7 @@
 #define LLVM_LIB_TARGET_AGX_AGX_H
 
 #include <optional>
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Intrinsics.h"
@@ -23,6 +24,8 @@
 
 namespace llvm {
 class Function;
+class SCEV;
+class ScalarEvolution;
 /// The most 32-bit registers that F's IR values hold at once (SSA liveness,
 /// each value by its size): an estimate of its register pressure before
 /// instruction selection.
@@ -69,6 +72,11 @@ std::optional<uint64_t> knownGridExtent(const Function &F, unsigned IntrinsicID)
 /// The extent a position read is below: the known grid's or the kernel's
 /// agx-upper-bounds (AGXSpecialRegisterRanges, L15-E391).
 std::optional<uint64_t> knownUpperBound(const Function &F, unsigned IntrinsicID);
+/// An upper bound on an integer SCEV's value from constants, positions, sums,
+/// products, extensions, truncations, minimums and bounded recurrences
+/// (AGXNarrowInductions' upperBound), as a 128-bit APInt.
+std::optional<APInt> scevUpperBound(const SCEV *S, ScalarEvolution &SE,
+                                    const Function &F);
 } // namespace AGX
 FunctionPass *createAGXVectorAccessesPass(bool BeforeVectorizer);
 FunctionPass *createAGXLowerGenericAddressesPass();

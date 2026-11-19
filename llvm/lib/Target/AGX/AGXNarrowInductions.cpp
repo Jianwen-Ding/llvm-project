@@ -1105,6 +1105,11 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
   return R;
 }
 
+std::optional<APInt> AGX::scevUpperBound(const SCEV *S, ScalarEvolution &SE,
+                                         const Function &F) {
+  return upperBound(S, SE, F);
+}
+
 /// A lower bound on S's value where upperBound bounds it (so no step of it
 /// wraps): constants, positions (0), sums, products, zero extensions, and
 /// the start of a non-decreasing recurrence.

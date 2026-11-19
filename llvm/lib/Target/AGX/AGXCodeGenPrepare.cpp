@@ -4861,6 +4861,92 @@ static bool bfloatSqrts(Function &F, const AGXSubtarget &ST) {
   return !Sqrts.empty();
 }
 
+static cl::opt<bool> AGXRebaseLoopIndices(
+    "agx-rebase-loop-indices", cl::init(true), cl::Hidden,
+    cl::desc("A loop's device access at B[zext(X + Y)], X invariant, as (B + "
+             "zext(X))[zext(Y)] where another access's index is Y"));
+
+/// In a loop, an access at B[zext(x + y)] (x invariant, x + y not wrapping)
+/// beside one at C[y'] whose index is y as well (a convolution's x[i + k]
+/// and w[k], k the counter): loop strength reduction keeps a counter for
+/// each index, an add each an iteration. As (B + zext(x))[zext(y)], both
+/// accesses take one index register (and the loop's counter is that one),
+/// for an invariant base computed once (L15-E398).
+static bool rebaseLoopIndices(Function &F) {
+  if (!AGXRebaseLoopIndices)
+    return false;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  if (LI.empty())
+    return false;
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *Pre = L->getLoopPreheader();
+    if (!L->isInnermost() || !Pre)
+      continue;
+    // the accesses' 64-bit index SCEVs
+    SmallVector<std::pair<GetElementPtrInst *, const SCEV *>, 8> Accesses;
+    for (BasicBlock *BB : L->blocks())
+      for (Instruction &I : *BB) {
+        Value *Ptr = getLoadStorePointerOperand(&I);
+        auto *G = dyn_cast_or_null<GetElementPtrInst>(Ptr);
+        if (!G || G->getAddressSpace() != AGX::DEVICE_ADDRESS ||
+            G->getNumIndices() != 1 || !L->isLoopInvariant(G->getPointerOperand()) ||
+            !G->getOperand(1)->getType()->isIntegerTy(64))
+          continue;
+        Accesses.push_back({G, SE.getSCEV(G->getOperand(1))});
+      }
+    for (auto &Acc : Accesses) {
+      GetElementPtrInst *G = Acc.first;
+      Value *X, *Y;
+      if (!match(G->getOperand(1), m_ZExt(m_Add(m_Value(X), m_Value(Y)))))
+        continue;
+      if (!L->isLoopInvariant(X))
+        std::swap(X, Y);
+      // (a constant x is E250's immediate index from one shared base)
+      if (!L->isLoopInvariant(X) || L->isLoopInvariant(Y) ||
+          !X->getType()->isIntegerTy(32) || isa<Constant>(X))
+        continue;
+      if (auto *XI = dyn_cast<Instruction>(X);
+          XI && !DT.dominates(XI, Pre->getTerminator()))
+        continue;
+      if (!isa<Instruction>(G->getOperand(1)) ||
+          !cast<Instruction>(G->getOperand(1))->hasOneUse())
+        continue;
+      // another access indexed by zext(y)
+      const SCEV *SY = SE.getZeroExtendExpr(SE.getSCEV(Y),
+                                            Type::getInt64Ty(F.getContext()));
+      GetElementPtrInst *Self = G;
+      if (none_of(Accesses,
+                  [&](auto &A) { return A.first != Self && A.second == SY; }))
+        continue;
+      // x + y does not wrap
+      std::optional<APInt> BX = AGX::scevUpperBound(SE.getSCEV(X), SE, F);
+      std::optional<APInt> BY = AGX::scevUpperBound(SE.getSCEV(Y), SE, F);
+      if (!BX || !BY || !(*BX + *BY).ult(APInt(128, 1).shl(32)))
+        continue;
+      IRBuilder<> PB(Pre->getTerminator());
+      Value *Base = PB.CreateGEP(G->getSourceElementType(),
+                                 G->getPointerOperand(),
+                                 PB.CreateZExt(X, PB.getInt64Ty()), "rebased");
+      IRBuilder<> B(G);
+      auto *Idx = cast<Instruction>(G->getOperand(1));
+      Value *NG = B.CreateGEP(G->getSourceElementType(), Base,
+                              B.CreateZExt(Y, B.getInt64Ty()));
+      G->replaceAllUsesWith(NG);
+      G->eraseFromParent();
+      RecursivelyDeleteTriviallyDeadInstructions(Idx);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNeverNaNTests(
     "agx-never-nan-tests", cl::init(true), cl::Hidden,
     cl::desc("Fold NaN tests of values no execution makes a NaN (a running "
@@ -5111,6 +5197,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
   Changed |= zeroSignFreeMinMax(F);
+  Changed |= rebaseLoopIndices(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)
