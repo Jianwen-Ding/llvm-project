@@ -218,3 +218,88 @@ entry:
   store float %42, ptr addrspace(1) %43, align 4
   ret void
 }
+
+; @causal_rowmax: the MLIR bench's causal_rowmax, m the SIMD-group's fmax of a
+; loop's maxnum of select(j > row, -inf, x), whose exp the second loop uses
+; only where the same j > row is false: there x is at most m (L15-E455).
+; CHECK-LABEL: causal_rowmax:
+; CHECK:       simd_max.f
+; CHECK:       Loop Header
+; CHECK-NOT:   icmpsel sgt
+; CHECK:       jmp_exec_any
+; OFF-LABEL:   causal_rowmax:
+; OFF:         simd_max.f
+; OFF:         Loop Header
+; OFF:         icmpsel sgt
+declare i32 @llvm.agx.thread.index.in.simdgroup()
+define agx_kernel void @causal_rowmax(ptr addrspace(1) nofree readonly captures(none) %0, ptr addrspace(1) nofree writeonly captures(none) %1) #2 {
+entry:
+  %2 = tail call i32 @llvm.agx.thread.index.in.simdgroup()
+  %3 = tail call i32 @llvm.agx.threadgroup.position.in.grid.x()
+  %4 = zext i32 %3 to i64
+  %5 = zext i32 %2 to i64
+  %6 = shl i32 %3, 10
+  %7 = icmp ult i32 %2, 1024
+  %8 = sub nsw i64 1024, %5
+  %9 = tail call i64 @llvm.umin.i64(i64 %8, i64 1048576)
+  %10 = trunc nuw nsw i64 %9 to i32
+  %11 = select i1 %7, i32 %10, i32 0
+  %invariant.op = add i32 %6, %2
+  %.not11 = icmp eq i32 %11, 0
+  br i1 %.not11, label %._crit_edge, label %.lr.ph.preheader
+
+.lr.ph.preheader:                                 ; preds = %entry
+  %12 = zext nneg i32 %11 to i64
+  br label %.lr.ph
+
+.lr.ph:                                           ; preds = %.lr.ph.preheader, %.lr.ph
+  %indvars.iv = phi i64 [ 0, %.lr.ph.preheader ], [ %indvars.iv.next, %.lr.ph ]
+  %13 = phi float [ -inf, %.lr.ph.preheader ], [ %20, %.lr.ph ]
+  %14 = add nuw nsw i64 %indvars.iv, %5
+  %15 = trunc nuw nsw i64 %indvars.iv to i32
+  %.reass = add i32 %invariant.op, %15
+  %16 = zext i32 %.reass to i64
+  %17 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %0, i64 %16
+  %18 = load float, ptr addrspace(1) %17, align 4
+  %.not3 = icmp samesign ugt i64 %14, %4
+  %19 = select i1 %.not3, float -inf, float %18
+  %20 = tail call float @llvm.maxnum.f32(float %13, float %19)
+  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 32
+  %21 = icmp samesign ult i64 %indvars.iv.next, %12
+  br i1 %21, label %.lr.ph, label %._crit_edge
+
+._crit_edge:                                      ; preds = %.lr.ph, %entry
+  %.lcssa4 = phi float [ -inf, %entry ], [ %20, %.lr.ph ]
+  %22 = tail call float @llvm.agx.simd.reduce.f32(float %.lcssa4, i32 7)
+  br i1 %.not11, label %._crit_edge9, label %.lr.ph8.preheader
+
+.lr.ph8.preheader:                                ; preds = %._crit_edge
+  %23 = zext nneg i32 %11 to i64
+  br label %.lr.ph8
+
+.lr.ph8:                                          ; preds = %.lr.ph8.preheader, %.lr.ph8
+  %indvars.iv15 = phi i64 [ 0, %.lr.ph8.preheader ], [ %indvars.iv.next16, %.lr.ph8 ]
+  %24 = phi float [ 0.000000e+00, %.lr.ph8.preheader ], [ %33, %.lr.ph8 ]
+  %25 = add nuw nsw i64 %indvars.iv15, %5
+  %26 = trunc nuw nsw i64 %indvars.iv15 to i32
+  %.reass6 = add i32 %invariant.op, %26
+  %27 = zext i32 %.reass6 to i64
+  %28 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %0, i64 %27
+  %29 = load float, ptr addrspace(1) %28, align 4
+  %.not = icmp samesign ugt i64 %25, %4
+  %30 = fsub float %29, %22
+  %31 = tail call float @llvm.exp.f32(float %30)
+  %32 = select i1 %.not, float 0.000000e+00, float %31
+  %33 = fadd float %24, %32
+  %indvars.iv.next16 = add nuw nsw i64 %indvars.iv15, 32
+  %34 = icmp samesign ult i64 %indvars.iv.next16, %23
+  br i1 %34, label %.lr.ph8, label %._crit_edge9
+
+._crit_edge9:                                     ; preds = %.lr.ph8, %._crit_edge
+  %.lcssa = phi float [ 0.000000e+00, %._crit_edge ], [ %33, %.lr.ph8 ]
+  %35 = tail call float @llvm.agx.simd.reduce.f32(float %.lcssa, i32 1)
+  %36 = zext i32 %invariant.op to i64
+  %37 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %1, i64 %36
+  store float %35, ptr addrspace(1) %37, align 4
+  ret void
+}

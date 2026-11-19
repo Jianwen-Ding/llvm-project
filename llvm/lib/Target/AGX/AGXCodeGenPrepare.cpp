@@ -7643,6 +7643,11 @@ static Value *stripSinglePhis(Value *V) {
   return V;
 }
 
+static cl::opt<bool> AGXExpMaskedMax(
+    "agx-exp-masked-max", cl::init(true), cl::Hidden,
+    cl::desc("agx-exp-below-loop-max also for a maximum of select(c, -inf, "
+             "x) whose exp is used only where the same c is false"));
+
 static cl::opt<bool> AGXExpInPlaceStores(
     "agx-exp-in-place-stores", cl::init(true), cl::Hidden,
     cl::desc("exp(x - m) below an earlier loop's maximum also where x's "
@@ -7803,16 +7808,42 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
   // u = max(p, v) with p the header phi it updates, v a load of L1
   PHINode *P = nullptr;
   LoadInst *V = nullptr;
+  ICmpInst *Mask = nullptr;
+  bool MaskOnTrue = false;
   for (unsigned I = 0; I < 2; ++I) {
     auto *Phi = dyn_cast<PHINode>(U->getArgOperand(I));
     // (or the frozen load, the same value: a load reads no poison here)
     Value *A = U->getArgOperand(1 - I);
     if (auto *Fr = dyn_cast<FreezeInst>(A))
       A = Fr->getOperand(0);
+    // (or the load where c1 is false, -inf where it is true: a masked
+    // maximum, whose exp the loop with it uses only where the same
+    // condition is false, L15-E455)
+    ICmpInst *C = nullptr;
+    bool OnTrue = false;
+    if (auto *S = dyn_cast<SelectInst>(A); S && AGXExpMaskedMax) {
+      auto NegInf = [](Value *K) {
+        auto *CF = dyn_cast<ConstantFP>(K);
+        return CF && CF->isInfinity() && CF->isNegative();
+      };
+      Value *Ld = nullptr;
+      if (NegInf(S->getTrueValue()))
+        Ld = S->getFalseValue();
+      else if (NegInf(S->getFalseValue()))
+        Ld = S->getTrueValue(), OnTrue = true;
+      C = dyn_cast<ICmpInst>(S->getCondition());
+      if (Ld && C) {
+        if (auto *Fr = dyn_cast<FreezeInst>(Ld))
+          Ld = Fr->getOperand(0);
+        A = Ld;
+      } else {
+        C = nullptr;
+      }
+    }
     auto *Ld = dyn_cast<LoadInst>(A);
     if (Phi && Ld && Phi->getParent() == L1->getHeader() &&
         Phi->getIncomingValueForBlock(Latch1) == U)
-      P = Phi, V = Ld;
+      P = Phi, V = Ld, Mask = C, MaskOnTrue = OnTrue;
   }
   if (!P || !V || !V->isSimple() || V->getType() != X->getType() ||
       !L1->contains(V))
@@ -7872,6 +7903,24 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
   if (!Same(SE.getSCEV(V->getPointerOperand()),
             SE.getSCEV(L2Load->getPointerOperand())))
     return false;
+  // a masked maximum: every use of the exp a select of it where the same
+  // condition of the iteration (the same compare of the same functions of
+  // it) has the value that the maximum took the load with
+  if (Mask) {
+    if (E->use_empty())
+      return false;
+    for (User *Us : E->users()) {
+      auto *S = dyn_cast<SelectInst>(Us);
+      auto *C2 = S ? dyn_cast<ICmpInst>(S->getCondition()) : nullptr;
+      if (!C2 || C2->getPredicate() != Mask->getPredicate() ||
+          !L2->contains(S) || S->getCondition() == E ||
+          (MaskOnTrue ? S->getTrueValue() : S->getFalseValue()) != E ||
+          (MaskOnTrue ? S->getFalseValue() : S->getTrueValue()) == E ||
+          !Same(SE.getSCEV(Mask->getOperand(0)), SE.getSCEV(C2->getOperand(0))) ||
+          !Same(SE.getSCEV(Mask->getOperand(1)), SE.getSCEV(C2->getOperand(1))))
+        return false;
+    }
+  }
   if (L1->getLoopDepth() != 1 || L2->getLoopDepth() != 1)
     return false;
   const SCEV *B1 = SE.getBackedgeTakenCount(L1);
