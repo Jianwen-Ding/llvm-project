@@ -1144,6 +1144,73 @@ static std::optional<APInt> lowerBound(const SCEV *S, ScalarEvolution &SE,
   return R;
 }
 
+static cl::opt<bool> AGXMergeCongruentCounters(
+    "agx-merge-congruent-counters", cl::init(true), cl::Hidden,
+    cl::desc("One of two 32-bit header phis with the same recurrence for both "
+             "(a narrowed index beside its own 32-bit copy)"));
+
+/// Two integer phis of a block whose incoming values from each predecessor
+/// are the same value, or each the phi itself plus the same constant, hold
+/// the same value on every path (the narrowed load index lsr.iv.lo, split
+/// from a 64-bit counter, beside an index_cast's i32 copy of it in an MLIR
+/// loop): the later one's uses take the first, and its increment is the
+/// first's, moved before it where needed, with the flags both have
+/// (L15-E431).
+static bool mergeCongruentCounters(Function &F) {
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    SmallVector<PHINode *, 4> Phis;
+    for (PHINode &P : BB.phis())
+      if (P.getType()->isIntegerTy())
+        Phis.push_back(&P);
+    for (unsigned I = 0; I < Phis.size(); ++I) {
+      PHINode *P = Phis[I];
+      if (!P)
+        continue;
+      for (unsigned J = I + 1; J < Phis.size(); ++J) {
+        PHINode *Q = Phis[J];
+        if (!Q || Q->getType() != P->getType())
+          continue;
+        // the pairs of increments, P + c and Q + c
+        SmallVector<std::pair<BinaryOperator *, BinaryOperator *>, 2> Steps;
+        bool Same = true;
+        for (BasicBlock *Pred : predecessors(&BB)) {
+          Value *A = P->getIncomingValueForBlock(Pred);
+          Value *B = Q->getIncomingValueForBlock(Pred);
+          if (A == B)
+            continue;
+          const APInt *CA, *CB;
+          if (match(A, m_Add(m_Specific(P), m_APInt(CA))) &&
+              match(B, m_Add(m_Specific(Q), m_APInt(CB))) && *CA == *CB &&
+              cast<Instruction>(A)->getParent() ==
+                  cast<Instruction>(B)->getParent()) {
+            Steps.push_back(
+                {cast<BinaryOperator>(A), cast<BinaryOperator>(B)});
+            continue;
+          }
+          Same = false;
+          break;
+        }
+        if (!Same || Steps.empty())
+          continue;
+        for (auto [PN, QN] : Steps) {
+          if (QN->comesBefore(PN))
+            PN->moveBefore(QN->getIterator());
+          PN->andIRFlags(QN);
+          QN->replaceAllUsesWith(PN);
+          QN->eraseFromParent();
+        }
+        Q->replaceAllUsesWith(P);
+        Q->eraseFromParent();
+        Phis[J] = nullptr;
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNarrowAfterCounters(
     "agx-narrow-bounded-after-counters", cl::init(true), cl::Hidden,
     cl::desc("agx-narrow-bounded-i64 again after the counters are narrowed"));
@@ -1579,6 +1646,9 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   for (Loop *L : LI.getLoopsInPreorder())
     if (L->isInnermost())
       Changed |= hoistAddressOffsets(*L);
+  // (a narrowed index's element index beside a 32-bit copy of the index)
+  if (AGXMergeCongruentCounters)
+    Changed |= mergeCongruentCounters(F);
   if (!AGXSplitWideCounters)
     return Changed;
   // Innermost loops only: each split adds blocks that the other loops'
@@ -1597,6 +1667,9 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   for (const WideCounter &W : Counters)
     splitWideCounter(W);
   Changed |= !Counters.empty();
+  // (a split counter's low word beside a 32-bit copy of the counter)
+  if (AGXMergeCongruentCounters && !Counters.empty())
+    Changed |= mergeCongruentCounters(F);
   // (64-bit trees of the narrowed counters' extensions, which the
   // CodeGenPrepare pass saw as 64-bit phis: a mask j <= i of j = lane + c)
   if (AGXNarrowAfterCounters)

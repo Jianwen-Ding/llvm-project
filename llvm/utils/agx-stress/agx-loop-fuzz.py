@@ -7,7 +7,8 @@ that a load and a running hash use; the trip t a bounded unsigned minimum of an 
 for a trip that is a multiple of s); a guarded do-while or a plain while loop. Starts are thread positions
 (bounded), shifted and offset ones, or input words that wrap; steps are powers of two and not, constants or an input's
 (a & 63) + 1 (invariant, E417's merged counters); some hashes take a mask c + (tid & 31) <= (b & 2047) of
-the counter in its own width (E426). Each loop's hash is
+the counter in its own width (E426), some an i32 twin of the counter stepped by s or another constant
+(E431's congruent counters). Each loop's hash is
 stored per thread. Compiled with llc (and every other seed with opt -O2 first), run with agx_run on 1024 threads
 of random words (40% boundary values) and compared with the model: this covers AGXNarrowInductions (narrowed
 counters, E386's up-counters merged into their index, E206's down-counters), loop strength reduction and the
@@ -58,6 +59,9 @@ def gen(seed):
             fstart=R.choice(['num', 'a']),
             vstep=R.random() < 0.3,  # s = (a & 63) + 1, invariant, not a constant (E417)
             cmask=R.random() < 0.35,  # (c + (tid & 31) <= (b & 2047)) ? 1 : 0 into the hash (E426)
+            # an i32 twin d = 0, e, 2e, ... of the counter into the hash, e = s or not (E431)
+            twin=R.random() < 0.35,
+            tsame=R.random() < 0.6,
         ))
     return loops
 
@@ -90,6 +94,11 @@ def maximumnum(x, y):
     if fx == fy:
         return x & y          # (-0 below +0)
     return x if fx > fy else y
+
+
+def twin_step(p):
+    """The twin counter's constant step: the counter's own where it is one, or another."""
+    return p['step'] if p['tsame'] and not p.get('vstep') else p['step'] * 2 + 1
 
 
 def emit(loops):
@@ -157,6 +166,8 @@ def emit(loops):
                   '  %%%sah = phi i32 [ %%a, %%%spre0 ], [ %%%san, %%%sbody ]' % (q, q, q, q)]
             if p['fmax']:
                 L.append('  %%%sfh = phi float [ %s, %%%spre0 ], [ %%%sfn, %%%sbody ]' % (q, fs, q, q, q))
+            if p.get('twin'):
+                L.append('  %%%sd = phi i32 [ 0, %%%spre0 ], [ %%%sdn, %%%sbody ]' % (q, q, q, q))
             L += ['  %%%sgo = icmp ult %s %%%sch, %s' % (q, ty, q, tripv),
                   '  br i1 %%%sgo, label %%%sbody, label %%%sexit' % (q, q, q)]
             entry_pred = 'head'
@@ -167,6 +178,8 @@ def emit(loops):
             c, acc = '%%%sc' % q, '%%%sacc' % q
             if p['fmax']:
                 L.append('  %%%sfm = phi float [ %s, %%%spre0 ], [ %%%sfn, %%%sbody ]' % (q, fs, q, q, q))
+            if p.get('twin'):
+                L.append('  %%%sd = phi i32 [ 0, %%%spre0 ], [ %%%sdn, %%%sbody ]' % (q, q, q, q))
             fm = '%%%sfm' % q
         else:
             c, acc = '%%%sch' % q, '%%%sah' % q
@@ -198,6 +211,10 @@ def emit(loops):
                 L += ['  %%%smk = add i32 %s, %%%smt' % (q, c, q), '  %%%smc = icmp ule i32 %%%smk, %%%smb' % (q, q, q)]
             L += ['  %%%sms = select i1 %%%smc, i32 1, i32 0' % (q, q), '  %%%sh6 = xor i32 %s, %%%sms' % (q, h, q)]
             h = '%%%sh6' % q
+        if p.get('twin'):
+            L += ['  %%%sh7 = xor i32 %s, %%%sd' % (q, h, q),
+                  '  %%%sdn = add i32 %%%sd, %d' % (q, q, twin_step(p))]
+            h = '%%%sh7' % q
         L += ['  %%%san = add i32 %s, %%%sv' % (q, h, q),
               '  %%%scn = add nuw %s %s, %s' % (q, ty, c,
                                                 (('%%%ssv64' % q) if p['wide'] else s) if p.get('vstep') else str(s))]
@@ -245,7 +262,7 @@ def model(loops, tid, a, b, inp):
         if p['exact']:
             t = ((t + 1) * s) & M
         # wide counters compare 64-bit values, i32 ones may wrap (not here: t + s < 2^32)
-        acc, c = a, 0
+        acc, c, d = a, 0, 0
         fm = 0xff61b1e6 if p['fstart'] == 'num' else san(a)   # -3e38
         first = True
         while True:
@@ -262,6 +279,9 @@ def model(loops, tid, a, b, inp):
             if p.get('cmask'):
                 k = (c + (tid & 31)) if p['wide'] else ((c + (tid & 31)) & M)
                 h ^= 1 if k <= (b & 2047) else 0
+            if p.get('twin'):
+                h ^= d
+                d = (d + twin_step(p)) & M
             acc = (h + v) & M
             fm = maximumnum(fm, san(v))
             c += s

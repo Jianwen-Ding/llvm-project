@@ -52,5 +52,6 @@ the kernel's, as memory at VA).
 | `spmv_csr` | CSR sparse y = A x, a thread per row: an `scf.for` between i32 row offsets from memory (`--map VA=@FILE`) and a gather of x |
 | `causal_rowmax` | a causally masked row (j <= i) by a SIMD-group: running maximum, then the sum of exponentials, the mask on the 64-bit index |
 | `conv3x3_pad` | a zero-padded 3 x 3 convolution of a 1024 x 1024 image: nine bounds-guarded loads in flight across their ifs |
+| `argmax_rows` | a thread's argmax over a row of 256 floats: the narrowed load index and the i32 index are one counter |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.
