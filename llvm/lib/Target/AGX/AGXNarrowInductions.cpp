@@ -1082,6 +1082,19 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
           R = B;
     return R;
   }
+  // (an unsigned maximum at most the largest of its operands', all bounded:
+  // E481's start, umin(s', umax(n, s)))
+  if (auto *MM = dyn_cast<SCEVUMaxExpr>(S)) {
+    APInt R(128, 0);
+    for (const SCEV *Op : MM->operands()) {
+      std::optional<APInt> B = upperBound(Op, SE, F, Depth + 1);
+      if (!B)
+        return std::nullopt;
+      if (B->ugt(R))
+        R = *B;
+    }
+    return R;
+  }
   if (auto *U = dyn_cast<SCEVUnknown>(S)) {
     auto *II = dyn_cast<IntrinsicInst>(U->getValue());
     if (!II)
@@ -1117,9 +1130,30 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
     auto *N = dyn_cast<SCEVConstant>(
         SE.getConstantMaxBackedgeTakenCount(AR->getLoop()));
     std::optional<APInt> B = upperBound(AR->getStart(), SE, F, Depth + 1);
-    if (!AR->isAffine() || !T || T->getAPInt().isNegative() || !N || !B)
+    if (!AR->isAffine() || !T || T->getAPInt().isNegative() || !B)
       return std::nullopt;
-    return Fits(*B + T->getAPInt().zext(128) * N->getAPInt().zext(128));
+    std::optional<APInt> R;
+    if (N)
+      R = Fits(*B + T->getAPInt().zext(128) * N->getAPInt().zext(128));
+    // or by the exit: where the latch goes on only while the next value is
+    // below X, every value is the start or below X (L15-E481's raised
+    // start, which leaves SCEV's count unbounded)
+    const Loop *L = AR->getLoop();
+    if (BasicBlock *Latch = L->getLoopLatch())
+      if (auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+          Br && Br->getSuccessor(0) == L->getHeader())
+        if (auto *C = dyn_cast<ICmpInst>(Br->getCondition());
+            C && C->getPredicate() == ICmpInst::ICMP_ULT &&
+            L->isLoopInvariant(C->getOperand(1)) &&
+            SE.isSCEVable(C->getOperand(0)->getType()) &&
+            SE.getSCEV(C->getOperand(0)) == AR->getPostIncExpr(SE))
+          if (std::optional<APInt> XB =
+                  upperBound(SE.getSCEV(C->getOperand(1)), SE, F, Depth + 1)) {
+            APInt E = XB->isZero() ? *B : APIntOps::umax(*B, *XB - 1);
+            if (!R || E.ult(*R))
+              R = E;
+          }
+    return R;
   }
   bool Add = isa<SCEVAddExpr>(S), Mul = isa<SCEVMulExpr>(S);
   if (!Add && !Mul)

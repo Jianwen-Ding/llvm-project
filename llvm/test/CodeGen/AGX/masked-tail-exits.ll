@@ -1,4 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-masked-head-starts=0 < %s | FileCheck %s --check-prefix=NOHEAD
 ;
 ; A loop whose reductions take their identity once a mask on an increasing
 ; index holds (a causal mask: j + lane > row) ends there: its bound becomes
@@ -216,8 +217,17 @@ done:
 ; condition (an and with the inverse compare), or its masked form (an or
 ; with the compare): the tail compare implies the mask (L15-E480). An and of
 ; the compare with something else does not.
+; Its lower edge j + 128 >= row, a mask true up to an iteration, moves the
+; start past those iterations (at most to the last one), after the bound
+; (L15-E481).
 ; CHECK-LABEL: @window(
 ; CHECK: %unmasked.bound = call i64 @llvm.umin.i64
+; CHECK: %unmasked.start = add nuw i64
+; CHECK: %unmasked.start.b = call i64 @llvm.umin.i64(i64 %unmasked.start, i64
+; CHECK: phi i64 [ %unmasked.start.b, %entry ]
+; NOHEAD-LABEL: @window(
+; NOHEAD-NOT: unmasked.start
+; NOHEAD: ret void
 define agx_kernel void @window(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %row32, i32 %lane32, i32 %n32) {
 entry:
   %row = zext i32 %row32 to i64

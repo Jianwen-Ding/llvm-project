@@ -7513,6 +7513,98 @@ static cl::opt<bool> AGXMaskedTailExits(
 /// that, once true, stays true (j > k, j >= k: a causal mask's j > row),
 /// leaves the loop as soon as the next iteration would be masked: those
 /// iterations change nothing (L15-E476).
+static cl::opt<bool> AGXMaskedHeadStarts(
+    "agx-masked-head-starts", cl::init(true), cl::Hidden,
+    cl::desc("agx-masked-tail-exits also starts a loop at the first "
+             "iteration a mask true up to some iteration leaves (a sliding "
+             "window's lower edge)"));
+
+/// The induction's start S0 (step s, the loop going on while iv.next < UB)
+/// advanced past the iterations where the mask A < K (A <= K) holds, A an
+/// increasing recurrence with the induction's step: by k = ceil(max(K -
+/// A0, 0) / s) steps (K + 1 for <=), but at most to the last iteration the
+/// loop ran, k_max = max(UB - (S0 + 1), 0) / s, which the mask then also
+/// covers (the loads stay those of iterations that ran) (L15-E481).
+static bool raiseMaskedHead(Loop *L, PHINode *IV, BinaryOperator *IVNext,
+                            ICmpInst *Exit,
+                            const std::tuple<Value *, Value *, CmpPredicate> &M,
+                            ScalarEvolution &SE, DominatorTree &DT) {
+  Value *UB = Exit->getOperand(1);
+  auto [A, K, Pred] = M;
+  auto *ARA = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
+  auto *ARI = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(IV));
+  auto *Step = dyn_cast<ConstantInt>(IVNext->getOperand(1));
+  if (!ARA || !ARI || !Step || IVNext->getOperand(0) != IV ||
+      ARA->getStepRecurrence(SE) != ARI->getStepRecurrence(SE) ||
+      A->getType() != IV->getType() || K->getType() != IV->getType() ||
+      !Step->getValue().isStrictlyPositive())
+    return false;
+  BasicBlock *PH = L->getLoopPredecessor();
+  if (auto *KI = dyn_cast<Instruction>(K);
+      KI && !DT.dominates(KI, PH->getTerminator()))
+    return false;
+  const SCEV *A0 = ARA->getStart();
+  SCEVExpander Exp(SE, "maskhead");
+  if (!Exp.isSafeToExpand(A0))
+    return false;
+  Instruction *At = PH->getTerminator();
+  Value *A0V = Exp.expandCodeFor(A0, A->getType(), At);
+  IRBuilder<> B(At);
+  Value *S0 = IV->getIncomingValueForBlock(PH);
+  // (in 32 bits where every input fits, extended: the start's range then
+  // shows, which the indices' 32-bit rebasing needs; K + 1 saturating at
+  // 2^32 - 1 there only advances the start less)
+  Type *Wide = IV->getType();
+  Type *Ty = Wide;
+  if (Wide->getIntegerBitWidth() > 32 &&
+      all_of(std::initializer_list<const SCEV *>{SE.getSCEV(UB), SE.getSCEV(K),
+                                                 A0, SE.getSCEV(S0)},
+             [&](const SCEV *X) {
+               return SE.getUnsignedRangeMax(X).isIntN(32);
+             }) &&
+      Step->getValue().ult(1u << 16)) {
+    Ty = B.getInt32Ty();
+    UB = B.CreateTrunc(UB, Ty);
+    K = B.CreateTrunc(K, Ty);
+    A0V = B.CreateTrunc(A0V, Ty);
+    S0 = B.CreateTrunc(S0, Ty);
+    Step = ConstantInt::get(cast<IntegerType>(Ty), Step->getZExtValue());
+  }
+  Value *One = ConstantInt::get(Ty, 1);
+  Value *KK = Pred == ICmpInst::ICMP_ULE
+                  ? B.CreateBinaryIntrinsic(Intrinsic::uadd_sat, K, One)
+                  : K;
+  Value *D = B.CreateBinaryIntrinsic(Intrinsic::usub_sat, KK, A0V);
+  Value *KHead = B.CreateAdd(
+      B.CreateUDiv(D, Step),
+      B.CreateZExt(B.CreateICmpNE(B.CreateURem(D, Step),
+                                  ConstantInt::get(Ty, 0)),
+                   Ty));
+  Value *KMax = B.CreateUDiv(
+      B.CreateBinaryIntrinsic(
+          Intrinsic::usub_sat, UB,
+          B.CreateBinaryIntrinsic(Intrinsic::uadd_sat, S0, One)),
+      Step);
+  Value *Kk = B.CreateBinaryIntrinsic(Intrinsic::umin, KHead, KMax);
+  Value *NewS0 = B.CreateAdd(S0, B.CreateMul(Kk, Step, "", /*NUW=*/true),
+                             "unmasked.start", /*NUW=*/true);
+  if (Ty != Wide)
+    NewS0 = B.CreateZExt(NewS0, Wide);
+  // umin(start, umax(UB, S0)), the start itself (at most the last
+  // iteration, below UB, or S0 where that is not below UB), whose range
+  // SCEV then bounds by UB's and S0's (the counters' 32-bit narrowing needs
+  // it: it does not see through the saturating subtractions)
+  Value *S0W = IV->getIncomingValueForBlock(PH);
+  Value *UBW = Exit->getOperand(1);
+  NewS0 = B.CreateBinaryIntrinsic(
+      Intrinsic::umin, NewS0,
+      B.CreateBinaryIntrinsic(Intrinsic::umax, UBW, S0W), nullptr,
+      "unmasked.start.b");
+  IV->setIncomingValueForBlock(PH, NewS0);
+  SE.forgetLoop(L);
+  return true;
+}
+
 static cl::opt<bool> AGXMaskedTailOr(
     "agx-masked-tail-or", cl::init(true), cl::Hidden,
     cl::desc("agx-masked-tail-exits also for a mask that is an or with the "
@@ -7552,7 +7644,8 @@ static bool maskedTailExits(Function &F) {
     // m: icmp of an increasing recurrence with an invariant, true from
     // some iteration on; the recurrence and the compare as (A, K, Pred)
     // with Pred(A, K) the mask
-    auto MaskOf = [&](Value *C, bool Inverse = false)
+    // (Head: a mask true up to some iteration instead, A < K or A <= K)
+    auto MaskOf = [&](Value *C, bool Inverse = false, bool Head = false)
         -> std::optional<std::tuple<Value *, Value *, CmpPredicate>> {
       auto *Cmp = dyn_cast<ICmpInst>(C);
       if (!Cmp || Cmp->getParent() != BB)
@@ -7567,8 +7660,10 @@ static bool maskedTailExits(Function &F) {
       if (!L->isLoopInvariant(K) || !A->getType()->isIntegerTy())
         return std::nullopt;
       bool Signed = ICmpInst::isSigned(P);
-      if (P != ICmpInst::ICMP_UGT && P != ICmpInst::ICMP_UGE &&
+      if (!Head && P != ICmpInst::ICMP_UGT && P != ICmpInst::ICMP_UGE &&
           P != ICmpInst::ICMP_SGT && P != ICmpInst::ICMP_SGE)
+        return std::nullopt;
+      if (Head && P != ICmpInst::ICMP_ULT && P != ICmpInst::ICMP_ULE)
         return std::nullopt;
       auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
       if (!AR || AR->getLoop() != L || !AR->isAffine())
@@ -7607,48 +7702,53 @@ static bool maskedTailExits(Function &F) {
         return std::nullopt;
       return std::make_tuple(A, K, P);
     };
-    // the reductions
-    std::optional<std::tuple<Value *, Value *, CmpPredicate>> Mask;
-    Value *MaskCond = nullptr;
-    // (a mask that the tail compare implies: the compare itself, or an or
-    // of it with anything; or, negated, the condition of the unmasked
-    // values: the inverse compare, or an and of it with anything, as a
-    // sliding window's j <= row && j + w >= row: L15-E480)
-    std::function<std::optional<std::tuple<Value *, Value *, CmpPredicate>>(
-        Value *, bool, unsigned)>
-        Implied = [&](Value *C, bool Unmasked, unsigned D)
-        -> std::optional<std::tuple<Value *, Value *, CmpPredicate>> {
-      if (!Unmasked) {
-        if (auto M = MaskOf(C))
-          return M;
-      } else if (auto M = MaskOf(C, /*Inverse=*/true)) {
-        // the inverse of a tail mask
+    // the reductions' masks: the tail compares (true from some iteration
+    // on) and the head compares (true up to some iteration) each implies
+    using MaskT = std::tuple<Value *, Value *, CmpPredicate>;
+    // (a mask that the compare implies: the compare itself, or an or of it
+    // with anything; or, negated, the condition of the unmasked values: the
+    // inverse compare, or an and of it with anything, as a sliding window's
+    // j <= row && j + w >= row: L15-E480)
+    std::function<std::optional<MaskT>(Value *, bool, bool, unsigned)>
+        Implied = [&](Value *C, bool Unmasked, bool Head,
+                      unsigned D) -> std::optional<MaskT> {
+      if (auto M = MaskOf(C, /*Inverse=*/Unmasked, Head))
         return M;
-      }
       Value *X, *Y;
       if (D < 3 && AGXMaskedTailOr && isa<Instruction>(C) &&
           cast<Instruction>(C)->getParent() == BB &&
           (Unmasked ? match(C, m_LogicalAnd(m_Value(X), m_Value(Y)))
                     : match(C, m_LogicalOr(m_Value(X), m_Value(Y))))) {
-        if (auto M = Implied(X, Unmasked, D + 1))
+        if (auto M = Implied(X, Unmasked, Head, D + 1))
           return M;
-        return Implied(Y, Unmasked, D + 1);
+        return Implied(Y, Unmasked, Head, D + 1);
       }
       return std::nullopt;
     };
+    auto Same = [](const std::optional<MaskT> &X,
+                   const std::optional<MaskT> &Y) {
+      return X && Y && std::get<0>(*X) == std::get<0>(*Y) &&
+             std::get<1>(*X) == std::get<1>(*Y) &&
+             static_cast<CmpInst::Predicate>(std::get<2>(*X)) ==
+                 static_cast<CmpInst::Predicate>(std::get<2>(*Y));
+    };
+    // every reduction's mask implies Mask (the tail) / HeadMask, or it is
+    // given up (a first reduction sets them)
+    std::optional<MaskT> Mask, HeadMask;
+    bool First = true, TailOK = true, HeadOK = AGXMaskedHeadStarts;
     auto SameMask = [&](Value *C, bool Unmasked = false) {
-      auto M = Implied(C, Unmasked, 0);
-      if (!M)
+      auto T = Implied(C, Unmasked, false, 0);
+      auto H = Implied(C, Unmasked, true, 0);
+      if (!T && !H)
         return false;
-      if (!Mask) {
-        Mask = M;
-        MaskCond = C;
-        return true;
+      if (First) {
+        Mask = T;
+        HeadMask = H;
+        First = false;
       }
-      return std::get<0>(*M) == std::get<0>(*Mask) &&
-             std::get<1>(*M) == std::get<1>(*Mask) &&
-             static_cast<CmpInst::Predicate>(std::get<2>(*M)) ==
-                 static_cast<CmpInst::Predicate>(std::get<2>(*Mask));
+      TailOK &= Same(T, Mask);
+      HeadOK &= Same(H, HeadMask);
+      return TailOK || HeadOK;
     };
     // x is P's identity under op where the mask holds
     auto Identity = [&](Instruction *Op, PHINode *P, Value *I) {
@@ -7730,7 +7830,16 @@ static bool maskedTailExits(Function &F) {
         break;
       }
     }
-    if (!OK || !Mask || !IV)
+    unsigned IVs = 0;
+    for (PHINode &P : BB->phis())
+      IVs += SE.isSCEVable(P.getType()) && isa<SCEVAddRecExpr>(SE.getSCEV(&P));
+    if (!OK || First || !(TailOK || HeadOK) || !IV)
+      continue;
+    if (!TailOK)
+      Mask.reset();
+    if (!HeadOK || IVs != 1)
+      HeadMask.reset();
+    if (!Mask && !HeadMask)
       continue;
     // after the loop only the reductions' values (theirs at the early exit
     // are their final ones)
@@ -7749,8 +7858,7 @@ static bool maskedTailExits(Function &F) {
     // UB becomes umin(UB, (K + 1) - c) (saturating; K - c for >=), computed
     // before the loop: the exit stays one compare of the induction, for
     // SCEV and the indices' rebasing.
-    auto [A, K, Pred] = *Mask;
-    if (ICmpInst::isSigned(Pred) || !ContinueOnTrue)
+    if (!ContinueOnTrue)
       continue;
     auto *Exit = dyn_cast<ICmpInst>(Br->getCondition());
     if (!Exit || Exit->getPredicate() != ICmpInst::ICMP_ULT ||
@@ -7761,8 +7869,26 @@ static bool maskedTailExits(Function &F) {
     if (!IVNext || IVNext != IV->getIncomingValueForBlock(BB) ||
         IVNext->getOpcode() != Instruction::Add ||
         !IVNext->hasNoUnsignedWrap() || !L->isLoopInvariant(UB) ||
-        UB->getType() != A->getType())
+        UB->getType() != IV->getType())
       continue;
+    BasicBlock *PH = L->getLoopPredecessor();
+    if (auto *UI = dyn_cast<Instruction>(UB);
+        UI && !DT.dominates(UI, PH->getTerminator()))
+      continue;
+    // the tail's bound, then the head's start
+    auto Head = [&] {
+      if (HeadMask && raiseMaskedHead(L, IV, IVNext, Exit, *HeadMask, SE, DT))
+        Changed = true;
+    };
+    if (!Mask) {
+      Head();
+      continue;
+    }
+    auto [A, K, Pred] = *Mask;
+    if (ICmpInst::isSigned(Pred) || UB->getType() != A->getType()) {
+      Head();
+      continue;
+    }
     Value *Off = nullptr;
     if (A == IV)
       Off = ConstantInt::get(A->getType(), 0);
@@ -7773,14 +7899,17 @@ static bool maskedTailExits(Function &F) {
         if (Add->getOperand(Op) == IV &&
             L->isLoopInvariant(Add->getOperand(1 - Op)))
           Off = Add->getOperand(1 - Op);
-    if (!Off)
+    if (!Off) {
+      Head();
       continue;
-    BasicBlock *PH = L->getLoopPredecessor();
+    }
     for (Value *V : {K, Off, UB})
       if (auto *VI = dyn_cast<Instruction>(V); VI && !DT.dominates(VI, PH->getTerminator()))
         Off = nullptr;
-    if (!Off)
+    if (!Off) {
+      Head();
       continue;
+    }
     IRBuilder<> B(PH->getTerminator());
     // max(K - c, 0) (+ 1 for >), the subtraction in the narrower type
     // where K and c are zero extensions of it (exact; extended), the + 1
@@ -7810,6 +7939,7 @@ static bool maskedTailExits(Function &F) {
                                            nullptr, "unmasked.bound");
     Exit->setOperand(1, NewUB);
     Changed = true;
+    Head();
   }
   return Changed;
 }
