@@ -5842,6 +5842,8 @@ static cl::opt<bool> AGXZeroSignFreeMinMax(
     cl::desc("Mark a float min / max nsz where nothing its value reaches "
              "depends on the sign of a zero (lowered without its zero fix)"));
 
+static Value *orderedSIMDMaxOf(Value *M);
+
 namespace {
 /// Every use of a value (through the values it reaches) gives the same
 /// result for +0 and -0 in its place, or a result differing at most in the
@@ -6001,6 +6003,12 @@ struct ThreadgroupAccesses {
   }
 };
 
+static cl::opt<bool> AGXZeroSignFreeOrderedMax(
+    "agx-zero-sign-free-ordered-max", cl::init(true), cl::Hidden,
+    cl::desc("A value whose bits only make MLIR's maximumf subgroup "
+             "reduction key keeps no zero sign if the decoded maximum does "
+             "not"));
+
 static cl::opt<bool> AGXZeroSignFreeSums(
     "agx-zero-sign-free-sums", cl::init(true), cl::Hidden,
     cl::desc("A sum whose other operand is never the zero that would tell "
@@ -6075,6 +6083,61 @@ struct ZeroSignFree {
     return true;
   }
 
+  /// bits(m) only in MLIR's maximumf subgroup reduction key (the xor of
+  /// its sign mask, the NaN select) into the SIMD-group's signed maximum,
+  /// whose decoded value M (orderedSIMDMaxOf) is free of zero signs: m's
+  /// zero sign only orders -0 below +0 there (L15-E477).
+  bool orderedMaxKey(BitCastInst *BC) {
+    if (!AGXZeroSignFreeOrderedMax)
+      return false;
+    Value *Src = BC->getOperand(0);
+    // every user of the bits within the key's compare / select / xor, up
+    // to the reduction
+    SmallVector<Instruction *, 8> Work{BC};
+    SmallPtrSet<Instruction *, 8> Seen{BC};
+    IntrinsicInst *R = nullptr;
+    while (!Work.empty()) {
+      Instruction *V = Work.pop_back_val();
+      for (User *U : V->users()) {
+        auto *UI = cast<Instruction>(U);
+        if (auto *II = dyn_cast<IntrinsicInst>(UI);
+            II && II->getIntrinsicID() == Intrinsic::agx_simd_reduce) {
+          if (R && R != II)
+            return false;
+          R = II;
+          continue;
+        }
+        if (!(isa<ICmpInst>(UI) || isa<SelectInst>(UI) ||
+              (UI->getOpcode() == Instruction::Xor)) ||
+            Seen.size() > 8)
+          return false;
+        if (Seen.insert(UI).second)
+          Work.push_back(UI);
+      }
+    }
+    if (!R)
+      return false;
+    // the decoded maxima (bitcasts to float of the reduction's order
+    // inverted back)
+    bool Found = false;
+    SmallPtrSet<Instruction *, 8> Near;
+    std::function<void(Instruction *, unsigned)> Collect =
+        [&](Instruction *V, unsigned D) {
+          for (User *U : V->users())
+            if (Near.insert(cast<Instruction>(U)).second && D < 3)
+              Collect(cast<Instruction>(U), D + 1);
+        };
+    Collect(R, 1);
+    for (Instruction *N : Near)
+      if (auto *M = dyn_cast<BitCastInst>(N);
+          M && orderedSIMDMaxOf(M) == Src) {
+        if (!value(M))
+          return false;
+        Found = true;
+      }
+    return Found;
+  }
+
   bool value(Instruction *I) {
     if (Assumed.contains(I))
       return true;
@@ -6103,7 +6166,8 @@ struct ZeroSignFree {
              BC->getSrcTy()->isFloatingPointTy() &&
              BC->getType()->getScalarSizeInBits() ==
                  BC->getSrcTy()->getScalarSizeInBits() &&
-             !BC->getType()->isVectorTy() && movedBits(BC);
+             !BC->getType()->isVectorTy() &&
+             (movedBits(BC) || orderedMaxKey(BC));
     if (auto *Sel = dyn_cast<SelectInst>(I))
       return U.getOperandNo() != 0 && value(Sel);
     // a + b, a's zero either sign: (+-0) + b is b's value then unless b is
