@@ -8772,6 +8772,10 @@ static cl::opt<bool> AGXQuotientAboveOne(
     cl::desc("(c' - e) / (e + c), e an exponential of a non-positive value, "
              "as Markstein's quotient step without the division's scaling"));
 
+static cl::opt<bool> AGXSiluQuotient(
+    "agx-silu-quotient", cl::init(true), cl::Hidden,
+    cl::desc("x / (e^-x + 1) as a scaled Markstein quotient step"));
+
 static cl::opt<bool> AGXReciprocalConverted(
     "agx-reciprocal-converted", cl::init(true), cl::Hidden,
     cl::desc("1 / (a converted 32-bit integer or widened half) as the "
@@ -8870,6 +8874,56 @@ static bool reciprocalsAboveOne(Function &F) {
       Quots.push_back(&I);
     }
   }
+  // x / (e^-x + 1) (silu): d in [1, +inf] or a NaN, x any float. Scaled
+  // by 2^-64 both where d > 2^64 (x < -44: x stays exact), E282's correctly
+  // rounded 1 / d and Markstein's q0 = x y, r = x - d q0, q = q0 + r y;
+  // at d = +inf and x = +inf, q0.
+  // The quotient of one value: checked for every float x (L15-E483).
+  SmallVector<Instruction *, 4> Silus;
+  if (AGXSiluQuotient)
+    for (Instruction &I : instructions(F)) {
+      Value *X, *D, *E, *A;
+      if (!I.getType()->isFloatTy() ||
+          !match(&I, m_FDiv(m_Value(X), m_Value(D))) ||
+          cast<FPMathOperator>(I).getFastMathFlags().any() ||
+          !match(D, m_c_FAdd(m_Value(E), m_FPOne())) ||
+          !match(E, m_Intrinsic<Intrinsic::exp>(m_Value(A))) ||
+          cast<FPMathOperator>(E)->getFastMathFlags().any() ||
+          !match(A, m_FNeg(m_Specific(X))))
+        continue;
+      Silus.push_back(&I);
+    }
+  for (Instruction *I : Silus) {
+    IRBuilder<> B(I);
+    Value *X = I->getOperand(0), *D = I->getOperand(1);
+    Type *Ty = D->getType();
+    Value *Big = B.CreateFCmpOGT(D, ConstantFP::get(Ty, 0x1p64));
+    Value *Sc = B.CreateSelect(Big, ConstantFP::get(Ty, 0x1p-64),
+                               ConstantFP::get(Ty, 1.0));
+    Value *DS = B.CreateFMul(D, Sc);
+    Value *XS = B.CreateFMul(X, Sc);
+    Value *NDS = B.CreateFNeg(DS);
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {DS});
+    Value *E1 = B.CreateIntrinsic(Intrinsic::fma, {Ty},
+                                  {NDS, Y0, ConstantFP::get(Ty, 1.0)});
+    Value *Y = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {E1, Y0, Y0});
+    // (y as 0 at d = +inf, where q0 = x * 0 is then the quotient, -0 or a
+    // NaN for x = -inf; and at x = +inf, q0 = +inf is: where the residual
+    // is a NaN, q0)
+    Y = B.CreateSelect(B.CreateFCmpOEQ(D, ConstantFP::getInfinity(Ty)),
+                       ConstantFP::get(Ty, 0.0), Y);
+    Value *Q0 = B.CreateFMul(XS, Y);
+    // (the residual negated, d q0 - x, and q0 - r' y: the same where x is
+    // not zero, and -0 for x = -0, where x - d q0 would be +0)
+    Value *R = B.CreateIntrinsic(Intrinsic::fma, {Ty},
+                                 {DS, Q0, B.CreateFNeg(XS)});
+    Value *Q = B.CreateIntrinsic(Intrinsic::fma, {Ty},
+                                 {B.CreateFNeg(R), Y, Q0});
+    Q = B.CreateSelect(B.CreateFCmpUNO(R, R), Q0, Q);
+    Q->takeName(I);
+    I->replaceAllUsesWith(Q);
+    I->eraseFromParent();
+  }
   for (Instruction *I : Quots) {
     IRBuilder<> B(I);
     Value *N = I->getOperand(0), *D = I->getOperand(1);
@@ -8902,7 +8956,7 @@ static bool reciprocalsAboveOne(Function &F) {
     I->replaceAllUsesWith(R);
     I->eraseFromParent();
   }
-  return !Divs.empty() || !Quots.empty();
+  return !Divs.empty() || !Quots.empty() || !Silus.empty();
 }
 
 /// Whether \p V reaches only f32 arithmetic that flushes a denormal operand
