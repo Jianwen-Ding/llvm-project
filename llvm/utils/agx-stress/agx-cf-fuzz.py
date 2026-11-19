@@ -4,7 +4,8 @@
 Each seed generates a structured program over five i32 variables: assignments of integer expressions, nested
 if / else (and pairs of ifs on the same condition), loops whose trip count depends on a variable ((v & 7) + 1, capped), break and continue on data-dependent
 conditions, nested up to four deep. It is emitted as LLVM IR with private variables and compiled the way the
-benchmark kernels are (opt -O2, which promotes them to phis, then llc -O3), run on 512 threads with 40% boundary
+benchmark kernels are (opt -O2, which promotes them to phis, then llc -O3; every third seed llc alone, which promotes them
+itself), run on 512 threads with 40% boundary
 inputs, and each thread's final variables are compared with an interpreter of the program. This covers the
 structurizer, the execution-mask code, loop exits and the loop optimizations of opt and the backend
 (EXPERIMENTS.md L15-E382).
@@ -44,8 +45,22 @@ class G:
     if inloop and k<0.18: return ('break' if R.random()<0.5 else 'continue',s.cond())
     if s.depth>=4 or k<0.45: return ('assign',R.randrange(NV),s.expr())
     s.depth+=1
-    if k<0.62:
+    if k<0.52:
       r=('if',s.cond(),s.block(inloop),s.block(inloop) if R.random()<0.5 else [])
+    elif k<0.62:
+      # an if / else whose sides both end with the same assignment of an
+      # operation of variables neither side assigns (one operation of the
+      # same values on each side, then a phi: L15-E421)
+      c=s.cond(); b1=[s.stmt(inloop)]; b2=[s.stmt(inloop)] if R.random()<0.7 else []
+      busy=assigned(b1)|assigned(b2)
+      free=[v for v in range(NV) if v not in busy]
+      if free:
+        x=('var',R.choice(free))
+        y=('var',R.choice(free)) if R.random()<0.6 else ('const',R.choice([1,3,5,31,255,-7]))
+        a=('assign',R.randrange(NV),(R.choice(['add','sub','mul','xor','and','or']),x,y))
+        r=('if',c,b1+[a],b2+[a])
+      else:
+        r=('if',c,b1,b2)
     elif k<0.7:
       # two ifs on the same condition, one after the other, each loading a
       # table entry (which opt cannot speculate) into variables the
@@ -63,6 +78,14 @@ class G:
     return r
   def block(s,inloop):
     return [s.stmt(inloop) for _ in range(s.R.randint(1,3))]
+def assigned(block):
+  out=set()
+  for st in block:
+    if st[0]=='assign': out.add(st[1])
+    elif st[0]=='if': out|=assigned(st[2])|assigned(st[3])
+    elif st[0]=='loop': out|=assigned(st[3])
+    elif st[0]=='seq': out|=assigned(st[1])
+  return out
 def vars_of(e):
   if e[0]=='var': return {e[1]}
   if e[0]=='const': return set()
@@ -115,7 +138,7 @@ def run(prog,V):
       if evc(st[1],V): raise Cnt()
 # ---- IR emission with allocas
 def emit(prog):
-  L=[]; n=[0]
+  L=[]; n=[0]; allocas=[]  # (every alloca in the entry block: static, promoted by llc alone too)
   def t(): n[0]+=1; return f'%t{n[0]}'
   def b(): n[0]+=1; return f'b{n[0]}'
   def ee(e):
@@ -149,7 +172,7 @@ def emit(prog):
         nvv=ee(('var',st[1])); m=t(); L.append(f'  {m} = and i32 {nvv}, 7'); m2=t(); L.append(f'  {m2} = add i32 {m}, 1')
         m3=t(); L.append(f'  {m3} = call i32 @llvm.umin.i32(i32 {m2}, i32 {st[2]})')
         ic=t().replace('%t','%i'); bh,bb,bl,bx=b(),b(),b(),b()
-        L.append(f'  {ic} = alloca i32, addrspace(5)'); L.append(f'  store i32 0, ptr addrspace(5) {ic}'); L.append(f'  br label %{bh}')
+        allocas.append(f'  {ic} = alloca i32, addrspace(5)'); L.append(f'  store i32 0, ptr addrspace(5) {ic}'); L.append(f'  br label %{bh}')
         L.append(f'{bh}:'); iv=t(); L.append(f'  {iv} = load i32, ptr addrspace(5) {ic}'); cc=t(); L.append(f'  {cc} = icmp ult i32 {iv}, {m3}')
         L.append(f'  br i1 {cc}, label %{bb}, label %{bx}'); L.append(f'{bb}:'); blk(st[3],bx,bl); L.append(f'  br label %{bl}')
         L.append(f'{bl}:'); iv2=t(); L.append(f'  {iv2} = load i32, ptr addrspace(5) {ic}'); iv3=t(); L.append(f'  {iv3} = add i32 {iv2}, 1')
@@ -166,6 +189,7 @@ def emit(prog):
   tail=[]
   for i in range(NV):
     tail+=[f'  %r{i} = load i32, ptr addrspace(5) %a{i}', f'  %o{i} = getelementptr i32, ptr addrspace(1) %q, i32 {i*65536}', f'  %o{i}b = getelementptr i32, ptr addrspace(1) %o{i}, i32 %t', f'  store i32 %r{i}, ptr addrspace(1) %o{i}b']
+  head=head[:7]+allocas+head[7:]
   return '\n'.join(head+L+tail+['  ret void','}'])+'\n'
 
 
@@ -178,10 +202,15 @@ def run_seed(seed, a, tmp):
     src = emit(prog)
     ll, oll, obj, code = (os.path.join(tmp, s) for s in ("k.ll", "o.ll", "k.o", "k.bin"))
     open(ll, "w").write(src)
-    r = subprocess.run([os.path.join(a.bin, "opt"), "-mtriple=agx", "-mcpu=" + a.mcpu, "-O2", ll, "-S", "-o", oll],
-                       capture_output=True, text=True)
-    if r.returncode:
-        return src, "opt failure: " + (r.stderr.strip().splitlines() or ["?"])[0][:200]
+    if seed % 3 == 2:
+        # (every third seed straight to llc, which promotes the variables
+        # itself: the shapes opt -O2 would have merged reach the backend)
+        oll = ll
+    else:
+        r = subprocess.run([os.path.join(a.bin, "opt"), "-mtriple=agx", "-mcpu=" + a.mcpu, "-O2", ll, "-S", "-o",
+                            oll], capture_output=True, text=True)
+        if r.returncode:
+            return src, "opt failure: " + (r.stderr.strip().splitlines() or ["?"])[0][:200]
     r = subprocess.run([os.path.join(a.bin, "llc"), "-mtriple=agx", "-mcpu=" + a.mcpu, "-O3", "-filetype=obj", oll,
                         "-o", obj], capture_output=True, text=True)
     if r.returncode:

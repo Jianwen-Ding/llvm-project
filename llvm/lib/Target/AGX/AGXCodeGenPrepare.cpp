@@ -6152,6 +6152,65 @@ static bool zeroSignFreeMinMax(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXMergePhiOperations(
+    "agx-merge-phi-operations", cl::init(true), cl::Hidden,
+    cl::desc("A phi of the same binary operation of the same operands from "
+             "each predecessor as that one operation in the phi's block"));
+
+/// phi [x op y, A], [x op y, B] is x op y in the phi's block, with the
+/// flags both had (each original goes where the phi was its only user): x
+/// and y dominate every predecessor, so the join. InstCombine's phi folding, which llc does not run: the PTX
+/// front end's x + 1 on both sides of a branch (jacobi2d), each then its own
+/// register and a copy at the join (L15-E421).
+static bool mergePhiOperations(Function &F) {
+  if (!AGXMergePhiOperations)
+    return false;
+  bool Changed = false;
+  for (BasicBlock &BB : F)
+    for (PHINode &P : make_early_inc_range(BB.phis())) {
+      if (P.getNumIncomingValues() < 2)
+        continue;
+      auto *First = dyn_cast<BinaryOperator>(P.getIncomingValue(0));
+      // (not a division: one with other uses would be computed twice)
+      if (!First || First->isIntDivRem() ||
+          First->getOpcode() == Instruction::FDiv ||
+          First->getOpcode() == Instruction::FRem)
+        continue;
+      bool Same = true;
+      for (Value *V : P.incoming_values()) {
+        auto *B = dyn_cast<BinaryOperator>(V);
+        Same &= B && B->getOpcode() == First->getOpcode() &&
+                B->getOperand(0) == First->getOperand(0) &&
+                B->getOperand(1) == First->getOperand(1) &&
+                B->getParent() != &BB;
+      }
+      // (two distinct instructions at least; one may come in on several
+      // edges)
+      SmallPtrSet<Value *, 4> Distinct(P.incoming_values().begin(),
+                                       P.incoming_values().end());
+      if (!Same || Distinct.size() < 2)
+        continue;
+      auto *N = BinaryOperator::Create(First->getOpcode(),
+                                       First->getOperand(0),
+                                       First->getOperand(1), P.getName(),
+                                       BB.getFirstInsertionPt());
+      N->copyIRFlags(First);
+      for (Value *V : P.incoming_values())
+        N->andIRFlags(V);
+      P.replaceAllUsesWith(N);
+      SmallVector<Instruction *, 4> Old;
+      for (Value *V : Distinct)
+        Old.push_back(cast<Instruction>(V));
+      P.eraseFromParent();
+      // (one that has other uses stays)
+      for (Instruction *I : Old)
+        if (I->use_empty())
+          I->eraseFromParent();
+      Changed = true;
+    }
+  return Changed;
+}
+
 static cl::opt<bool> AGXSpeculateThreadgroupLoads(
     "agx-speculate-threadgroup-loads", cl::init(true), cl::Hidden,
     cl::desc("Run a guarded threadgroup load that stays within its global "
@@ -6254,6 +6313,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool Changed = diagnoseDoubles(F);
   Changed |= mergeSameConditionIfs(F);
+  Changed |= mergePhiOperations(F);
   Changed |= signedWideMuls(F);
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
