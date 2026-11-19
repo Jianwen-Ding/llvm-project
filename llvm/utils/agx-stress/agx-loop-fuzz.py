@@ -8,7 +8,8 @@ for a trip that is a multiple of s); a guarded do-while or a plain while loop. S
 (bounded), shifted and offset ones, or input words that wrap; steps are powers of two and not, constants or an input's
 (a & 63) + 1 (invariant, E417's merged counters); some hashes take a mask c + (tid & 31) <= (b & 2047) of
 the counter in its own width (E426), some an i32 twin of the counter stepped by s or another constant
-(E431's congruent counters). Each loop's hash is
+(E431's congruent counters), some a constant trip that opt unrolls (E439's counters down by the factor). Each
+loop's hash is
 stored per thread. Compiled with llc (and every other seed with opt -O2 first), run with agx_run on 1024 threads
 of random words (40% boundary values) and compared with the model: this covers AGXNarrowInductions (narrowed
 counters, E386's up-counters merged into their index, E206's down-counters), loop strength reduction and the
@@ -62,7 +63,13 @@ def gen(seed):
             # an i32 twin d = 0, e, 2e, ... of the counter into the hash, e = s or not (E431)
             twin=R.random() < 0.35,
             tsame=R.random() < 0.6,
+            # a constant trip in steps of 1 (opt unrolls it: LSR's counter
+            # then counts down by the factor, E439)
+            ctrip=R.choice([None, None, None, 8, 16, 64, 96, 256]),
         ))
+    for p in loops:
+        if p['ctrip']:
+            p.update(step=1, exact=False, vstep=False)
     return loops
 
 
@@ -140,6 +147,8 @@ def emit(loops):
         L += ['  %%%sbm = and i32 %%b, %d' % (q, p['mask'] - (1 << 32) if p['mask'] >> 31 else p['mask']),
               '  %%%stu = call i32 @llvm.umin.i32(i32 %%%sbm, i32 %d)' % (q, q, p['lim'])]
         trip = '%%%stu' % q
+        if p.get('ctrip'):
+            trip = str(p['ctrip'])
         if p['exact']:
             L += ['  %%%stu1 = add i32 %%%stu, 1' % (q, q), '  %%%stx = mul i32 %%%stu1, %s' % (q, q, s)]
             trip = '%%%stx' % q
@@ -259,6 +268,8 @@ def model(loops, tid, a, b, inp):
         st = {'tid': tid, 'a': a, 'tid_shl': (tid << p['shl']) & M, 'row_lane': ((tid >> 5) << 10) + (tid & 31),
               'a_tid': (a * p['k'] + tid) & M, 'neg': (-64 - tid) & M}[p['start']]
         t = min(b & p['mask'], p['lim'])
+        if p.get('ctrip'):
+            t = p['ctrip']
         if p['exact']:
             t = ((t + 1) * s) & M
         # wide counters compare 64-bit values, i32 ones may wrap (not here: t + s < 2^32)

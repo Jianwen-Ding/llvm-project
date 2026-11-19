@@ -958,6 +958,11 @@ static cl::opt<bool> AGXDeadAfterNarrowing(
     cl::desc("Delete what narrowing a loop's inductions left dead before the "
              "rewrites that count uses"));
 
+static cl::opt<bool> AGXMergeDownCountersByStep(
+    "agx-merge-down-counters-by-step", cl::init(true), cl::Hidden,
+    cl::desc("Also a down-counter by a constant d > 1 from a constant d "
+             "divides"));
+
 static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
@@ -965,9 +970,22 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
       C.getNumIncomingValues() != 2)
     return false;
   auto *Cn = dyn_cast<BinaryOperator>(C.getIncomingValueForBlock(Latch));
-  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_AllOnes())) ||
-      Cn->getParent() != Latch || !C.hasOneUse())
+  // c' = c - d: d = 1, or (an unrolled loop's counter, L15-E439) a larger d
+  // from a constant c0 that d divides, which reaches zero after c0 / d
+  // iterations
+  const APInt *Dec;
+  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_APInt(Dec))) ||
+      !Dec->isNegative() || Cn->getParent() != Latch || !C.hasOneUse())
     return false;
+  APInt D = -*Dec;
+  std::optional<APInt> Trips;
+  if (!D.isOne()) {
+    auto *C0 = dyn_cast<ConstantInt>(C.getIncomingValueForBlock(Pre));
+    if (!AGXMergeDownCountersByStep || !C0 || C0->getValue().isNegative() ||
+        C0->isZero() || !C0->getValue().urem(D).isZero())
+      return false;
+    Trips = C0->getValue().udiv(D);
+  }
   // c' only in the phi and one exit test against zero by the latch's branch
   ICmpInst *Cmp = nullptr;
   for (User *U : Cn->users()) {
@@ -994,17 +1012,23 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
     // s = 2^m odd: s c' = s n holds for c' = n mod 2^(32 - m) only, so with
     // fewer than 2^(32 - m) iterations (the trip count's constant bound).
     if (unsigned M = S->countr_zero()) {
-      auto *Max =
-          dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
-      if (!Max || Max->getAPInt().getActiveBits() > 32 - M ||
-          !(Max->getAPInt().zext(64) + 1).ult(APInt(64, 1).shl(32 - M)))
-        continue;
+      if (Trips) {
+        if (!Trips->zext(64).ult(APInt(64, 1).shl(32 - M)))
+          continue;
+      } else {
+        auto *Max =
+            dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
+        if (!Max || Max->getAPInt().getActiveBits() > 32 - M ||
+            !(Max->getAPInt().zext(64) + 1).ult(APInt(64, 1).shl(32 - M)))
+          continue;
+      }
     }
     IRBuilder<> PB(Pre->getTerminator());
     Value *End = PB.CreateAdd(
         I.getIncomingValueForBlock(Pre),
-        PB.CreateMul(C.getIncomingValueForBlock(Pre),
-                     ConstantInt::get(C.getType(), *S)));
+        Trips ? ConstantInt::get(C.getType(), *Trips * *S)
+              : PB.CreateMul(C.getIncomingValueForBlock(Pre),
+                             ConstantInt::get(C.getType(), *S)));
     IRBuilder<> B(Latch->getTerminator());
     Value *NewCmp = B.CreateICmp(Cmp->getPredicate(), In, End);
     Cmp->replaceAllUsesWith(NewCmp);

@@ -54,5 +54,6 @@ the kernel's, as memory at VA).
 | `conv3x3_pad` | a zero-padded 3 x 3 convolution of a 1024 x 1024 image: nine bounds-guarded loads in flight across their ifs |
 | `argmax_rows` | a thread's argmax over a row of 256 floats: the narrowed load index and the i32 index are one counter |
 | `xent_rows` | cross-entropy per row of 1000 logits by a SIMD-group: maximumf, the sum of exponentials, lane 0's log and label |
+| `colsum` | a thread per column of a 512 x 1024 matrix: a strided loop of a constant trip, unrolled by 8 |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.
