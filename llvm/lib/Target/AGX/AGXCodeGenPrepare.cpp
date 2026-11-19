@@ -5010,6 +5010,11 @@ static cl::opt<bool> AGXExactDyadicI16(
     "agx-exact-dyadic-i16", cl::init(true), cl::Hidden,
     cl::desc("Build exact dyadic sums in 16 bits where they fit"));
 
+static cl::opt<bool> AGXExactDyadicFloatRoots(
+    "agx-exact-dyadic-float-roots", cl::init(true), cl::Hidden,
+    cl::desc("Exact dyadic sums whose value stays a float: in integers, "
+             "converted once"));
+
 static cl::opt<bool> AGXExactDyadicSums(
     "agx-exact-dyadic-sums", cl::init(true), cl::Hidden,
     cl::desc("Float sums of converted small integers times dyadic constants "
@@ -5272,11 +5277,9 @@ static bool exactDyadicSums(Function &F) {
         int64_t M = std::max(std::abs(MD->Lo), std::abs(MD->Hi));
         Need = Shift > 16 ? INT64_MAX : std::max(Need, M << Shift);
       }
-    bool Narrow = AGXExactDyadicI16 && Need < (int64_t(1) << 15) &&
-                  all_of(DS.Tree, [](Instruction *T) {
-                    return !isa<UIToFPInst, SIToFPInst>(T) ||
-                           T->getOperand(0)->getType()->getIntegerBitWidth() <= 16;
-                  });
+    // (the leaves among them: a wider integer whose range fits truncates
+    // exactly)
+    bool Narrow = AGXExactDyadicI16 && Need < (int64_t(1) << 15);
     DS.Ty = Narrow ? Type::getInt16Ty(F.getContext())
                    : Type::getInt32Ty(F.getContext());
     IRBuilder<> B(Conv);
@@ -5287,6 +5290,81 @@ static bool exactDyadicSums(Function &F) {
     Conv->replaceAllUsesWith(R);
     Conv->eraseFromParent();
     RecursivelyDeleteTriviallyDeadInstructions(V);
+    Changed = true;
+  }
+  // An exact tree whose value stays a float (a box filter's sum of bytes,
+  // then scaled by 1/9): N in integers, one conversion, times 2^E (exact:
+  // |N| < 2^24, 2^-126 <= 2^E). Of non-negative values only (no fsub, every
+  // node at least 0): the float tree's zeros are +0, as the conversion's;
+  // with two converted leaves or more (L15-E407).
+  if (!AGXExactDyadicFloatRoots)
+    return Changed;
+  SmallVector<Instruction *, 16> Cands;
+  for (Instruction &I : instructions(F))
+    if (I.getType()->isFloatTy() &&
+        (I.getOpcode() == Instruction::FAdd ||
+         I.getOpcode() == Instruction::FMul ||
+         match(&I, PatternMatch::m_Intrinsic<Intrinsic::fma>()) ||
+         match(&I, PatternMatch::m_Intrinsic<Intrinsic::fmuladd>())))
+      Cands.push_back(&I);
+  SmallVector<WeakTrackingVH, 16> Work(Cands.begin(), Cands.end());
+  for (WeakTrackingVH &WV : Work) {
+    auto *Root = dyn_cast_or_null<Instruction>(WV);
+    if (!Root)
+      continue;
+    DyadicSums DS(F.getDataLayout());
+    std::optional<Dyadic> D = DS.get(Root);
+    if (!D || D->Zero || D->Lo < 0)
+      continue;
+    // a root: some user is not part of an exact tree
+    bool IsRoot = any_of(Root->users(), [&](User *U) {
+      DyadicSums UD(F.getDataLayout());
+      return !UD.get(U);
+    });
+    if (!IsRoot)
+      continue;
+    unsigned Leaves = 0;
+    bool NonNeg = true;
+    for (Instruction *T : DS.Tree) {
+      if (isa<UIToFPInst, SIToFPInst>(T))
+        ++Leaves;
+      if (T->getOpcode() == Instruction::FSub)
+        NonNeg = false;
+      std::optional<Dyadic> TD = DS.Memo.lookup(T);
+      if (!TD || (!TD->Zero && TD->Lo < 0))
+        NonNeg = false;
+    }
+    for (auto &[Val, MD] : DS.Memo)
+      if (isa<ConstantFP>(Val) && MD && !MD->Zero && MD->Lo < 0)
+        NonNeg = false;
+    if (!NonNeg || Leaves < 2 ||
+        !all_of(DS.Tree, [&](Instruction *T) {
+          return T == Root || all_of(T->users(), [&](User *U) {
+                   return DS.Tree.contains(cast<Instruction>(U));
+                 });
+        }))
+      continue;
+    int64_t Need = D->Hi;
+    for (auto &[Val, MD] : DS.Memo)
+      if (MD && !MD->Zero) {
+        int Shift = std::max(0, MD->E - D->E);
+        int64_t M = std::max(std::abs(MD->Lo), std::abs(MD->Hi));
+        Need = Shift > 16 ? INT64_MAX : std::max(Need, M << Shift);
+      }
+    // (the leaves among them: a wider integer whose range fits truncates
+    // exactly)
+    bool Narrow = AGXExactDyadicI16 && Need < (int64_t(1) << 15);
+    DS.Ty = Narrow ? Type::getInt16Ty(F.getContext())
+                   : Type::getInt32Ty(F.getContext());
+    IRBuilder<> B(Root->getNextNode());
+    Value *N = DS.build(B, Root, D->E);
+    Value *R = B.CreateUIToFP(N, Root->getType());
+    if (D->E)
+      R = B.CreateFMul(R, ConstantFP::get(Root->getType(),
+                                          std::ldexp(1.0, D->E)));
+    // (N and R are built from the leaves, not from the root)
+    Root->replaceAllUsesWith(R);
+    RecursivelyDeleteTriviallyDeadInstructions(Root);
     Changed = true;
   }
   return Changed;

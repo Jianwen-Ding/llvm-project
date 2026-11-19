@@ -7,6 +7,8 @@
 ; xor of it, E86). Only the bytes up to the last one used are loaded (1, 2 or
 ; 4 from the word's address): byte0, bytes01. A byte extended to 64 bits is
 ; loaded into a 32-bit register, not a 16-bit half and a move: byte64.
+; (bytes01's float sum of two bytes is exact: one 16-bit add and one
+; conversion, L15-E407.)
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 define agx_kernel void @bytes4(ptr addrspace(1) %p, ptr addrspace(1) %o) {
@@ -188,16 +190,15 @@ define agx_kernel void @byte0(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 define agx_kernel void @bytes01(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 ; CHECK-LABEL: bytes01:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 4 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 3 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
 ; CHECK-NEXT:    device_load 0, i8, xy, r2l_r2h, u0_u1, r1, unsigned, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    convert u16_to_f, r3, r2l, rte
-; CHECK-NEXT:    convert u16_to_f, r2, r2h, rte
-; CHECK-NEXT:    fadd32 r2, r3, r2
+; CHECK-NEXT:    iadd r2l, r2l, r2h
+; CHECK-NEXT:    convert u16_to_f, r2, r2l, rte
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, unsigned
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

@@ -81,7 +81,7 @@ def gen(seed):
         if R.random() < 0.6:
             t = ('add', t, ('c', Fraction(1, 2)))
         conv = R.choice(['fptosi.i32', 'fptoui.i32', 'fptosi.sat.i16', 'fptoui.sat.i16', 'fptosi.sat.i32',
-                         'fptosi.i16'])
+                         'fptosi.i16', 'float', 'float', 'scaled'])
         trees.append((t, conv))
     return trees
 
@@ -134,7 +134,12 @@ def emit(trees):
     for j, (t, conv) in enumerate(trees):
         v = go(t)
         r = nv()
-        if conv in ('fptosi.i32', 'fptoui.i32'):
+        if conv in ('float', 'scaled'):
+            # the float itself (E407: a tree whose value stays a float), or scaled by a non-dyadic constant
+            if conv == 'scaled':
+                L.append('  %s = fmul float %s, 0x3FD5555560000000' % (r, v)); v = r; r = nv()
+            L.append('  %s = bitcast float %s to i32' % (r, v)); ri = r
+        elif conv in ('fptosi.i32', 'fptoui.i32'):
             L.append('  %s = %s float %s to i32' % (r, conv.split('.')[0], v)); ri = r
         elif conv == 'fptosi.i16':
             L.append('  %s = fptosi float %s to i16' % (r, v)); ri = nv(); L.append('  %s = sext i16 %s to i32' % (ri, r))
@@ -173,9 +178,49 @@ def model(trees, words):
         if k == 'mul':
             return f32(go(t[1]) * go(t[2]))
         return f32(go(t[1]) * go(t[2]) + go(t[3]))  # fma; fmuladd either way: compared only where it agrees
+    def bits(v, neg_zero):
+        if v == 0:
+            return 0x80000000 if neg_zero else 0
+        return struct.unpack('<I', struct.pack('<f', float(v)))[0]
+
+    def negzero(t):
+        # whether the tree's float result is -0 (zeros of two signs: IEEE's rules for +, -, *, fma)
+        k = t[0]
+        if k == 'c':
+            return False
+        if k == 'in':
+            return False
+        if k == 'mul':
+            a, b = go(t[1]), go(t[2])
+            if a * b != 0:
+                return False
+            sa = negzero(t[1]) if a == 0 else a < 0
+            sb = negzero(t[2]) if b == 0 else b < 0
+            return sa != sb
+        if k in ('add', 'sub'):
+            a, b = go(t[1]), go(t[2])
+            if f32(a + b if k == 'add' else a - b) != 0 or a != 0 or b != 0:
+                return False
+            na, nb = negzero(t[1]), negzero(t[2])
+            if k == 'sub':
+                nb = not nb
+            return na and nb
+        a, b, c = go(t[1]), go(t[2]), go(t[3])
+        if f32(a * b + c) != 0 or a * b != 0 or c != 0:
+            return False
+        sa = negzero(t[1]) if a == 0 else a < 0
+        sb = negzero(t[2]) if b == 0 else b < 0
+        return (sa != sb) and negzero(t[3])
     res = []
     for t, conv in trees:
         v = go(t)
+        if conv == 'float':
+            res.append((True, bits(v, negzero(t))))
+            continue
+        if conv == 'scaled':
+            w = f32(v * f32(Fraction(np.float32(1 / 3).item())))
+            res.append((True, bits(w, negzero(t) if v == 0 else False)))
+            continue
         tr = int(v)  # toward zero
         if conv == 'fptosi.i32':
             ok = -2**31 <= tr < 2**31; r = tr & 0xFFFFFFFF

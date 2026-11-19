@@ -88,3 +88,41 @@ define void @wide(ptr addrspace(1) %p) {
   store i32 %i, ptr addrspace(1) %p
   ret void
 }
+
+; An exact tree whose value stays a float (a box filter's sum, then x 1/3):
+; the sum in integers, converted once (L15-E407). @floatsub's fsub could make
+; -0 where the integer sum's conversion gives +0: it keeps its float sum.
+; CHECK-LABEL: @box(
+; CHECK:       add i16
+; CHECK:       uitofp i16
+; CHECK-NOT:   fadd
+; CHECK:       fmul float
+; CHECK:       ret void
+define void @box(ptr addrspace(1) %p, ptr addrspace(1) %f) {
+  %a = load i8, ptr addrspace(1) %p
+  %q1 = getelementptr i8, ptr addrspace(1) %p, i32 1
+  %b = load i8, ptr addrspace(1) %q1
+  %q2 = getelementptr i8, ptr addrspace(1) %p, i32 2
+  %c = load i8, ptr addrspace(1) %q2
+  %fa = uitofp i8 %a to float
+  %fb = uitofp i8 %b to float
+  %fc = uitofp i8 %c to float
+  %s1 = fadd float %fa, %fb
+  %s = fadd float %s1, %fc
+  %m = fmul float %s, 0x3FD5555560000000
+  store float %m, ptr addrspace(1) %f
+  ret void
+}
+
+; CHECK-LABEL: @floatsub(
+; CHECK:       fsub float
+define void @floatsub(ptr addrspace(1) %p, ptr addrspace(1) %f) {
+  %a = load i8, ptr addrspace(1) %p
+  %q1 = getelementptr i8, ptr addrspace(1) %p, i32 1
+  %b = load i8, ptr addrspace(1) %q1
+  %fa = uitofp i8 %a to float
+  %fb = uitofp i8 %b to float
+  %s = fsub float %fa, %fb
+  store float %s, ptr addrspace(1) %f
+  ret void
+}
