@@ -94,6 +94,8 @@ public:
 
   unsigned getInstSizeInBytes(const MachineInstr &MI) const override;
 
+  bool isAsCheapAsAMove(const MachineInstr &MI) const override;
+
   /// The real instruction of the subtarget's encoding family for the pseudo
   /// instruction \p Opcode, or -1 if there is none.
   int pseudoToMCOpcode(unsigned Opcode) const;

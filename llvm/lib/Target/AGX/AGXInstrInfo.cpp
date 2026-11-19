@@ -17,6 +17,7 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
@@ -279,6 +280,39 @@ bool AGXInstrInfo::isBasicBlockPrologue(const MachineInstr &MI,
                                         Register Reg) const {
   return MI.getOpcode() == AGX::AGX_END_CF ||
          MI.getOpcode() == AGX::SET_NEST;
+}
+
+static cl::opt<bool> AGXCSEConstants(
+    "agx-cse-constants", cl::init(true), cl::Hidden,
+    cl::desc("A constant materialization whose uses all read it as an "
+             "operand is not as cheap as a move: MachineCSE reuses one from "
+             "any dominating block, not only its own or a predecessor"));
+
+/// MachineCSE reuses a cheap instruction only from its own block or an
+/// immediate predecessor (its heuristic against longer live ranges): the
+/// same constant then takes a mov_imm per if region or loop preheader
+/// (conv3x3_pad's bound 1024 compared in nine guarded loads, the exp
+/// coefficients of softmax's two loops). Constants read as plain operands are
+/// reused from any dominating block (L15-E451); those a phi, a copy or a
+/// tied operand reads (zero accumulators, a masked load's default) would
+/// take a copy instead, and keep the heuristic.
+bool AGXInstrInfo::isAsCheapAsAMove(const MachineInstr &MI) const {
+  if (AGXCSEConstants &&
+      (MI.getOpcode() == AGX::MOV_IMM32 || MI.getOpcode() == AGX::MOV_IMM16) &&
+      MI.getOperand(0).getReg().isVirtual()) {
+    const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
+    bool Plain = true;
+    for (const MachineOperand &U :
+         MRI.use_nodbg_operands(MI.getOperand(0).getReg())) {
+      const MachineInstr &UI = *U.getParent();
+      if (UI.isPHI() || UI.isCopyLike() || UI.isRegSequence() ||
+          U.isTied() || UI.isInsertSubreg())
+        Plain = false;
+    }
+    if (Plain)
+      return false;
+  }
+  return MI.isAsCheapAsAMove();
 }
 
 unsigned AGXInstrInfo::getInstSizeInBytes(const MachineInstr &MI) const {
