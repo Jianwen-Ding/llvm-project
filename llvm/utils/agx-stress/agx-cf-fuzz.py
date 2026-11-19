@@ -2,7 +2,7 @@
 """Differential fuzz of the AGX backend's control flow against an interpreter, on the AGX Performance Simulator.
 
 Each seed generates a structured program over five i32 variables: assignments of integer expressions, nested
-if / else, loops whose trip count depends on a variable ((v & 7) + 1, capped), break and continue on data-dependent
+if / else (and pairs of ifs on the same condition), loops whose trip count depends on a variable ((v & 7) + 1, capped), break and continue on data-dependent
 conditions, nested up to four deep. It is emitted as LLVM IR with private variables and compiled the way the
 benchmark kernels are (opt -O2, which promotes them to phis, then llc -O3), run on 512 threads with 40% boundary
 inputs, and each thread's final variables are compared with an interpreter of the program. This covers the
@@ -44,8 +44,17 @@ class G:
     if inloop and k<0.18: return ('break' if R.random()<0.5 else 'continue',s.cond())
     if s.depth>=4 or k<0.45: return ('assign',R.randrange(NV),s.expr())
     s.depth+=1
-    if k<0.7:
+    if k<0.62:
       r=('if',s.cond(),s.block(inloop),s.block(inloop) if R.random()<0.5 else [])
+    elif k<0.7:
+      # two ifs on the same condition, one after the other, each loading a
+      # table entry (which opt cannot speculate) into variables the
+      # condition does not read (L15-E413)
+      c=s.cond()
+      used=vars_of(c); free=[v for v in range(NV) if v not in used] or [0]
+      def body():
+        return [('assign',R.choice(free),('tab',s.expr())) for _ in range(R.randint(1,2))]
+      r=('seq',[('if',c,body(),[]),('if',c,body(),[])])
     elif k<0.9:
       r=('loop',R.randrange(NV),R.choice([3,5,8,13]),s.block(True))
     else:
@@ -54,6 +63,12 @@ class G:
     return r
   def block(s,inloop):
     return [s.stmt(inloop) for _ in range(s.R.randint(1,3))]
+def vars_of(e):
+  if e[0]=='var': return {e[1]}
+  if e[0]=='const': return set()
+  return set().union(*(vars_of(x) for x in e[1:] if isinstance(x,tuple)))
+# a table of 256 words in memory after the threads' inputs of variable 0
+TAB=[(i*2654435761+12345)&0xffffffff for i in range(256)]
 def gen(seed):
   g=G(seed); prog=g.block(False)+[g.stmt(False) for _ in range(2)]
   return prog
@@ -62,6 +77,7 @@ def ev(e,V):
   k=e[0]
   if k=='var': return V[e[1]]
   if k=='const': return e[1]&M
+  if k=='tab': return TAB[ev(e[1],V)&255]
   a,b=ev(e[1],V),ev(e[2],V)
   if k=='add': return (a+b)&M
   if k=='sub': return (a-b)&M
@@ -83,6 +99,7 @@ def run(prog,V):
   for st in prog:
     k=st[0]
     if k=='assign': V[st[1]]=ev(st[2],V)
+    elif k=='seq': run(st[1],V)
     elif k=='if':
       run(st[2] if evc(st[1],V) else st[3],V)
     elif k=='loop':
@@ -105,6 +122,10 @@ def emit(prog):
     k=e[0]
     if k=='var': r=t(); L.append(f'  {r} = load i32, ptr addrspace(5) %a{e[1]}'); return r
     if k=='const': return str(e[1] if e[1]<0x80000000 else e[1]-(1<<32))
+    if k=='tab':
+      x=ee(e[1]); m=t(); L.append(f'  {m} = and i32 {x}, 255'); o=t(); L.append(f'  {o} = add i32 {m}, {N}')
+      g=t(); L.append(f'  {g} = getelementptr i32, ptr addrspace(1) %p, i32 {o}'); r=t()
+      L.append(f'  {r} = load i32, ptr addrspace(1) {g}'); return r
     x,y=ee(e[1]),ee(e[2]); r=t()
     if k in ('shl','lshr','ashr'):
       m=t(); L.append(f'  {m} = and i32 {y}, 31'); y=m
@@ -118,6 +139,8 @@ def emit(prog):
       k=st[0]
       if k=='assign':
         v=ee(st[2]); L.append(f'  store i32 {v}, ptr addrspace(5) %a{st[1]}')
+      elif k=='seq':
+        blk(st[1],brk,cnt)
       elif k=='if':
         c=ec(st[1]); bt,bf,bj=b(),b(),b()
         L.append(f'  br i1 {c}, label %{bt}, label %{bf}'); L.append(f'{bt}:'); blk(st[2],brk,cnt); L.append(f'  br label %{bj}')
@@ -172,6 +195,7 @@ def run_seed(seed, a, tmp):
         m = rng.random(N) < 0.4
         x[m] = rng.choice(EDGE, m.sum())
         inp[i * 65536:i * 65536 + N] = x
+    inp[N:N + 256] = TAB
     fin, fout = os.path.join(tmp, "in.bin"), os.path.join(tmp, "out.bin")
     inp.tofile(fin)
     nb = NV * 65536 * 4

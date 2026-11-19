@@ -516,6 +516,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool simdScans(Function &F, const AGXSubtarget &ST);
   bool simdReductions(Function &F, const AGXSubtarget &ST);
   bool mergeLoopExits(Function &F);
+  bool mergeSameConditionIfs(Function &F);
   bool forwardOwnSlots(Function &F);
   bool strideDivisions(Function &F);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
@@ -2100,6 +2101,118 @@ static cl::opt<unsigned> AGXMergeLoopExits(
 /// runs in H, the loop has one exit on e1 | e2, and a block after it goes
 /// to XH where e1 held, else to XT: T's work is wasted only on the last
 /// iteration of the threads that leave by e1.
+static cl::opt<bool> AGXMergeSameConditionIfs(
+    "agx-merge-same-condition-ifs", cl::init(true), cl::Hidden,
+    cl::desc("Merge an if on c whose join only holds phis and branches on c "
+             "again with the next if (JumpThreading, off on divergent "
+             "targets)"));
+
+/// A: br c, T1, M; T1: ...; br M; M: phis; br c, T2, J; T2: ...; br J (the
+/// same c, the same side): M's branch takes T2 exactly when A's took T1, so
+/// T2's code runs at the end of T1 (with M's phis as T1's values) and A
+/// branches to J; M's phis become phis of J. One if instead of two: one
+/// push, skip and pop fewer, in the PTX front end's guarded loads
+/// (v = c ? a[i] : x; w = c ? b[i] : y). JumpThreading would thread it but
+/// does nothing on targets with branch divergence; the threads that run T2
+/// are those that run T1 either way. T2 without convergent calls (whose
+/// threads would be the same, but which are left in place).
+bool AGXCodeGenPrepare::mergeSameConditionIfs(Function &F) {
+  if (!AGXMergeSameConditionIfs)
+    return false;
+  bool Changed = false;
+  for (bool Again = true; Again;) {
+    Again = false;
+    for (BasicBlock &MB : F) {
+      BasicBlock *M = &MB;
+      auto *Br2 = dyn_cast<CondBrInst>(M->getTerminator());
+      if (!Br2 || M->getFirstNonPHIIt() != Br2->getIterator() ||
+          pred_size(M) != 2)
+        continue;
+      Value *C = Br2->getCondition();
+      BasicBlock *A = nullptr, *T1 = nullptr;
+      unsigned K = 0;
+      for (BasicBlock *P : predecessors(M)) {
+        auto *Br1 = dyn_cast<CondBrInst>(P->getTerminator());
+        if (!Br1 || Br1->getCondition() != C)
+          continue;
+        for (unsigned I = 0; I < 2; ++I)
+          if (Br1->getSuccessor(1 - I) == M && Br1->getSuccessor(I) != M)
+            A = P, T1 = Br1->getSuccessor(I), K = I;
+      }
+      if (!A || T1 == M || !T1->getSinglePredecessor() ||
+          T1->getSingleSuccessor() != M ||
+          !isa<UncondBrInst>(T1->getTerminator()) || isa<PHINode>(T1->front()))
+        continue;
+      if (!llvm::is_contained(predecessors(M), T1))
+        continue;
+      BasicBlock *T2 = Br2->getSuccessor(K), *J = Br2->getSuccessor(1 - K);
+      if (T2 == J || T2 == M || J == M || T2 == T1 || J == A || J == T1 ||
+          T2->getSinglePredecessor() != M || T2->getSingleSuccessor() != J ||
+          !isa<UncondBrInst>(T2->getTerminator()) ||
+          isa<PHINode>(T2->front()) || pred_size(J) != 2 ||
+          !llvm::is_contained(predecessors(J), T2))
+        continue;
+      bool Bad = false;
+      for (Instruction &I : *T2)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          Bad |= CB->isConvergent();
+      SmallVector<PHINode *, 4> Phis;
+      for (PHINode &P : M->phis()) {
+        Phis.push_back(&P);
+        for (Value *V : P.incoming_values())
+          if (auto *I = dyn_cast<Instruction>(V))
+            Bad |= I->getParent() == M;
+      }
+      if (Bad)
+        continue;
+      auto fromA = [&](Value *V) {
+        auto *P = dyn_cast<PHINode>(V);
+        return P && P->getParent() == M ? P->getIncomingValueForBlock(A) : V;
+      };
+      auto fromT1 = [&](Value *V) {
+        auto *P = dyn_cast<PHINode>(V);
+        return P && P->getParent() == M ? P->getIncomingValueForBlock(T1) : V;
+      };
+      // J's phis: M's edge becomes A's, T2's becomes T1's.
+      for (PHINode &Q : J->phis())
+        for (unsigned I = 0, E = Q.getNumIncomingValues(); I != E; ++I) {
+          if (Q.getIncomingBlock(I) == M) {
+            Q.setIncomingValue(I, fromA(Q.getIncomingValue(I)));
+            Q.setIncomingBlock(I, A);
+          } else if (Q.getIncomingBlock(I) == T2) {
+            Q.setIncomingValue(I, fromT1(Q.getIncomingValue(I)));
+            Q.setIncomingBlock(I, T1);
+          }
+        }
+      // T2's code, with T1's values of M's phis, at the end of T1.
+      for (PHINode *P : Phis)
+        P->replaceUsesWithIf(P->getIncomingValueForBlock(T1), [&](Use &U) {
+          return cast<Instruction>(U.getUser())->getParent() == T2;
+        });
+      T1->getTerminator()->eraseFromParent();
+      T1->splice(T1->end(), T2);
+      cast<UncondBrInst>(T1->getTerminator())->setSuccessor(0, J);
+      cast<CondBrInst>(A->getTerminator())->setSuccessor(1 - K, J);
+      for (PHINode *P : Phis) {
+        if (!P->use_empty()) {
+          PHINode *N = PHINode::Create(P->getType(), 2, P->getName(),
+                                       J->begin());
+          N->addIncoming(P->getIncomingValueForBlock(A), A);
+          N->addIncoming(P->getIncomingValueForBlock(T1), T1);
+          P->replaceAllUsesWith(N);
+        }
+        P->eraseFromParent();
+      }
+      Br2->eraseFromParent();
+      M->eraseFromParent();
+      T2->eraseFromParent();
+      Changed = Again = true;
+      break;
+    }
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
   if (!AGXMergeLoopExits)
     return false;
@@ -5758,6 +5871,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool Changed = diagnoseDoubles(F);
+  Changed |= mergeSameConditionIfs(F);
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
   Changed |= zeroSignFreeMinMax(F);
