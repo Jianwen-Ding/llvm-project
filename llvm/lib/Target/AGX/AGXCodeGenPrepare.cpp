@@ -7061,6 +7061,86 @@ static bool combineDeferredMinMax(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXOnlineSoftmaxExp(
+    "agx-online-softmax-exp", cl::init(true), cl::Hidden,
+    cl::desc("exp(a - max(a, b)) and exp(b - max(a, b)) as one exponential "
+             "and 1 + (x - x) for the other"));
+
+/// e^(a - u) and e^(b - u), u = maximum(a, b) (or maximumnum, nsz or not):
+/// an online softmax's rescale e^(m - m') and new term e^(v - m'). Where
+/// b > a, u is b and b - u is b - b, +0 or (b infinite) a NaN, whose
+/// exponential is 1 or a NaN, 1 + (b - u) exactly (the simulator's NaNs of
+/// arithmetic are its default one either way); otherwise (b <= a, or a NaN)
+/// a - u is that trivial one (u is a, a zero of a tie, or a NaN). So
+///   x = b > a ? a - u : b - u, e = e^x,
+///   e^(a - u) = b > a ? e : 1 + (a - u), e^(b - u) = b > a ? 1 + (b - u) : e:
+/// one precise exponential (some twenty instructions) instead of two, x at
+/// most 0 or a NaN (its clamps' upper bound needless: !agx.exp.below.max)
+/// (L15-E464).
+static bool onlineSoftmaxExps(Function &F) {
+  if (!AGXOnlineSoftmaxExp)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<std::pair<IntrinsicInst *, IntrinsicInst *>, 4> Pairs;
+  SmallPtrSet<IntrinsicInst *, 8> Taken;
+  for (Instruction &I : instructions(F)) {
+    auto *E1 = dyn_cast<IntrinsicInst>(&I);
+    if (!E1 || E1->getIntrinsicID() != Intrinsic::exp ||
+        !E1->getType()->isFloatTy() || E1->hasApproxFunc() || Taken.count(E1))
+      continue;
+    Value *A, *U;
+    if (!match(E1->getArgOperand(0), m_FSub(m_Value(A), m_Value(U))))
+      continue;
+    auto *UI = dyn_cast<IntrinsicInst>(U);
+    if (!UI || (UI->getIntrinsicID() != Intrinsic::maximum &&
+                UI->getIntrinsicID() != Intrinsic::maximumnum))
+      continue;
+    Value *B = UI->getArgOperand(0) == A ? UI->getArgOperand(1)
+               : UI->getArgOperand(1) == A ? UI->getArgOperand(0)
+                                            : nullptr;
+    if (!B || B == A)
+      continue;
+    // the partner e^(b - u) in the same block
+    IntrinsicInst *E2 = nullptr;
+    for (User *Us : U->users()) {
+      Value *X;
+      if (!match(Us, m_FSub(m_Value(X), m_Specific(U))) || X != B)
+        continue;
+      for (User *Us2 : Us->users())
+        if (auto *II = dyn_cast<IntrinsicInst>(Us2);
+            II && II->getIntrinsicID() == Intrinsic::exp &&
+            II->getParent() == E1->getParent() && !II->hasApproxFunc() &&
+            II != E1 && !Taken.count(II))
+          E2 = II;
+    }
+    if (!E2)
+      continue;
+    Taken.insert(E1);
+    Taken.insert(E2);
+    Pairs.push_back({E1, E2});
+  }
+  for (auto [E1, E2] : Pairs) {
+    IntrinsicInst *Late = E1->comesBefore(E2) ? E2 : E1;
+    auto *FA = cast<Instruction>(E1->getArgOperand(0));
+    auto *FB = cast<Instruction>(E2->getArgOperand(0));
+    Value *A = FA->getOperand(0), *B = FB->getOperand(0);
+    IRBuilder<> Bld(Late);
+    Value *C = Bld.CreateFCmpOGT(B, A);
+    Value *X = Bld.CreateSelect(C, FA, FB);
+    auto *E = cast<Instruction>(
+        Bld.CreateUnaryIntrinsic(Intrinsic::exp, X, E1, "exp.one"));
+    E->setMetadata("agx.exp.below.max", MDNode::get(F.getContext(), {}));
+    Value *One = ConstantFP::get(E->getType(), 1.0);
+    Value *EA = Bld.CreateSelect(C, E, Bld.CreateFAdd(One, FA));
+    Value *EB = Bld.CreateSelect(C, Bld.CreateFAdd(One, FB), E);
+    E1->replaceAllUsesWith(EA);
+    E2->replaceAllUsesWith(EB);
+    E1->eraseFromParent();
+    E2->eraseFromParent();
+  }
+  return !Pairs.empty();
+}
+
 static cl::opt<bool> AGXNarrowTruncatedOps(
     "agx-narrow-truncated-ops", cl::init(true), cl::Hidden,
     cl::desc("A 64-bit add, sub, mul, and, or, xor or shl whose every user "
@@ -7267,6 +7347,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   // this defers, to as few instructions)
   Changed |= deferredMinMaxReductions(F);
   Changed |= combineDeferredMinMax(F);
+  Changed |= onlineSoftmaxExps(F);
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
