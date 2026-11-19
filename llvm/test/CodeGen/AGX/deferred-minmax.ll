@@ -120,3 +120,42 @@ done:
   store float %sn, ptr addrspace(1) %o1, align 4
   ret void
 }
+
+; A vector's running maximum reduced after the loop: the results of its
+; lanes, combined by maximum nsz of their m's and smax of their z's, one
+; result instead of four and three maximums (L15-E454).
+; CHECK-LABEL: @vec4(
+; CHECK:       done:
+; CHECK:       call nsz float @llvm.maximum.f32(float %m.i0.m.next, float %m.i1.m.next)
+; CHECK:       call i32 @llvm.smax.i32
+; CHECK:       call nsz float @llvm.maximum.f32
+; CHECK:       call i32 @llvm.smax.i32
+; CHECK:       call nsz float @llvm.maximum.f32
+; CHECK:       call i32 @llvm.smax.i32
+; CHECK-NOT:   @llvm.maximum.f32
+; CHECK:       select i1 %{{.*}}, float 0.000000e+00, float
+; CHECK:       ret void
+define agx_kernel void @vec4(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %in, %loop ]
+  %m = phi <4 x float> [ splat (float 0xFFF0000000000000), %entry ], [ %mn, %loop ]
+  %p = getelementptr inbounds <4 x float>, ptr addrspace(1) %x, i32 %i
+  %v = load <4 x float>, ptr addrspace(1) %p, align 16
+  %mn = call <4 x float> @llvm.maximum.v4f32(<4 x float> %m, <4 x float> %v)
+  %in = add nuw i32 %i, 1
+  %c = icmp ult i32 %in, %n
+  br i1 %c, label %loop, label %done
+done:
+  %e0 = extractelement <4 x float> %mn, i64 0
+  %e1 = extractelement <4 x float> %mn, i64 1
+  %m01 = call float @llvm.maximum.f32(float %e0, float %e1)
+  %e2 = extractelement <4 x float> %mn, i64 2
+  %m012 = call float @llvm.maximum.f32(float %m01, float %e2)
+  %e3 = extractelement <4 x float> %mn, i64 3
+  %r = call float @llvm.maximum.f32(float %m012, float %e3)
+  store float %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+declare <4 x float> @llvm.maximum.v4f32(<4 x float>, <4 x float>)

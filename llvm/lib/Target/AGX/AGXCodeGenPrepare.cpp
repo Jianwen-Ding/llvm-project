@@ -6686,6 +6686,11 @@ static cl::opt<bool> AGXDeferredMinMaxNum(
              "minimumnum from a number, its zero-sign-free uses in the loop "
              "taking the deferred value"));
 
+static cl::opt<bool> AGXDeferredLaneResults(
+    "agx-deferred-minmax-lane-results", cl::init(true), cl::Hidden,
+    cl::desc("agx-deferred-minmax-reductions' results of a vector's elements "
+             "per element, and maximum / minimum of two results as one"));
+
 static cl::opt<bool> AGXDeferredNaNInM(
     "agx-deferred-minmax-nan-in-m", cl::init(true), cl::Hidden,
     cl::desc("agx-deferred-minmax-reductions' running value as maximum / "
@@ -6854,13 +6859,21 @@ static bool deferredMinMaxReductions(Function &F) {
       // the result at a point after U
       auto Result = [&](IRBuilder<> &RB, Value *MV, Value *NV,
                         Value *ZV) -> Value * {
-        Value *Zero = ConstantFP::get(Ty, Max ? 0.0 : -0.0);
-        Value *IsZero = RB.CreateFCmpOEQ(MV, ConstantFP::get(Ty, 0.0));
-        Value *Seen = Max ? RB.CreateICmpSGE(ZV, Constant::getNullValue(ITy))
-                          : RB.CreateICmpSLT(ZV, Constant::getNullValue(ITy));
+        // (of the vector or, for an extraction, of its element)
+        Type *RTy = MV->getType(), *RITy = ZV->getType();
+        Value *Zero = ConstantFP::get(RTy, Max ? 0.0 : -0.0);
+        Value *IsZero = RB.CreateFCmpOEQ(MV, ConstantFP::get(RTy, 0.0));
+        Value *Seen = Max ? RB.CreateICmpSGE(ZV, Constant::getNullValue(RITy))
+                          : RB.CreateICmpSLT(ZV, Constant::getNullValue(RITy));
         Value *R = RB.CreateSelect(RB.CreateAnd(IsZero, Seen), Zero, MV);
-        if (Num || NaNInM)
+        if (Num || NaNInM) {
+          // (a result combineDeferredMinMax may merge: its z belongs to m)
+          if (NaNInM)
+            if (auto *RI = dyn_cast<Instruction>(R))
+              RI->setMetadata("agx.deferred.minmax",
+                              MDNode::get(RI->getContext(), {}));
           return R;
+        }
         return RB.CreateSelect(RB.CreateFCmpUNO(NV, NV), NV, R,
                                U->getName() + ".r");
       };
@@ -6893,6 +6906,19 @@ static bool deferredMinMaxReductions(Function &F) {
           continue;
         }
         IRBuilder<> RB(I);
+        // an element of a vector's result: the result of the elements
+        // (one lane's selects, which combineDeferredMinMax can merge)
+        if (auto *EE = dyn_cast<ExtractElementInst>(I);
+            EE && AGXDeferredLaneResults && EE->getVectorOperand() == U) {
+          Value *Idx = EE->getIndexOperand();
+          Value *R = Result(RB, RB.CreateExtractElement(M2, Idx),
+                            NaNInM || Num ? nullptr
+                                          : RB.CreateExtractElement(N2, Idx),
+                            RB.CreateExtractElement(Z2, Idx));
+          EE->replaceAllUsesWith(R);
+          EE->eraseFromParent();
+          continue;
+        }
         Value *R = Result(RB, M2, N2, Z2);
         I->replaceUsesOfWith(U, R);
       }
@@ -6908,6 +6934,75 @@ static bool deferredMinMaxReductions(Function &F) {
       }
       Changed = true;
     }
+  }
+  return Changed;
+}
+
+/// maximum(r1, r2) of two deferred maxima's results r = m == 0 && z >= 0 ?
+/// +0 : m (agx-deferred-minmax-nan-in-m's, minimum mirrored) is the result of
+/// maximum nsz(m1, m2) (a NaN if either is one, m2's if both: maximum's NaN
+/// of r1 and r2) and smax(z1, z2): the larger m's result, and for two zero
+/// m's +0 where either has a clear sign among its values' bits (maximum's
+/// +0 of +0 and a zero). Else a zero or denormal m2 where maximum gives -0:
+/// both denormal results (L15-E454). The lanes of a vector's running maximum
+/// reduced after its loop (rowmax_vec4): one result instead of one per lane
+/// and three maximums.
+static bool combineDeferredMinMax(Function &F) {
+  if (!AGXDeferredLaneResults)
+    return false;
+  using namespace PatternMatch;
+  struct Parts {
+    Value *M, *Z;
+  };
+  auto Match = [](Value *V, bool Max) -> std::optional<Parts> {
+    Value *M, *Z, *M2;
+    CmpPredicate P1, P2;
+    const APFloat *Zero, *C;
+    auto *S = dyn_cast<SelectInst>(V);
+    if (!S || !S->hasOneUse() || !S->getType()->isFloatTy() ||
+        !S->getMetadata("agx.deferred.minmax") ||
+        !match(S, m_Select(m_And(m_FCmp(P1, m_Value(M), m_APFloat(C)),
+                                 m_ICmp(P2, m_Value(Z), m_Zero())),
+                           m_APFloat(Zero), m_Value(M2))) ||
+        M != M2 || P1 != FCmpInst::FCMP_OEQ || !C->isZero() ||
+        !Zero->isZero() || Zero->isNegative() == Max ||
+        P2 != (Max ? ICmpInst::ICMP_SGE : ICmpInst::ICMP_SLT) ||
+        !Z->getType()->isIntegerTy(32))
+      return std::nullopt;
+    return Parts{M, Z};
+  };
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (!II || !II->getType()->isFloatTy())
+      continue;
+    Intrinsic::ID ID = II->getIntrinsicID();
+    if (ID != Intrinsic::maximum && ID != Intrinsic::minimum)
+      continue;
+    bool Max = ID == Intrinsic::maximum;
+    auto A = Match(II->getArgOperand(0), Max),
+         B = Match(II->getArgOperand(1), Max);
+    if (!A || !B)
+      continue;
+    IRBuilder<> RB(II);
+    auto *MM = cast<Instruction>(RB.CreateBinaryIntrinsic(ID, A->M, B->M));
+    MM->setHasNoSignedZeros(true);
+    Value *Z = Max ? RB.CreateBinaryIntrinsic(Intrinsic::smax, A->Z, B->Z)
+                   : RB.CreateBinaryIntrinsic(Intrinsic::smin, A->Z, B->Z);
+    Value *IsZero = RB.CreateFCmpOEQ(MM, ConstantFP::get(MM->getType(), 0.0));
+    Value *Seen = Max ? RB.CreateICmpSGE(Z, RB.getInt32(0))
+                      : RB.CreateICmpSLT(Z, RB.getInt32(0));
+    Value *R = RB.CreateSelect(RB.CreateAnd(IsZero, Seen),
+                               ConstantFP::get(MM->getType(), Max ? 0.0 : -0.0),
+                               MM, II->getName());
+    cast<Instruction>(R)->setMetadata("agx.deferred.minmax",
+                                      MDNode::get(F.getContext(), {}));
+    Value *OA = II->getArgOperand(0), *OB = II->getArgOperand(1);
+    II->replaceAllUsesWith(R);
+    II->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(OA);
+    RecursivelyDeleteTriviallyDeadInstructions(OB);
+    Changed = true;
   }
   return Changed;
 }
@@ -7117,6 +7212,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   // (after the zero-sign-free min / max: an nsz link lowers without the fix
   // this defers, to as few instructions)
   Changed |= deferredMinMaxReductions(F);
+  Changed |= combineDeferredMinMax(F);
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
