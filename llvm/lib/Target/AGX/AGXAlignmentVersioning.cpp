@@ -61,6 +61,11 @@ static cl::opt<unsigned> AlignmentVersioningMin(
     cl::desc("Device accesses whose alignment the check must raise for a "
              "loop to be versioned"));
 
+static cl::opt<bool> CountVectorElements(
+    "agx-alignment-versioning-elements", cl::init(true), cl::Hidden,
+    cl::desc("Count a vector access as its elements towards "
+             "-agx-alignment-versioning-min"));
+
 namespace {
 
 class AGXAlignmentVersioning : public FunctionPass {
@@ -204,7 +209,14 @@ static bool versionLoop(Loop &L, Function &F, LoopInfo &LI, DominatorTree &DT,
   SmallVector<Raise, 16> Raises;
   SetVector<Value *> Bases;
   findRaises(L, SE, Raises, Bases);
-  if (Raises.size() < AlignmentVersioningMin)
+  // A vector access counts as its elements: below 4 bytes each element is
+  // an access of its own (MLIR's vector<4xf16> at align 2: L15-E478).
+  unsigned Accesses = 0;
+  for (const Raise &R : Raises) {
+    auto *VT = dyn_cast<FixedVectorType>(getLoadStoreType(R.I));
+    Accesses += VT && CountVectorElements ? VT->getNumElements() : 1;
+  }
+  if (Accesses < AlignmentVersioningMin)
     return false;
   for (Value *Base : Bases)
     if (auto *BI = dyn_cast<Instruction>(Base);

@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning-elements=0 < %s | FileCheck %s --check-prefix=ONE
 
 ; A loop over a half row known aligned to 2 bytes only: a copy for a 4-byte
 ; aligned base (a test of the kernel argument, uniform) whose loads at
@@ -147,3 +148,37 @@ exit:
   store float %s7, ptr addrspace(1) %o, align 4
   ret void
 }
+
+; One <4 x half> load a step (MLIR's vector<4xf16> at align 2): four 16-bit
+; loads, which count as four accesses towards the minimum (L15-E478); the
+; aligned copy loads the vector at once.
+; CHECK-LABEL: vec4_sumsq:
+; CHECK: and {{r[0-9]+}}, u0, 3
+; CHECK: device_load 0, i32, xy,
+; ONE-LABEL: vec4_sumsq:
+; ONE-NOT: and {{r[0-9]+}}, u0, 3
+; ONE-NOT: i32, xy
+; ONE: stop
+define agx_kernel void @vec4_sumsq(ptr addrspace(1) %x, ptr addrspace(1) %y) {
+entry:
+  %lane = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %l4 = shl nuw nsw i32 %lane, 2
+  %l64 = zext i32 %l4 to i64
+  br label %loop
+loop:
+  %j = phi i64 [ %l64, %entry ], [ %jn, %loop ]
+  %a = phi <4 x float> [ zeroinitializer, %entry ], [ %an, %loop ]
+  %p = getelementptr half, ptr addrspace(1) %x, i64 %j
+  %h = load <4 x half>, ptr addrspace(1) %p, align 2
+  %v = fpext <4 x half> %h to <4 x float>
+  %an = call <4 x float> @llvm.fma.v4f32(<4 x float> %v, <4 x float> %v, <4 x float> %a)
+  %jn = add nuw nsw i64 %j, 128
+  %c = icmp ult i64 %jn, 1024
+  br i1 %c, label %loop, label %done
+done:
+  %e = extractelement <4 x float> %an, i32 0
+  %q = getelementptr float, ptr addrspace(1) %y, i32 %lane
+  store float %e, ptr addrspace(1) %q
+  ret void
+}
+declare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)
