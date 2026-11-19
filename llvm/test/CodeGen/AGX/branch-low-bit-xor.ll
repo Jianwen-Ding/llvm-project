@@ -28,13 +28,12 @@ define agx_kernel void @exchange(ptr addrspace(1) %k, ptr addrspace(1) %w) {
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    icmpsel ugt, r8, r1, r3, 1, 0
 ; CHECK-NEXT:    if_icmp r0l, nueq, r8, r9, 1
-; CHECK-NEXT:    jmp_exec_none .LBB0_2
 ; CHECK-NEXT:  // %bb.1: // %swap
 ; CHECK-NEXT:    iadd r6_r7, r6_r7, r2.sx, lsl 2
 ; CHECK-NEXT:    iadd r4_r5, r4_r5, r2.sx, lsl 2
 ; CHECK-NEXT:    device_store 0, i32, x, r3, r6_r7, 0, signed
 ; CHECK-NEXT:    device_store 0, i32, x, r1, r4_r5, 0, signed
-; CHECK-NEXT:  .LBB0_2: // %done
+; CHECK-NEXT:  // %bb.2: // %done
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -65,13 +64,12 @@ define agx_kernel void @exchange(ptr addrspace(1) %k, ptr addrspace(1) %w) {
 ; OFF-NEXT:    and r8, r4, 1
 ; OFF-NEXT:    bitop 0101, r4, u2, 0
 ; OFF-NEXT:    if_icmp r0l, nueq, r8, 0, 1
-; OFF-NEXT:    jmp_exec_none .LBB0_2
 ; OFF-NEXT:  // %bb.1: // %swap
 ; OFF-NEXT:    iadd r6_r7, r6_r7, r2.sx, lsl 2
 ; OFF-NEXT:    iadd r4_r5, r4_r5, r2.sx, lsl 2
 ; OFF-NEXT:    device_store 0, i32, x, r3, r6_r7, 0, signed
 ; OFF-NEXT:    device_store 0, i32, x, r1, r4_r5, 0, signed
-; OFF-NEXT:  .LBB0_2: // %done
+; OFF-NEXT:  // %bb.2: // %done
 ; OFF-NEXT:    pop_exec r0l, 1
 ; OFF-NEXT:    stop
 ; OFF-NEXT:    trap

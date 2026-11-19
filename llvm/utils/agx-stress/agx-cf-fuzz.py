@@ -3,7 +3,7 @@
 
 Each seed generates a structured program over five i32 variables: assignments of integer expressions, nested
 if / else (and pairs of ifs on the same condition), loops whose trip count depends on a variable ((v & 7) + 1, capped), break and continue on data-dependent
-conditions, nested up to four deep. It is emitted as LLVM IR with private variables and compiled the way the
+conditions, nested up to four deep, and stores to the thread's output slots (guarded device stores under ifs). It is emitted as LLVM IR with private variables and compiled the way the
 benchmark kernels are (opt -O2, which promotes them to phis, then llc -O3; every third seed llc alone, which promotes them
 itself), run on 512 threads with 40% boundary
 inputs, and each thread's final variables are compared with an interpreter of the program. This covers the
@@ -24,6 +24,7 @@ import numpy as np
 
 M=0xffffffff
 NV=5
+NS=4  # output slots a 'put' stores to, after the variables' outputs
 def sx(v): return v-(1<<32) if v>>31 else v
 class G:
   def __init__(s,seed):
@@ -43,7 +44,11 @@ class G:
   def stmt(s,inloop):
     R=s.R; k=R.random()
     if inloop and k<0.18: return ('break' if R.random()<0.5 else 'continue',s.cond())
-    if s.depth>=4 or k<0.45: return ('assign',R.randrange(NV),s.expr())
+    if s.depth>=4 or k<0.45:
+      # (some a store to one of the thread's output slots, under its ifs a
+      # guarded device store: L15-E433)
+      if R.random()<0.15: return ('put',R.randrange(NS),s.expr())
+      return ('assign',R.randrange(NV),s.expr())
     s.depth+=1
     if k<0.52:
       r=('if',s.cond(),s.block(inloop),s.block(inloop) if R.random()<0.5 else [])
@@ -122,6 +127,7 @@ def run(prog,V):
   for st in prog:
     k=st[0]
     if k=='assign': V[st[1]]=ev(st[2],V)
+    elif k=='put': V[NV+st[1]]=ev(st[2],V)
     elif k=='seq': run(st[1],V)
     elif k=='if':
       run(st[2] if evc(st[1],V) else st[3],V)
@@ -162,6 +168,9 @@ def emit(prog):
       k=st[0]
       if k=='assign':
         v=ee(st[2]); L.append(f'  store i32 {v}, ptr addrspace(5) %a{st[1]}')
+      elif k=='put':
+        v=ee(st[2]); g=t(); L.append(f'  {g} = getelementptr i32, ptr addrspace(1) %q, i32 {(NV+st[1])*65536}')
+        g2=t(); L.append(f'  {g2} = getelementptr i32, ptr addrspace(1) {g}, i32 %t'); L.append(f'  store i32 {v}, ptr addrspace(1) {g2}')
       elif k=='seq':
         blk(st[1],brk,cnt)
       elif k=='if':
@@ -227,7 +236,7 @@ def run_seed(seed, a, tmp):
     inp[N:N + 256] = TAB
     fin, fout = os.path.join(tmp, "in.bin"), os.path.join(tmp, "out.bin")
     inp.tofile(fin)
-    nb = NV * 65536 * 4
+    nb = (NV + NS) * 65536 * 4
     rr = subprocess.run([a.run, code, "--grid", "%d,1,1" % N, "--wg", "64,1,1", "--map", "0x1000000=" + fin,
                          "--alloc", "0x2000000=%d" % nb, "--dump", "0x2000000=%d:%s" % (nb, fout),
                          "--uniform", "0=16777216", "--uniform", "1=0", "--uniform", "2=33554432", "--uniform", "3=0"],
@@ -236,9 +245,9 @@ def run_seed(seed, a, tmp):
         return src, "agx_run failure: " + (rr.stdout + rr.stderr)[-200:]
     got = np.fromfile(fout, np.uint32)
     for th in range(N):
-        V = [int(inp[i * 65536 + th]) for i in range(NV)]
+        V = [int(inp[i * 65536 + th]) for i in range(NV)] + [0] * NS
         run(prog, V)
-        g = [int(got[i * 65536 + th]) for i in range(NV)]
+        g = [int(got[i * 65536 + th]) for i in range(NV + NS)]
         if g != V:
             return src, "thread %d ended with %s, the interpreter %s" % (th, [hex(x) for x in g], [hex(x) for x in V])
     return src, None

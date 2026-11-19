@@ -4,7 +4,8 @@
 ; Guarded loads whose results are first used after the joins stay in flight
 ; across the ifs (L15-E428): one wait, before the sum, not one at the end of
 ; each guarded side. @exit_unused's load is unused on the path that ends the
-; kernel: its block waits before the branch, not the exit before its stop.
+; kernel: its block waits before the branch, not the exit before its stop
+; (the side is long enough to be jumped over, L15-E433).
 
 ; CHECK-LABEL: guarded:
 ; CHECK:       device_load
@@ -63,8 +64,13 @@ entry:
   %c = icmp ult i32 %x, %n
   br i1 %c, label %st, label %end
 st:
+  %w = fmul float %v, %v
+  %w2 = fadd float %w, 3.0
+  %w3 = fmul float %w2, %w
+  %w4 = fadd float %w3, %v
+  %w5 = fmul float %w4, %w2
   %po = getelementptr inbounds float, ptr addrspace(1) %o, i32 %x
-  store float %v, ptr addrspace(1) %po, align 4
+  store float %w5, ptr addrspace(1) %po, align 4
   br label %end
 end:
   ret void

@@ -60,11 +60,10 @@ define agx_kernel void @early_return(ptr addrspace(1) %out, i32 %n) {
 ; CHECK-NEXT:    mov_imm r0l, 0
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
 ; CHECK-NEXT:    if_icmp r0l, ult, r1, u2, 1
-; CHECK-NEXT:    jmp_exec_none .LBB1_2
 ; CHECK-NEXT:  // %bb.1: // %then
 ; CHECK-NEXT:    mov_imm r2, 1
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
-; CHECK-NEXT:  .LBB1_2: // %unified.return
+; CHECK-NEXT:  // %bb.2: // %unified.return
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -301,10 +300,9 @@ define agx_kernel void @trap(ptr addrspace(1) %out, i32 %n) {
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:  .LBB5_2: // %Flow
 ; CHECK-NEXT:    else_fcmp r0l, eq, 0.0, 0.0, 1
-; CHECK-NEXT:    jmp_exec_none .LBB5_4
 ; CHECK-NEXT:  // %bb.3: // %ok
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
-; CHECK-NEXT:  .LBB5_4: // %unified.return
+; CHECK-NEXT:  // %bb.4: // %unified.return
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

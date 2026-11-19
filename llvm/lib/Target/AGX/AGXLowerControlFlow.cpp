@@ -90,6 +90,12 @@ static cl::opt<bool> AGXSkipLoads(
              "when it has plain loads"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> AGXSkipDeviceStores(
+    "agx-unskipped-device-stores",
+    cl::desc("Let an if or else body run with an empty execution mask also "
+             "when it has plain device stores"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<unsigned> MaxUnskippedInstrs(
     "agx-max-unskipped-instrs",
     cl::desc("Most ALU instructions an if or else body may have and still be "
@@ -157,13 +163,14 @@ static bool isControlFlowPseudo(unsigned Opc) {
 }
 
 /// Whether the blocks a jump_exec_none at the end of MBB would skip, up to
-/// Target, are a straight run of at most MaxUnskippedInstrs ALU instructions
-/// and plain loads, so that running them with an empty execution mask is
-/// cheaper than the jump. B31 measured a masked device_load + wait at 10-17
-/// ns; the jump costs its issue where a lane enters the body and a taken
-/// jump's latency and scheduler hold where none does. E135 kept loads out
-/// before the simulator modelled the masked cost; with it, the jump loses
-/// even where no lane ever enters a body of one load (L15-E432).
+/// Target, are a straight run of at most MaxUnskippedInstrs ALU instructions,
+/// plain loads and plain device stores, so that running them with an empty
+/// execution mask is cheaper than the jump. B31 measured a masked
+/// device_load + wait at 10-17 ns and a masked device_store at 7-10 ns; the
+/// jump costs its issue where a lane enters the body and a taken jump's
+/// latency and scheduler hold where none does. E135 kept memory accesses out
+/// before the simulator modelled the masked costs; with them, the jump loses
+/// even where no lane ever enters a body of one access (L15-E432, E433).
 static bool isShortALURun(MachineBasicBlock &MBB, MachineBasicBlock *Target) {
   unsigned Count = 0;
   MachineFunction &MF = *MBB.getParent();
@@ -182,12 +189,20 @@ static bool isShortALURun(MachineBasicBlock &MBB, MachineBasicBlock *Target) {
       // A branch to the next block is left out.
       if (MI.getOpcode() == AGX::AGX_BR && MI.getOperand(0).getMBB() == Next)
         continue;
-      // A plain load (not a store, atomic or volatile access) touches
-      // nothing with an empty mask either (L15-E432).
+      // A plain load (not an atomic or volatile access) touches nothing
+      // with an empty mask either (L15-E432), nor does a plain device store
+      // (L15-E433; B31 measured it, unlike a threadgroup store's).
       bool Load = AGXSkipLoads && MI.mayLoad() && !MI.mayStore() &&
                   !MI.hasOrderedMemoryRef();
+      bool Store =
+          AGXSkipDeviceStores && MI.mayStore() && !MI.mayLoad() &&
+          !MI.hasOrderedMemoryRef() && !MI.memoperands_empty() &&
+          llvm::all_of(MI.memoperands(), [](const MachineMemOperand *M) {
+            return M->getAddrSpace() == AGX::DEVICE_ADDRESS;
+          });
       if (isControlFlowPseudo(MI.getOpcode()) ||
-          (MI.mayLoadOrStore() && !Load) || MI.hasUnmodeledSideEffects() ||
+          (MI.mayLoadOrStore() && !Load && !Store) ||
+          MI.hasUnmodeledSideEffects() ||
           MI.isCall() || MI.isTerminator() || AGXInstrInfo::isExecMaskOp(MI))
         return false;
       // A shuffle also moves its index to r0h and resets it.

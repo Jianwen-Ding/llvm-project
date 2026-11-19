@@ -1,10 +1,12 @@
 ; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -agx-max-unskipped-instrs=0 -verify-machineinstrs < %s | FileCheck %s --check-prefix=ALWAYS
 ; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -agx-unskipped-loads=0 -verify-machineinstrs < %s | FileCheck %s --check-prefix=NOLOADS
+; RUN: llc -mtriple=agx -agx-fold-condition-chains=0 -agx-preisel-simplifycfg=0 -mcpu=agx-g14c -agx-unskipped-device-stores=0 -verify-machineinstrs < %s | FileCheck %s --check-prefix=NOSTORES
 
 ; A short ALU-only body runs with an empty execution mask instead of being
-; jumped over (B31), and so does one with a plain load (L15-E432); a body
-; with a store, or any body with the threshold at 0, is jumped over.
+; jumped over (B31), and so does one with a plain load (L15-E432) or a plain
+; device store (L15-E433); a body with a threadgroup store, or any body with
+; the threshold at 0, is jumped over.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 
@@ -32,7 +34,11 @@ join:
 
 ; CHECK-LABEL: {{^}}memory:
 ; CHECK:         if_icmp
-; CHECK-NEXT:    jmp_exec_none
+; CHECK-NOT:     jmp_exec_none
+; CHECK:         device_store
+; NOSTORES-LABEL: {{^}}memory:
+; NOSTORES:      if_icmp
+; NOSTORES-NEXT: jmp_exec_none
 define agx_kernel void @memory(ptr addrspace(1) %out, i32 %n) {
 entry:
   %t = call i32 @llvm.agx.thread.position.in.grid.x()
@@ -67,5 +73,24 @@ join:
   %r = phi i32 [ %v, %then ], [ 7, %entry ]
   %po = getelementptr inbounds i32, ptr addrspace(1) %out, i32 %t
   store i32 %r, ptr addrspace(1) %po, align 4
+  ret void
+}
+
+@tg = internal addrspace(3) global [64 x i32] undef, align 4
+
+; CHECK-LABEL: {{^}}tg_store:
+; CHECK:         if_icmp
+; CHECK-NEXT:    jmp_exec_none
+define agx_kernel void @tg_store(i32 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %c = icmp ult i32 %t, %n
+  br i1 %c, label %then, label %join
+then:
+  %i = and i32 %t, 63
+  %p = getelementptr i32, ptr addrspace(3) @tg, i32 %i
+  store i32 %t, ptr addrspace(3) %p
+  br label %join
+join:
   ret void
 }

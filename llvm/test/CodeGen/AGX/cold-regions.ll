@@ -43,7 +43,8 @@ then:
   %w = mul i32 %v, %v
   %w2 = mul i32 %w, %v
   %w3 = add i32 %w2, %x
-  store i32 %w3, ptr addrspace(1) %a
+  %w4 = xor i32 %w3, %t
+  store i32 %w4, ptr addrspace(1) %a
   br label %end
 end:
   ret void

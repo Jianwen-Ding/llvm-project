@@ -14,11 +14,10 @@ define agx_kernel void @b(ptr addrspace(1) %p, i32 %a, i32 %b) {
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    mov_imm r0l, 0
 ; CHECK-NEXT:    if_icmp r0l, sgte, u2, 0, 1
-; CHECK-NEXT:    jmp_exec_none .LBB0_2
 ; CHECK-NEXT:  // %bb.1: // %x
 ; CHECK-NEXT:    bitop 0101, r1, u3, 0
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
-; CHECK-NEXT:  .LBB0_2: // %y
+; CHECK-NEXT:  // %bb.2: // %y
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
