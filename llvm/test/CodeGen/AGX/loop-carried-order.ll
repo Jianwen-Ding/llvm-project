@@ -25,7 +25,6 @@ define agx_kernel void @escape(ptr addrspace(1) %p, float %cr, float %ci, i32 %n
 ; CHECK-NEXT:    fmadd32 r8, r2, r2, r7
 ; CHECK-NEXT:    // implicit-def: $r6
 ; CHECK-NEXT:    if_fcmp r0l, lt, r8, 4.0, 1
-; CHECK-NEXT:    jmp_exec_none .LBB0_3
 ; CHECK-NEXT:  // %bb.2: // %body
 ; CHECK-NEXT:    // in Loop: Header=BB0_1 Depth=1
 ; CHECK-NEXT:    fmul32 r5, r2, r2
@@ -36,7 +35,7 @@ define agx_kernel void @escape(ptr addrspace(1) %p, float %cr, float %ci, i32 %n
 ; CHECK-NEXT:    fmadd32 r3, r7, r3, u3
 ; CHECK-NEXT:    bitop 0101, r4, r1, 0
 ; CHECK-NEXT:    icmpsel ueq, r5, u4, r6, 1, 0
-; CHECK-NEXT:  .LBB0_3: // %Flow
+; CHECK-NEXT:  // %bb.3: // %Flow
 ; CHECK-NEXT:    // in Loop: Header=BB0_1 Depth=1
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    bitop 0101, r7, r4, 0

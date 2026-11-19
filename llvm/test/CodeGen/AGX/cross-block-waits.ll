@@ -1,11 +1,12 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-max-unskipped-instrs=4 -verify-machineinstrs < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-cross-block-waits=0 < %s | FileCheck %s --check-prefix=BLOCK
 
 ; Guarded loads whose results are first used after the joins stay in flight
 ; across the ifs (L15-E428): one wait, before the sum, not one at the end of
 ; each guarded side. @exit_unused's load is unused on the path that ends the
 ; kernel: its block waits before the branch, not the exit before its stop
-; (the side is long enough to be jumped over, L15-E433).
+; (the side is long enough to be jumped over at a limit of 4 instructions,
+; L15-E433, E434).
 
 ; CHECK-LABEL: guarded:
 ; CHECK:       device_load

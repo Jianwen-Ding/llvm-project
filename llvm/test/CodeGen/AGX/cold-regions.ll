@@ -44,7 +44,7 @@ then:
   %w2 = mul i32 %w, %v
   %w3 = add i32 %w2, %x
   %w4 = xor i32 %w3, %t
-  store i32 %w4, ptr addrspace(1) %a
+  %old = atomicrmw add ptr addrspace(1) %a, i32 %w4 monotonic
   br label %end
 end:
   ret void

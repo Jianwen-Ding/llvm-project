@@ -100,7 +100,7 @@ static cl::opt<unsigned> MaxUnskippedInstrs(
     "agx-max-unskipped-instrs",
     cl::desc("Most ALU instructions an if or else body may have and still be "
              "run with an empty execution mask instead of jumped over"),
-    cl::init(4), cl::Hidden);
+    cl::init(12), cl::Hidden);
 
 // Integer conditions.
 static constexpr unsigned ICondUEQ = 0;
