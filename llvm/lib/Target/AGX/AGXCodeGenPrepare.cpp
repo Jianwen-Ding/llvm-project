@@ -4986,6 +4986,119 @@ static bool foldNeverNaNTests(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXZeroSignFreeMinMax(
+    "agx-zero-sign-free-minmax", cl::init(true), cl::Hidden,
+    cl::desc("Mark a float min / max nsz where nothing its value reaches "
+             "depends on the sign of a zero (lowered without its zero fix)"));
+
+namespace {
+/// Every use of a value (through the values it reaches) gives the same
+/// result for +0 and -0 in its place, or a result differing at most in the
+/// sign of a zero: a compare; an exponential (e^+-0 = 1); fabs; the
+/// magnitude of a copysign; or, passing it on, a phi, a select's arm,
+/// fneg, fadd, fsub, fmul, fma, canonicalize or a min / max (each, given
+/// zeros of two signs in an operand, differs at most in its result's zero
+/// sign). A phi or select is assumed while its own uses are checked (the
+/// differences then circulate only among such values).
+struct ZeroSignFree {
+  SmallPtrSet<Instruction *, 16> Assumed;
+  unsigned Budget = 256;
+
+  bool value(Instruction *I) {
+    if (Assumed.contains(I))
+      return true;
+    if (!Budget)
+      return false;
+    --Budget;
+    Assumed.insert(I);
+    for (Use &U : I->uses())
+      if (!use(U)) {
+        Assumed.erase(I);
+        return false;
+      }
+    return true;
+  }
+
+  bool use(Use &U) {
+    auto *I = cast<Instruction>(U.getUser());
+    if (isa<FCmpInst>(I))
+      return true;
+    if (isa<PHINode>(I))
+      return value(I);
+    if (auto *Sel = dyn_cast<SelectInst>(I))
+      return U.getOperandNo() != 0 && value(Sel);
+    switch (I->getOpcode()) {
+    case Instruction::FNeg:
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+      return value(I);
+    default:
+      break;
+    }
+    auto *II = dyn_cast<IntrinsicInst>(I);
+    if (!II)
+      return false;
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::exp:
+    case Intrinsic::exp2:
+    case Intrinsic::exp10:
+    case Intrinsic::agx_exp2:
+    case Intrinsic::fabs:
+      return true;
+    case Intrinsic::copysign:
+      return U.getOperandNo() == 0;
+    case Intrinsic::fma:
+    case Intrinsic::fmuladd:
+    case Intrinsic::canonicalize:
+    case Intrinsic::maxnum:
+    case Intrinsic::minnum:
+    case Intrinsic::maximum:
+    case Intrinsic::minimum:
+    case Intrinsic::maximumnum:
+    case Intrinsic::minimumnum:
+      return value(II);
+    default:
+      return false;
+    }
+  }
+};
+} // namespace
+
+/// A float min / max whose value reaches nothing that depends on the sign
+/// of a zero (ZeroSignFree) is nsz: lowered without the fix that orders -0
+/// below +0 (an and / or of the operands' bits, its flush and a select on
+/// their equality: three of four instructions). A running maximum that only
+/// offsets an exponential, e^(x - m): attn_decode's (L15-E389).
+static bool zeroSignFreeMinMax(Function &F) {
+  if (!AGXZeroSignFreeMinMax)
+    return false;
+  bool Changed = false;
+  for (Instruction &I : instructions(F)) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (!II || !II->getType()->isFloatingPointTy() ||
+        II->hasNoSignedZeros())
+      continue;
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::maxnum:
+    case Intrinsic::minnum:
+    case Intrinsic::maximum:
+    case Intrinsic::minimum:
+    case Intrinsic::maximumnum:
+    case Intrinsic::minimumnum:
+      break;
+    default:
+      continue;
+    }
+    ZeroSignFree Z;
+    if (!Z.value(II))
+      continue;
+    II->setHasNoSignedZeros(true);
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -4997,6 +5110,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   bool Changed = diagnoseDoubles(F);
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
+  Changed |= zeroSignFreeMinMax(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)
