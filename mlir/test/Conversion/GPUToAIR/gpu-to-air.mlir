@@ -543,6 +543,63 @@ gpu.module @narrow_loops {
     air.simdgroup_matrix_store %acc, %c[%c0, %c0] : vector<64xf32> -> memref<8x8xf32, 1>
     gpu.return
   }
+  // A loop by 1 between i32 values cast to index (a CSR row's) is the loop
+  // over i32 between them, compared signed for signed casts; an iv that
+  // indexes a memref each iteration is not negative, cast unsigned.
+  // CHECK-LABEL: llvm.func @csr_row(
+  // CHECK-SAME: %[[B:[^:]*]]: i32, %[[E:[^:]*]]: i32)
+  // CHECK: llvm.br ^bb1(%[[B]], %{{.*}} : i32, f32)
+  // CHECK: ^bb1(%[[J:.*]]: i32, %{{.*}}: f32):
+  // CHECK: llvm.icmp "slt" %[[J]], %[[E]] : i32
+  // CHECK: llvm.zext %[[J]] : i32 to i64
+  // CHECK: llvm.add %[[J]], %{{.*}} : i32
+  // OFF-LABEL: llvm.func @csr_row(
+  // OFF: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+  gpu.func @csr_row(%a: memref<1048576xf32, 1>, %o: memref<1xf32, 1>, %b: i32, %e: i32) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0.0 : f32
+    %lb = arith.index_cast %b : i32 to index
+    %ub = arith.index_cast %e : i32 to index
+    %s = scf.for %j = %lb to %ub step %c1 iter_args(%acc = %zero) -> f32 {
+      %v = memref.load %a[%j] : memref<1048576xf32, 1>
+      %r = arith.addf %acc, %v : f32
+      scf.yield %r : f32
+    }
+    memref.store %s, %o[%c0] : memref<1xf32, 1>
+    gpu.return
+  }
+  // From a constant (-8: signed), the iv's index arithmetic is 32-bit;
+  // unsigned casts give an unsigned loop.
+  // CHECK-LABEL: llvm.func @i32_bounds(
+  // CHECK-SAME: %[[N:[^:]*]]: i32, %[[U:[^:]*]]: i32)
+  // CHECK: %[[M8:.*]] = llvm.mlir.constant(-8 : i32) : i32
+  // CHECK: llvm.br ^bb1(%[[M8]] : i32)
+  // CHECK: ^bb1(%[[J:.*]]: i32):
+  // CHECK: llvm.icmp "slt" %[[J]], %[[N]] : i32
+  // CHECK: %[[J1:.*]] = llvm.add %[[J]], %{{.*}} : i32
+  // CHECK: llvm.mul %[[J1]], %[[J1]] : i32
+  // CHECK: llvm.add %[[J]], %{{.*}} overflow<nsw> : i32
+  // CHECK: ^bb4(%[[K:.*]]: i32):
+  // CHECK: llvm.icmp "ult" %[[K]], %[[U]] : i32
+  // CHECK: llvm.add %[[K]], %{{.*}} overflow<nuw> : i32
+  gpu.func @i32_bounds(%a: memref<1048576xf32, 1>, %n: i32, %u: i32) kernel {
+    %cm8 = arith.constant -8 : index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %f = arith.constant 1.0 : f32
+    %ub = arith.index_cast %n : i32 to index
+    scf.for %j = %cm8 to %ub step %c1 {
+      %k = arith.addi %j, %c1 : index
+      %k2 = arith.muli %k, %k : index
+      memref.store %f, %a[%k2] : memref<1048576xf32, 1>
+    }
+    %uu = arith.index_castui %u : i32 to index
+    scf.for %j = %c0 to %uu step %c1 {
+      memref.store %f, %a[%j] : memref<1048576xf32, 1>
+    }
+    gpu.return
+  }
 }
 
 // -----

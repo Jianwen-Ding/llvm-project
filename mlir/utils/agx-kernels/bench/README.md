@@ -12,7 +12,8 @@ python3 mlir/utils/agx-kernels/bench/bench.py --bin build/bin \
 Each file holds a `gpu.module @k` with one kernel, static memref shapes (the bare-pointer convention),
 `known_block_size` and, where loops or bounds depend on arguments, a `// agx-cost:` line with the launch agx_cost
 traces (`--uniform I=V` sets 32-bit uniform I: a pointer takes two, an `index` two, an `f32` one, in argument order;
-the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
+the `threadgroups_per_grid` uniform is named in llc's kernel header comment; `--map VA=@FILE` maps a file, relative to
+the kernel's, as memory at VA).
 
 | Kernel | What it models |
 | --- | --- |
@@ -48,5 +49,6 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `relu6_vec4` | ReLU6 of `vector<4xf32>` by `arith.maximumf` / `arith.minimumf` |
 | `box3_u8f` | a 3-tap box filter of bytes to floats (an exact float sum, then x 1/3) |
 | `fir_taps` | an FIR filter with a runtime tap count: x[i + k] and w[k] in a loop over k |
+| `spmv_csr` | CSR sparse y = A x, a thread per row: an `scf.for` between i32 row offsets from memory (`--map VA=@FILE`) and a gather of x |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

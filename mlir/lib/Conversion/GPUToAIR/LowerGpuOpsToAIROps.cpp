@@ -2308,6 +2308,101 @@ static bool narrowBinarySearch(scf::WhileOp w, IRRewriter &rewriter) {
   return true;
 }
 
+/// The i32 of index \p v if it is an i32 cast to index (by a signed cast if
+/// \p isSigned, else an unsigned one) or a constant that one gives.
+static Value i32Bound(OpBuilder &b, Location loc, Value v, bool isSigned) {
+  Type i32 = b.getI32Type();
+  APInt c;
+  if (matchPattern(v, m_ConstantInt(&c))) {
+    if (isSigned ? !c.isSignedIntN(32) : !c.isIntN(32))
+      return {};
+    return arith::ConstantIntOp::create(b, loc, i32, c.trunc(32).getSExtValue());
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getOperand(0).getType() != i32 ||
+      !(isSigned ? isa<arith::IndexCastOp>(def)
+                 : isa<arith::IndexCastUIOp>(def)))
+    return {};
+  return def->getOperand(0);
+}
+
+/// Whether every iteration of `loop` (that has no undefined behaviour)
+/// accesses a memref at an index that is its iv: before any op of its body
+/// that has regions or calls. The iv is then not negative.
+static bool indexesEveryIteration(scf::ForOp loop) {
+  Value iv = loop.getInductionVar();
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    if (op.getNumRegions() || isa<CallOpInterface>(op))
+      return false;
+    ValueRange indices;
+    if (auto load = dyn_cast<memref::LoadOp>(op))
+      indices = load.getIndices();
+    else if (auto store = dyn_cast<memref::StoreOp>(op))
+      indices = store.getIndices();
+    if (llvm::is_contained(indices, iv))
+      return true;
+  }
+  return false;
+}
+
+/// An scf.for over index by 1 from lb to ub, both i32 values cast to index by
+/// signed casts (or both by unsigned ones), at least one not a constant, is
+/// the loop over i32 from lb to ub (compared signed, or unsigned), its iv the
+/// i32 iv cast to index the same way: the iterations are the same, and the
+/// i32 iv + 1 does not wrap (it is at most ub). (A signed iv from a constant
+/// lb >= 0, or that every iteration uses as a memref index, is not negative,
+/// and is cast unsigned,
+/// which keeps its addresses' extensions zero extensions.) No access bounds are needed
+/// (unlike the offsets loop below) and no trip count is computed.
+static bool narrowI32BoundsLoop(scf::ForOp loop, IRRewriter &rewriter) {
+  if (!matchPattern(loop.getStep(), m_One()))
+    return false;
+  Value lb = loop.getLowerBound(), ub = loop.getUpperBound();
+  if (matchPattern(lb, m_Constant()) && matchPattern(ub, m_Constant()))
+    return false;
+  Location loc = loop.getLoc();
+  for (bool isSigned : {true, false}) {
+    rewriter.setInsertionPoint(loop);
+    Value l = i32Bound(rewriter, loc, lb, isSigned);
+    Value u = l ? i32Bound(rewriter, loc, ub, isSigned) : Value();
+    if (!l || !u) {
+      for (Value v : {l, u})
+        if (v && v.getDefiningOp<arith::ConstantOp>() && v.use_empty())
+          rewriter.eraseOp(v.getDefiningOp());
+      continue;
+    }
+    Value one = arith::ConstantIntOp::create(rewriter, loc,
+                                             rewriter.getI32Type(), 1);
+    auto newLoop = scf::ForOp::create(rewriter, loc, l, u, one,
+                                      loop.getInitArgs(),
+                                      /*bodyBuilder=*/nullptr,
+                                      /*unsignedCmp=*/!isSigned);
+    Block *body = newLoop.getBody();
+    if (!body->empty())
+      rewriter.eraseOp(body->getTerminator());
+    rewriter.setInsertionPointToStart(body);
+    Value iv = newLoop.getInductionVar();
+    Type index = rewriter.getIndexType();
+    APInt lbValue;
+    std::optional<APInt> lbConst;
+    if (matchPattern(lb, m_ConstantInt(&lbValue)))
+      lbConst = lbValue;
+    Value wide =
+        isSigned && !(lbConst && !lbConst->isNegative()) &&
+                !indexesEveryIteration(loop)
+            ? arith::IndexCastOp::create(rewriter, loc, index, iv)
+                       .getResult()
+                 : arith::IndexCastUIOp::create(rewriter, loc, index, iv)
+                       .getResult();
+    SmallVector<Value> args{wide};
+    llvm::append_range(args, newLoop.getRegionIterArgs());
+    rewriter.mergeBlocks(loop.getBody(), body, args);
+    rewriter.replaceOp(loop, newLoop.getResults());
+    return true;
+  }
+  return false;
+}
+
 /// An scf.for over index whose offsets o = iv - lb are below a bound B <=
 /// 2^31 (loopOffsetBound) is a loop over o in i32, unsigned: from 0 to
 /// umin(ub - lb, B) (0 for ub <= lb) by umin(step, B), with iv = lb + o.
@@ -2331,6 +2426,8 @@ static void narrowLoops(gpu::GPUModuleOp m) {
   });
   IRRewriter rewriter(m.getContext());
   for (scf::ForOp loop : loops) {
+    if (narrowI32BoundsLoop(loop, rewriter))
+      continue;
     std::optional<uint64_t> bound = loopOffsetBound(loop);
     if (!bound)
       continue;

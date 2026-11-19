@@ -67,9 +67,13 @@ def cost(bindir, costbin, ll, tmp, cpu, args, optimize=True):
 
 
 def launch_args(src):
+  # --map VA=@FILE: FILE relative to the kernel file (memory contents, e.g.
+  # CSR row offsets).
   for l in open(src):
     if l.startswith('// agx-cost:'):
-      return l.split(':', 1)[1].split()
+      return [re.sub(r'=@(.*)$', lambda m: '=' + os.path.join(
+                  os.path.dirname(os.path.abspath(src)), m.group(1)), x)
+              for x in l.split(':', 1)[1].split()]
   return []
 
 
