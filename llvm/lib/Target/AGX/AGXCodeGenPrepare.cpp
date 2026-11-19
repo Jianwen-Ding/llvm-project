@@ -3346,7 +3346,10 @@ static Bytes4 byteSources(Value *V, unsigned Depth,
         R[B] = Src;
     }
   } else if (match(I, m_ZExt(m_Value(X))) &&
-             X->getType()->getIntegerBitWidth() <= 16) {
+             (X->getType()->isIntegerTy(8) || X->getType()->isIntegerTy(16))) {
+    // (not a narrower value: Leaf would give it no bytes, all zero, and an
+    // or with it would lose it; the cf fuzzer's (x & 255) | zext(i1),
+    // L15-E467)
     Value *W;
     if (X->getType()->isIntegerTy(16) && match(X, m_Trunc(m_Value(W))) &&
         W->getType()->isIntegerTy(32)) {
