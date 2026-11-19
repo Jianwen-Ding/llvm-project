@@ -5006,6 +5006,268 @@ static bool reluZeroSelects(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXExactDyadicSums(
+    "agx-exact-dyadic-sums", cl::init(true), cl::Hidden,
+    cl::desc("Float sums of converted small integers times dyadic constants "
+             "that are exact, converted back to integers, in integers"));
+
+namespace {
+/// A float value that is exactly N 2^E, N an integer in [Lo, Hi] (a zero
+/// has no exponent of its own: Zero).
+struct Dyadic {
+  int E = 0;
+  int64_t Lo = 0, Hi = 0;
+  bool Zero = false;
+};
+
+/// Float arithmetic on small integers (converted bytes, say) and dyadic
+/// constants whose every result is exact: |N| < 2^24 at a common exponent
+/// E >= -126 (no rounding, no denormal to flush), so the float operations
+/// compute N 2^E exactly whatever the rounding (L15-E401).
+struct DyadicSums {
+  const DataLayout &DL;
+  DenseMap<Value *, std::optional<Dyadic>> Memo;
+  SmallPtrSet<Instruction *, 16> Tree;
+  explicit DyadicSums(const DataLayout &DL) : DL(DL) {}
+
+  static bool fits(int64_t Lo, int64_t Hi, int E) {
+    return Lo > -(int64_t(1) << 24) && Hi < (int64_t(1) << 24) && E >= -126 &&
+           E <= 100;
+  }
+
+  std::optional<Dyadic> get(Value *V, unsigned Depth = 0) {
+    if (auto It = Memo.find(V); It != Memo.end())
+      return It->second;
+    std::optional<Dyadic> R = compute(V, Depth);
+    Memo[V] = R;
+    if (R)
+      if (auto *I = dyn_cast<Instruction>(V))
+        Tree.insert(I);
+    return R;
+  }
+
+  std::optional<Dyadic> compute(Value *V, unsigned Depth) {
+    using namespace PatternMatch;
+    if (Depth > 32 || !V->getType()->isFloatTy())
+      return std::nullopt;
+    if (auto *C = dyn_cast<ConstantFP>(V)) {
+      const APFloat &F = C->getValueAPF();
+      if (!F.isFinite())
+        return std::nullopt;
+      if (F.isZero()) {
+        Dyadic D;
+        D.Zero = true;
+        return D;
+      }
+      int Exp = ilogb(F);
+      // m 2^(Exp - 23), m the 24-bit significand, then made odd
+      APFloat M = scalbn(F, 23 - Exp, APFloat::rmNearestTiesToEven);
+      bool Exact;
+      APSInt I(64, /*isUnsigned=*/false);
+      M.convertToInteger(I, APFloat::rmTowardZero, &Exact);
+      if (!Exact)
+        return std::nullopt;
+      int64_t N = I.getExtValue();
+      int E = Exp - 23;
+      while (N % 2 == 0) {
+        N /= 2;
+        ++E;
+      }
+      if (!fits(N, N, E))
+        return std::nullopt;
+      return Dyadic{E, N, N, false};
+    }
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      return std::nullopt;
+    if (isa<UIToFPInst>(I) || isa<SIToFPInst>(I)) {
+      Value *X = I->getOperand(0);
+      if (!X->getType()->isIntegerTy() ||
+          X->getType()->getIntegerBitWidth() > 32)
+        return std::nullopt;
+      ConstantRange CR = computeConstantRangeIncludingKnownBits(
+          X, isa<SIToFPInst>(I), SimplifyQuery(DL));
+      int64_t Lo, Hi;
+      if (isa<UIToFPInst>(I)) {
+        Lo = 0;
+        Hi = CR.getUnsignedMax().getZExtValue();
+      } else {
+        Lo = CR.getSignedMin().getSExtValue();
+        Hi = CR.getSignedMax().getSExtValue();
+      }
+      if (!fits(Lo, Hi, 0))
+        return std::nullopt;
+      return Dyadic{0, Lo, Hi, false};
+    }
+    auto Mul = [&](const Dyadic &A, const Dyadic &B) -> std::optional<Dyadic> {
+      if (A.Zero || B.Zero) {
+        Dyadic D;
+        D.Zero = true;
+        return D;
+      }
+      int64_t P[] = {A.Lo * B.Lo, A.Lo * B.Hi, A.Hi * B.Lo, A.Hi * B.Hi};
+      Dyadic D{A.E + B.E, *std::min_element(P, P + 4),
+               *std::max_element(P, P + 4), false};
+      if (!fits(D.Lo, D.Hi, D.E))
+        return std::nullopt;
+      return D;
+    };
+    auto Add = [&](const Dyadic &A, const Dyadic &B,
+                   bool Sub) -> std::optional<Dyadic> {
+      if (B.Zero)
+        return A;
+      Dyadic Bn = B;
+      if (Sub)
+        Bn = Dyadic{B.E, -B.Hi, -B.Lo, false};
+      if (A.Zero)
+        return Bn;
+      int E = std::min(A.E, Bn.E);
+      if (A.E - E > 24 || Bn.E - E > 24)
+        return std::nullopt;
+      int64_t SA = int64_t(1) << (A.E - E), SB = int64_t(1) << (Bn.E - E);
+      // (each operand scaled to E fits the i32 it is built in)
+      auto Small = [](int64_t V) { return V > -(int64_t(1) << 30) && V < (int64_t(1) << 30); };
+      if (!Small(A.Lo * SA) || !Small(A.Hi * SA) || !Small(Bn.Lo * SB) ||
+          !Small(Bn.Hi * SB))
+        return std::nullopt;
+      Dyadic D{E, A.Lo * SA + Bn.Lo * SB, A.Hi * SA + Bn.Hi * SB, false};
+      if (!fits(D.Lo, D.Hi, D.E))
+        return std::nullopt;
+      return D;
+    };
+    Value *X, *Y, *Z;
+    if (match(I, m_FMul(m_Value(X), m_Value(Y)))) {
+      auto A = get(X, Depth + 1), B = get(Y, Depth + 1);
+      return A && B ? Mul(*A, *B) : std::nullopt;
+    }
+    if (match(I, m_FAdd(m_Value(X), m_Value(Y))) ||
+        match(I, m_FSub(m_Value(X), m_Value(Y)))) {
+      auto A = get(X, Depth + 1), B = get(Y, Depth + 1);
+      return A && B ? Add(*A, *B, I->getOpcode() == Instruction::FSub)
+                    : std::nullopt;
+    }
+    if (match(I, m_Intrinsic<Intrinsic::fma>(m_Value(X), m_Value(Y), m_Value(Z))) ||
+        match(I, m_Intrinsic<Intrinsic::fmuladd>(m_Value(X), m_Value(Y),
+                                                 m_Value(Z)))) {
+      auto A = get(X, Depth + 1), B = get(Y, Depth + 1), C = get(Z, Depth + 1);
+      if (!A || !B || !C)
+        return std::nullopt;
+      auto P = Mul(*A, *B);
+      return P ? Add(*P, *C, false) : std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+  /// N of V at exponent E (E at most V's own), as an i32.
+  Value *build(IRBuilder<> &B, Value *V, int E) {
+    using namespace PatternMatch;
+    Dyadic D = *Memo.lookup(V);
+    if (D.Zero)
+      return B.getInt32(0);
+    auto Scaled = [&](Value *N, int From) {
+      return From == E ? N : B.CreateShl(N, From - E);
+    };
+    if (auto *C = dyn_cast<ConstantFP>(V))
+      return Scaled(B.getInt32(int32_t(D.Lo)), D.E);
+    auto *I = cast<Instruction>(V);
+    if (isa<UIToFPInst>(I) || isa<SIToFPInst>(I)) {
+      Value *X = I->getOperand(0);
+      Value *N = isa<UIToFPInst>(I) ? B.CreateZExtOrTrunc(X, B.getInt32Ty())
+                                    : B.CreateSExtOrTrunc(X, B.getInt32Ty());
+      return Scaled(N, 0);
+    }
+    Value *X, *Y, *Z;
+    auto Prod = [&](Value *A, Value *Bv) -> std::pair<Value *, int> {
+      Dyadic DA = *Memo.lookup(A), DB = *Memo.lookup(Bv);
+      if (DA.Zero || DB.Zero)
+        return {B.getInt32(0), E};
+      return {B.CreateMul(build(B, A, DA.E), build(B, Bv, DB.E)), DA.E + DB.E};
+    };
+    if (match(I, m_FMul(m_Value(X), m_Value(Y)))) {
+      auto [N, PE] = Prod(X, Y);
+      return Scaled(N, PE);
+    }
+    if (match(I, m_FAdd(m_Value(X), m_Value(Y))) ||
+        match(I, m_FSub(m_Value(X), m_Value(Y)))) {
+      Value *NX = build(B, X, E), *NY = build(B, Y, E);
+      return I->getOpcode() == Instruction::FSub ? B.CreateSub(NX, NY)
+                                                 : B.CreateAdd(NX, NY);
+    }
+    if (match(I, m_Intrinsic<Intrinsic::fma>(m_Value(X), m_Value(Y), m_Value(Z))) ||
+        match(I, m_Intrinsic<Intrinsic::fmuladd>(m_Value(X), m_Value(Y),
+                                                 m_Value(Z)))) {
+      auto [N, PE] = Prod(X, Y);
+      return B.CreateAdd(Scaled(N, PE), build(B, Z, E));
+    }
+    llvm_unreachable("not a dyadic value");
+  }
+};
+} // namespace
+
+/// fptosi / fptoui (saturating or not) of an exact dyadic sum (DyadicSums):
+/// the truncation of N 2^E, in integers, where nothing else uses the float
+/// values (a 3 x 3 blur of bytes with weights 1/16, 1/8, 1/4, rounded by
+/// + 0.5: (sum of w p + 8) >> 4).
+static bool exactDyadicSums(Function &F) {
+  if (!AGXExactDyadicSums)
+    return false;
+  SmallVector<Instruction *, 8> Convs;
+  for (Instruction &I : instructions(F)) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (isa<FPToSIInst>(I) || isa<FPToUIInst>(I) ||
+        (II && (II->getIntrinsicID() == Intrinsic::fptosi_sat ||
+                II->getIntrinsicID() == Intrinsic::fptoui_sat)))
+      if (I.getOperand(0)->getType()->isFloatTy() &&
+          I.getType()->isIntegerTy() && I.getType()->getIntegerBitWidth() <= 32)
+        Convs.push_back(&I);
+  }
+  bool Changed = false;
+  for (Instruction *Conv : Convs) {
+    DyadicSums DS(F.getDataLayout());
+    Value *V = Conv->getOperand(0);
+    std::optional<Dyadic> D = DS.get(V);
+    if (!D || D->Zero || !isa<Instruction>(V))
+      continue;
+    // (only these conversions use the tree's values: it is replaced)
+    if (!all_of(DS.Tree, [&](Instruction *T) {
+          return all_of(T->users(), [&](User *U) {
+            auto *UI = cast<Instruction>(U);
+            return UI == Conv || DS.Tree.contains(UI);
+          });
+        }))
+      continue;
+    // the truncation of N 2^E toward zero; a saturating one in range
+    unsigned W = Conv->getType()->getIntegerBitWidth();
+    bool Signed = isa<FPToSIInst>(Conv) ||
+                  (isa<IntrinsicInst>(Conv) &&
+                   cast<IntrinsicInst>(Conv)->getIntrinsicID() ==
+                       Intrinsic::fptosi_sat);
+    bool Sat = isa<IntrinsicInst>(Conv);
+    if (D->E < 0 && D->Lo < 0)
+      continue; // (mixed or negative: not a plain shift)
+    if (D->E > 0 && (D->Hi >= (int64_t(1) << (31 - D->E))))
+      continue;
+    int64_t TLo = D->E >= 0 ? D->Lo << D->E : D->Lo >> -D->E;
+    int64_t THi = D->E >= 0 ? D->Hi << D->E : D->Hi >> -D->E;
+    if (Sat) {
+      int64_t Min = Signed ? -(int64_t(1) << (W - 1)) : 0;
+      int64_t Max = Signed ? (int64_t(1) << (W - 1)) - 1
+                           : (int64_t(1) << W) - 1;
+      if (TLo < Min || THi > Max)
+        continue;
+    }
+    IRBuilder<> B(Conv);
+    Value *N = DS.build(B, V, D->E);
+    Value *R = D->E >= 0 ? B.CreateShl(N, D->E) : B.CreateLShr(N, -D->E);
+    R = B.CreateTrunc(R, Conv->getType());
+    Conv->replaceAllUsesWith(R);
+    Conv->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(V);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNeverNaNTests(
     "agx-never-nan-tests", cl::init(true), cl::Hidden,
     cl::desc("Fold NaN tests of values no execution makes a NaN (a running "
@@ -5258,6 +5520,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= zeroSignFreeMinMax(F);
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);
+  Changed |= exactDyadicSums(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)
