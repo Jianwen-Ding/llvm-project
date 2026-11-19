@@ -12,8 +12,8 @@ declare float @llvm.maximum.f32(float, float)
 ; CHECK:       [[DB:%.*]] = fsub float %b, %u
 ; CHECK:       [[C:%.*]] = fcmp ogt float %b, %a
 ; CHECK:       select i1 [[C]], float [[DA]], float [[DB]]
-; CHECK:       @llvm.roundeven.f32
-; CHECK-NOT:   @llvm.roundeven.f32
+; CHECK:       fadd float {{.*}}, f0x4B400000
+; CHECK-NOT:   fadd float {{.*}}, f0x4B400000
 ; CHECK:       %exp.one = select
 ; CHECK:       [[OA:%.*]] = fadd float 1.000000e+00, [[DA]]
 ; CHECK:       select i1 [[C]], float %exp.one, float [[OA]]
@@ -36,8 +36,8 @@ define agx_kernel void @pair(ptr addrspace(1) %p, float %a, float %b) {
 declare float @llvm.maxnum.f32(float, float)
 ; CHECK-LABEL: @pair_maxnum(
 ; CHECK:       fcmp ogt float %b, %a
-; CHECK:       @llvm.roundeven.f32
-; CHECK-NOT:   @llvm.roundeven.f32
+; CHECK:       fadd float {{.*}}, f0x4B400000
+; CHECK-NOT:   fadd float {{.*}}, f0x4B400000
 ; CHECK:       ret void
 define agx_kernel void @pair_maxnum(ptr addrspace(1) %p, float %a, float %b) {
   %u = call float @llvm.maxnum.f32(float %a, float %b)

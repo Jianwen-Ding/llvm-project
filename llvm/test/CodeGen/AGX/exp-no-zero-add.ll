@@ -5,13 +5,15 @@
 ; would only turn r = -0 into +0, where e^r is 1 either way; and no +inf / +0
 ; selects beyond the clamps of x to [-104, 89], where the result overflows
 ; and rounds to +0 by itself (both checked for every float, flushing and
-; not). The two clamps stay; the scale 2^n, an exponent addition where f32
+; not). n = round(x / ln 2) is t + 1.5 2^23 - 1.5 2^23, the constant read
+; negated the second time (L15-E469). The two clamps stay; the scale 2^n, an exponent addition where f32
 ; flushes, ends in one NaN select (a NaN x makes n arbitrary).
 
 ; CHECK-LABEL: e:
 ; CHECK: fcmpsel lt,
 ; CHECK: fcmpsel gt,
-; CHECK: rint
+; CHECK: fadd32 [[M:r[0-9]+]], {{r[0-9]+}}, [[C:r[0-9]+]]
+; CHECK-NEXT: fadd32 {{r[0-9]+}}, [[M]], [[C]].neg
 ; CHECK-NOT: fadd32 {{r[0-9]+}}, {{r[0-9]+}}, 0.0
 ; CHECK: fcmpsel eq
 ; CHECK-NOT: fcmpsel

@@ -34,6 +34,11 @@
 using namespace llvm;
 using namespace llvm::PatternMatch;
 
+static cl::opt<bool> ExpMagicRound(
+    "agx-exp-magic-round", cl::init(true), cl::Hidden,
+    cl::desc("exp's n = round(x / ln 2) by adding and subtracting 1.5 2^23, "
+             "its integer the sum's low bits (no rint or convert)"));
+
 static cl::opt<bool> NegatedClamp(
     "agx-exp-negated-clamp",
     cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
@@ -504,12 +509,17 @@ public:
   }
   /// v * 2^n for an integral n in [-252, 254], in two steps. The split is
   /// done on the integer: i >> 1 and i - (i >> 1) are both in [-126, 127].
+  /// \p MagicBits: n's integer in the low bits of a float's (n + 1.5 2^23,
+  /// whose bits are 0x4b400000 + n), instead of converting n.
   Value *ldexp(Value *V, Value *N, bool NoOverflow = false,
-              bool NoUnderflow = false) {
+              bool NoUnderflow = false, Value *MagicBits = nullptr) {
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
-    Value *I = B.CreateFreeze(B.CreateFPToSI(N, intTy()));
+    Value *I = MagicBits ? nullptr : B.CreateFreeze(B.CreateFPToSI(N, intTy()));
     if (NoDenormals && IntegerLdexp) {
+      // (0x4b400000 << 23 is 0 mod 2^32: the magic bits shift as n does)
+      if (MagicBits)
+        I = B.CreateFreeze(MagicBits);
       // v is the exponential's e^r in [0.7, 1.42] (or a NaN): v 2^n is its
       // bits plus n << 23 while that is a normal float; at or past the
       // infinite exponent +inf, below the normal range the +0 that the
@@ -524,6 +534,8 @@ public:
         R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
       return sel(B.CreateFCmpUNO(V, V), V, R);
     }
+    if (!I)
+      I = B.CreateFreeze(B.CreateSub(MagicBits, ki(0x4b400000)));
     Value *I1 = B.CreateAShr(I, ki(1));
     return mul(mul(V, pow2i(I1)), pow2i(B.CreateSub(I, I1)));
   }
@@ -565,11 +577,22 @@ public:
                         : sel(gt(Hi, 89.0), k(89.0),
                               sel(lt(Hi, -104.0), k(-104.0), Hi));
     }
-    Value *N = call(Intrinsic::roundeven, {mul(C, k(M_LOG2E))});
+    Value *T = mul(C, k(M_LOG2E));
+    Value *N, *MagicBits = nullptr;
+    if (ExpMagicRound) {
+      // |t| <= 151: t + 1.5 2^23 rounds to the integer nearest t, ties to
+      // even (1.5 2^23 is even), on the FP pipe instead of the shared
+      // units' rint and convert (L15-E469); n = that - 1.5 2^23 exactly.
+      Value *M = add(T, k(12582912.0));
+      N = sub(M, k(12582912.0));
+      MagicBits = B.CreateBitCast(M, intTy());
+    } else {
+      N = call(Intrinsic::roundeven, {T});
+    }
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
     Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N,
-                     NoOverflow && !Lo, NonNegative);
+                     NoOverflow && !Lo, NonNegative, MagicBits);
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.

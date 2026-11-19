@@ -17,7 +17,7 @@ define agx_kernel void @exp_neg(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 ; CHECK: fcmpsel gt, r1h, r1l, r1h, r1h, r1l
 ; CHECK-NEXT: fcmpsel lt, r1l, r1l, r2l, r2l, r1h
 ; CHECK: fmul32 r2, r1l.neg, r2
-; CHECK: fmadd32 r1, r2, r3, r1l.neg
+; CHECK: fmadd32 r1, r3, r4, r1l.neg
 ; OFF-LABEL: exp_neg:
 ; OFF: fadd32 r1, r1l, -0.0
 ; OFF-NEXT: fcmpsel gt, r2, r1, r2, r2, r1

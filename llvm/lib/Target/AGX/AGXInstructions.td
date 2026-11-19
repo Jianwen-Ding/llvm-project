@@ -588,7 +588,9 @@ def agx_shl_local_oneuse : PatFrag<(ops node:$a, node:$s), (shl node:$a, node:$s
   if (A.getOpcode() == ISD::FREEZE)
     A = A.getOperand(0);
   return N->hasOneUse() && (A.getOpcode() == ISD::FP_TO_SINT ||
-                            A.getOpcode() == ISD::FP_TO_SINT_SAT);
+                            A.getOpcode() == ISD::FP_TO_SINT_SAT ||
+                            (A.getOpcode() == ISD::BITCAST &&
+                             A.getOperand(0).getValueType() == MVT::f32));
 }]>;
 let AddedComplexity = 1 in
 def : Pat<(i32 (add (agx_shl_local_oneuse AGXIntSrc32:$a, agx_imadd_shift_reg:$s),

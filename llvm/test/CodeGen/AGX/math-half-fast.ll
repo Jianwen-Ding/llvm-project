@@ -14,7 +14,7 @@
 ; CHECK-NOT: fmadd32 {{r[0-9]+}}, {{r[0-9]+}}.neg, [[Y]], 1.0
 ; CHECK: stop
 ; OFF-LABEL: tanh_h:
-; OFF: rint
+; OFF: mov_imm {{r[0-9]+}}, 1262485504
 ; OFF: fmadd32 {{r[0-9]+}}, {{r[0-9]+}}.neg, {{r[0-9]+}}, 1.0
 define void @tanh_h(ptr addrspace(1) %p) {
   %x = load half, ptr addrspace(1) %p
@@ -26,10 +26,10 @@ define void @tanh_h(ptr addrspace(1) %p) {
 ; CHECK-LABEL: cosh_h:
 ; CHECK: exp2
 ; CHECK: rcp
-; CHECK-NOT: rint
+; CHECK-NOT: mov_imm {{r[0-9]+}}, 1262485504
 ; CHECK: stop
 ; OFF-LABEL: cosh_h:
-; OFF: rint
+; OFF: mov_imm {{r[0-9]+}}, 1262485504
 define void @cosh_h(ptr addrspace(1) %p) {
   %x = load half, ptr addrspace(1) %p
   %r = call half @llvm.cosh.f16(half %x)
@@ -54,7 +54,7 @@ define void @atan_h(ptr addrspace(1) %p) {
 
 ; bfloat: the float expansion
 ; CHECK-LABEL: tanh_bf:
-; CHECK: rint
+; CHECK: mov_imm {{r[0-9]+}}, 1262485504
 define void @tanh_bf(ptr addrspace(1) %p) {
   %x = load bfloat, ptr addrspace(1) %p
   %r = call bfloat @llvm.tanh.bf16(bfloat %x)

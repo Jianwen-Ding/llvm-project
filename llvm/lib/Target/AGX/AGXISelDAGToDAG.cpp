@@ -613,6 +613,11 @@ bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
   return Opc == ISD::SIGN_EXTEND || !InnerSX;
 }
 
+static cl::opt<bool> AGXNegConstantModifiers(
+    "agx-neg-constant-modifiers", cl::init(true), cl::Hidden,
+    cl::desc("A negative floating point constant source is its magnitude "
+             "with the neg modifier"));
+
 /// Floating point sources fold neg and abs into modifiers, and constants
 /// representable as 8-bit floats into the instruction.
 bool AGXDAGToDAGISel::SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods) {
@@ -651,6 +656,31 @@ bool AGXDAGToDAGISel::SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods) {
         Mods = getI32Imm(0, DL);
         return true;
       }
+    }
+    // A negative constant whose magnitude the block also uses is that
+    // negated by the modifier: c and -c share one register (exp's t + 1.5 2^23 - 1.5 2^23, L15-E469).
+    if (AGXNegConstantModifiers && !(M & AGX::SRC_MOD_ABS) &&
+        C->getValueAPF().isNegative() && C->getValueAPF().isFiniteNonZero() &&
+        (N.getValueType() == MVT::f32 || N.getValueType() == MVT::f16 ||
+         N.getValueType() == MVT::bf16)) {
+      APFloat Mag = C->getValueAPF();
+      Mag.clearSign();
+      EVT VT = N.getValueType();
+      // only where the block uses the magnitude itself
+      SDValue Pos = CurDAG->getConstantFP(Mag, DL, VT);
+      if (Pos->use_empty()) {
+        CurDAG->RemoveDeadNode(Pos.getNode());
+        Src = N;
+        Mods = getI32Imm(M, DL);
+        return true;
+      }
+      Src = SDValue(CurDAG->getMachineNode(
+                        VT == MVT::f32 ? AGX::MOV_IMM32 : AGX::MOV_IMM16, DL, VT,
+                        CurDAG->getTargetConstant(
+                            Mag.bitcastToAPInt().getZExtValue(), DL, MVT::i32)),
+                    0);
+      Mods = getI32Imm(M ^ AGX::SRC_MOD_NEG, DL);
+      return true;
     }
   }
 
