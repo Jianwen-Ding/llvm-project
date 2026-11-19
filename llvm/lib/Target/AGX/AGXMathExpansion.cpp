@@ -54,6 +54,11 @@ static cl::opt<bool> ExpUnclamped(
     cl::desc("exp's +0 select by its argument's compare too, and no clamps "
              "of the argument"));
 
+static cl::opt<bool> ExpFlushedUnderflow(
+    "agx-exp-flushed-underflow", cl::init(true), cl::Hidden,
+    cl::desc("exp below a maximum whose users flush denormal operands: "
+             "clamped at its +0 bound, no +0 select"));
+
 static cl::opt<bool> TanhDoubledClamp(
     "agx-tanh-doubled-clamp", cl::init(true), cl::Hidden,
     cl::desc("tanh's 2 min(|x|, 9) as min(|x| + |x|, 18)"));
@@ -141,6 +146,8 @@ class MathBuilder {
 public:
   // f32 arithmetic's NaN is 0x7fc00000 (no canonical-nan feature).
   bool NativeNaN = false;
+  // exp's result only reaches arithmetic that flushes denormal operands.
+  bool ExpResultFlushed = false;
 
   MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false,
               bool HalfResult = false, bool NarrowResult = false)
@@ -619,11 +626,17 @@ public:
     // integer sum wraps: all selected away.)
     // (Not below a maximum: there only the clamp at -104 would go, and the
     // argument held to the end took a register: attn_decode_f16 +1.1% tput.)
+    bool FlushedUnderflow = ExpResultFlushed && ExpFlushedUnderflow &&
+                            ExpMagicRound && NoDenormals && IntegerLdexp;
     bool Unclamped = !Lo && !Bounded && !NoOverflow && ExpUnclamped &&
                      ExpOverflowByArg && ExpMagicRound && NativeNaN &&
                      NoDenormals && IntegerLdexp;
     if (Unclamped) {
       C = Hi;
+    } else if (NoOverflow && !Bounded && !Lo && FlushedUnderflow) {
+      // (E474's +0 bound as the clamp: there the scaled bits are 0x007fffxx,
+      // a denormal its users flush to the +0 the select gave: L15-E479)
+      C = sel(lt(Hi, -87.3365478515625), k(-87.3365478515625), Hi);
     } else if (NoOverflow && !Bounded && !Lo) {
       // (at most a denormal above 0: only the clamp below)
       C = sel(lt(Hi, -104.0), k(-104.0), Hi);
@@ -655,8 +668,10 @@ public:
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
     Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N,
-                     NoOverflow && !Lo, NonNegative, MagicBits,
-                     !Lo && !Bounded ? C : nullptr);
+                     NoOverflow && !Lo,
+                     NonNegative ||
+                         (NoOverflow && !Bounded && !Lo && FlushedUnderflow),
+                     MagicBits, !Lo && !Bounded ? C : nullptr);
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.
@@ -942,10 +957,12 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                        ArrayRef<Value *> Args, bool FlushF32,
-                       bool ExpNoOverflow, bool NativeNaN) {
+                       bool ExpNoOverflow, bool NativeNaN,
+                       bool ExpResultFlushed) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
                    M.NativeNaN = NativeNaN;
+                   M.ExpResultFlushed = ExpResultFlushed;
                    switch (ID) {
                    case Intrinsic::tan:
                      return M.tan(A[0]);

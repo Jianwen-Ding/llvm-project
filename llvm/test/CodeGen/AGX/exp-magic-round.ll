@@ -72,6 +72,7 @@ declare float @llvm.sin.f32(float)
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -mattr=+canonical-nan < %s | FileCheck %s --check-prefix=CNAN
 ; CHECK-LABEL: below_max:
 ; CHECK-NOT: fcmpsel eq
+; CHECK: icmpsel slt
 ; CHECK: stop
 ; CNAN-LABEL: below_max:
 ; CNAN: fcmpsel eq
@@ -84,3 +85,24 @@ define agx_kernel void @below_max(ptr addrspace(1) %p) {
   ret void
 }
 !0 = !{}
+
+; Below a maximum, with only f32 arithmetic using the result (which flushes
+; a denormal operand): the argument clamped at the +0 bound -87.3365479,
+; where the scaled bits are a denormal, and no +0 select (L15-E479). Stored
+; directly (below_max above) the select stays.
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-exp-flushed-underflow=0 < %s | FileCheck %s --check-prefix=SEL
+; CHECK-LABEL: below_max_sum:
+; CHECK: mov_imm {{r[0-9]+}}, -1028740016
+; CHECK-NOT: icmpsel slt
+; CHECK: stop
+; SEL-LABEL: below_max_sum:
+; SEL: icmpsel slt
+define agx_kernel void @below_max_sum(ptr addrspace(1) %p, float %s) {
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr float, ptr addrspace(1) %p, i32 %t
+  %x = load float, ptr addrspace(1) %q, align 4
+  %y = call float @llvm.exp.f32(float %x), !agx.exp.below.max !0
+  %z = fadd float %y, %s
+  store float %z, ptr addrspace(1) %q, align 4
+  ret void
+}

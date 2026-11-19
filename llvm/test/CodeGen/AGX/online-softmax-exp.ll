@@ -14,7 +14,7 @@ declare float @llvm.maximum.f32(float, float)
 ; CHECK:       select i1 [[C]], float [[DA]], float [[DB]]
 ; CHECK:       fadd float {{.*}}, f0x4B400000
 ; CHECK-NOT:   fadd float {{.*}}, f0x4B400000
-; CHECK:       %exp.one = select
+; CHECK:       %exp.one = {{select|bitcast}}
 ; CHECK:       [[OA:%.*]] = fadd float 1.000000e+00, [[DA]]
 ; CHECK:       select i1 [[C]], float %exp.one, float [[OA]]
 ; CHECK:       [[OB:%.*]] = fadd float 1.000000e+00, [[DB]]

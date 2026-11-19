@@ -8732,6 +8732,65 @@ static bool reciprocalsAboveOne(Function &F) {
   return !Divs.empty() || !Quots.empty();
 }
 
+/// Whether \p V reaches only f32 arithmetic that flushes a denormal operand
+/// (fadd, fsub, fmul, fma; through selects' values, phis, negations and
+/// vector moves): a denormal there is the zero of its sign.
+static bool onlyFlushingUses(Value *V) {
+  SmallVector<Value *, 16> Work{V};
+  SmallPtrSet<Value *, 16> Seen{V};
+  while (!Work.empty()) {
+    Value *X = Work.pop_back_val();
+    for (Use &U : X->uses()) {
+      auto *I = cast<Instruction>(U.getUser());
+      if (!I->getType()->getScalarType()->isFloatTy() &&
+          !isa<ExtractElementInst>(I))
+        return false;
+      // (not with a constant that makes it the identity a fold would turn
+      // into the operand itself, unflushed: x + -0, x * 1, ...)
+      auto Degenerate = [&](Instruction *J) {
+        return any_of(J->operands(), [](Value *O) {
+          const APFloat *C;
+          return match(O, PatternMatch::m_APFloat(C)) &&
+                 (C->isZero() || C->isExactlyValue(1.0) ||
+                  C->isExactlyValue(-1.0));
+        });
+      };
+      switch (I->getOpcode()) {
+      case Instruction::FAdd:
+      case Instruction::FSub:
+      case Instruction::FMul:
+        if (Degenerate(I))
+          return false;
+        continue;
+      case Instruction::Select:
+        if (U.getOperandNo() == 0)
+          return false;
+        break;
+      case Instruction::PHI:
+      case Instruction::FNeg:
+      case Instruction::InsertElement:
+      case Instruction::ShuffleVector:
+      case Instruction::ExtractElement:
+        if (isa<InsertElementInst>(I) && U.getOperandNo() == 2)
+          return false;
+        break;
+      default:
+        if (auto *II = dyn_cast<IntrinsicInst>(I);
+            II && (II->getIntrinsicID() == Intrinsic::fma ||
+                   II->getIntrinsicID() == Intrinsic::fmuladd) &&
+            !Degenerate(II))
+          continue;
+        return false;
+      }
+      if (Seen.size() > 64)
+        return false;
+      if (Seen.insert(I).second)
+        Work.push_back(I);
+    }
+  }
+  return true;
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
   bool Changed = expandRoundToInt(F);
   Changed |= expandPowI(F);
@@ -8786,7 +8845,10 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
       SmallVector<Value *, 2> Args(II->args());
       Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args,
                                  !ST.hasIEEEFP32(), ExpNoOverflow.count(II),
-                                 !ST.hasCanonicalNaN());
+                                 !ST.hasCanonicalNaN(),
+                                 !ST.hasIEEEFP32() &&
+                                     II->getIntrinsicID() == Intrinsic::exp &&
+                                     onlyFlushingUses(II));
       R->takeName(II);
       II->replaceAllUsesWith(R);
       ExpNoOverflow.erase(II);
