@@ -53,3 +53,24 @@ done:
   store float %mn, ptr addrspace(1) %o, align 4
   ret void
 }
+
+; An nsz maximum (no zero sign to keep) lowers to its compare-select and NaN
+; select already: it stays (L15-E445).
+; CHECK-LABEL: @nsz(
+; CHECK:       call nsz float @llvm.maximum.f32
+define agx_kernel void @nsz(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %in, %loop ]
+  %m = phi float [ 0xFFF0000000000000, %entry ], [ %mn, %loop ]
+  %p = getelementptr inbounds float, ptr addrspace(1) %x, i32 %i
+  %v = load float, ptr addrspace(1) %p, align 4
+  %mn = call nsz float @llvm.maximum.f32(float %m, float %v)
+  %in = add nuw i32 %i, 1
+  %c = icmp ult i32 %in, %n
+  br i1 %c, label %loop, label %done
+done:
+  store float %mn, ptr addrspace(1) %o, align 4
+  ret void
+}

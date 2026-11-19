@@ -6543,7 +6543,8 @@ static bool deferredMinMaxReductions(Function &F) {
         if (X == U)
           break;
         if (!C || C->getIntrinsicID() != U->getIntrinsicID() ||
-            !L->contains(C) || Chain.size() > 16) {
+            !L->contains(C) || Chain.size() > 16 ||
+            C->hasNoSignedZeros()) {
           Bad = true;
           break;
         }
@@ -6848,8 +6849,10 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= signedWideMuls(F);
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
-  Changed |= deferredMinMaxReductions(F);
   Changed |= zeroSignFreeMinMax(F);
+  // (after the zero-sign-free min / max: an nsz link lowers without the fix
+  // this defers, to as few instructions)
+  Changed |= deferredMinMaxReductions(F);
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
