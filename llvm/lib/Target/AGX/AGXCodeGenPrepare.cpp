@@ -5289,11 +5289,81 @@ static Value *stripSinglePhis(Value *V) {
   return V;
 }
 
+static cl::opt<bool> AGXExpInPlaceStores(
+    "agx-exp-in-place-stores", cl::init(true), cl::Hidden,
+    cl::desc("exp(x - m) below an earlier loop's maximum also where x's "
+             "loop stores to the address it loaded x from"));
+
+/// The addresses P takes in L's iterations, each accessing Size bytes, do
+/// not overlap: P is invariant terms plus one of an affine recurrence of L
+/// with a constant step, through zero or sign extensions and a constant
+/// scale at least Size whose product cannot wrap, the recurrence not
+/// wrapping (its width) over L's maximum trip.
+static bool disjointIterations(const SCEV *P, const Loop *L,
+                               ScalarEvolution &SE, uint64_t Size) {
+  const SCEV *BTC = SE.getConstantMaxBackedgeTakenCount(L);
+  auto *N = dyn_cast<SCEVConstant>(BTC);
+  if (!N || N->getAPInt().getActiveBits() > 32)
+    return false;
+  APInt Back = N->getAPInt().zext(128);
+  // the variant operand of a sum
+  while (auto *A = dyn_cast<SCEVAddExpr>(P)) {
+    const SCEV *V = nullptr;
+    for (const SCEV *Op : A->operands())
+      if (!SE.isLoopInvariant(Op, L)) {
+        if (V)
+          return false;
+        V = Op;
+      }
+    if (!V)
+      return false;
+    P = V;
+  }
+  // a scale: c * ext(r), c at least Size, c * 2^width(r) within P's width
+  uint64_t Scale = 1;
+  if (auto *M = dyn_cast<SCEVMulExpr>(P)) {
+    auto *C = dyn_cast<SCEVConstant>(M->getOperand(0));
+    if (M->getNumOperands() != 2 || !C || C->getAPInt().isNegative() ||
+        C->getAPInt().getActiveBits() > 32)
+      return false;
+    Scale = C->getAPInt().getZExtValue();
+    P = M->getOperand(1);
+    auto *Ext = dyn_cast<SCEVCastExpr>(P);
+    if (!isa_and_nonnull<SCEVZeroExtendExpr, SCEVSignExtendExpr>(Ext))
+      return false;
+    unsigned From = Ext->getOperand()->getType()->getScalarSizeInBits();
+    unsigned To = Ext->getType()->getScalarSizeInBits();
+    if (From > 64 || To > 64 ||
+        !(APInt(128, Scale) << From).ule(APInt(128, 1) << To))
+      return false;
+  }
+  while (isa<SCEVZeroExtendExpr, SCEVSignExtendExpr>(P))
+    P = cast<SCEVCastExpr>(P)->getOperand();
+  auto *R = dyn_cast<SCEVAddRecExpr>(P);
+  if (!R || R->getLoop() != L || !R->isAffine())
+    return false;
+  auto *S = dyn_cast<SCEVConstant>(R->getStepRecurrence(SE));
+  if (!S || S->getAPInt().isZero())
+    return false;
+  unsigned W = R->getType()->getScalarSizeInBits();
+  APInt Step = S->getAPInt().abs().zext(128);
+  // r's values distinct mod 2^w: every difference j s, 0 < j <= the
+  // backedge-taken count,
+  // below 2^w; then the addresses differ by at least the step (unscaled)
+  // or the scale, and at most 2^w less that.
+  APInt Span = Step * Back;
+  APInt Top = APInt(128, 1) << W;
+  if (Scale == 1)
+    return Step.uge(Size) && (Span + Size).ule(Top);
+  return Scale >= Size && Span.ult(Top);
+}
+
 /// exp(x - m) where m is an earlier loop's running maximum (maxnum,
 /// maximumnum or maximum, every iteration) of a load whose address
 /// recurrence {s, +, t} is x's load's, x's loop running at most as many
 /// iterations, and nothing that writes memory or synchronizes between the
-/// two: each x is a value the maximum took in, so x - m is at most 0 (or a
+/// two (but x's loop's stores to x's own address after the load, no two
+/// iterations overlapping): each x is a value the maximum took in, so x - m is at most 0 (or a
 /// denormal where the maximum's comparison flushes) or a NaN, and e^(x - m)
 /// does not overflow (a softmax's or cross-entropy's second pass).
 static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
@@ -5408,6 +5478,22 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
       !(B1 == B2 || SE.isKnownPredicate(ICmpInst::ICMP_ULE, B2, B1)))
     return false;
   // nothing between L1 and the load writes memory or waits for other threads
+  // but, in L2 (an in-place pass: softmax's third), a store after the load
+  // to its own address, which no other iteration's access overlaps
+  // (L15-E387)
+  const SCEV *P2 = SE.getSCEV(L2Load->getPointerOperand());
+  const DataLayout &DL = E->getDataLayout();
+  auto OwnStore = [&](Instruction &I) {
+    auto *St = dyn_cast<StoreInst>(&I);
+    return AGXExpInPlaceStores && St && St->isSimple() && L2->contains(St) &&
+           SE.getSCEV(St->getPointerOperand()) == P2 &&
+           DT.dominates(L2Load, St) &&
+           disjointIterations(P2, L2, SE,
+                              std::max(DL.getTypeStoreSize(X->getType()),
+                                       DL.getTypeStoreSize(
+                                           St->getValueOperand()->getType()))
+                                  .getFixedValue());
+  };
   BasicBlock *H1 = L1->getHeader(), *To = L2Load->getParent();
   for (BasicBlock &BB : *E->getFunction()) {
     if (!isPotentiallyReachable(H1, &BB, nullptr, &DT, &LI) ||
@@ -5416,8 +5502,9 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
     for (Instruction &I : BB)
       // (barriers have side effects; a SIMD-group reduction does not
       // touch memory)
-      if (I.mayWriteToMemory() || I.mayHaveSideEffects() ||
-          (isa<CallBase>(I) && !isa<IntrinsicInst>(I)))
+      if ((I.mayWriteToMemory() || I.mayHaveSideEffects() ||
+           (isa<CallBase>(I) && !isa<IntrinsicInst>(I))) &&
+          !OwnStore(I))
         return false;
   }
   return true;
