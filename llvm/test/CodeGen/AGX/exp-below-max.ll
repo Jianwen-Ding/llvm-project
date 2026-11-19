@@ -11,21 +11,21 @@
 
 ; CHECK-LABEL: xent:
 ; CHECK:       // %l2
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       jmp_exec_any
 ; OFF-LABEL:   xent:
 ; OFF:         // %l2
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK-LABEL: local:
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       stop
 ; OFF-LABEL:   local:
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK-LABEL: simd:
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       stop
 ; OFF-LABEL:   simd:
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 
 target triple = "agx"
 
@@ -130,12 +130,12 @@ define agx_kernel void @simd(ptr addrspace(1) %x) {
 ; CHECK-LABEL: xent_rows:
 ; CHECK:       simd_max.s
 ; CHECK:       Loop Header
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       jmp_exec_any
 ; OFF-LABEL:   xent_rows:
 ; OFF:         simd_max.s
 ; OFF:         Loop Header
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 declare i32 @llvm.agx.threadgroup.position.in.grid.x()
 declare i32 @llvm.agx.thread.position.in.threadgroup.x()
 declare i64 @llvm.umin.i64(i64, i64)
@@ -225,12 +225,12 @@ entry:
 ; CHECK-LABEL: causal_rowmax:
 ; CHECK:       simd_max.f
 ; CHECK:       Loop Header
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       jmp_exec_any
 ; OFF-LABEL:   causal_rowmax:
 ; OFF:         simd_max.f
 ; OFF:         Loop Header
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 declare i32 @llvm.agx.thread.index.in.simdgroup()
 define agx_kernel void @causal_rowmax(ptr addrspace(1) nofree readonly captures(none) %0, ptr addrspace(1) nofree writeonly captures(none) %1) #2 {
 entry:
@@ -310,12 +310,12 @@ entry:
 ; CHECK-LABEL: softmax_f16:
 ; CHECK:       simd_max.s
 ; CHECK:       Loop Header
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       jmp_exec_any
 ; OFF-LABEL:   softmax_f16:
 ; OFF:         simd_max.s
 ; OFF:         Loop Header
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 define agx_kernel void @softmax_f16(ptr addrspace(1) nofree readonly captures(none) %0, ptr addrspace(1) nofree writeonly captures(none) %1) #2 {
 entry:
   %2 = tail call i32 @llvm.agx.thread.index.in.simdgroup()

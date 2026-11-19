@@ -6,8 +6,10 @@
 ; selects beyond the clamps of x to [-104, 89], where the result overflows
 ; and rounds to +0 by itself (both checked for every float, flushing and
 ; not). n = round(x / ln 2) is t + 1.5 2^23 - 1.5 2^23, the constant read
-; negated the second time (L15-E469). The two clamps stay; the scale 2^n, an exponent addition where f32
-; flushes, ends in one NaN select (a NaN x makes n arbitrary).
+; negated the second time (L15-E469). The two clamps stay; the scale 2^n, an
+; exponent addition where f32 flushes, ends in its +inf select, a compare of
+; the argument with 88.7228394 that a NaN fails, and no NaN select (a NaN's
+; sum adds 0 to the exponent: L15-E473).
 
 ; CHECK-LABEL: e:
 ; CHECK: fcmpsel lt,
@@ -15,7 +17,8 @@
 ; CHECK: fadd32 [[M:r[0-9]+]], {{r[0-9]+}}, [[C:r[0-9]+]]
 ; CHECK-NEXT: fadd32 {{r[0-9]+}}, [[M]], [[C]].neg
 ; CHECK-NOT: fadd32 {{r[0-9]+}}, {{r[0-9]+}}, 0.0
-; CHECK: fcmpsel eq
+; CHECK-NOT: fcmpsel eq
+; CHECK: fcmpsel gte
 ; CHECK-NOT: fcmpsel
 ; CHECK: stop
 define agx_kernel void @e(ptr addrspace(1) %p) {

@@ -15,22 +15,22 @@
 ; CHECK-LABEL: inplace:
 ; CHECK:       Loop Header
 ; CHECK:       Loop Header
-; CHECK-NOT:   icmpsel sgt
+; CHECK-NOT:   {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK:       device_store
 ; CHECK:       jmp_exec_any
 ; OFF-LABEL:   inplace:
 ; OFF:         Loop Header
 ; OFF:         Loop Header
-; OFF:         icmpsel sgt
+; OFF:         {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; OFF:         device_store
 ; CHECK-LABEL: next:
 ; CHECK:       Loop Header
 ; CHECK:       Loop Header
-; CHECK:       icmpsel sgt
+; CHECK:       {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 ; CHECK-LABEL: short:
 ; CHECK:       Loop Header
 ; CHECK:       Loop Header
-; CHECK:       icmpsel sgt
+; CHECK:       {{fcmpsel (gte|lte), r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+, r[0-9]+}}
 
 declare i32 @llvm.agx.thread.index.in.simdgroup()
 declare i32 @llvm.agx.threadgroup.position.in.grid.x()

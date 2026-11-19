@@ -6487,6 +6487,12 @@ static bool halfFromFloat(Function &F) {
   return !Roots.empty();
 }
 
+static cl::opt<bool> AGXHalfInexactCompares(
+    "agx-half-inexact-compares", cl::init(true), cl::Hidden,
+    cl::desc("A compare of an extended half (or its negation) with a float "
+             "constant inexact in half done on the half, with the half next "
+             "to the constant"));
+
 static cl::opt<bool> AGXHalfSelects(
     "agx-half-selects", cl::init(true), cl::Hidden,
     cl::desc("A select or compare of halves extended to float (or of float "
@@ -6529,6 +6535,65 @@ static bool halfSelects(Function &F) {
     auto *S = dyn_cast<SelectInst>(V);
     return Narrow(V) || (S && Cand.contains(S));
   };
+  // fcmp p (-x), c is fcmp p' x, -c (p' the swapped predicate); an
+  // inequality with a float constant inexact in half is one with the half
+  // below it (> and >=: no half is c) or above it (< and <=) (L15-E473:
+  // exp's +inf bound 88.7228394 of an extended half's clamp).
+  struct HalfCmp {
+    CmpInst::Predicate P;
+    Value *X;
+    Constant *K;
+  };
+  auto InexactCmp = [&](FCmpInst *C) -> std::optional<HalfCmp> {
+    if (!AGXHalfInexactCompares)
+      return std::nullopt;
+    CmpInst::Predicate P = C->getPredicate();
+    Value *X = C->getOperand(0);
+    auto *K = dyn_cast<ConstantFP>(C->getOperand(1));
+    if (!K) {
+      K = dyn_cast<ConstantFP>(C->getOperand(0));
+      X = C->getOperand(1);
+      P = CmpInst::getSwappedPredicate(P);
+    }
+    if (!K || !K->getType()->isFloatTy() || !K->getValueAPF().isFinite())
+      return std::nullopt;
+    APFloat V = K->getValueAPF();
+    Value *Y;
+    if (match(X, m_FNeg(m_Value(Y)))) {
+      X = Y;
+      V.changeSign();
+      P = CmpInst::getSwappedPredicate(P);
+    }
+    bool Up;
+    switch (P) {
+    case CmpInst::FCMP_OGT: case CmpInst::FCMP_OGE:
+    case CmpInst::FCMP_UGT: case CmpInst::FCMP_UGE:
+      Up = false;
+      break;
+    case CmpInst::FCMP_OLT: case CmpInst::FCMP_OLE:
+    case CmpInst::FCMP_ULT: case CmpInst::FCMP_ULE:
+      Up = true;
+      break;
+    default:
+      return std::nullopt;
+    }
+    APFloat HV = V;
+    bool LosesInfo;
+    HV.convert(APFloat::IEEEhalf(),
+               Up ? APFloat::rmTowardPositive : APFloat::rmTowardNegative,
+               &LosesInfo);
+    if (!LosesInfo)
+      return std::nullopt; // exact: Narrow's
+    // x >= c, x > c: x > down(c); x <= c, x < c: x < up(c)
+    switch (P) {
+    case CmpInst::FCMP_OGE: P = CmpInst::FCMP_OGT; break;
+    case CmpInst::FCMP_UGE: P = CmpInst::FCMP_UGT; break;
+    case CmpInst::FCMP_OLE: P = CmpInst::FCMP_OLT; break;
+    case CmpInst::FCMP_ULE: P = CmpInst::FCMP_ULT; break;
+    default: break;
+    }
+    return HalfCmp{P, X, ConstantFP::get(H, HV)};
+  };
   for (Instruction &I : instructions(F))
     if (auto *S = dyn_cast<SelectInst>(&I);
         S && S->getType()->getScalarType()->isFloatTy() &&
@@ -6549,7 +6614,13 @@ static bool halfSelects(Function &F) {
     case Instruction::FPTrunc:
       return I->getType()->getScalarType()->isHalfTy();
     case Instruction::FCmp:
-      return NarrowOrCand(I->getOperand(1 - U.getOperandNo()));
+      if (NarrowOrCand(I->getOperand(1 - U.getOperandNo())))
+        return true;
+      if (auto HC = InexactCmp(cast<FCmpInst>(I)))
+        return HC->X == U.get() ||
+               (match(U.get(), m_FNeg(m_Value())) &&
+                cast<Instruction>(U.get())->getOperand(0) == HC->X);
+      return false;
     case Instruction::FNeg:
       return D < 2 && all_of(I->uses(),
                              [&](Use &V) { return Reads16(V, D + 1); });
@@ -6601,6 +6672,13 @@ static bool halfSelects(Function &F) {
         NarrowOrCand(C->getOperand(0)) && NarrowOrCand(C->getOperand(1)) &&
         !(isa<Constant>(C->getOperand(0)) && isa<Constant>(C->getOperand(1))))
       Cmps.push_back(C);
+  SmallVector<std::pair<FCmpInst *, HalfCmp>, 4> InexactCmps;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<FCmpInst>(&I);
+        C && C->getOperand(0)->getType()->isFloatTy() &&
+        !is_contained(Cmps, C))
+      if (auto HC = InexactCmp(C); HC && NarrowOrCand(HC->X))
+        InexactCmps.push_back({C, *HC});
   // (a candidate operand laid out after its user: none of it)
   SmallPtrSet<SelectInst *, 8> Seen;
   for (SelectInst *S : Order) {
@@ -6630,12 +6708,22 @@ static bool halfSelects(Function &F) {
     C->replaceAllUsesWith(N);
     Changed = true;
   }
+  for (auto &[C, HC] : InexactCmps) {
+    IRBuilder<> B(C);
+    Value *N = B.CreateFCmp(HC.P, Get(HC.X), HC.K, C->getName() + ".h");
+    if (auto *NI = dyn_cast<Instruction>(N))
+      NI->copyFastMathFlags(C);
+    C->replaceAllUsesWith(N);
+    Changed = true;
+  }
   for (SelectInst *S : Order)
     if (Value *N = NewOf.lookup(S)) {
       IRBuilder<> B(S);
       S->replaceAllUsesWith(B.CreateFPExt(N, S->getType()));
     }
   for (FCmpInst *C : Cmps)
+    C->eraseFromParent();
+  for (auto &[C, HC] : InexactCmps)
     C->eraseFromParent();
   for (SelectInst *S : reverse(Order))
     if (NewOf.count(S))

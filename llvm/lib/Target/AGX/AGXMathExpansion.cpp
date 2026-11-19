@@ -44,6 +44,11 @@ static cl::opt<bool> ExpNaNThroughScale(
     cl::desc("exp without the +inf select: no NaN select, the NaN's sum "
              "bits adding nothing to the scale"));
 
+static cl::opt<bool> ExpOverflowByArg(
+    "agx-exp-overflow-by-arg", cl::init(true), cl::Hidden,
+    cl::desc("exp's +inf select by its argument's compare, and no NaN "
+             "select"));
+
 static cl::opt<bool> TanhDoubledClamp(
     "agx-tanh-doubled-clamp", cl::init(true), cl::Hidden,
     cl::desc("tanh's 2 min(|x|, 9) as min(|x| + |x|, 18)"));
@@ -534,8 +539,11 @@ public:
   /// done on the integer: i >> 1 and i - (i >> 1) are both in [-126, 127].
   /// \p MagicBits: n's integer in the low bits of a float's (n + 1.5 2^23,
   /// whose bits are 0x4b400000 + n), instead of converting n.
+  /// \p ExpArg: the clamped argument of exp (no low part), whose result
+  /// overflows exactly from 0x42b17218 (88.7228394) on.
   Value *ldexp(Value *V, Value *N, bool NoOverflow = false,
-              bool NoUnderflow = false, Value *MagicBits = nullptr) {
+              bool NoUnderflow = false, Value *MagicBits = nullptr,
+              Value *ExpArg = nullptr) {
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
     Value *I = MagicBits ? nullptr : B.CreateFreeze(B.CreateFPToSI(N, intTy()));
@@ -551,14 +559,22 @@ public:
       Value *S = B.CreateAdd(B.CreateBitCast(V, intTy()),
                              B.CreateShl(I, ki(23)));
       Value *R = B.CreateBitCast(S, Ty);
+      // A NaN's magic bits add 0 to its own bits (E472), but they are past
+      // the +inf bound: for exp, its argument's compare instead, which a NaN
+      // fails, and then no NaN select (L15-E473).
+      bool ArgBound = ExpArg && MagicBits && NativeNaN && ExpOverflowByArg;
       if (!NoOverflow)
-        R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
+        R = ArgBound ? sel(B.CreateFCmpOGE(ExpArg, k(88.72283935546875)),
+                           k(INFINITY), R)
+                     : sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
       if (!NoUnderflow)
         R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
       // A NaN v comes from a NaN argument, whose sum t + 1.5 2^23 is then
       // the NaN 0x7fc00000, 0 shifted by 23: s is v's bits, which no +inf
       // select overrides (L15-E472).
       if (MagicBits && NoOverflow && NativeNaN && ExpNaNThroughScale)
+        return R;
+      if (ArgBound)
         return R;
       return sel(B.CreateFCmpUNO(V, V), V, R);
     }
@@ -620,7 +636,8 @@ public:
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
     Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N,
-                     NoOverflow && !Lo, NonNegative, MagicBits);
+                     NoOverflow && !Lo, NonNegative, MagicBits,
+                     !Lo && !Bounded ? C : nullptr);
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.

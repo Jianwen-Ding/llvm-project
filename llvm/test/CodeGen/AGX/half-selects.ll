@@ -17,7 +17,7 @@ define agx_kernel void @exp_neg(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 ; CHECK: fcmpsel gt, r1h, r1l, r1h, r1h, r1l
 ; CHECK-NEXT: fcmpsel lt, r1l, r1l, r2l, r2l, r1h
 ; CHECK: fmul32 r2, r1l.neg, r2
-; CHECK: fmadd32 r1, r3, r4, r1l.neg
+; CHECK: fmadd32 {{r[0-9]+}}, {{r[0-9]+}}, {{r[0-9]+}}, r1l.neg
 ; OFF-LABEL: exp_neg:
 ; OFF: fadd32 r1, r1l, -0.0
 ; OFF-NEXT: fcmpsel gt, r2, r1, r2, r2, r1
@@ -70,5 +70,27 @@ define agx_kernel void @stored(ptr addrspace(1) %p, ptr addrspace(1) %q) {
   %c1 = fcmp ogt float %x, 4.0
   %a = select i1 %c1, float 4.0, float %x
   store float %a, ptr addrspace(1) %q
+  ret void
+}
+
+; A compare with a constant inexact in half is the half's with the half next
+; to it: x >= 0.1 is h > 0.0999755859375 (0x2e66), -x <= -0.1 likewise
+; (L15-E473).
+; CHECK-LABEL: inexact_cmp:
+; CHECK-NOT: fadd32 {{r[0-9]+}}, r1l, -0.0
+; CHECK: mov_imm [[K:r[0-9]+[lh]]], 11878
+; CHECK: fcmpsel gt, {{r[0-9]+}}, r1l, [[K]],
+; CHECK: fcmpsel gt, {{r[0-9]+}}, r1l, [[K]],
+; OFF-LABEL: inexact_cmp:
+; OFF: fadd32 {{r[0-9]+}}, r1l, -0.0
+define agx_kernel void @inexact_cmp(ptr addrspace(1) %p, ptr addrspace(1) %q) {
+  %h = load half, ptr addrspace(1) %p
+  %x = fpext half %h to float
+  %c = fcmp oge float %x, 0x3FB99999A0000000
+  %n = fneg float %x
+  %d = fcmp ole float %n, 0xBFB99999A0000000
+  %s = select i1 %c, float 1.0, float 2.0
+  %t = select i1 %d, float 3.0, float %s
+  store float %t, ptr addrspace(1) %q
   ret void
 }

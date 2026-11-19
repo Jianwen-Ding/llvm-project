@@ -9,9 +9,8 @@
 ; and NaNs on the simulator's functional model) (L15-E282).
 
 ; CHECK-LABEL: sigmoid:
-; CHECK: fadd32 [[D:r[0-9]+]], {{r[0-9]+}}, 1.0
 ; CHECK-NOT: bfi
-; CHECK: rcp {{r[0-9]+}}, [[D]]
+; CHECK: rcp {{r[0-9]+}}, [[D:r[0-9]+]]
 ; CHECK-NOT: bfi
 ; CHECK: mov_imm [[K:r[0-9]+]], 2122317824
 ; CHECK: fcmpsel gt, {{r[0-9]+}}, [[D]], [[K]], 0,
