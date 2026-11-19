@@ -517,6 +517,7 @@ class AGXCodeGenPrepare : public FunctionPass {
   bool simdReductions(Function &F, const AGXSubtarget &ST);
   bool mergeLoopExits(Function &F);
   bool mergeSameConditionIfs(Function &F);
+  bool signedWideMuls(Function &F);
   bool forwardOwnSlots(Function &F);
   bool strideDivisions(Function &F);
   bool lowerMatrixFMA(Function &F, const AGXSubtarget &ST);
@@ -2101,6 +2102,48 @@ static cl::opt<unsigned> AGXMergeLoopExits(
 /// runs in H, the loop has one exit on e1 | e2, and a block after it goes
 /// to XH where e1 held, else to XT: T's work is wasted only on the last
 /// iteration of the threads that leave by e1.
+static cl::opt<bool> AGXSignedWideMuls(
+    "agx-signed-wide-muls", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit product of a sign-extended i32 and a zero-extended "
+             "non-negative i32 as the product of two sign extensions"));
+
+/// mul i64 (sext a), (zext b) with b not negative (zext nneg, or known): the
+/// zext is b's sign extension, made next to the mul, so that the selector
+/// sees two sign extensions (one imadd with .sx sources) and not an unsigned
+/// product with a correction of the high word by a's sign (three
+/// instructions), which it also does when the zext is in another block (an
+/// i64 register).
+bool AGXCodeGenPrepare::signedWideMuls(Function &F) {
+  if (!AGXSignedWideMuls)
+    return false;
+  const DataLayout &DL = F.getDataLayout();
+  bool Changed = false;
+  for (Instruction &I : instructions(F)) {
+    auto *Mul = dyn_cast<BinaryOperator>(&I);
+    if (!Mul || Mul->getOpcode() != Instruction::Mul ||
+        !Mul->getType()->isIntegerTy(64))
+      continue;
+    for (unsigned K = 0; K < 2; ++K) {
+      auto *S = dyn_cast<SExtInst>(Mul->getOperand(K));
+      auto *Z = dyn_cast<ZExtInst>(Mul->getOperand(1 - K));
+      if (!S || !Z || !S->getSrcTy()->isIntegerTy(32) ||
+          !Z->getSrcTy()->isIntegerTy(32))
+        continue;
+      Value *B = Z->getOperand(0);
+      if (!Z->hasNonNeg() && !isKnownNonNegative(B, SimplifyQuery(DL)))
+        continue;
+      Mul->setOperand(1 - K,
+                      new SExtInst(B, Mul->getType(), B->getName() + ".sx",
+                                   Mul->getIterator()));
+      if (Z->use_empty())
+        Z->eraseFromParent();
+      Changed = true;
+      break;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXMergeSameConditionIfs(
     "agx-merge-same-condition-ifs", cl::init(true), cl::Hidden,
     cl::desc("Merge an if on c whose join only holds phis and branches on c "
@@ -5872,6 +5915,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool Changed = diagnoseDoubles(F);
   Changed |= mergeSameConditionIfs(F);
+  Changed |= signedWideMuls(F);
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
   Changed |= zeroSignFreeMinMax(F);
