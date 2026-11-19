@@ -1220,8 +1220,12 @@ static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
     IRBuilder<> PB(Pre->getTerminator());
     Value *Trip = N;
     if (RoundUp) {
-      Value *One = ConstantInt::get(N->getType(), 1);
-      Trip = PB.CreateBinaryIntrinsic(Intrinsic::umax, N, One);
+      // (max(n, 1) is n where the loop is only entered for n != 0)
+      const SCEV *SN = SE.getSCEV(N);
+      if (!SE.isLoopEntryGuardedByCond(&L, ICmpInst::ICMP_NE, SN,
+                                       SE.getZero(SN->getType())))
+        Trip = PB.CreateBinaryIntrinsic(Intrinsic::umax, N,
+                                        ConstantInt::get(N->getType(), 1));
       Trip = PB.CreateAnd(
           PB.CreateNUWAdd(Trip, ConstantInt::get(N->getType(), *S - 1)),
           ConstantInt::get(N->getType(), -*S));

@@ -17,7 +17,9 @@ declare i32 @llvm.agx.thread.position.in.threadgroup.x()
 declare float @llvm.maxnum.f32(float, float)
 declare i64 @llvm.umin.i64(i64, i64)
 
+; (the loop entered only for a trip != 0: no max(trip, 1), L15-E403)
 ; CHECK-LABEL: rowmax:
+; CHECK-NOT: icmpsel ugt, r{{[0-9]+}}, r{{[0-9]+}}, 1, r{{[0-9]+}}, 1
 ; CHECK: and{{[[:space:]]}}r
 ; CHECK: Loop Header
 ; CHECK: iadd
