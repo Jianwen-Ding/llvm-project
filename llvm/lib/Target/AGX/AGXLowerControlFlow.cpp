@@ -84,6 +84,12 @@ static cl::opt<bool> RegisterOnlyBetweenFences(
              "fence before, and a fence right after the same fence"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> AGXSkipLoads(
+    "agx-unskipped-loads",
+    cl::desc("Let an if or else body run with an empty execution mask also "
+             "when it has plain loads"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<unsigned> MaxUnskippedInstrs(
     "agx-max-unskipped-instrs",
     cl::desc("Most ALU instructions an if or else body may have and still be "
@@ -151,8 +157,13 @@ static bool isControlFlowPseudo(unsigned Opc) {
 }
 
 /// Whether the blocks a jump_exec_none at the end of MBB would skip, up to
-/// Target, are a straight run of at most MaxUnskippedInstrs ALU instructions,
-/// so that running them with an empty execution mask is cheaper than the jump.
+/// Target, are a straight run of at most MaxUnskippedInstrs ALU instructions
+/// and plain loads, so that running them with an empty execution mask is
+/// cheaper than the jump. B31 measured a masked device_load + wait at 10-17
+/// ns; the jump costs its issue where a lane enters the body and a taken
+/// jump's latency and scheduler hold where none does. E135 kept loads out
+/// before the simulator modelled the masked cost; with it, the jump loses
+/// even where no lane ever enters a body of one load (L15-E432).
 static bool isShortALURun(MachineBasicBlock &MBB, MachineBasicBlock *Target) {
   unsigned Count = 0;
   MachineFunction &MF = *MBB.getParent();
@@ -171,9 +182,13 @@ static bool isShortALURun(MachineBasicBlock &MBB, MachineBasicBlock *Target) {
       // A branch to the next block is left out.
       if (MI.getOpcode() == AGX::AGX_BR && MI.getOperand(0).getMBB() == Next)
         continue;
-      if (isControlFlowPseudo(MI.getOpcode()) || MI.mayLoadOrStore() ||
-          MI.hasUnmodeledSideEffects() || MI.isCall() || MI.isTerminator() ||
-          AGXInstrInfo::isExecMaskOp(MI))
+      // A plain load (not a store, atomic or volatile access) touches
+      // nothing with an empty mask either (L15-E432).
+      bool Load = AGXSkipLoads && MI.mayLoad() && !MI.mayStore() &&
+                  !MI.hasOrderedMemoryRef();
+      if (isControlFlowPseudo(MI.getOpcode()) ||
+          (MI.mayLoadOrStore() && !Load) || MI.hasUnmodeledSideEffects() ||
+          MI.isCall() || MI.isTerminator() || AGXInstrInfo::isExecMaskOp(MI))
         return false;
       // A shuffle also moves its index to r0h and resets it.
       Count += isShuffle(MI.getOpcode()) ? 3 : 1;
