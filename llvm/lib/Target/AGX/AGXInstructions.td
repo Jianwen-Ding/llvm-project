@@ -577,6 +577,23 @@ def : Pat<(i32 (sub (agx_shl_oneuse AGXIntSrc32:$a, agx_imadd_shift:$s),
                     AGXIntSrc32:$c)),
           (IMSUB_I32 0, $a, 0, (i32 (AGXPow2Imm $s)), 0, $c, 0)>;
 }
+// The exp expansion's ldexp, bits + (n << 23) with n a float's conversion,
+// likewise: 2^23 from a register, which its underflow test already has (one
+// mov_imm, MachineCSE's). Not other shifts past 7: an address's loop-
+// invariant shift, hoisted, and the register for the power cost more there
+// (sgemm_reg4x4, gemm_smem_tile) (L15-E457).
+def agx_imadd_shift_reg : ImmLeaf<i32, [{ return Imm == 23; }]>;
+def agx_shl_local_oneuse : PatFrag<(ops node:$a, node:$s), (shl node:$a, node:$s), [{
+  SDValue A = N->getOperand(0);
+  if (A.getOpcode() == ISD::FREEZE)
+    A = A.getOperand(0);
+  return N->hasOneUse() && (A.getOpcode() == ISD::FP_TO_SINT ||
+                            A.getOpcode() == ISD::FP_TO_SINT_SAT);
+}]>;
+let AddedComplexity = 1 in
+def : Pat<(i32 (add (agx_shl_local_oneuse AGXIntSrc32:$a, agx_imadd_shift_reg:$s),
+                    AGXIntSrc32:$c)),
+          (IMADD_I32 0, $a, 0, (MOV_IMM32 (AGXPow2Imm $s)), 0, $c, 0)>;
 
 // 32-bit adds, subtracts and multiply-adds of 16-bit values sign or zero
 // extended read the 16-bit registers (with .sx for the sign) instead of
