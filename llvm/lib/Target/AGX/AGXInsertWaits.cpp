@@ -12,7 +12,7 @@
 // pass inserts a wait on a group before any instruction reads or overwrites a
 // register with a pending result in it, both groups before barriers and at the
 // end of a block with pending results whose successors could not take them
-// over. At most eight requests are kept outstanding.
+// over. At most sixteen requests are kept outstanding.
 //
 // A request's lanes are those of its issue: a result stays pending across
 // control flow (exec mask changes included) into a later block whose
@@ -77,7 +77,12 @@ static cl::opt<bool> AGXCrossBlockWaits(
     cl::desc("Keep load results pending into later blocks reached only from "
              "earlier ones instead of waiting at every block end"));
 
-static constexpr unsigned MaxPending = 8;
+/// (B34 measured 16 independent loads in flight behind one wait; a request
+/// beyond what the hardware tracks would stall its issue, not change a
+/// result: L15-E437, from 8)
+static cl::opt<unsigned> MaxPending(
+    "agx-max-pending-loads", cl::init(16), cl::Hidden,
+    cl::desc("Most load requests kept outstanding before a wait"));
 
 static bool isBarrier(const MachineInstr &MI) {
   return MI.getOpcode() == AGX::THREADGROUP_BARRIER ||

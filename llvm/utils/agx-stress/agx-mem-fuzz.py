@@ -6,7 +6,8 @@ Each seed generates a kernel in which every thread owns 32 input and 32 output b
 loads at aligned offsets (some declared align 1), add / xor / or / and / shl / lshr / mul, trunc / zext / sext, and
 i8 / i16 / i32 stores at aligned offsets that overlap each other, in program order. The output buffer starts with
 random bytes; agx_run's output is compared byte for byte with the model's, which exercises the backend's byte
-and halfword load / store combining, byte permutes and bit-field inserts (EXPERIMENTS.md L15-E379).
+and halfword load / store combining, byte permutes and bit-field inserts (EXPERIMENTS.md L15-E379). Some kernels
+also load bursts of 9-14 words at data-dependent offsets, more requests in flight than eight (L15-E437).
 
   agx-mem-fuzz.py --llc build/bin/llc --run path/to/agx_run [--objcopy build/bin/llvm-objcopy] [--seeds A:B]
                   [--mcpu agx-g14c] [--keep DIR]
@@ -41,6 +42,25 @@ def gen(seed):
       else:
         b=[x for x in vals if x[1]==w]; c=R.choice(b)[0] if b and R.random()<0.6 else R.choice([1,3,0x55,0x7f,0xff])&W[w]
       body.append(f'  {r} = {op} {T} {a[0]}, {c}'); ops.append((r,w,(op,a[0],c))); vals.append((r,w))
+    elif k<0.67 and any(x[1]==32 for x in vals):
+      # a burst of 9-14 i32 loads at offsets ((a >> s) & 7) * 4 (distinct
+      # shifts: no two the same address expression) that no combining
+      # merges, all in flight before their xor (more than eight requests
+      # outstanding: L15-E437)
+      a=R.choice([x for x in vals if x[1]==32]); loaded=[]
+      for c in R.sample(range(29),R.randint(9,14)):
+        x=nv(); m=nv(); o=nv(); g=nv(); v=nv()
+        body+=[f'  {x} = lshr i32 {a[0]}, {c}', f'  {m} = and i32 {x}, 7', f'  {o} = shl i32 {m}, 2',
+               f'  {g} = getelementptr i8, ptr addrspace(1) %pin, i32 {o}', f'  {v} = load i32, ptr addrspace(1) {g}, align 4']
+        ops.append((v,32,('dload',a[0],c))); loaded.append(v)
+      acc=loaded[0]
+      for v in loaded[1:]:
+        r=nv(); body.append(f'  {r} = xor i32 {acc}, {v}'); ops.append((r,32,('xor',acc,v))); acc=r
+      vals.append((acc,32))
+      # (stored, so that the burst is live)
+      off=R.randrange(0,32,4); g=nv()
+      body+=[f'  {g} = getelementptr i8, ptr addrspace(1) %pout, i32 {off}', f'  store i32 {acc}, ptr addrspace(1) {g}, align 4']
+      ops.append((None,32,('store',off,acc)))
     elif k<0.72:
       a=R.choice(vals); nw=R.choice([x for x in (8,16,32) if x!=a[1]]); r=nv()
       if nw<a[1]: body.append(f'  {r} = trunc i{a[1]} {a[0]} to i{nw}'); ops.append((r,nw,('trunc',a[0])))
@@ -59,6 +79,7 @@ def evaluate(ops, inb, outb0):
   for r,w,op in ops:
     k=op[0]; m=W[w]
     if k=='load': v=int.from_bytes(inb[op[1]:op[1]+w//8],'little')
+    elif k=='dload': o=((e[op[1]]>>op[2])&7)*4; v=int.from_bytes(inb[o:o+4],'little')
     elif k=='store': out[op[1]:op[1]+w//8]=(e[op[2]]&m).to_bytes(w//8,'little'); continue
     elif k=='trunc': v=e[op[1]]
     elif k=='zext': v=e[op[1]]

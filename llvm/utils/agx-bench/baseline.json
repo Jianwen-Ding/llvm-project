@@ -217,25 +217,25 @@
  },
  "cuda_blur_rgba8.ll:blur_rgba8:agx-g13g": {
   "bytes": 706,
-  "cycles": 408.6,
+  "cycles": 405.9,
   "gprs": 23,
   "groups": 72,
   "instructions": 94,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 34.2,
+  "tput": 34.3,
   "uniform_halves": 18,
   "waits": 2
  },
  "cuda_blur_rgba8.ll:blur_rgba8:agx-g14c": {
   "bytes": 706,
-  "cycles": 408.6,
+  "cycles": 405.9,
   "gprs": 23,
   "groups": 72,
   "instructions": 94,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 34.2,
+  "tput": 34.3,
   "uniform_halves": 18,
   "waits": 2
  },
@@ -264,28 +264,28 @@
   "waits": 2
  },
  "cuda_conv3x3.ll:conv3x3:agx-g13g": {
-  "bytes": 1880,
-  "cycles": 15150.4,
+  "bytes": 1876,
+  "cycles": 10762.7,
   "gprs": 51,
   "groups": 32,
-  "instructions": 268,
+  "instructions": 266,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 893.2,
+  "tput": 878.0,
   "uniform_halves": 24,
-  "waits": 13
+  "waits": 11
  },
  "cuda_conv3x3.ll:conv3x3:agx-g14c": {
-  "bytes": 1880,
-  "cycles": 15150.4,
+  "bytes": 1876,
+  "cycles": 10762.7,
   "gprs": 51,
   "groups": 32,
-  "instructions": 268,
+  "instructions": 266,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 893.2,
+  "tput": 878.0,
   "uniform_halves": 24,
-  "waits": 13
+  "waits": 11
  },
  "cuda_ddot.ll:ddot:agx-g13g": {
   "bytes": 31318,
@@ -552,28 +552,28 @@
   "waits": 13
  },
  "cuda_q8_matvec.ll:q8_matvec:agx-g13g": {
-  "bytes": 1006,
-  "cycles": 2662.8,
+  "bytes": 1002,
+  "cycles": 2577.2,
   "gprs": 52,
   "groups": 32,
-  "instructions": 148,
+  "instructions": 146,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 206.2,
+  "tput": 201.9,
   "uniform_halves": 20,
-  "waits": 6
+  "waits": 4
  },
  "cuda_q8_matvec.ll:q8_matvec:agx-g14c": {
-  "bytes": 1006,
-  "cycles": 2662.8,
+  "bytes": 1002,
+  "cycles": 2577.2,
   "gprs": 52,
   "groups": 32,
-  "instructions": 148,
+  "instructions": 146,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 206.2,
+  "tput": 201.9,
   "uniform_halves": 20,
-  "waits": 6
+  "waits": 4
  },
  "cuda_radix_hist.ll:radix_hist:agx-g13g": {
   "bytes": 226,
