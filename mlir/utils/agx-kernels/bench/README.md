@@ -58,5 +58,6 @@ the kernel's, as memory at VA).
 | `rowmax_vec4` | a thread's maximumf over a row of 256 floats in vector<4xf32> steps: NaN and zero signs deferred to the loop's exit |
 | `softmax_f16` | row softmax of f16 logits in f32 by a SIMD-group: extended loads, maximumf, the sum of exponentials and the f16 normalized write |
 | `online_softmax` | one-pass softmax normalizer (log-sum-exp) of 1024-float rows by a SIMD-group: a running maximumf whose old and new values rescale the running sum, merged across lanes |
+| `online_softmax_vec4` | the same by a thread per row in vector<4xf32> steps: four running maximumf / sums combined by vector reductions |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.
