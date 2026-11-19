@@ -10,11 +10,11 @@ declare i32 @llvm.agx.thread.position.in.threadgroup.x()
 
 ; CHECK-LABEL: tile:
 ; CHECK: and {{r[0-9]+}}, {{r[0-9]+}}, 15
-; CHECK: if_fcmp
+; CHECK: // =>This Inner Loop Header
 ; CHECK-NOT: and
 ; CHECK: jmp_exec_any
 ; OFF-LABEL: tile:
-; OFF: if_fcmp
+; OFF: // =>This Inner Loop Header
 ; OFF: and
 ; OFF: jmp_exec_any
 define agx_kernel void @tile(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %n) {

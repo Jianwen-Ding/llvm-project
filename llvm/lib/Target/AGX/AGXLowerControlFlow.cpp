@@ -484,10 +484,99 @@ static void removeRedundantIndexResets(MachineFunction &MF) {
   }
 }
 
+static cl::opt<bool> ShareLoopLevels(
+    "agx-share-loop-levels", cl::init(true), cl::Hidden,
+    cl::desc("A loop whose exit pop is followed at once by another pop runs "
+             "at the level of the construct around it, without its own push "
+             "and pop"));
+
+/// The loop entry push (if_fcmp r0l, eq, 0.0, 0.0, 1) and the exit pop of a
+/// loop whose exit pop is followed at once by another pop (of the construct
+/// the loop ends) are left out. With the push, a thread at level v > 0 on
+/// entry is at v + 1 in the loop, one that leaves it at 1; the two pops take
+/// these to v - 1 and 0. Without, they are at v and 1 in the loop and the
+/// one pop takes them to the same levels. In the loop, the threads that are
+/// active are the same: its own mask instructions (while, n = 1) only change
+/// active threads, and each construct inside it pushes before it tells
+/// levels apart (an else toggles level 1 only after its if has pushed every
+/// inactive thread deeper). Calls (which push 2 and rely on their callee's
+/// levels) are left alone.
+static bool shareLoopLevels(MachineFunction &MF) {
+  if (!ShareLoopLevels || MF.getFrameInfo().hasCalls())
+    return false;
+  auto count = [](MachineBasicBlock &MBB, unsigned Opc) {
+    return llvm::count_if(MBB, [&](MachineInstr &MI) {
+      return MI.getOpcode() == Opc;
+    });
+  };
+  bool Changed = false;
+  for (MachineBasicBlock &L : MF) {
+    MachineInstr *Latch = nullptr;
+    unsigned HeaderOp = 0;
+    for (MachineInstr &MI : L) {
+      switch (MI.getOpcode()) {
+      case AGX::AGX_LOOP:
+        Latch = &MI, HeaderOp = 1;
+        break;
+      case AGX::AGX_LOOP_ICMP:
+      case AGX::AGX_LOOP_FCMP:
+      case AGX::AGX_LOOP_ICMP16:
+        Latch = &MI, HeaderOp = 5;
+        break;
+      default:
+        break;
+      }
+    }
+    if (!Latch || L.succ_size() != 2)
+      continue;
+    MachineBasicBlock *Header = Latch->getOperand(HeaderOp).getMBB();
+    MachineBasicBlock *Exit = nullptr;
+    for (MachineBasicBlock *S : L.successors())
+      if (S != Header)
+        Exit = S;
+    if (!Exit || Exit->pred_size() != 1 || !L.isLayoutSuccessor(Exit) ||
+        Header->pred_size() != 2)
+      continue;
+    MachineBasicBlock *Pre = nullptr;
+    for (MachineBasicBlock *P : Header->predecessors())
+      if (P != &L)
+        Pre = P;
+    if (!Pre || Pre == &L || count(*Pre, AGX::AGX_LOOP_BEGIN) != 1)
+      continue;
+    unsigned Pops = count(*Exit, AGX::AGX_END_CF);
+    if (Pops == 0)
+      continue;
+    if (Pops == 1) {
+      // The exit holds the pop alone, and falls through to a block whose
+      // first instructions are pops.
+      bool Alone = llvm::all_of(*Exit, [](MachineInstr &MI) {
+        return MI.isMetaInstruction() || MI.getOpcode() == AGX::AGX_END_CF;
+      });
+      if (!Alone || Exit->succ_size() != 1)
+        continue;
+      MachineBasicBlock *Next = *Exit->succ_begin();
+      if (!Exit->isLayoutSuccessor(Next) || count(*Next, AGX::AGX_END_CF) == 0)
+        continue;
+    }
+    for (MachineInstr &MI : make_early_inc_range(*Pre))
+      if (MI.getOpcode() == AGX::AGX_LOOP_BEGIN)
+        MI.eraseFromParent();
+    for (MachineInstr &MI : *Exit)
+      if (MI.getOpcode() == AGX::AGX_END_CF) {
+        MI.eraseFromParent();
+        break;
+      }
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
   const AGXInstrInfo &TII = *MF.getSubtarget<AGXSubtarget>().getInstrInfo();
   bool HasControlFlow = false;
   bool HasShuffleIndex = false;
+
+  shareLoopLevels(MF);
 
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
