@@ -6686,6 +6686,10 @@ static cl::opt<bool> AGXDeferredMinMaxNum(
              "minimumnum from a number, its zero-sign-free uses in the loop "
              "taking the deferred value"));
 
+static cl::opt<bool> AGXDeferredHalf(
+    "agx-deferred-minmax-half", cl::init(true), cl::Hidden,
+    cl::desc("agx-deferred-minmax-reductions of extended halves in half"));
+
 static cl::opt<bool> AGXDeferredLaneResults(
     "agx-deferred-minmax-lane-results", cl::init(true), cl::Hidden,
     cl::desc("agx-deferred-minmax-reductions' results of a vector's elements "
@@ -6800,8 +6804,42 @@ static bool deferredMinMaxReductions(Function &F) {
       if (!OK)
         continue;
       Type *Ty = P->getType();
-      Type *ITy = Ty->getWithNewType(Type::getInt32Ty(F.getContext()));
       Value *Init = P->getIncomingValueForBlock(Pre);
+      // Values that are all extended halves, from a constant exact in half:
+      // the running value in half, extended once after the loop (maximum of
+      // extensions is the extension of the maximum; f16 compares flush no
+      // denormal) (L15-E462).
+      Type *FTy = Ty;
+      bool Narrow = false;
+      SmallVector<Instruction *, 4> OldExts;
+      if (AGXDeferredHalf && Ty->isFloatTy() && Side.empty()) {
+        auto *CI = dyn_cast<ConstantFP>(Init);
+        bool Exact = false;
+        if (CI) {
+          APFloat A = CI->getValueAPF();
+          bool Lost;
+          Exact = A.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven,
+                            &Lost) == APFloat::opOK &&
+                  !Lost;
+        }
+        Narrow = Exact && all_of(Vs, [](Value *V) {
+                   auto *E = dyn_cast<FPExtInst>(V);
+                   return E && E->getSrcTy()->isHalfTy();
+                 });
+        if (Narrow) {
+          Ty = Type::getHalfTy(F.getContext());
+          APFloat A = CI->getValueAPF();
+          bool Lost;
+          A.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven, &Lost);
+          Init = ConstantFP::get(Ty, A);
+          for (Value *&V : Vs) {
+            OldExts.push_back(cast<Instruction>(V));
+            V = cast<FPExtInst>(V)->getOperand(0);
+          }
+        }
+      }
+      Type *ITy = Ty->getWithNewType(
+          IntegerType::get(F.getContext(), Ty->getScalarSizeInBits()));
       IRBuilder<> PB(Pre->getTerminator());
       // z: the signed integer maximum (minimum) of the values' bits: where
       // the result is a zero, every value seen is at most a zero or
@@ -6857,8 +6895,8 @@ static bool deferredMinMaxReductions(Function &F) {
       Z->addIncoming(Bits(PB, Init), Pre);
       Z->addIncoming(Z2, Latch);
       // the result at a point after U
-      auto Result = [&](IRBuilder<> &RB, Value *MV, Value *NV,
-                        Value *ZV) -> Value * {
+      auto ResultW = [&](IRBuilder<> &RB, Value *MV, Value *NV,
+                         Value *ZV) -> Value * {
         // (of the vector or, for an extraction, of its element)
         Type *RTy = MV->getType(), *RITy = ZV->getType();
         Value *Zero = ConstantFP::get(RTy, Max ? 0.0 : -0.0);
@@ -6876,6 +6914,11 @@ static bool deferredMinMaxReductions(Function &F) {
         }
         return RB.CreateSelect(RB.CreateFCmpUNO(NV, NV), NV, R,
                                U->getName() + ".r");
+      };
+      auto Result = [&](IRBuilder<> &RB, Value *MV, Value *NV,
+                        Value *ZV) -> Value * {
+        Value *R = ResultW(RB, MV, NV, ZV);
+        return Narrow ? RB.CreateFPExt(R, FTy) : R;
       };
       // the zero-sign-free uses in the loop: the deferred value (the same
       // but for a zero's sign)
@@ -6923,11 +6966,13 @@ static bool deferredMinMaxReductions(Function &F) {
         I->replaceUsesOfWith(U, R);
       }
       for (IntrinsicInst *C : reverse(Chain)) {
-        C->replaceAllUsesWith(PoisonValue::get(Ty));
+        C->replaceAllUsesWith(PoisonValue::get(FTy));
         C->eraseFromParent();
       }
-      P->replaceAllUsesWith(PoisonValue::get(Ty));
+      P->replaceAllUsesWith(PoisonValue::get(FTy));
       P->eraseFromParent();
+      for (Instruction *E : OldExts)
+        RecursivelyDeleteTriviallyDeadInstructions(E);
       if (Num || NaNInM) {
         N->replaceAllUsesWith(PoisonValue::get(Ty));
         N->eraseFromParent();

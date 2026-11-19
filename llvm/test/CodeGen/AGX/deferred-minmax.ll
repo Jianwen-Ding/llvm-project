@@ -159,3 +159,31 @@ done:
   ret void
 }
 declare <4 x float> @llvm.maximum.v4f32(<4 x float>, <4 x float>)
+
+; A running maximum of extended halves from -inf: the deferred chain in half,
+; its result extended once after the loop (L15-E462).
+; CHECK-LABEL: @halves(
+; CHECK:       loop:
+; CHECK-NOT:   fpext
+; CHECK:       call nsz half @llvm.maximum.f16
+; CHECK:       icmp sgt i16
+; CHECK:       done:
+; CHECK:       fpext half
+; CHECK:       ret void
+define agx_kernel void @halves(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %in, %loop ]
+  %m = phi float [ 0xFFF0000000000000, %entry ], [ %mn, %loop ]
+  %p = getelementptr inbounds half, ptr addrspace(1) %x, i32 %i
+  %h = load half, ptr addrspace(1) %p, align 2
+  %v = fpext half %h to float
+  %mn = call float @llvm.maximum.f32(float %m, float %v)
+  %in = add nuw i32 %i, 1
+  %c = icmp ult i32 %in, %n
+  br i1 %c, label %loop, label %done
+done:
+  store float %mn, ptr addrspace(1) %o, align 4
+  ret void
+}
