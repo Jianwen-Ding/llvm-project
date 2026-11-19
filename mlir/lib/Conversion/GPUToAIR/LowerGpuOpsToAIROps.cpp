@@ -2633,6 +2633,42 @@ struct LowerGpuOpsToAIROpsPass final
       op.replaceAllUsesWith(v);
       op.erase();
     });
+    // The upper_bounds of the thread and threadgroup positions that hold
+    // for the whole kernel: those of reads in its entry block that every
+    // execution reaches (no op with regions or a call before them). AIR's
+    // position vectors carry a range only where all three components are
+    // bounded; the AGX backend bounds each component's register by these
+    // (L15-E391).
+    llvm::StringMap<std::array<std::array<uint64_t, 3>, 3>> kernelBounds;
+    m.walk([&](gpu::GPUFuncOp f) {
+      if (!f.isKernel() || f.getBody().empty())
+        return;
+      std::array<std::array<uint64_t, 3>, 3> bounds{};
+      bool any = false;
+      auto note = [&](unsigned kind, gpu::Dimension d,
+                      std::optional<APInt> ub) {
+        if (!ub || ub->getActiveBits() > 32)
+          return;
+        uint64_t v = ub->getZExtValue();
+        uint64_t &b = bounds[kind][static_cast<unsigned>(d)];
+        if (v && v < (uint64_t(1) << 32) && (!b || v < b)) {
+          b = v;
+          any = true;
+        }
+      };
+      for (Operation &op : f.getBody().front()) {
+        if (op.getNumRegions() || isa<CallOpInterface>(op))
+          break;
+        if (auto o = dyn_cast<gpu::ThreadIdOp>(op))
+          note(0, o.getDimension(), o.getUpperBound());
+        else if (auto o = dyn_cast<gpu::BlockIdOp>(op))
+          note(1, o.getDimension(), o.getUpperBound());
+        else if (auto o = dyn_cast<gpu::GlobalIdOp>(op))
+          note(2, o.getDimension(), o.getUpperBound());
+      }
+      if (any)
+        kernelBounds[f.getName()] = bounds;
+    });
     ::approximateHalfFunctions = approximateHalfFunctions;
     if (narrowLoops)
       ::narrowLoops(m);
@@ -2872,6 +2908,21 @@ struct LowerGpuOpsToAIROpsPass final
           passthrough.push_back(ArrayAttr::get(
               ctx, {StringAttr::get(ctx, "agx-threads-per-grid"),
                     StringAttr::get(ctx, join(threads))}));
+        }
+      }
+      if (auto it = kernelBounds.find(f.getName()); it != kernelBounds.end()) {
+        static const char *const roles[] = {
+            "air.thread_position_in_threadgroup",
+            "air.threadgroup_position_in_grid", "air.thread_position_in_grid"};
+        for (auto [kind, b] : llvm::enumerate(it->second)) {
+          if (!b[0] && !b[1] && !b[2])
+            continue;
+          passthrough.push_back(ArrayAttr::get(
+              ctx, {StringAttr::get(ctx, std::string("agx-upper-bounds:") +
+                                             roles[kind]),
+                    StringAttr::get(ctx, std::to_string(b[0]) + "," +
+                                             std::to_string(b[1]) + "," +
+                                             std::to_string(b[2]))}));
         }
       }
       f.setPassthroughAttr(ArrayAttr::get(ctx, passthrough));

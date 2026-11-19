@@ -1060,8 +1060,13 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
     if (!II)
       return std::nullopt;
     Intrinsic::ID ID = II->getIntrinsicID();
-    if (std::optional<uint64_t> E = AGX::knownGridExtent(F, ID))
+    if (std::optional<uint64_t> E = AGX::knownUpperBound(F, ID))
       return APInt(128, *E - 1);
+    // (a range the call carries: AGXSpecialRegisterRanges', from the
+    // kernel's upper bounds, L15-E391)
+    if (std::optional<ConstantRange> R = II->getRange();
+        R && !R->isFullSet() && !R->isWrappedSet())
+      return R->getUnsignedMax().zext(128);
     switch (ID) {
     case Intrinsic::agx_thread_position_in_threadgroup_x:
     case Intrinsic::agx_thread_position_in_threadgroup_y:

@@ -66,6 +66,9 @@ bool addSpecialRegisterRanges(Function &F,
 /// The extent of the grid position an intrinsic reads that the kernel's known
 /// grid gives (agx-threads-per-grid, agx-threadgroups-per-grid), if any.
 std::optional<uint64_t> knownGridExtent(const Function &F, unsigned IntrinsicID);
+/// The extent a position read is below: the known grid's or the kernel's
+/// agx-upper-bounds (AGXSpecialRegisterRanges, L15-E391).
+std::optional<uint64_t> knownUpperBound(const Function &F, unsigned IntrinsicID);
 } // namespace AGX
 FunctionPass *createAGXVectorAccessesPass(bool BeforeVectorizer);
 FunctionPass *createAGXLowerGenericAddressesPass();

@@ -194,6 +194,57 @@ gridBounds(const Function &F, Intrinsic::ID ID) {
   return std::nullopt;
 }
 
+static cl::opt<unsigned> AGXUpperBoundRanges(
+    "agx-upper-bound-ranges", cl::init(1), cl::Hidden,
+    cl::desc("Bound thread and threadgroup positions by the kernel's "
+             "agx-upper-bounds:<AIR system value> attributes: 0 not, 1 in "
+             "AGXNarrowInductions' bounds, 2 also as the reads' ranges"));
+
+/// [0, b) of a position, b from the kernel's "agx-upper-bounds:<role>"
+/// attribute ("x,y,z", 0 where unknown): MLIR's upper_bound of a read every
+/// execution of the kernel reaches (L15-E391).
+static std::optional<std::pair<uint64_t, uint64_t>>
+upperBounds(const Function &F, Intrinsic::ID ID) {
+  if (!AGXUpperBoundRanges)
+    return std::nullopt;
+  unsigned D;
+  StringRef Role;
+  switch (ID) {
+  case Intrinsic::agx_thread_position_in_threadgroup_x: D = 0; Role = "air.thread_position_in_threadgroup"; break;
+  case Intrinsic::agx_thread_position_in_threadgroup_y: D = 1; Role = "air.thread_position_in_threadgroup"; break;
+  case Intrinsic::agx_thread_position_in_threadgroup_z: D = 2; Role = "air.thread_position_in_threadgroup"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_x: D = 0; Role = "air.threadgroup_position_in_grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_y: D = 1; Role = "air.threadgroup_position_in_grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_z: D = 2; Role = "air.threadgroup_position_in_grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_x: D = 0; Role = "air.thread_position_in_grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_y: D = 1; Role = "air.thread_position_in_grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_z: D = 2; Role = "air.thread_position_in_grid"; break;
+  default:
+    return std::nullopt;
+  }
+  Attribute A = F.getFnAttribute((Twine("agx-upper-bounds:") + Role).str());
+  if (!A.isStringAttribute())
+    return std::nullopt;
+  SmallVector<StringRef, 3> Parts;
+  A.getValueAsString().split(Parts, ',');
+  uint64_t B;
+  if (Parts.size() != 3 || Parts[D].getAsInteger(10, B) || B == 0 ||
+      B >= (1ull << 32))
+    return std::nullopt;
+  return std::pair(uint64_t(0), B);
+}
+
+std::optional<uint64_t> AGX::knownUpperBound(const Function &F,
+                                            unsigned IntrinsicID) {
+  std::optional<uint64_t> R;
+  if (auto G = gridBounds(F, Intrinsic::ID(IntrinsicID)))
+    R = G->second;
+  if (auto U = upperBounds(F, Intrinsic::ID(IntrinsicID)))
+    if (!R || U->second < *R)
+      R = U->second;
+  return R;
+}
+
 std::optional<uint64_t> AGX::knownGridExtent(const Function &F,
                                             unsigned IntrinsicID) {
   if (auto G = gridBounds(F, Intrinsic::ID(IntrinsicID)))
@@ -240,6 +291,10 @@ bool AGX::addSpecialRegisterRanges(Function &F,
       if (auto G = gridBounds(F, II->getIntrinsicID()))
         if (!B || G->second - G->first < B->second - B->first)
           B = G;
+    if (AGXUpperBoundRanges >= 2)
+      if (auto U = upperBounds(F, II->getIntrinsicID()))
+        if (!B || U->second - U->first < B->second - B->first)
+          B = U;
     if (!B || II->getRetAttributes().hasAttribute(Attribute::Range))
       continue;
     II->addRetAttr(Attribute::get(

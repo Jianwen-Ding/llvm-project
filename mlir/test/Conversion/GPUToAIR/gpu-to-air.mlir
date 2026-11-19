@@ -1291,3 +1291,37 @@ gpu.module @half_erfc {
     gpu.return
   }
 }
+
+// -----
+
+// The upper_bounds of positions read in the kernel's entry block before any
+// op with regions or a call hold for every execution: AGX hints, one
+// "x,y,z" per AIR system value, 0 where unknown (the backend's loop
+// analyses bound the position registers by them, L15-E391). A read after
+// a loop gives none.
+gpu.module @upper_bounds {
+  // CHECK-LABEL: llvm.func @entry(
+  // CHECK-SAME: ["agx-upper-bounds:air.threadgroup_position_in_grid", "256,0,0"]
+  // CHECK-SAME: ["agx-upper-bounds:air.thread_position_in_grid", "0,1024,0"]
+  gpu.func @entry(%out: memref<8xindex, 1>) kernel {
+    %b = gpu.block_id x upper_bound 256
+    %g = gpu.global_id y upper_bound 1024
+    %s = arith.addi %b, %g : index
+    %c0 = arith.constant 0 : index
+    memref.store %s, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @after_loop(
+  // CHECK-NOT: agx-upper-bounds
+  // CHECK: llvm.return
+  gpu.func @after_loop(%out: memref<8xindex, 1>, %n: index) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %n step %c1 {
+      memref.store %i, %out[%c0] : memref<8xindex, 1>
+    }
+    %b = gpu.block_id x upper_bound 256
+    memref.store %b, %out[%c1] : memref<8xindex, 1>
+    gpu.return
+  }
+}
