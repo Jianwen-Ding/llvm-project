@@ -48,6 +48,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -1754,21 +1755,36 @@ void LowerAIR::recoverAGXOperations(Function &F) {
       auto *MM = dyn_cast<IntrinsicInst>(Ordered);
       if (auto *ZSel = dyn_cast<SelectInst>(Ordered)) {
         MM = dyn_cast<IntrinsicInst>(ZSel->getFalseValue());
-        Value *X, *Y, *Or;
+        Value *Or, *P, *Q;
         bool Min = MM && MM->getIntrinsicID() == Intrinsic::minnum;
+        // The bits of an operand: bitcast(v), or v's constant bits folded
+        // (maximum(x, 0): or(bits(x), 0), L15-E400).
+        auto BitsOf = [&](Value *I, Value *V) {
+          if (match(I, m_BitCast(m_Specific(V))))
+            return true;
+          auto *C = dyn_cast<Constant>(V);
+          return C && isa<Constant>(I) &&
+                 ConstantFoldCastOperand(Instruction::BitCast, C, I->getType(),
+                                         F.getDataLayout()) == I;
+        };
+        auto BothBits = [&](Value *L, Value *R) {
+          Value *A0 = MM->getArgOperand(0), *A1 = MM->getArgOperand(1);
+          return (BitsOf(L, A0) && BitsOf(R, A1)) ||
+                 (BitsOf(L, A1) && BitsOf(R, A0));
+        };
         // zero_check: (bits(a) | bits(b)) << 1 == 0; the zero: bits(a) | bits(b)
         // for minimum, bits(a) & bits(b) for maximum.
         if (!MM ||
             !match(ZSel->getCondition(),
                    m_SpecificICmp(ICmpInst::ICMP_EQ,
                                   m_Shl(m_Value(Or), m_One()), m_Zero())) ||
-            !match(Or, m_Or(m_BitCast(m_Value(X)), m_BitCast(m_Value(Y)))) ||
-            !((X == MM->getArgOperand(0) && Y == MM->getArgOperand(1)) ||
-              (X == MM->getArgOperand(1) && Y == MM->getArgOperand(0))) ||
-            !(Min ? match(ZSel->getTrueValue(), m_BitCast(m_Specific(Or)))
-                  : match(ZSel->getTrueValue(),
-                          m_BitCast(m_c_And(m_BitCast(m_Specific(X)),
-                                            m_BitCast(m_Specific(Y)))))))
+            !match(Or, m_Or(m_Value(P), m_Value(Q))) || !BothBits(P, Q))
+          MM = nullptr;
+        Value *Z;
+        if (MM && !(Min ? match(ZSel->getTrueValue(), m_BitCast(m_Specific(Or)))
+                        : match(ZSel->getTrueValue(), m_BitCast(m_Value(Z))) &&
+                              match(Z, m_And(m_Value(P), m_Value(Q))) &&
+                              BothBits(P, Q)))
           MM = nullptr;
       }
       if (MM &&
