@@ -2865,6 +2865,52 @@ struct LowerGpuOpsToAIROpsPass final
         rewriter.replaceOpWithNewOp<arith::TruncIOp>(op, op.getType(),
                                                      reduced.getResult());
       }
+      // i64 minimum / maximum (signed or not) as two AIR reductions of i32:
+      // the high words' (in the operation's signedness), then the low
+      // words' (unsigned) of the lanes whose high word is that one, the
+      // others giving the identity (0 for a maximum, ~0 for a minimum):
+      // instead of a shuffle butterfly of 64-bit compares (L15-E442).
+      SmallVector<gpu::SubgroupReduceOp> wide;
+      m.walk([&](gpu::SubgroupReduceOp op) {
+        std::optional<uint32_t> cluster = op.getClusterSize();
+        if (op.getType().isInteger(64) &&
+            (!cluster || (op.getClusterStride() == 1 &&
+                          (*cluster == 4 || *cluster == 32))) &&
+            (op.getOp() == gpu::AllReduceOperation::MAXUI ||
+             op.getOp() == gpu::AllReduceOperation::MINUI ||
+             op.getOp() == gpu::AllReduceOperation::MAXSI ||
+             op.getOp() == gpu::AllReduceOperation::MINSI))
+          wide.push_back(op);
+      });
+      for (gpu::SubgroupReduceOp op : wide) {
+        rewriter.setInsertionPoint(op);
+        Location loc = op.getLoc();
+        Type i32 = rewriter.getI32Type(), i64 = rewriter.getI64Type();
+        bool isMax = op.getOp() == gpu::AllReduceOperation::MAXUI ||
+                     op.getOp() == gpu::AllReduceOperation::MAXSI;
+        Value v = op.getValue();
+        Value c32 = arith::ConstantIntOp::create(rewriter, loc, i64, 32);
+        Value hi = arith::TruncIOp::create(
+            rewriter, loc, i32, arith::ShRUIOp::create(rewriter, loc, v, c32));
+        Value lo = arith::TruncIOp::create(rewriter, loc, i32, v);
+        Value mh = gpu::SubgroupReduceOp::create(
+            rewriter, loc, hi, op.getOp(), op.getUniform(), op.getClusterSize(),
+            op.getClusterStride());
+        Value eq = arith::CmpIOp::create(rewriter, loc,
+                                         arith::CmpIPredicate::eq, hi, mh);
+        Value id = arith::ConstantIntOp::create(rewriter, loc, i32,
+                                                isMax ? 0 : -1);
+        Value lo2 = arith::SelectOp::create(rewriter, loc, eq, lo, id);
+        Value ml = gpu::SubgroupReduceOp::create(
+            rewriter, loc, lo2,
+            isMax ? gpu::AllReduceOperation::MAXUI
+                  : gpu::AllReduceOperation::MINUI,
+            op.getUniform(), op.getClusterSize(), op.getClusterStride());
+        Value h64 = arith::ShLIOp::create(
+            rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, mh), c32);
+        Value l64 = arith::ExtUIOp::create(rewriter, loc, i64, ml);
+        rewriter.replaceOpWithNewOp<arith::OrIOp>(op, h64, l64);
+      }
       SmallVector<Operation *> clustered;
       m.walk([&](gpu::SubgroupReduceOp op) {
         if (!airSubgroupReduce(op))

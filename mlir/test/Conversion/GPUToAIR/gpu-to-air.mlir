@@ -840,16 +840,17 @@ gpu.module @clustered_reduce {
 
 // -----
 
-// Reductions AIR has no op for: of i64 (64-bit xor shuffles at 1 .. 16, the
-// shuffle lowering splitting each), and over clusters of 8 of f16 (AIR's
-// quad-group reduction, then a shuffle at 4).
+// Reductions AIR has no op for: an i64 sum (64-bit xor shuffles at 1 .. 16,
+// the shuffle lowering splitting each; an i64 minimum / maximum is two i32
+// reductions, L15-E442), and over clusters of 8 of f16 (AIR's quad-group
+// reduction, then a shuffle at 4).
 gpu.module @shuffle_reduce {
-  // CHECK-LABEL: llvm.func @i64max(
-  gpu.func @i64max(%a: memref<64xi64, 1>) kernel {
+  // CHECK-LABEL: llvm.func @i64add(
+  gpu.func @i64add(%a: memref<64xi64, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<64xi64, 1>
     // CHECK-COUNT-10: llvm.call @air.simd_shuffle_xor.u.i32
-    %r = gpu.subgroup_reduce maxui %v : (i64) -> i64
+    %r = gpu.subgroup_reduce add %v : (i64) -> i64
     memref.store %r, %a[%c0] : memref<64xi64, 1>
     gpu.return
   }
@@ -1379,6 +1380,33 @@ gpu.module @upper_bounds {
     }
     %b = gpu.block_id x upper_bound 256
     memref.store %b, %out[%c1] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// i64 minimum / maximum reductions: two i32 AIR reductions, the high words'
+// in the operation's signedness, then the unsigned low words' of the lanes
+// whose high word is the result (L15-E442), no shuffles.
+gpu.module @k {
+  // CHECK-LABEL: llvm.func @reduce_i64
+  gpu.func @reduce_i64(%b: memref<64xi64, 1>, %o: memref<64xi64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %w = memref.load %b[%c0] : memref<64xi64, 1>
+    // CHECK-NOT: shuffle
+    // CHECK: %[[H:.*]] = llvm.call @air.simd_max.s.i32(%[[HI:.*]]) : (i32) -> i32
+    // CHECK: %[[EQ:.*]] = llvm.icmp "eq" %[[HI]], %[[H]] : i32
+    // CHECK: %[[LO:.*]] = llvm.select %[[EQ]], %{{.*}}, %{{.*}} : i1, i32
+    // CHECK: llvm.call @air.simd_max.u.i32(%[[LO]]) : (i32) -> i32
+    %m = gpu.subgroup_reduce maxsi %w : (i64) -> i64
+    // CHECK: llvm.call @air.quad_min.u.i32
+    // CHECK: llvm.call @air.quad_min.u.i32
+    // CHECK-NOT: shuffle
+    %n = gpu.subgroup_reduce minui %w cluster(size = 4) : (i64) -> i64
+    memref.store %m, %o[%c0] : memref<64xi64, 1>
+    memref.store %n, %o[%c1] : memref<64xi64, 1>
     gpu.return
   }
 }
