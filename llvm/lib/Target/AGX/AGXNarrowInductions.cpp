@@ -54,6 +54,11 @@ using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "agx-narrow-inductions"
 
+static cl::opt<bool> AGXUnknownRanges(
+    "agx-upper-bound-unknown-ranges", cl::init(true), cl::Hidden,
+    cl::desc("The upper bound of a value SCEV does not analyze is its "
+             "unsigned range's"));
+
 static cl::opt<bool> AGXNonNegativeCasts(
     "agx-non-negative-casts", cl::init(true), cl::Hidden,
     cl::desc("Signed extensions, divisions and arithmetic shifts of values "
@@ -1055,8 +1060,28 @@ static cl::opt<unsigned> LoopIndexBases(
 /// threadgroup's shape or 1024, the known grid or 2^31), their sums,
 /// products and zero extensions, and add recurrences up to the loop's
 /// constant maximum trip count.
+static std::optional<APInt> upperBoundStructural(const SCEV *S,
+                                                 ScalarEvolution &SE,
+                                                 const Function &F,
+                                                 unsigned Depth);
+
+/// The structural bound, or SCEV's unsigned range where that has none (a
+/// sum with a negative term, 1024 - lane, in L15-E481's raised start).
 static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
                                        const Function &F, unsigned Depth = 0) {
+  std::optional<APInt> R = upperBoundStructural(S, SE, F, Depth);
+  if (R || !AGXUnknownRanges || Depth > 8)
+    return R;
+  APInt M = SE.getUnsignedRangeMax(S);
+  if (M.getActiveBits() <= 63)
+    return M.zext(128);
+  return std::nullopt;
+}
+
+static std::optional<APInt> upperBoundStructural(const SCEV *S,
+                                                 ScalarEvolution &SE,
+                                                 const Function &F,
+                                                 unsigned Depth) {
   if (Depth > 8)
     return std::nullopt;
   auto Fits = [](APInt V) -> std::optional<APInt> {
@@ -1097,8 +1122,14 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
   }
   if (auto *U = dyn_cast<SCEVUnknown>(S)) {
     auto *II = dyn_cast<IntrinsicInst>(U->getValue());
-    if (!II)
+    if (!II) {
+      // (another value: SCEV's range, a select of bounded values among
+      // them: a loop count min(n, ...) or 0, L15-E481)
+      APInt R = SE.getUnsignedRangeMax(S);
+      if (AGXUnknownRanges && R.getActiveBits() <= 63)
+        return R.zext(128);
       return std::nullopt;
+    }
     Intrinsic::ID ID = II->getIntrinsicID();
     if (std::optional<uint64_t> E = AGX::knownUpperBound(F, ID))
       return APInt(128, *E - 1);
