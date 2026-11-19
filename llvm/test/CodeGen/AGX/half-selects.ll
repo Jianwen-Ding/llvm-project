@@ -9,18 +9,18 @@ target triple = "agx"
 
 declare float @llvm.exp.f32(float)
 
-; e^-x of an extended half: the clamps of the expansion's argument are
-; selects of halves, the conversion folds into the multiplication and fma
+; e^-x of an extended half: the compares of the expansion's argument (since
+; L15-E474 its +inf and +0 selects', with no clamps) are of the half, the
+; conversion folds into the multiplication and fma
 define agx_kernel void @exp_neg(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 ; CHECK-LABEL: exp_neg:
 ; CHECK-NOT: fadd32 {{r[0-9]+}}, r1l, -0.0
-; CHECK: fcmpsel gt, r1h, r1l, r1h, r1h, r1l
-; CHECK-NEXT: fcmpsel lt, r1l, r1l, r2l, r2l, r1h
 ; CHECK: fmul32 r2, r1l.neg, r2
 ; CHECK: fmadd32 {{r[0-9]+}}, {{r[0-9]+}}, {{r[0-9]+}}, r1l.neg
+; CHECK: fcmpsel lt, {{r[0-9]+}}, r1l, r1h,
+; CHECK: fcmpsel gt, {{r[0-9]+}}, r1l, r1h,
 ; OFF-LABEL: exp_neg:
 ; OFF: fadd32 r1, r1l, -0.0
-; OFF-NEXT: fcmpsel gt, r2, r1, r2, r2, r1
   %h = load half, ptr addrspace(1) %p
   %x = fpext half %h to float
   %n = fneg float %x

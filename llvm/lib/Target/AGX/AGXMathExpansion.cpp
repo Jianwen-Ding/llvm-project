@@ -49,6 +49,11 @@ static cl::opt<bool> ExpOverflowByArg(
     cl::desc("exp's +inf select by its argument's compare, and no NaN "
              "select"));
 
+static cl::opt<bool> ExpUnclamped(
+    "agx-exp-unclamped", cl::init(true), cl::Hidden,
+    cl::desc("exp's +0 select by its argument's compare too, and no clamps "
+             "of the argument"));
+
 static cl::opt<bool> TanhDoubledClamp(
     "agx-tanh-doubled-clamp", cl::init(true), cl::Hidden,
     cl::desc("tanh's 2 min(|x|, 9) as min(|x| + |x|, 18)"));
@@ -567,8 +572,11 @@ public:
         R = ArgBound ? sel(B.CreateFCmpOGE(ExpArg, k(88.72283935546875)),
                            k(INFINITY), R)
                      : sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
+      // (and +0 exactly up to -87.3365479, 0xc2aeac50: L15-E474)
       if (!NoUnderflow)
-        R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
+        R = ArgBound && ExpUnclamped && !NoOverflow
+                ? sel(B.CreateFCmpOLE(ExpArg, k(-87.3365478515625)), k(0.0), R)
+                : sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
       // A NaN v comes from a NaN argument, whose sum t + 1.5 2^23 is then
       // the NaN 0x7fc00000, 0 shifted by 23: s is v's bits, which no +inf
       // select overrides (L15-E472).
@@ -605,7 +613,18 @@ public:
                  bool NoOverflow = false, bool NonNegative = false) {
     Value *C;
     Value *Y;
-    if (NoOverflow && !Bounded && !Lo) {
+    // exp's +inf and +0 selects by its argument's compares (E473, E474) give
+    // +inf and +0 beyond the clamps as well (a NaN failing both): no clamps.
+    // (Its n and r are then garbage there, an infinity's a NaN, and the
+    // integer sum wraps: all selected away.)
+    // (Not below a maximum: there only the clamp at -104 would go, and the
+    // argument held to the end took a register: attn_decode_f16 +1.1% tput.)
+    bool Unclamped = !Lo && !Bounded && !NoOverflow && ExpUnclamped &&
+                     ExpOverflowByArg && ExpMagicRound && NativeNaN &&
+                     NoDenormals && IntegerLdexp;
+    if (Unclamped) {
+      C = Hi;
+    } else if (NoOverflow && !Bounded && !Lo) {
       // (at most a denormal above 0: only the clamp below)
       C = sel(lt(Hi, -104.0), k(-104.0), Hi);
     } else if (!Bounded && NegatedClamp && match(Hi, m_FNeg(m_Value(Y)))) {

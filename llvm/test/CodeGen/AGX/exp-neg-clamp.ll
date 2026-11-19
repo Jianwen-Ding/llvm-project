@@ -5,10 +5,15 @@
 ; addend modifier, instead of an xor before the clamp's selects (bit-identical
 ; on the simulator's functional model).
 
+; Since L15-E474 exp has no clamps: its +inf and +0 selects compare the
+; argument, here -x, x itself against the negated bounds.
 ; CHECK-LABEL: nexp:
 ; CHECK-NOT: xor
-; CHECK-DAG: fcmpsel lt,
-; CHECK-DAG: fcmpsel gt,
+; CHECK: fmadd32 {{r[0-9]+}}, {{r[0-9]+}}, {{r[0-9]+}}, u2.neg
+; CHECK-NOT: fcmpsel lt,
+; CHECK-NOT: fcmpsel gt,
+; CHECK: fcmpsel lte, {{r[0-9]+}}, u2,
+; CHECK: fcmpsel gte, {{r[0-9]+}}, u2, {{r[0-9]+}}, 0,
 ; CHECK-NOT: xor
 ; CHECK: stop
 define agx_kernel void @nexp(ptr addrspace(1) %p, float %x) {
