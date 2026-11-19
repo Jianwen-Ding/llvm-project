@@ -37,6 +37,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
@@ -386,10 +387,11 @@ static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
 }
 
 static cl::opt<unsigned> TapBasesMin(
-    "agx-tap-bases-min", cl::init(5), cl::Hidden,
-    cl::desc("Device accesses at inttoptr(k_j + p), p stepped by an "
-             "innermost loop and the k_j invariant, a loop must have to get "
-             "a copy addressing them from one base (0: off)"));
+    "agx-tap-bases-min", cl::init(3), cl::Hidden,
+    cl::desc("Distinct invariant k_j of device accesses at inttoptr(k_j + "
+             "p), p stepped by an innermost loop and not an extended 32-bit "
+             "index, a loop must have to get a copy addressing them from one "
+             "base (0: off)"));
 
 /// The PTX front end's accesses at integer addresses inttoptr(k_j + p): a
 /// convolution's taps, p the channel's offset stepped each iteration and
@@ -461,6 +463,15 @@ static bool versionTapBases(Loop &L, Function &F, LoopInfo &LI,
       if (auto *KI = dyn_cast<Instruction>(K);
           KI && !DT.dominates(KI, Pre->getTerminator()))
         continue;
+      // (p an extended 32-bit index, scaled: loop strength reduction already
+      // takes it as the accesses' index register)
+      {
+        using namespace PatternMatch;
+        if (match(V, m_ZExtOrSExt(m_Value())) ||
+            match(V, m_Shl(m_ZExtOrSExt(m_Value()), m_ConstantInt())) ||
+            match(V, m_Mul(m_ZExtOrSExt(m_Value()), m_ConstantInt())))
+          continue;
+      }
       SmallVector<Tap, 4> Points;
       bool OK = true;
       for (User *U : P->users()) {

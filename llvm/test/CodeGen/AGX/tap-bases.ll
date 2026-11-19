@@ -8,7 +8,9 @@
 ; loop addresses them from inttoptr(k_0 + p) and 32-bit element indices
 ; (k_j - k_0) / 4, where every difference is a multiple of 4 whose quotient fits
 ; 32 signed bits for the whole SIMD-group (L15-E395); the loop as it was
-; elsewhere.
+; elsewhere. @index's p is an extended 32-bit index scaled by 4, which loop
+; strength reduction already takes as the accesses' index register: no copy
+; (L15-E396).
 
 ; CHECK-LABEL: @taps(
 ; CHECK:       call i32 @llvm.agx.simd.ballot
@@ -71,6 +73,57 @@ loop:
   %v4 = load float, ptr addrspace(1) %q4, align 4
   %s4 = call float @llvm.fma.f32(float %v4, float %v4, float %s3)
   %p.next = add i64 %p, %stride
+  %i.next = add i32 %i, 1
+  %c1 = icmp slt i32 %i.next, %c
+  br i1 %c1, label %loop, label %exit
+
+exit:
+  %o = getelementptr float, ptr addrspace(1) %out, i32 %tid
+  store float %s4, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+; CHECK-LABEL: @index(
+; CHECK-NOT:   onebase
+; OFF-LABEL:   index:
+; CHECK:       ret void
+define agx_kernel void @index(ptr addrspace(1) %out, i64 %in, i32 %stride, i32 %c, i64 %o0, i64 %o1, i64 %o2, i64 %o3, i64 %o4) {
+entry:
+  %tid = call i32 @llvm.agx.thread.position.in.grid.x()
+  %k0 = add i64 %in, %o0
+  %k1 = add i64 %in, %o1
+  %k2 = add i64 %in, %o2
+  %k3 = add i64 %in, %o3
+  %k4 = add i64 %in, %o4
+  br label %loop
+
+loop:
+  %j = phi i32 [ %tid, %entry ], [ %j.next, %loop ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  %s = phi float [ 0.0, %entry ], [ %s4, %loop ]
+  %je = sext i32 %j to i64
+  %p = shl nsw i64 %je, 2
+  %a0 = add i64 %k0, %p
+  %q0 = inttoptr i64 %a0 to ptr addrspace(1)
+  %v0 = load float, ptr addrspace(1) %q0, align 4
+  %s0 = call float @llvm.fma.f32(float %v0, float %v0, float %s)
+  %a1 = add i64 %k1, %p
+  %q1 = inttoptr i64 %a1 to ptr addrspace(1)
+  %v1 = load float, ptr addrspace(1) %q1, align 4
+  %s1 = call float @llvm.fma.f32(float %v1, float %v1, float %s0)
+  %a2 = add i64 %k2, %p
+  %q2 = inttoptr i64 %a2 to ptr addrspace(1)
+  %v2 = load float, ptr addrspace(1) %q2, align 4
+  %s2 = call float @llvm.fma.f32(float %v2, float %v2, float %s1)
+  %a3 = add i64 %k3, %p
+  %q3 = inttoptr i64 %a3 to ptr addrspace(1)
+  %v3 = load float, ptr addrspace(1) %q3, align 4
+  %s3 = call float @llvm.fma.f32(float %v3, float %v3, float %s2)
+  %a4 = add i64 %k4, %p
+  %q4 = inttoptr i64 %a4 to ptr addrspace(1)
+  %v4 = load float, ptr addrspace(1) %q4, align 4
+  %s4 = call float @llvm.fma.f32(float %v4, float %v4, float %s3)
+  %j.next = add i32 %j, %stride
   %i.next = add i32 %i, 1
   %c1 = icmp slt i32 %i.next, %c
   br i1 %c1, label %loop, label %exit
