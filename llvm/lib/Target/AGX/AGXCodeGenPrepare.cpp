@@ -6484,6 +6484,182 @@ static bool halfFromFloat(Function &F) {
   return !Roots.empty();
 }
 
+static cl::opt<bool> AGXHalfSelects(
+    "agx-half-selects", cl::init(true), cl::Hidden,
+    cl::desc("A select or compare of halves extended to float (or of float "
+             "constants exact in half) done on the halves"));
+
+/// select(c, ext a, ext b) is ext(select(c, a, b)) and fcmp(ext a, ext b) is
+/// fcmp(a, b), a and b halves (or, on one side, a float constant exact in
+/// half): the extension is exact, keeps NaNs and the order. The select's
+/// extension then folds into the float operations reading it as a 16-bit
+/// source, instead of being a conversion before the select (the clamps of
+/// the exp expansion's argument, silu's e^-x of an extended half; L15-E449).
+/// Selects only where every user reads a 16-bit source: float arithmetic,
+/// fmas, half truncations, compares and selects turned to half here, and
+/// negations of those.
+static bool halfSelects(Function &F) {
+  if (!AGXHalfSelects)
+    return false;
+  using namespace PatternMatch;
+  const DataLayout &DL = F.getDataLayout();
+  Type *H = Type::getHalfTy(F.getContext());
+  auto Narrow = [&](Value *V) -> Value * {
+    Value *X;
+    if (match(V, m_FPExt(m_Value(X))) &&
+        X->getType()->getScalarType()->isHalfTy())
+      return X;
+    if (auto *C = dyn_cast<Constant>(V);
+        C && V->getType()->getScalarType()->isFloatTy()) {
+      Type *HT = V->getType()->getWithNewType(H);
+      Constant *T = ConstantFoldCastOperand(Instruction::FPTrunc, C, HT, DL);
+      if (T && ConstantFoldCastOperand(Instruction::FPExt, T, V->getType(),
+                                       DL) == C)
+        return T;
+    }
+    return nullptr;
+  };
+  auto IsExt = [](Value *V) { return isa<FPExtInst>(V); };
+  // both values narrow (one an extension) or selects becoming narrow
+  SmallPtrSet<SelectInst *, 8> Cand;
+  auto NarrowOrCand = [&](Value *V) {
+    auto *S = dyn_cast<SelectInst>(V);
+    return Narrow(V) || (S && Cand.contains(S));
+  };
+  for (Instruction &I : instructions(F))
+    if (auto *S = dyn_cast<SelectInst>(&I);
+        S && S->getType()->getScalarType()->isFloatTy() &&
+        NarrowOrCand(S->getTrueValue()) && NarrowOrCand(S->getFalseValue()) &&
+        (IsExt(S->getTrueValue()) || IsExt(S->getFalseValue()) ||
+         isa<SelectInst>(S->getTrueValue()) ||
+         isa<SelectInst>(S->getFalseValue())))
+      Cand.insert(S);
+  // (users reading the value as a 16-bit source)
+  std::function<bool(Use &, unsigned)> Reads16 = [&](Use &U,
+                                                     unsigned D) -> bool {
+    auto *I = cast<Instruction>(U.getUser());
+    switch (I->getOpcode()) {
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+      return true;
+    case Instruction::FPTrunc:
+      return I->getType()->getScalarType()->isHalfTy();
+    case Instruction::FCmp:
+      return NarrowOrCand(I->getOperand(1 - U.getOperandNo()));
+    case Instruction::FNeg:
+      return D < 2 && all_of(I->uses(),
+                             [&](Use &V) { return Reads16(V, D + 1); });
+    case Instruction::Select: {
+      auto *S = cast<SelectInst>(I);
+      return U.getOperandNo() != 0 && Cand.contains(S);
+    }
+    default:
+      break;
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(I))
+      return II->getIntrinsicID() == Intrinsic::fma ||
+             II->getIntrinsicID() == Intrinsic::fmuladd;
+    return false;
+  };
+  // (users first: a candidate stays one only if its users all read 16 bits)
+  SmallVector<SelectInst *, 8> Order;
+  for (Instruction &I : instructions(F))
+    if (auto *S = dyn_cast<SelectInst>(&I); S && Cand.contains(S))
+      Order.push_back(S);
+  for (bool Again = true; Again;) {
+    Again = false;
+    for (SelectInst *S : Order)
+      if (Cand.contains(S) &&
+          !all_of(S->uses(), [&](Use &U) { return Reads16(U, 0); })) {
+        Cand.erase(S);
+        Again = true;
+      }
+    for (SelectInst *S : Order)
+      if (Cand.contains(S) && !(NarrowOrCand(S->getTrueValue()) &&
+                                NarrowOrCand(S->getFalseValue()))) {
+        Cand.erase(S);
+        Again = true;
+      }
+  }
+  bool Changed = false;
+  DenseMap<SelectInst *, Value *> NewOf;
+  auto Get = [&](Value *V) -> Value * {
+    if (auto *S = dyn_cast<SelectInst>(V); S && NewOf.count(S))
+      return NewOf[S];
+    return Narrow(V);
+  };
+  // compares of narrow values (or of selects becoming narrow), then the
+  // selects in order (operands before users)
+  SmallVector<FCmpInst *, 8> Cmps;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<FCmpInst>(&I);
+        C && C->getOperand(0)->getType()->getScalarType()->isFloatTy() &&
+        NarrowOrCand(C->getOperand(0)) && NarrowOrCand(C->getOperand(1)) &&
+        !(isa<Constant>(C->getOperand(0)) && isa<Constant>(C->getOperand(1))))
+      Cmps.push_back(C);
+  // (a candidate operand laid out after its user: none of it)
+  SmallPtrSet<SelectInst *, 8> Seen;
+  for (SelectInst *S : Order) {
+    Seen.insert(S);
+    for (Value *V : {S->getTrueValue(), S->getFalseValue()})
+      if (auto *O = dyn_cast<SelectInst>(V);
+          O && Cand.contains(O) && !Seen.contains(O))
+        return false;
+  }
+  for (SelectInst *S : Order) {
+    if (!Cand.contains(S))
+      continue;
+    IRBuilder<> B(S);
+    Value *N = B.CreateSelect(S->getCondition(), Get(S->getTrueValue()),
+                              Get(S->getFalseValue()), S->getName() + ".h");
+    if (auto *NI = dyn_cast<Instruction>(N))
+      NI->copyMetadata(*S);
+    NewOf[S] = N;
+    Changed = true;
+  }
+  for (FCmpInst *C : Cmps) {
+    IRBuilder<> B(C);
+    Value *N = B.CreateFCmp(C->getPredicate(), Get(C->getOperand(0)),
+                            Get(C->getOperand(1)), C->getName() + ".h");
+    if (auto *NI = dyn_cast<Instruction>(N))
+      NI->copyFastMathFlags(C);
+    C->replaceAllUsesWith(N);
+    Changed = true;
+  }
+  for (SelectInst *S : Order)
+    if (Value *N = NewOf.lookup(S)) {
+      IRBuilder<> B(S);
+      S->replaceAllUsesWith(B.CreateFPExt(N, S->getType()));
+    }
+  for (FCmpInst *C : Cmps)
+    C->eraseFromParent();
+  for (SelectInst *S : reverse(Order))
+    if (NewOf.count(S))
+      RecursivelyDeleteTriviallyDeadInstructions(S);
+  // -ext(h) as ext(-h), a 16-bit source with its negation modifier (the
+  // instruction selection's extended operands are an fpext at the top)
+  SmallVector<UnaryOperator *, 8> Negs;
+  for (Instruction &I : instructions(F))
+    if (auto *N = dyn_cast<UnaryOperator>(&I);
+        N && N->getOpcode() == Instruction::FNeg &&
+        isa<FPExtInst>(N->getOperand(0)) &&
+        cast<FPExtInst>(N->getOperand(0))
+            ->getSrcTy()
+            ->getScalarType()
+            ->isHalfTy())
+      Negs.push_back(N);
+  for (UnaryOperator *N : Negs) {
+    IRBuilder<> B(N);
+    auto *E = cast<FPExtInst>(N->getOperand(0));
+    Value *R = B.CreateFPExt(B.CreateFNeg(E->getOperand(0)), N->getType());
+    N->replaceAllUsesWith(R);
+    RecursivelyDeleteTriviallyDeadInstructions(N);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXDeferredMinMax(
     "agx-deferred-minmax-reductions", cl::init(true), cl::Hidden,
     cl::desc("A loop's running llvm.maximum / minimum as an ordered compare-"
@@ -6947,6 +7123,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= flushHalfDenormals(F);
   Changed |= flushFloatMinMax(F);
   Changed |= expandDivisions(F);
+  // (after the expansions: the exp argument's clamps, the divisions' uses)
+  Changed |= halfSelects(F);
   Changed |= mergeMaskedOrs(F);
   Changed |= permuteBytes(F);
   Changed |= loadBFloatsAsWords(F);

@@ -179,6 +179,10 @@ def fmax32_0(s):
   if (s & 0x7f800000) == 0x7f800000 and s & 0x7fffff: return 0
   if s >> 31: return 0
   return s
+# float constants for the selects: exact in half (104, -89, 0.5, +-0, 65504,
+# +-inf, 2^-24, 1) and not (0.1, 1e5, 70000)
+KF=[0x42D00000,0xC2B20000,0x3F000000,0,0x80000000,0x477FE000,0x7F800000,0xFF800000,0x33800000,0x3F800000,
+    0x3DCCCCCD,0x47C35000,0x4788B800]
 PRED=['oeq','ogt','oge','olt','ole','one','ord','ueq','ugt','uge','ult','ule','une','uno']
 def hcmp(p,a,b):
   x,y=h2f(a),h2f(b); un=math.isnan(x) or math.isnan(y)
@@ -233,7 +237,27 @@ def gen(seed):
         body.append(f'  {t} = {op2} float {s}, {ec}')
       body.append(f'  {r} = fptrunc float {t} to half')
       ops.append((r,'ext32b',op,op2,a,b,c)); hv.append(r)
-    elif k<0.82:
+    elif k<0.81:
+      # a select of extended halves (or float constants, exact in half or
+      # not) on a compare of them, perhaps clamped again and negated, read
+      # by a float operation (its select of halves, L15-E449)
+      def fv():
+        if R.random()<0.35:
+          kb=R.choice(KF); return ('k',kb), '0x%016X'%struct.unpack('<Q',struct.pack('<d',fl(kb)))[0]
+        h=R.choice(hv); e=nv(); body.append(f'  {e} = fpext half {h} to float'); return ('e',h), e
+      p=R.choice(PRED); A=fv(); B=fv(); X=fv(); Y=fv(); c=nv(); s=nv()
+      body+=[f'  {c} = fcmp {p} float {A[1]}, {B[1]}', f'  {s} = select i1 {c}, float {X[1]}, float {Y[1]}']
+      chain=[(p,A[0],B[0],X[0],Y[0])]
+      if R.random()<0.5:
+        p2=R.choice(PRED); K=fv(); c2=nv(); s2=nv()
+        body+=[f'  {c2} = fcmp {p2} float {s}, {K[1]}', f'  {s2} = select i1 {c2}, float {K[1]}, float {s}']
+        chain.append((p2,K[0])); s=s2
+      neg=R.random()<0.4
+      if neg: t=nv(); body.append(f'  {t} = fneg float {s}'); s=t
+      C=fv(); op=R.choice(['fadd','fmul']); u=nv()
+      body+=[f'  {u} = {op} float {s}, {C[1]}', f'  {r} = fptrunc float {u} to half']
+      ops.append((r,'ext32sel',chain,neg,op,C[0])); hv.append(r)
+    elif k<0.84:
       fn=R.choice(['fneg','fabs'])
       if fn=='fneg': body.append(f'  {r} = fneg half {a}')
       else: decl.add('declare half @llvm.fabs.f16(half)'); body.append(f'  {r} = call half @llvm.fabs.f16(half {a})')
@@ -279,6 +303,14 @@ def evaluate(ops,outs,hv,ins,N):
         if op[3]=='max0': t=fmax32_0(s)
         else: t=fadd32(s,z) if op[3]=='fadd' else fmul32(s,z)
         v=fptrunc(t)
+      elif k=='ext32sel':
+        val=lambda d: fpext(e[d[1]]) if d[0]=='e' else d[1]
+        p,A,B,X,Y=op[2][0]
+        s=val(X) if fcmp(p,val(A),val(B)) else val(Y)
+        if len(op[2])>1:
+          p2,K=op[2][1]; s=val(K) if fcmp(p2,s,val(K)) else s
+        if op[3]: s^=0x80000000
+        c=val(op[5]); t=fadd32(s,c) if op[4]=='fadd' else fmul32(s,c); v=fptrunc(t)
       elif k=='fneg': v=e[op[2]]^0x8000
       elif k=='fabs': v=e[op[2]]&0x7fff
       elif k in ('sitofp','uitofp'): v=i2h(e[op[2]],k=='sitofp')
