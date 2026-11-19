@@ -38,6 +38,7 @@
 #include "AGXInstrInfo.h"
 #include "AGXSubtarget.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/Support/CommandLine.h"
@@ -501,14 +502,40 @@ static cl::opt<bool> ShareLoopLevels(
 /// levels apart (an else toggles level 1 only after its if has pushed every
 /// inactive thread deeper). Calls (which push 2 and rely on their callee's
 /// levels) are left alone.
+static unsigned countOpcode(MachineBasicBlock &MBB, unsigned Opc) {
+  return llvm::count_if(
+      MBB, [&](MachineInstr &MI) { return MI.getOpcode() == Opc; });
+}
+
+/// Whether MBB starts with two pops (it holds two end.cf pseudos, which go to
+/// its start), or holds one alone and falls through to a block that starts
+/// with one.
+static bool popFollowedByPop(MachineBasicBlock &MBB) {
+  unsigned Pops = countOpcode(MBB, AGX::AGX_END_CF);
+  if (Pops != 1)
+    return Pops >= 2;
+  bool Alone = llvm::all_of(MBB, [](MachineInstr &MI) {
+    return MI.isMetaInstruction() || MI.getOpcode() == AGX::AGX_END_CF;
+  });
+  if (!Alone || MBB.succ_size() != 1)
+    return false;
+  MachineBasicBlock *Next = *MBB.succ_begin();
+  return MBB.isLayoutSuccessor(Next) &&
+         countOpcode(*Next, AGX::AGX_END_CF) != 0;
+}
+
+static void eraseOne(MachineBasicBlock &MBB, unsigned Opc) {
+  for (MachineInstr &MI : MBB)
+    if (MI.getOpcode() == Opc) {
+      MI.eraseFromParent();
+      return;
+    }
+}
+
 static bool shareLoopLevels(MachineFunction &MF) {
   if (!ShareLoopLevels || MF.getFrameInfo().hasCalls())
     return false;
-  auto count = [](MachineBasicBlock &MBB, unsigned Opc) {
-    return llvm::count_if(MBB, [&](MachineInstr &MI) {
-      return MI.getOpcode() == Opc;
-    });
-  };
+  auto count = countOpcode;
   bool Changed = false;
   for (MachineBasicBlock &L : MF) {
     MachineInstr *Latch = nullptr;
@@ -543,32 +570,62 @@ static bool shareLoopLevels(MachineFunction &MF) {
         Pre = P;
     if (!Pre || Pre == &L || count(*Pre, AGX::AGX_LOOP_BEGIN) != 1)
       continue;
-    unsigned Pops = count(*Exit, AGX::AGX_END_CF);
-    if (Pops == 0)
+    if (!popFollowedByPop(*Exit))
       continue;
-    if (Pops == 1) {
-      // The exit holds the pop alone, and falls through to a block whose
-      // first instructions are pops.
-      bool Alone = llvm::all_of(*Exit, [](MachineInstr &MI) {
-        return MI.isMetaInstruction() || MI.getOpcode() == AGX::AGX_END_CF;
-      });
-      if (!Alone || Exit->succ_size() != 1)
-        continue;
-      MachineBasicBlock *Next = *Exit->succ_begin();
-      if (!Exit->isLayoutSuccessor(Next) || count(*Next, AGX::AGX_END_CF) == 0)
-        continue;
-    }
     for (MachineInstr &MI : make_early_inc_range(*Pre))
       if (MI.getOpcode() == AGX::AGX_LOOP_BEGIN)
         MI.eraseFromParent();
-    for (MachineInstr &MI : *Exit)
-      if (MI.getOpcode() == AGX::AGX_END_CF) {
-        MI.eraseFromParent();
-        break;
-      }
+    eraseOne(*Exit, AGX::AGX_END_CF);
     Changed = true;
   }
   return Changed;
+}
+
+static cl::opt<bool> ShareIfLevels(
+    "agx-share-if-levels", cl::init(true), cl::Hidden,
+    cl::desc("An if without an else whose pop is followed at once by another "
+             "pop deactivates its threads by a while at the level of the "
+             "construct around it, without its own pop"));
+
+/// The ifs without an else whose pop is followed at once by another pop (of
+/// the construct the if ends): their compare is a while (n = 1), which
+/// deactivates the active threads where it fails (level 1) and leaves the
+/// inactive ones where they are, and their pop is left out. With the if, a
+/// thread at level v > 0 goes to v + 1 and one that fails to 1, and the two
+/// pops take them to v - 1 and 0; with the while, to v and 1, and the one
+/// pop gives the same. The active threads in the if are the same (the
+/// argument of shareLoopLevels). An else would tell its if's failing threads
+/// from the inactive ones by their level, so ifs with one are left alone.
+/// Inner ifs go first (from the end of the function), so that a run of them
+/// ending together shares one level.
+static void shareIfLevels(MachineFunction &MF,
+                          SmallPtrSetImpl<MachineInstr *> &Shared) {
+  if (!ShareIfLevels || MF.getFrameInfo().hasCalls())
+    return;
+  for (MachineBasicBlock &MBB : llvm::reverse(MF)) {
+    MachineInstr *If = nullptr;
+    unsigned TargetOp = 0;
+    for (MachineInstr &MI : MBB)
+      switch (MI.getOpcode()) {
+      case AGX::AGX_IF:
+        If = &MI, TargetOp = 1;
+        break;
+      case AGX::AGX_IF_ICMP:
+      case AGX::AGX_IF_FCMP:
+      case AGX::AGX_IF_ICMP16:
+        If = &MI, TargetOp = 5;
+        break;
+      default:
+        break;
+      }
+    if (!If)
+      continue;
+    MachineBasicBlock &Flow = *If->getOperand(TargetOp).getMBB();
+    if (countOpcode(Flow, AGX::AGX_ELSE) || !popFollowedByPop(Flow))
+      continue;
+    eraseOne(Flow, AGX::AGX_END_CF);
+    Shared.insert(If);
+  }
 }
 
 bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
@@ -577,6 +634,8 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
   bool HasShuffleIndex = false;
 
   shareLoopLevels(MF);
+  SmallPtrSet<MachineInstr *, 8> SharedIfs;
+  shareIfLevels(MF, SharedIfs);
 
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
@@ -584,7 +643,9 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
       const DebugLoc &DL = MI.getDebugLoc();
       switch (MI.getOpcode()) {
       case AGX::AGX_IF: {
-        buildExecOp(MBB, I, DL, TII, AGX::IF_ICMP, ICondNE)
+        buildExecOp(MBB, I, DL, TII,
+                    SharedIfs.count(&MI) ? AGX::WHILE_ICMP : AGX::IF_ICMP,
+                    ICondNE)
             .addImm(0)
             .add(MI.getOperand(0))
             .addImm(0)
@@ -641,10 +702,12 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
         bool Float = Opc == AGX::AGX_IF_FCMP || Opc == AGX::AGX_LOOP_FCMP;
         bool Half = Opc == AGX::AGX_IF_ICMP16 || Opc == AGX::AGX_LOOP_ICMP16;
         unsigned CC = MI.getOperand(0).getImm() ^ (Loop ? 8 : 0);
+        // An if that shares the level around it is a while (shareIfLevels).
+        bool While = Loop || SharedIfs.count(&MI);
         unsigned Exec =
-            Half ? (Loop ? AGX::WHILE_ICMP16 : AGX::IF_ICMP16)
-            : Loop ? (Float ? AGX::WHILE_FCMP : AGX::WHILE_ICMP)
-                   : (Float ? AGX::IF_FCMP : AGX::IF_ICMP);
+            Half ? (While ? AGX::WHILE_ICMP16 : AGX::IF_ICMP16)
+            : While ? (Float ? AGX::WHILE_FCMP : AGX::WHILE_ICMP)
+                    : (Float ? AGX::IF_FCMP : AGX::IF_ICMP);
         buildExecOp(MBB, I, DL, TII, Exec, CC)
             .add(MI.getOperand(1))
             .add(MI.getOperand(2))
