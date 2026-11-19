@@ -482,6 +482,78 @@ static bool removeFencesAfterBarriers(MachineFunction &MF) {
   return Changed;
 }
 
+static cl::opt<bool> RemoveTrailingFences(
+    "agx-remove-trailing-fences", cl::init(true), cl::Hidden,
+    cl::desc("Remove a kernel's fences that no memory access, barrier or call "
+             "follows on any path to its end"));
+
+/// A fence orders the thread's accesses before it against those after it:
+/// in a kernel, a fence that no memory access, barrier or call follows on
+/// any path to the stop (an acq_rel atomic's acquire fence at the end, a
+/// histogram's) orders nothing (L15-E438), and neither does the wait of an
+/// acquire's sequence (wait 0, then the fence) there: AGXInsertWaits, which
+/// runs after, still waits before the stop for load results in flight.
+/// Barriers count: a fence before one orders this thread's stores for the
+/// threads after it.
+static bool removeTrailingFences(MachineFunction &MF) {
+  if (!RemoveTrailingFences ||
+      MF.getFunction().getCallingConv() != CallingConv::AGX_KERNEL)
+    return false;
+  auto Relevant = [](const MachineInstr &MI) {
+    if (MI.isMetaInstruction() || MI.getOpcode() == AGX::MEMORY_BARRIER ||
+        MI.getOpcode() == AGX::WAIT)
+      return false;
+    if (MI.mayLoadOrStore() || MI.isCall() || MI.isInlineAsm() ||
+        MI.getOpcode() == AGX::THREADGROUP_BARRIER ||
+        MI.getOpcode() == AGX::BLOCK_BARRIER)
+      return true;
+    // (the execution mask's instructions and the stop order no memory)
+    return MI.hasUnmodeledSideEffects() && !AGXInstrInfo::isExecMaskOp(MI) &&
+           !MI.isTerminator() && !MI.isBranch();
+  };
+  // Clean[B]: no relevant instruction from B's end on any path (the
+  // greatest fixpoint: a path through one clears it).
+  DenseMap<const MachineBasicBlock *, bool> Clean, Inside;
+  for (MachineBasicBlock &MBB : MF) {
+    Inside[&MBB] = llvm::none_of(MBB, Relevant);
+    Clean[&MBB] = true;
+  }
+  for (bool Again = true; Again;) {
+    Again = false;
+    for (MachineBasicBlock &MBB : MF) {
+      bool C = llvm::all_of(MBB.successors(), [&](MachineBasicBlock *S) {
+        return Inside[S] && Clean[S];
+      });
+      // (a block that ends otherwise than in a stop or by its successors:
+      // a return to a caller, which kernels have none of)
+      if (MBB.succ_empty() && !(MBB.getFirstTerminator() != MBB.end() &&
+                                MBB.getFirstTerminator()->getOpcode() ==
+                                    AGX::AGX_STOP))
+        C = false;
+      if (C != Clean[&MBB]) {
+        Clean[&MBB] = C;
+        Again = true;
+      }
+    }
+  }
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    bool C = Clean[&MBB];
+    for (MachineInstr &MI : make_early_inc_range(reverse(MBB))) {
+      if ((MI.getOpcode() == AGX::MEMORY_BARRIER ||
+           MI.getOpcode() == AGX::WAIT) &&
+          C) {
+        MI.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (Relevant(MI))
+        C = false;
+    }
+  }
+  return Changed;
+}
+
 /// Remove the r0h resets that the next shuffle index of their block
 /// overwrites before the execution mask can change.
 static void removeRedundantIndexResets(MachineFunction &MF) {
@@ -794,6 +866,7 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
   removeRepeatedBarriers(MF);
   if (MergeBarrierFences)
     removeFencesAfterBarriers(MF);
+  removeTrailingFences(MF);
 
   MachineBasicBlock &Entry = MF.front();
   if (HasShuffleIndex)

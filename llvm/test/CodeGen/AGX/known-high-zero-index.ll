@@ -19,8 +19,6 @@ define agx_kernel void @atomic_byte(ptr addrspace(1) %p, ptr addrspace(1) %h, i3
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    memory_barrier 0, 3, 3
 ; CHECK-NEXT:    atomic add, 0, _, u2_u3, r1, unsigned, r2, 0
-; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    memory_barrier 3, 1, 9
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap
@@ -43,8 +41,6 @@ define agx_kernel void @atomic_byte(ptr addrspace(1) %p, ptr addrspace(1) %h, i3
 ; OFF-NEXT:    wait 0
 ; OFF-NEXT:    memory_barrier 0, 3, 3
 ; OFF-NEXT:    atomic add, 0, _, u2_u3, r1, unsigned, r2, 0
-; OFF-NEXT:    wait 0
-; OFF-NEXT:    memory_barrier 3, 1, 9
 ; OFF-NEXT:    stop
 ; OFF-NEXT:    trap
 ; OFF-NEXT:    trap
