@@ -32,6 +32,8 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -45,6 +47,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
@@ -1235,6 +1238,106 @@ static bool mergeCongruentCounters(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXRebaseCompares(
+    "agx-rebase-compares", cl::init(true), cl::Hidden,
+    cl::desc("A compare of an induction value with an invariant on another "
+             "header phi of the same step (its offset added to the "
+             "invariant) where neither side can wrap"));
+
+/// In a loop, a compare of A = {a0,+,s} (an induction value the loop only
+/// computes for it, attention's causal mask j = lane + c <= row) with a
+/// loop-invariant B is the compare of a 32-bit header phi I = {i0,+,s} of
+/// the same step (the load's index base + lane + c) with B + D, D = i0 - a0
+/// invariant: I = A + D at every iteration, and an unsigned order (or
+/// equality) holds of A + D and B + D where neither passes 2^32 (bounds of
+/// A, B and D). B + D is computed before the loop; A's add (and a counter
+/// left only to the exit test: mergeUpCounter) goes (L15-E447).
+static bool rebaseCompares(Loop &L, ScalarEvolution &SE, const Function &F) {
+  BasicBlock *Pre = L.getLoopPreheader();
+  if (!AGXRebaseCompares || !Pre || !L.isInnermost())
+    return false;
+  using namespace PatternMatch;
+  auto Bound = [&](const SCEV *X) -> std::optional<APInt> {
+    APInt R = SE.getUnsignedRangeMax(X).zext(128);
+    std::optional<APInt> B = upperBound(X, SE, F);
+    return B && B->ult(R) ? *B : R;
+  };
+  Type *I32 = Type::getInt32Ty(F.getContext());
+  // a 32-bit value V stands for (an i32, the zero extension of one, a
+  // constant below 2^32)
+  auto Narrow = [&](Value *V) -> Value * {
+    if (V->getType() == I32)
+      return V;
+    Value *X;
+    if (match(V, m_ZExt(m_Value(X))) && X->getType() == I32)
+      return X;
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      if (C->getValue().isIntN(32))
+        return ConstantInt::get(I32, C->getZExtValue());
+    return nullptr;
+  };
+  SmallVector<ICmpInst *, 4> Cmps;
+  for (BasicBlock *BB : L.blocks())
+    for (Instruction &I : *BB)
+      if (auto *C = dyn_cast<ICmpInst>(&I))
+        if (C->isUnsigned() || C->isEquality())
+          Cmps.push_back(C);
+  bool Changed = false;
+  APInt Top = APInt(128, 1).shl(32);
+  for (ICmpInst *C : Cmps) {
+    for (unsigned Side = 0; Side < 2; ++Side) {
+      Value *A = Narrow(C->getOperand(Side)),
+            *B = Narrow(C->getOperand(1 - Side));
+      if (!A || !B || !L.isLoopInvariant(B))
+        continue;
+      auto *SA = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
+      if (!SA || SA->getLoop() != &L || !SA->isAffine())
+        continue;
+      PHINode *Found = nullptr;
+      const SCEV *D = nullptr;
+      for (PHINode &P : L.getHeader()->phis()) {
+        if (P.getType() != I32 || &P == A)
+          continue;
+        auto *SI = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(&P));
+        if (!SI || SI->getLoop() != &L || !SI->isAffine() ||
+            SI->getStepRecurrence(SE) != SA->getStepRecurrence(SE))
+          continue;
+        const SCEV *Diff = SE.getMinusSCEV(SI->getStart(), SA->getStart());
+        if (!SE.isLoopInvariant(Diff, &L) || isa<SCEVCouldNotCompute>(Diff) ||
+            Diff->isZero())
+          continue;
+        std::optional<APInt> BA = Bound(SA), BB = Bound(SE.getSCEV(B)),
+                             BD = Bound(Diff);
+        if (!BA || !BB || !BD || !(*BA + *BD).ult(Top) ||
+            !(*BB + *BD).ult(Top))
+          continue;
+        Found = &P;
+        D = Diff;
+        break;
+      }
+      if (!Found)
+        continue;
+      SCEVExpander Exp(SE, "agx.rebase");
+      if (!Exp.isSafeToExpand(D))
+        continue;
+      Value *DV = Exp.expandCodeFor(D, I32, Pre->getTerminator());
+      IRBuilder<> PB(Pre->getTerminator());
+      Value *NB = PB.CreateAdd(B, DV, "agx.rebased");
+      IRBuilder<> CB(C);
+      Value *N = Side == 0 ? CB.CreateICmp(C->getPredicate(), Found, NB)
+                           : CB.CreateICmp(C->getPredicate(), NB, Found);
+      C->replaceAllUsesWith(N);
+      Value *Old = C->getOperand(Side);
+      C->eraseFromParent();
+      RecursivelyDeleteTriviallyDeadInstructions(Old);
+      SE.forgetLoop(&L);
+      Changed = true;
+      break;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNarrowAfterCounters(
     "agx-narrow-bounded-after-counters", cl::init(true), cl::Hidden,
     cl::desc("agx-narrow-bounded-i64 again after the counters are narrowed"));
@@ -1698,5 +1801,39 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   // CodeGenPrepare pass saw as 64-bit phis: a mask j <= i of j = lane + c)
   if (AGXNarrowAfterCounters)
     Changed |= AGX::narrowBoundedI64(F);
+  // (on the final 32-bit compares, with analyses of the function as it now
+  // is: the splits added blocks)
+  if (AGXRebaseCompares) {
+    DominatorTree DT2(F);
+    LoopInfo LI2(DT2);
+    TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+    TargetLibraryInfo TLI(TLII, &F);
+    AssumptionCache AC(F);
+    ScalarEvolution SE2(F, TLI, AC, DT2, LI2);
+    for (Loop *L : LI2.getLoopsInPreorder()) {
+      if (!rebaseCompares(*L, SE2, F) || !AGXMergeUpCounters)
+        continue;
+      Changed = true;
+      // (what the rebased compare's operand left dead, whose uses the
+      // counter's one-use test would count)
+      SmallVector<WeakTrackingVH, 8> Dead;
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (isInstructionTriviallyDead(&I))
+            Dead.push_back(&I);
+      for (WeakTrackingVH &V : Dead)
+        if (auto *I = dyn_cast_or_null<Instruction>(V)) {
+          SE2.forgetValue(I);
+          RecursivelyDeleteTriviallyDeadInstructions(I);
+        }
+      SmallVector<PHINode *, 4> Counters;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isIntegerTy(32))
+          Counters.push_back(&Phi);
+      for (PHINode *Phi : Counters)
+        if (mergeUpCounter(*Phi, *L, SE2, F))
+          break;
+    }
+  }
   return Changed;
 }

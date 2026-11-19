@@ -73,12 +73,21 @@ def gen(seed):
             # value (no zero's sign reaches the hash: E446 gives it the
             # deferred value) or its bits hashed (a zero's sign does)
             fuse=R.choice([None, None, 'cmp', 'bits']),
+            # an attention row's causal mask: the counter j from the lane
+            # (tid & 31), the index the row's base plus j, unmasked, the
+            # mask j <= (b & 2047) (E447 compares the index instead)
+            lanestart=R.random() < 0.25,
         ))
     for p in loops:
         if p['ctrip']:
             p.update(step=1, exact=False, vstep=False)
         if not p['fmax'] or (p['fuse'] == 'bits' and p['fop'] not in ('maximumnum', 'minimumnum')):
             p['fuse'] = None   # (bits only of default NaNs)
+        if p['lanestart']:
+            # (an unguarded loop from the lane; the index below the input's
+            # words: rows of 1024, at most 1000 trips of 128)
+            p.update(start='row_lane', guarded=False, cmask=True, exact=False, vstep=False, ctrip=None,
+                     lim=min(p['lim'], 1000))
     return loops
 
 
@@ -179,6 +188,10 @@ def emit(loops):
             L += ['  %%%srw = lshr i32 %%tid, 5' % q, '  %%%srw2 = shl i32 %%%srw, 10' % (q, q),
                   '  %%%sln = and i32 %%tid, 31' % q, '  %%%sst = add i32 %%%srw2, %%%sln' % (q, q, q)]
             st = '%%%sst' % q
+            if p.get('lanestart'):
+                st = '%%%srw2' % q
+                if p['wide']:
+                    L.append('  %%%sln64 = zext i32 %%%sln to i64' % (q, q))
         elif p['start'] == 'a_tid':
             L += ['  %%%sm = mul i32 %%a, %d' % (q, p['k'] - (1 << 32) if p['k'] >> 31 else p['k']),
                   '  %%%sst = add i32 %%%sm, %%tid' % (q, q)]
@@ -213,7 +226,8 @@ def emit(loops):
             entry_pred = 'pre0'
         else:
             L += ['  br label %%%shead' % q, '%shead:' % q,
-                  '  %%%sch = phi %s [ 0, %%%spre0 ], [ %%%scn, %%%sbody ]' % (q, ty, q, q, q),
+                  '  %%%sch = phi %s [ %s, %%%spre0 ], [ %%%scn, %%%sbody ]' % (
+                      q, ty, ('%%%sln%s' % (q, '64' if p['wide'] else '')) if p.get('lanestart') else '0', q, q, q),
                   '  %%%sah = phi i32 [ %%a, %%%spre0 ], [ %%%san, %%%sbody ]' % (q, q, q, q)]
             if p['fmax']:
                 L.append('  %%%sfh = phi float [ %s, %%%spre0 ], [ %%%sfn, %%%sbody ]' % (q, fs, q, q, q))
@@ -239,7 +253,8 @@ def emit(loops):
         if p['wide']:
             L.append('  %%%sc32 = trunc %s %s to i32' % (q, ty, c)); c32 = '%%%sc32' % q
         L += ['  %%%si = add i32 %s, %s' % (q, st, c32),
-              '  %%%sim = and i32 %%%si, %d' % (q, q, WORDS - 1),
+              ('  %%%sim = and i32 %%%si, %d' % (q, q, WORDS - 1)) if not p.get('lanestart') else
+              ('  %%%sim = add i32 %%%si, 0' % (q, q)),
               '  %%%sp = getelementptr inbounds i32, ptr addrspace(1) %%in, i32 %%%sim' % (q, q),
               '  %%%sv = load i32, ptr addrspace(1) %%%sp, align 4' % (q, q),
               '  %%%sh1 = mul i32 %s, 31' % (q, acc),
@@ -254,7 +269,12 @@ def emit(loops):
             # a mask of the counter (in its own width) against a bound: a
             # compare that selects, as attention's j <= i
             L += ['  %%%smt = and i32 %%tid, 31' % q, '  %%%smb = and i32 %%b, 2047' % q]
-            if p['wide']:
+            if p.get('lanestart'):
+                if p['wide']:
+                    L += ['  %%%smb6 = zext i32 %%%smb to i64' % (q, q), '  %%%smc = icmp ule i64 %s, %%%smb6' % (q, c, q)]
+                else:
+                    L += ['  %%%smc = icmp ule i32 %s, %%%smb' % (q, c, q)]
+            elif p['wide']:
                 L += ['  %%%smt6 = zext i32 %%%smt to i64' % (q, q), '  %%%smb6 = zext i32 %%%smb to i64' % (q, q),
                       '  %%%smk = add i64 %s, %%%smt6' % (q, c, q),
                       '  %%%smc = icmp ule i64 %%%smk, %%%smb6' % (q, q, q)]
@@ -339,6 +359,8 @@ def model(loops, tid, a, b, inp):
             t = ((t + 1) * s) & M
         # wide counters compare 64-bit values, i32 ones may wrap (not here: t + s < 2^32)
         acc, c, d = a, 0, 0
+        if p.get('lanestart'):
+            st, c = (tid >> 5) << 10, tid & 31
         fm = (0x7f61b1e6 if p.get('fop', '').startswith('minimum') else 0xff61b1e6) \
             if p['fstart'] == 'num' else san(a)   # -+3e38
         first = True
@@ -354,7 +376,7 @@ def model(loops, tid, a, b, inp):
             h = (acc * 31) & M
             h = (h + (i ^ (i >> 7))) & M if not p['usec'] else ((h + (i ^ (i >> 7))) & M) ^ (c & M)
             if p.get('cmask'):
-                k = (c + (tid & 31)) if p['wide'] else ((c + (tid & 31)) & M)
+                k = c if p.get('lanestart') else (c + (tid & 31)) if p['wide'] else ((c + (tid & 31)) & M)
                 h ^= 1 if k <= (b & 2047) else 0
             if p.get('twin'):
                 h ^= d
