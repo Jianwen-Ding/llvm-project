@@ -7513,6 +7513,11 @@ static cl::opt<bool> AGXMaskedTailExits(
 /// that, once true, stays true (j > k, j >= k: a causal mask's j > row),
 /// leaves the loop as soon as the next iteration would be masked: those
 /// iterations change nothing (L15-E476).
+static cl::opt<bool> AGXMaskedTailOr(
+    "agx-masked-tail-or", cl::init(true), cl::Hidden,
+    cl::desc("agx-masked-tail-exits also for a mask that is an or with the "
+             "tail compare"));
+
 static bool maskedTailExits(Function &F) {
   if (!AGXMaskedTailExits)
     return false;
@@ -7547,13 +7552,14 @@ static bool maskedTailExits(Function &F) {
     // m: icmp of an increasing recurrence with an invariant, true from
     // some iteration on; the recurrence and the compare as (A, K, Pred)
     // with Pred(A, K) the mask
-    auto MaskOf = [&](Value *C) -> std::optional<std::tuple<Value *, Value *,
-                                                            CmpPredicate>> {
+    auto MaskOf = [&](Value *C, bool Inverse = false)
+        -> std::optional<std::tuple<Value *, Value *, CmpPredicate>> {
       auto *Cmp = dyn_cast<ICmpInst>(C);
       if (!Cmp || Cmp->getParent() != BB)
         return std::nullopt;
       Value *A = Cmp->getOperand(0), *K = Cmp->getOperand(1);
-      CmpPredicate P = Cmp->getCmpPredicate();
+      CmpPredicate P = Inverse ? CmpPredicate(Cmp->getInversePredicate())
+                               : Cmp->getCmpPredicate();
       if (L->isLoopInvariant(A)) {
         std::swap(A, K);
         P = CmpInst::getSwappedPredicate(P);
@@ -7604,8 +7610,34 @@ static bool maskedTailExits(Function &F) {
     // the reductions
     std::optional<std::tuple<Value *, Value *, CmpPredicate>> Mask;
     Value *MaskCond = nullptr;
-    auto SameMask = [&](Value *C) {
-      auto M = MaskOf(C);
+    // (a mask that the tail compare implies: the compare itself, or an or
+    // of it with anything; or, negated, the condition of the unmasked
+    // values: the inverse compare, or an and of it with anything, as a
+    // sliding window's j <= row && j + w >= row: L15-E480)
+    std::function<std::optional<std::tuple<Value *, Value *, CmpPredicate>>(
+        Value *, bool, unsigned)>
+        Implied = [&](Value *C, bool Unmasked, unsigned D)
+        -> std::optional<std::tuple<Value *, Value *, CmpPredicate>> {
+      if (!Unmasked) {
+        if (auto M = MaskOf(C))
+          return M;
+      } else if (auto M = MaskOf(C, /*Inverse=*/true)) {
+        // the inverse of a tail mask
+        return M;
+      }
+      Value *X, *Y;
+      if (D < 3 && AGXMaskedTailOr && isa<Instruction>(C) &&
+          cast<Instruction>(C)->getParent() == BB &&
+          (Unmasked ? match(C, m_LogicalAnd(m_Value(X), m_Value(Y)))
+                    : match(C, m_LogicalOr(m_Value(X), m_Value(Y))))) {
+        if (auto M = Implied(X, Unmasked, D + 1))
+          return M;
+        return Implied(Y, Unmasked, D + 1);
+      }
+      return std::nullopt;
+    };
+    auto SameMask = [&](Value *C, bool Unmasked = false) {
+      auto M = Implied(C, Unmasked, 0);
       if (!M)
         return false;
       if (!Mask) {
@@ -7613,7 +7645,10 @@ static bool maskedTailExits(Function &F) {
         MaskCond = C;
         return true;
       }
-      return C == MaskCond;
+      return std::get<0>(*M) == std::get<0>(*Mask) &&
+             std::get<1>(*M) == std::get<1>(*Mask) &&
+             static_cast<CmpInst::Predicate>(std::get<2>(*M)) ==
+                 static_cast<CmpInst::Predicate>(std::get<2>(*Mask));
     };
     // x is P's identity under op where the mask holds
     auto Identity = [&](Instruction *Op, PHINode *P, Value *I) {
@@ -7666,20 +7701,28 @@ static bool maskedTailExits(Function &F) {
         IV = &P;
         continue;
       }
-      // P' = select(m, P, y)
+      // P' = select(m, P, y), or select(u, y, P), u the unmasked values'
       if (auto *S = dyn_cast<SelectInst>(NI);
-          S && S->getTrueValue() == &P && SameMask(S->getCondition()))
+          S && ((S->getTrueValue() == &P && SameMask(S->getCondition())) ||
+                (S->getFalseValue() == &P &&
+                 SameMask(S->getCondition(), /*Unmasked=*/true))))
         continue;
-      // P' = op(P, select(m, identity, x)), op commutative here
+      // P' = op(P, select(m, identity, x)) or op(P, select(u, x, identity)),
+      // op commutative here
       bool Found = false;
       if (NI->getNumOperands() >= 2) {
         for (unsigned Idx = 0; Idx < 2 && !Found; ++Idx) {
           if (NI->getOperand(Idx) != &P)
             continue;
           auto *S = dyn_cast<SelectInst>(NI->getOperand(1 - Idx));
-          if (!S || !SameMask(S->getCondition()))
+          if (!S)
             continue;
-          Found = Identity(NI, &P, S->getTrueValue());
+          if (Identity(NI, &P, S->getTrueValue()) &&
+              SameMask(S->getCondition()))
+            Found = true;
+          else if (Identity(NI, &P, S->getFalseValue()) &&
+                   SameMask(S->getCondition(), /*Unmasked=*/true))
+            Found = true;
         }
       }
       if (!Found) {

@@ -211,3 +211,67 @@ done:
   store float %f, ptr addrspace(1) %o
   ret void
 }
+
+; A sliding window's j <= row && j + 128 >= row, the unmasked values'
+; condition (an and with the inverse compare), or its masked form (an or
+; with the compare): the tail compare implies the mask (L15-E480). An and of
+; the compare with something else does not.
+; CHECK-LABEL: @window(
+; CHECK: %unmasked.bound = call i64 @llvm.umin.i64
+define agx_kernel void @window(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %row32, i32 %lane32, i32 %n32) {
+entry:
+  %row = zext i32 %row32 to i64
+  %lane = zext i32 %lane32 to i64
+  %n = zext i32 %n32 to i64
+  %g = icmp ult i64 0, %n
+  br i1 %g, label %loop, label %done
+loop:
+  %j = phi i64 [ 0, %entry ], [ %j.n, %loop ]
+  %r = phi float [ 0.0, %entry ], [ %r.n, %loop ]
+  %a = add nuw i64 %j, %lane
+  %u1 = icmp ule i64 %a, %row
+  %aw = add nuw i64 %a, 128
+  %u2 = icmp uge i64 %aw, %row
+  %ok = and i1 %u1, %u2
+  %q = getelementptr float, ptr addrspace(1) %p, i64 %j
+  %x = load float, ptr addrspace(1) %q
+  %s = select i1 %ok, float %x, float 0.0
+  %r.n = fadd float %r, %s
+  %j.n = add nuw i64 %j, 32
+  %c = icmp ult i64 %j.n, %n
+  br i1 %c, label %loop, label %done
+done:
+  %f = phi float [ 0.0, %entry ], [ %r.n, %loop ]
+  store float %f, ptr addrspace(1) %o
+  ret void
+}
+
+; CHECK-LABEL: @masked_and(
+; CHECK-NOT: unmasked.bound
+; CHECK: ret void
+define agx_kernel void @masked_and(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %row32, i32 %lane32, i32 %n32) {
+entry:
+  %row = zext i32 %row32 to i64
+  %lane = zext i32 %lane32 to i64
+  %n = zext i32 %n32 to i64
+  %g = icmp ult i64 0, %n
+  br i1 %g, label %loop, label %done
+loop:
+  %j = phi i64 [ 0, %entry ], [ %j.n, %loop ]
+  %r = phi float [ 0.0, %entry ], [ %r.n, %loop ]
+  %a = add nuw i64 %j, %lane
+  %m1 = icmp ugt i64 %a, %row
+  %m2 = icmp ult i64 %a, 500
+  %m = and i1 %m1, %m2
+  %q = getelementptr float, ptr addrspace(1) %p, i64 %j
+  %x = load float, ptr addrspace(1) %q
+  %s = select i1 %m, float 0.0, float %x
+  %r.n = fadd float %r, %s
+  %j.n = add nuw i64 %j, 32
+  %c = icmp ult i64 %j.n, %n
+  br i1 %c, label %loop, label %done
+done:
+  %f = phi float [ 0.0, %entry ], [ %r.n, %loop ]
+  store float %f, ptr addrspace(1) %o
+  ret void
+}
