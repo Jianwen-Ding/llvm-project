@@ -4861,6 +4861,131 @@ static bool bfloatSqrts(Function &F, const AGXSubtarget &ST) {
   return !Sqrts.empty();
 }
 
+static cl::opt<bool> AGXNeverNaNTests(
+    "agx-never-nan-tests", cl::init(true), cl::Hidden,
+    cl::desc("Fold NaN tests of values no execution makes a NaN (a running "
+             "maximumnum from a number, through its loop's phi)"));
+
+namespace {
+/// V is never a NaN, given that the phis in Assumed are not: a number
+/// constant; maximumnum / minimumnum with an operand never a NaN (they give
+/// a NaN only where both are); canonicalize, fneg, fabs or copysign of one;
+/// a select on a NaN test of values never a NaN whose picked arm is; a
+/// select or phi all of whose values are; or what value tracking knows. A
+/// phi is assumed while its values are checked: every value a phi takes
+/// was computed before, so if no value of the set's phis is a NaN where
+/// those phis' are not, none ever is. Proven values are remembered until an
+/// assumption fails (an unrolled running maximum is a chain of eight
+/// maximumnums and selects, each select's test reading the value before).
+struct NeverNaN {
+  const SimplifyQuery &Q;
+  SmallPtrSet<PHINode *, 8> Assumed;
+  SmallPtrSet<Value *, 32> Proven;
+  unsigned Budget = 256;
+  explicit NeverNaN(const SimplifyQuery &Q) : Q(Q) {}
+
+  bool operator()(Value *V) {
+    if (Proven.contains(V))
+      return true;
+    if (!Budget || !V->getType()->isFPOrFPVectorTy())
+      return false;
+    --Budget;
+    if (!check(V))
+      return false;
+    Proven.insert(V);
+    return true;
+  }
+
+  bool check(Value *V) {
+    using namespace PatternMatch;
+    NeverNaN &N = *this;
+    if (auto *C = dyn_cast<ConstantFP>(V))
+      return !C->isNaN();
+    if (auto *P = dyn_cast<PHINode>(V)) {
+      if (Assumed.contains(P))
+        return true;
+      Assumed.insert(P);
+      for (Value *In : P->incoming_values())
+        if (!N(In)) {
+          Assumed.erase(P);
+          Proven.clear();
+          return false;
+        }
+      return true;
+    }
+    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::maximumnum:
+      case Intrinsic::minimumnum:
+        return N(II->getArgOperand(0)) || N(II->getArgOperand(1));
+      case Intrinsic::canonicalize:
+      case Intrinsic::fabs:
+      case Intrinsic::copysign:
+        return N(II->getArgOperand(0));
+      default:
+        break;
+      }
+    }
+    if (auto *U = dyn_cast<UnaryOperator>(V);
+        U && U->getOpcode() == Instruction::FNeg)
+      return N(U->getOperand(0));
+    if (auto *Sel = dyn_cast<SelectInst>(V)) {
+      Value *X, *Y;
+      CmpPredicate Pred;
+      // on a NaN test of values never a NaN: the arm it picks (as
+      // select(uno x, NaN, x), the default NaN where x is one, and what
+      // InstCombine makes of a maximumnum of it, select(uno x, y,
+      // maximumnum(x, y)))
+      if (match(Sel->getCondition(), m_FCmp(Pred, m_Value(X), m_Value(Y))) &&
+          (Pred == FCmpInst::FCMP_UNO || Pred == FCmpInst::FCMP_ORD) &&
+          N(X) && (Y == X || N(Y)))
+        return N(Pred == FCmpInst::FCMP_UNO ? Sel->getFalseValue()
+                                            : Sel->getTrueValue());
+      return N(Sel->getTrueValue()) && N(Sel->getFalseValue());
+    }
+    return isKnownNeverNaN(V,
+                           Q.getWithInstruction(dyn_cast<Instruction>(V)));
+  }
+};
+} // namespace
+
+/// fcmp uno / ord of values that are never a NaN (NeverNaN): false / true,
+/// and the selects on them their arm. The PTX front end's max.f32 is
+/// maximumnum then a select of the default NaN where it is one: in a loop's
+/// running maximum from a number (softmax_online, attn_decode) it never is
+/// (L15-E388).
+static bool foldNeverNaNTests(Function &F) {
+  if (!AGXNeverNaNTests)
+    return false;
+  SimplifyQuery Q(F.getDataLayout());
+  SmallVector<FCmpInst *, 8> Tests;
+  for (Instruction &I : instructions(F))
+    if (auto *C = dyn_cast<FCmpInst>(&I);
+        C && (C->getPredicate() == FCmpInst::FCMP_UNO ||
+              C->getPredicate() == FCmpInst::FCMP_ORD))
+      Tests.push_back(C);
+  bool Changed = false;
+  for (FCmpInst *C : Tests) {
+    NeverNaN N(Q);
+    if (!N(C->getOperand(0)) || !N(C->getOperand(1)))
+      continue;
+    Constant *K = ConstantInt::getBool(
+        C->getType(), C->getPredicate() == FCmpInst::FCMP_ORD);
+    for (User *U : make_early_inc_range(C->users()))
+      if (auto *Sel = dyn_cast<SelectInst>(U);
+          Sel && Sel->getCondition() == C) {
+        Value *Arm = K->isOneValue() ? Sel->getTrueValue()
+                                     : Sel->getFalseValue();
+        Sel->replaceAllUsesWith(Arm);
+        Sel->eraseFromParent();
+      }
+    C->replaceAllUsesWith(K);
+    C->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -4870,6 +4995,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool Changed = diagnoseDoubles(F);
+  // (before the min / max flushes, which hide the NaN selects' operands)
+  Changed |= foldNeverNaNTests(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)
