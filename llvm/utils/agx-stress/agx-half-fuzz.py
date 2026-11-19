@@ -254,7 +254,11 @@ def gen(seed):
         chain.append((p2,K[0])); s=s2
       neg=R.random()<0.4
       if neg: t=nv(); body.append(f'  {t} = fneg float {s}'); s=t
-      C=fv(); op=R.choice(['fadd','fmul']); u=nv()
+      # (C an extended half: with two other sources the conversion folds
+      # into the operation's 16-bit destination, which the simulator rounds
+      # once, not twice as fptrunc of it: L15-E458's open question)
+      h=R.choice(hv); e=nv(); body.append(f'  {e} = fpext half {h} to float'); C=(('e',h),e)
+      op=R.choice(['fadd','fmul']); u=nv()
       body+=[f'  {u} = {op} float {s}, {C[1]}', f'  {r} = fptrunc float {u} to half']
       ops.append((r,'ext32sel',chain,neg,op,C[0])); hv.append(r)
     elif k<0.84:
