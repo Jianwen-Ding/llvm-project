@@ -1149,6 +1149,11 @@ static cl::opt<bool> AGXMergeUpCounters(
     cl::desc("Exit on an index rather than on a counter up from zero that "
              "only the exit test uses"));
 
+static cl::opt<bool> AGXMergeUpCountersVariableStep(
+    "agx-merge-up-counters-variable-step", cl::init(true), cl::Hidden,
+    cl::desc("Also for a step invariant in the loop (not a constant): "
+             "equality tests, and <u where the bounds fit"));
+
 /// The up-counting form of mergeDownCounter: c = 0, s, 2s, ... with c' = c +
 /// s used only by the latch's exit test c' <u n (or c' != n), beside an
 /// index i = i0, i0 + s, ... stepped by the same s (an MLIR loop from the
@@ -1159,6 +1164,9 @@ static cl::opt<bool> AGXMergeUpCounters(
 /// suffices. Where i0 is unbounded (a threadgroup position) and s is a
 /// power of two, c' <u n is c' != t for t, the first multiple of s at or
 /// above max(n, 1), so i' != i0 + t. One add an iteration fewer, and a register (L15-E386).
+/// A step s invariant in the loop but not constant (a grid stride) takes
+/// upperBound(s) in place of s: equality tests always, <u where the bounds
+/// fit (L15-E417).
 static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
                            const Function &F) {
   using namespace PatternMatch;
@@ -1168,10 +1176,20 @@ static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
       !match(C.getIncomingValueForBlock(Pre), m_Zero()))
     return false;
   auto *Cn = dyn_cast<BinaryOperator>(C.getIncomingValueForBlock(Latch));
-  const APInt *S;
-  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_APInt(S))) || S->isZero() ||
-      S->isNegative() || Cn->getParent() != Latch || !C.hasOneUse())
+  if (!Cn || Cn->getParent() != Latch || !C.hasOneUse())
     return false;
+  // The step: a constant, or a value invariant in the loop (a grid stride,
+  // with <u where the bounds fit; L15-E417).
+  const APInt *S = nullptr;
+  Value *SV = nullptr;
+  if (match(Cn, m_Add(m_Specific(&C), m_APInt(S)))) {
+    if (S->isZero() || S->isNegative())
+      return false;
+  } else if (!AGXMergeUpCountersVariableStep ||
+             !match(Cn, m_c_Add(m_Specific(&C), m_Value(SV))) ||
+             !L.isLoopInvariant(SV)) {
+    return false;
+  }
   ICmpInst *Cmp = nullptr;
   for (User *U : Cn->users()) {
     if (U == &C)
@@ -1194,8 +1212,14 @@ static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
       continue;
     auto *In = dyn_cast<BinaryOperator>(I.getIncomingValueForBlock(Latch));
     const APInt *T;
-    if (!In || !match(In, m_Add(m_Specific(&I), m_APInt(T))) || *T != *S ||
-        In->getParent() != Latch || !In->comesBefore(Latch->getTerminator()))
+    if (!In || In->getParent() != Latch ||
+        !In->comesBefore(Latch->getTerminator()))
+      continue;
+    Value *TV = nullptr;
+    if (S ? !match(In, m_Add(m_Specific(&I), m_APInt(T))) || *T != *S
+          : !match(In, m_c_Add(m_Specific(&I), m_Value(TV))) ||
+                !L.isLoopInvariant(TV) ||
+                SE.getSCEV(TV) != SE.getSCEV(SV))
       continue;
     Value *I0 = I.getIncomingValueForBlock(Pre);
     ICmpInst::Predicate Pred = Cmp->getPredicate();
@@ -1209,13 +1233,14 @@ static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
         return B && B->ult(R) ? *B : R;
       };
       std::optional<APInt> BI = Bound(I0), BN = Bound(N);
+      APInt BS = S ? S->zext(128) : Bound(SV);
       APInt Top = APInt(128, 1).shl(32);
-      if (!BN || !(*BN + S->zext(128)).ult(Top))
+      if (!BN || !(*BN + BS).ult(Top))
         continue;
-      if (!BI || !(*BI + *BN + S->zext(128)).ult(Top)) {
+      if (!BI || !(*BI + *BN + BS).ult(Top)) {
         // i0 + n may wrap: exit where c' first reaches n, at
         // t = s * ceil(max(n, 1) / s), i' != i0 + t (exact mod 2^32).
-        if (!S->isPowerOf2())
+        if (!S || !S->isPowerOf2())
           continue;
         RoundUp = true;
         Pred = ICmpInst::ICMP_NE;

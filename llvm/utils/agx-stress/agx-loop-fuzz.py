@@ -5,7 +5,8 @@ Each seed generates a kernel of one to three strided loops, the shape MLIR's scf
 lowers to: a counter c = 0, s, 2s, ... (i32, or i64 against a zero-extended trip) beside an index i = start + c
 that a load and a running hash use; the trip t a bounded unsigned minimum of an input, the exit c' <u t (or c' != t
 for a trip that is a multiple of s); a guarded do-while or a plain while loop. Starts are thread positions
-(bounded), shifted and offset ones, or input words that wrap; steps are powers of two and not. Each loop's hash is
+(bounded), shifted and offset ones, or input words that wrap; steps are powers of two and not, constants or an input's
+(a & 63) + 1 (invariant, E417's merged counters). Each loop's hash is
 stored per thread. Compiled with llc (and every other seed with opt -O2 first), run with agx_run on 1024 threads
 of random words (40% boundary values) and compared with the model: this covers AGXNarrowInductions (narrowed
 counters, E386's up-counters merged into their index, E206's down-counters), loop strength reduction and the
@@ -54,6 +55,7 @@ def gen(seed):
             usec=R.random() < 0.15,
             fmax=R.random() < 0.4,
             fstart=R.choice(['num', 'a']),
+            vstep=R.random() < 0.3,  # s = (a & 63) + 1, invariant, not a constant (E417)
         ))
     return loops
 
@@ -106,6 +108,11 @@ def emit(loops):
         s, nxt = p['step'], 'l%d.pre0' % (j + 1)
         q = 'l%d.' % j
         L.append('%spre0:' % q)
+        if p.get('vstep'):
+            L += ['  %%%ssv0 = and i32 %%a, 63' % q, '  %%%ssv = add i32 %%%ssv0, 1' % (q, q)]
+            if p['wide']:
+                L.append('  %%%ssv64 = zext i32 %%%ssv to i64' % (q, q))
+            s = '%%%ssv' % q
         st = {'tid': '%tid', 'a': '%a'}.get(p['start'])
         if p['start'] == 'tid_shl':
             L.append('  %%%sst = shl i32 %%tid, %d' % (q, p['shl'])); st = '%%%sst' % q
@@ -123,7 +130,7 @@ def emit(loops):
               '  %%%stu = call i32 @llvm.umin.i32(i32 %%%sbm, i32 %d)' % (q, q, p['lim'])]
         trip = '%%%stu' % q
         if p['exact']:
-            L += ['  %%%stu1 = add i32 %%%stu, 1' % (q, q), '  %%%stx = mul i32 %%%stu1, %d' % (q, q, s)]
+            L += ['  %%%stu1 = add i32 %%%stu, 1' % (q, q), '  %%%stx = mul i32 %%%stu1, %s' % (q, q, s)]
             trip = '%%%stx' % q
         ty = 'i64' if p['wide'] else 'i32'
         if p['fmax']:
@@ -178,7 +185,8 @@ def emit(loops):
             L.append('  %%%sh5 = xor i32 %%%sh4, %s' % (q, q, c32))
             h = '%%%sh5' % q
         L += ['  %%%san = add i32 %s, %%%sv' % (q, h, q),
-              '  %%%scn = add nuw %s %s, %d' % (q, ty, c, s)]
+              '  %%%scn = add nuw %s %s, %s' % (q, ty, c,
+                                                (('%%%ssv64' % q) if p['wide'] else s) if p.get('vstep') else str(s))]
         if p['fmax']:
             L += sanitize(q + 'fv', '%%%sv' % q) + [
                 '  %%%sff = bitcast i32 %%%sfv to float' % (q, q),
@@ -216,7 +224,7 @@ def model(loops, tid, a, b, inp):
     """(output word, value) for each loop's hash and float maximum."""
     res = []
     for j, p in enumerate(loops):
-        s = p['step']
+        s = ((a & 63) + 1) if p.get('vstep') else p['step']
         st = {'tid': tid, 'a': a, 'tid_shl': (tid << p['shl']) & M, 'row_lane': ((tid >> 5) << 10) + (tid & 31),
               'a_tid': (a * p['k'] + tid) & M, 'neg': (-64 - tid) & M}[p['start']]
         t = min(b & p['mask'], p['lim'])

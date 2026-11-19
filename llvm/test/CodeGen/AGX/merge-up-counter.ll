@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-merge-up-counters=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-merge-up-counters-variable-step=0 < %s | FileCheck %s --check-prefix=VOFF
 
 ; An MLIR strided loop from the lane in steps of 32 after narrowing: a
 ; counter from zero against the trip n (min(n - lane, 1024)), beside the
@@ -207,3 +208,55 @@ exit:
 }
 
 attributes #0 = { "agx-upper-bounds:air.threadgroup_position_in_grid"="256,0,0" }
+
+; A grid-stride loop (MLIR's from the grid position by block_dim * grid_dim,
+; after narrowing): the step is invariant but not a constant; bounded start,
+; trip and step keep <u against start + n (L15-E417): one iadd a trip.
+; CHECK-LABEL: grid_stride:
+; CHECK: .LBB4_2:
+; CHECK-NOT: iadd
+; CHECK: iadd r{{[0-9]+}}, r{{[0-9]+}}, r{{[0-9]+}}
+; CHECK-NOT: iadd
+; CHECK: while_icmp r0l, ult
+; VOFF-LABEL: grid_stride:
+; VOFF: .LBB4_2:
+; VOFF: iadd
+; VOFF: iadd
+; VOFF: while_icmp r0l, ult
+define agx_kernel void @grid_stride(ptr addrspace(1) nofree readonly captures(none) %0, ptr addrspace(1) nofree captures(none) %1, ptr addrspace(4) noalias noundef nonnull readonly byref(float) align 4 captures(none) dereferenceable(4) %2, ptr addrspace(4) noalias noundef nonnull readonly byref(i64) align 8 captures(none) dereferenceable(8) %3) #9 {
+entry:
+  %.val = load float, ptr addrspace(4) %2, align 4
+  %.val1 = load i64, ptr addrspace(4) %3, align 8
+  %4 = tail call i32 @llvm.agx.thread.position.in.grid.x()
+  %5 = zext i32 %4 to i64
+  %6 = tail call i32 @llvm.agx.threadgroups.per.grid.x()
+  %7 = zext i32 %6 to i64
+  %8 = shl nuw nsw i64 %7, 8
+  %9 = icmp sgt i64 %.val1, %5
+  %10 = sub nsw i64 %.val1, %5
+  %11 = tail call i64 @llvm.umin.i64(i64 %10, i64 1048576)
+  %12 = tail call i64 @llvm.umin.i64(i64 %8, i64 1048576)
+  br i1 %9, label %.lr.ph, label %._crit_edge
+
+.lr.ph:                                           ; preds = %entry, %.lr.ph
+  %indvars.iv = phi i64 [ %indvars.iv.next, %.lr.ph ], [ 0, %entry ]
+  %13 = trunc nuw nsw i64 %indvars.iv to i32
+  %14 = add i32 %4, %13
+  %15 = zext i32 %14 to i64
+  %16 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %0, i64 %15
+  %17 = load float, ptr addrspace(1) %16, align 4
+  %18 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %1, i64 %15
+  %19 = load float, ptr addrspace(1) %18, align 4
+  %20 = tail call float @llvm.fma.f32(float %.val, float %17, float %19)
+  store float %20, ptr addrspace(1) %18, align 4
+  %indvars.iv.next = add nuw nsw i64 %indvars.iv, %12
+  %21 = icmp samesign ult i64 %indvars.iv.next, %11
+  br i1 %21, label %.lr.ph, label %._crit_edge
+
+._crit_edge:                                      ; preds = %.lr.ph, %entry
+  ret void
+}
+declare noundef i32 @llvm.agx.thread.position.in.grid.x()
+declare noundef i32 @llvm.agx.threadgroups.per.grid.x()
+declare float @llvm.fma.f32(float, float, float)
+attributes #9 = { "agx-max-threads-per-threadgroup"="256" "agx-threads-per-threadgroup"="256,1,1" "agx-upper-bounds:air.thread_position_in_grid"="1048576,0,0" }
