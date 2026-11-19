@@ -3252,6 +3252,12 @@ static cl::opt<bool> IntDivisorScale(
              "divisor's scale first, no test of the dividend's size"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> IntQuotient(
+    "agx-fdiv-int-quotient",
+    cl::desc("float division of two converted 32-bit integers as Markstein's "
+             "quotient step without scaling"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   const MVT VT = MVT::f32;
@@ -3272,6 +3278,35 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   };
   EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
 
+  // Both operands integers of at most 32 bits converted to float: |a| and
+  // |b| are 0 or in [1, 2^34], never -0, an infinity or a NaN. 1 / b is a
+  // normal float and so is every nonzero quotient (at least 2^-34), so with
+  // y the correctly rounded 1 / b, Markstein's q0 = a y, r = a - b q0 (exact)
+  // and q = q0 + r y is the correctly rounded quotient, no exponent scaling.
+  // For b = 0 the refinement is a NaN (-0 * inf + 1): a * rcp(0) = a * +inf
+  // is the quotient (+-inf, or a NaN for 0 / 0) (L15-E465).
+  // (also sums and differences of such, to depth 2: integers of magnitude at
+  // most 2^34, still never -0 (x - x is +0), an infinity or a NaN)
+  std::function<bool(SDValue, unsigned)> IntVal = [&](SDValue V,
+                                                      unsigned Depth) {
+    if (V.getOpcode() == ISD::SINT_TO_FP || V.getOpcode() == ISD::UINT_TO_FP)
+      return V.getOperand(0).getValueType().getScalarSizeInBits() <= 32;
+    if (Depth < 2 &&
+        (V.getOpcode() == ISD::FADD || V.getOpcode() == ISD::FSUB))
+      return IntVal(V.getOperand(0), Depth + 1) &&
+             IntVal(V.getOperand(1), Depth + 1);
+    return false;
+  };
+  auto IntConv = [&](SDValue V) { return IntVal(V, 0); };
+  if (IntQuotient && IntConv(A) && IntConv(B)) {
+    SDValue NegB = DAG.getNode(ISD::FNEG, DL, VT, B);
+    SDValue Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, VT, B);
+    SDValue Y = Fma(Fma(NegB, Y0, K(1.0f)), Y0, Y0);
+    SDValue Q0 = Mul(A, Y);
+    SDValue Q = Fma(Fma(NegB, Q0, A), Y, Q0);
+    return DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, B, K(0.0f), ISD::SETOEQ),
+                         Mul(A, Y0), Q);
+  }
   SDValue D, NegD, Y, PB;
   SmallVector<SDValue, 2> NaNOperands;
   auto *CB = dyn_cast<ConstantFPSDNode>(B);
