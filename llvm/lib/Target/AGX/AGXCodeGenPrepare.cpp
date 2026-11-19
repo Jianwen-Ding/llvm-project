@@ -5538,9 +5538,10 @@ static cl::opt<bool> AGXNarrowBoundedI64(
 /// i32 leaves, constants; shl / add / or / and / mul / lshr) is below 2^32
 /// (AGX::scevUpperBound: the positions' bounds, E391's upper_bounds among
 /// them), it is the zero extension of the same tree in i32: no 64-bit
-/// shifts, masks and adds (L15-E405). (Not as range attributes on the
+/// shifts, masks and adds (L15-E405). AGXNarrowInductions runs it again
+/// once the counters are narrowed (L15-E426). (Not as range attributes on the
 /// positions, which the DAG's address folds then use: E391.)
-static bool narrowBoundedI64(Function &F) {
+bool AGX::narrowBoundedI64(Function &F) {
   if (!AGXNarrowBoundedI64)
     return false;
   DominatorTree DT(F);
@@ -6321,7 +6322,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
-  Changed |= narrowBoundedI64(F);
+  Changed |= AGX::narrowBoundedI64(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)

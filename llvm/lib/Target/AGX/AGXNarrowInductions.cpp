@@ -1144,6 +1144,10 @@ static std::optional<APInt> lowerBound(const SCEV *S, ScalarEvolution &SE,
   return R;
 }
 
+static cl::opt<bool> AGXNarrowAfterCounters(
+    "agx-narrow-bounded-after-counters", cl::init(true), cl::Hidden,
+    cl::desc("agx-narrow-bounded-i64 again after the counters are narrowed"));
+
 static cl::opt<bool> AGXMergeUpCounters(
     "agx-merge-up-counters", cl::init(true), cl::Hidden,
     cl::desc("Exit on an index rather than on a counter up from zero that "
@@ -1592,5 +1596,10 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   }
   for (const WideCounter &W : Counters)
     splitWideCounter(W);
-  return Changed || !Counters.empty();
+  Changed |= !Counters.empty();
+  // (64-bit trees of the narrowed counters' extensions, which the
+  // CodeGenPrepare pass saw as 64-bit phis: a mask j <= i of j = lane + c)
+  if (AGXNarrowAfterCounters)
+    Changed |= AGX::narrowBoundedI64(F);
+  return Changed;
 }

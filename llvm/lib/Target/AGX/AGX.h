@@ -75,6 +75,10 @@ std::optional<uint64_t> knownUpperBound(const Function &F, unsigned IntrinsicID)
 /// An upper bound on an integer SCEV's value from constants, positions, sums,
 /// products, extensions, truncations, minimums and bounded recurrences
 /// (AGXNarrowInductions' upperBound), as a 128-bit APInt.
+/// AGXCodeGenPrepare's narrowing of 64-bit trees below 2^32 to 32 bits
+/// (L15-E405), which AGXNarrowInductions runs again once the counters are
+/// narrowed (L15-E426).
+bool narrowBoundedI64(Function &F);
 std::optional<APInt> scevUpperBound(const SCEV *S, ScalarEvolution &SE,
                                     const Function &F);
 } // namespace AGX

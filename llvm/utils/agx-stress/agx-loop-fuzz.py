@@ -6,7 +6,8 @@ lowers to: a counter c = 0, s, 2s, ... (i32, or i64 against a zero-extended trip
 that a load and a running hash use; the trip t a bounded unsigned minimum of an input, the exit c' <u t (or c' != t
 for a trip that is a multiple of s); a guarded do-while or a plain while loop. Starts are thread positions
 (bounded), shifted and offset ones, or input words that wrap; steps are powers of two and not, constants or an input's
-(a & 63) + 1 (invariant, E417's merged counters). Each loop's hash is
+(a & 63) + 1 (invariant, E417's merged counters); some hashes take a mask c + (tid & 31) <= (b & 2047) of
+the counter in its own width (E426). Each loop's hash is
 stored per thread. Compiled with llc (and every other seed with opt -O2 first), run with agx_run on 1024 threads
 of random words (40% boundary values) and compared with the model: this covers AGXNarrowInductions (narrowed
 counters, E386's up-counters merged into their index, E206's down-counters), loop strength reduction and the
@@ -56,6 +57,7 @@ def gen(seed):
             fmax=R.random() < 0.4,
             fstart=R.choice(['num', 'a']),
             vstep=R.random() < 0.3,  # s = (a & 63) + 1, invariant, not a constant (E417)
+            cmask=R.random() < 0.35,  # (c + (tid & 31) <= (b & 2047)) ? 1 : 0 into the hash (E426)
         ))
     return loops
 
@@ -184,6 +186,18 @@ def emit(loops):
         if p['usec']:  # the counter feeds the hash too (it is no longer the exit test's alone)
             L.append('  %%%sh5 = xor i32 %%%sh4, %s' % (q, q, c32))
             h = '%%%sh5' % q
+        if p.get('cmask'):
+            # a mask of the counter (in its own width) against a bound: a
+            # compare that selects, as attention's j <= i
+            L += ['  %%%smt = and i32 %%tid, 31' % q, '  %%%smb = and i32 %%b, 2047' % q]
+            if p['wide']:
+                L += ['  %%%smt6 = zext i32 %%%smt to i64' % (q, q), '  %%%smb6 = zext i32 %%%smb to i64' % (q, q),
+                      '  %%%smk = add i64 %s, %%%smt6' % (q, c, q),
+                      '  %%%smc = icmp ule i64 %%%smk, %%%smb6' % (q, q, q)]
+            else:
+                L += ['  %%%smk = add i32 %s, %%%smt' % (q, c, q), '  %%%smc = icmp ule i32 %%%smk, %%%smb' % (q, q, q)]
+            L += ['  %%%sms = select i1 %%%smc, i32 1, i32 0' % (q, q), '  %%%sh6 = xor i32 %s, %%%sms' % (q, h, q)]
+            h = '%%%sh6' % q
         L += ['  %%%san = add i32 %s, %%%sv' % (q, h, q),
               '  %%%scn = add nuw %s %s, %s' % (q, ty, c,
                                                 (('%%%ssv64' % q) if p['wide'] else s) if p.get('vstep') else str(s))]
@@ -245,6 +259,9 @@ def model(loops, tid, a, b, inp):
             v = int(inp[i & (WORDS - 1)])
             h = (acc * 31) & M
             h = (h + (i ^ (i >> 7))) & M if not p['usec'] else ((h + (i ^ (i >> 7))) & M) ^ (c & M)
+            if p.get('cmask'):
+                k = (c + (tid & 31)) if p['wide'] else ((c + (tid & 31)) & M)
+                h ^= 1 if k <= (b & 2047) else 0
             acc = (h + v) & M
             fm = maximumnum(fm, san(v))
             c += s
