@@ -6152,6 +6152,98 @@ static bool zeroSignFreeMinMax(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXSpeculateThreadgroupLoads(
+    "agx-speculate-threadgroup-loads", cl::init(true), cl::Hidden,
+    cl::desc("Run a guarded threadgroup load that stays within its global "
+             "unconditionally, a select in place of the if"));
+
+/// A: br c, T, J; T: threadgroup loads within their globals and arithmetic
+/// that may run anywhere; br J; J: phis (v = c ? sm[l] : x, the PTX front
+/// end's block reductions): T's code runs in A and J's phis are selects. The
+/// loads read threadgroup memory every thread may read (each global is
+/// allocated for the whole threadgroup, and racing stores make a load's
+/// value undefined, not the program, which then selects the other value):
+/// an if, its skip and pop fewer, for a select.
+static bool speculateThreadgroupLoads(Function &F) {
+  if (!AGXSpeculateThreadgroupLoads)
+    return false;
+  struct Candidate {
+    BasicBlock *A, *T, *J;
+  };
+  SmallVector<Candidate, 4> Candidates;
+  for (BasicBlock &BB : F) {
+    auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
+    if (!Br)
+      continue;
+    for (unsigned K = 0; K < 2; ++K) {
+      BasicBlock *T = Br->getSuccessor(K), *J = Br->getSuccessor(1 - K);
+      if (T == J || T == &BB || J == &BB || T->getSinglePredecessor() != &BB ||
+          T->getSingleSuccessor() != J ||
+          !isa<UncondBrInst>(T->getTerminator()) || pred_size(J) != 2 ||
+          isa<PHINode>(T->front()) || T->size() > 17 ||
+          std::distance(J->phis().begin(), J->phis().end()) != 1)
+        continue;
+      bool HasLoad = false, Ok = true;
+      for (Instruction &I : *T) {
+        if (I.isTerminator())
+          continue;
+        if (auto *L = dyn_cast<LoadInst>(&I)) {
+          Ok &= L->isSimple() && L->getPointerAddressSpace() == 3;
+          HasLoad = true;
+        } else {
+          Ok &= isSafeToSpeculativelyExecute(&I) && !I.mayReadOrWriteMemory();
+        }
+      }
+      if (Ok && HasLoad)
+        Candidates.push_back({&BB, T, J});
+    }
+  }
+  if (Candidates.empty())
+    return false;
+  SmallVector<WeakVH, 8> Ranged;
+  AGX::addSpecialRegisterRanges(F, &Ranged);
+  scope_exit Unrange([&] {
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<CallBase>(V))
+        CI->removeRetAttr(Attribute::Range);
+  });
+  ThreadgroupAccesses TG;
+  TG.build(F);
+  const DataLayout &DL = F.getDataLayout();
+  SmallVector<Candidate, 4> Safe;
+  for (Candidate &C : Candidates) {
+    // (within at A's end: the bounds must hold without T's condition)
+    bool Ok = true;
+    for (Instruction &I : *C.T)
+      if (auto *L = dyn_cast<LoadInst>(&I))
+        Ok &= TG.within(L->getPointerOperand(),
+                        DL.getTypeStoreSize(L->getType()),
+                        C.A->getTerminator()) != nullptr;
+    if (Ok)
+      Safe.push_back(C);
+  }
+  for (Candidate &C : Safe) {
+    auto *Br = cast<CondBrInst>(C.A->getTerminator());
+    bool TOnTrue = Br->getSuccessor(0) == C.T;
+    Value *Cond = Br->getCondition();
+    C.T->getTerminator()->eraseFromParent();
+    C.A->splice(Br->getIterator(), C.T);
+    IRBuilder<> B(Br);
+    for (PHINode &P : make_early_inc_range(C.J->phis())) {
+      Value *VT = P.getIncomingValueForBlock(C.T);
+      Value *VA = P.getIncomingValueForBlock(C.A);
+      Value *Sel = TOnTrue ? B.CreateSelect(Cond, VT, VA, P.getName())
+                           : B.CreateSelect(Cond, VA, VT, P.getName());
+      P.replaceAllUsesWith(Sel);
+      P.eraseFromParent();
+    }
+    UncondBrInst::Create(C.J, Br->getIterator());
+    Br->eraseFromParent();
+    C.T->eraseFromParent();
+  }
+  return !Safe.empty();
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -6210,6 +6302,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= expandMemIntrinsics(F, TTI);
   Changed |= fenceHostCoherentAccesses(F);
   Changed |= useBlockBarriers(F, ST);
+  // (late: the folds above see the phis of the guarded loads)
+  Changed |= speculateThreadgroupLoads(F);
   Changed |= unifyExits(F);
   return Changed;
 }
