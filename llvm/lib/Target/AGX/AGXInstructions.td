@@ -2655,6 +2655,18 @@ def : Pat<(i32 (srl (sra i32:$x, (i32 31)), agx_low_mask_shift:$s)),
           (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0,
                        (i32 (agx_low_mask_of_shift $s)), 0, (i32 0))>;
 
+// x ^ ((x < 0) ? c : 0), the conditional xor of an order-preserving float
+// key (MLIR's maximumf / minimumf subgroup reductions: c = 0x7fffffff, in
+// and out): (x < 0) ? x ^ c : x, a bitop and an icmpsel instead of an asr,
+// an and and the xor (L15-E459). (Not for an 8-bit c: the and is an icmpsel
+// above, the same count.)
+def agx_not_imm8_mask : PatLeaf<(i32 imm), [{
+  return !isUInt<8>(N->getZExtValue());
+}]>;
+def : Pat<(i32 (xor i32:$x, (and (sra i32:$x, (i32 31)), agx_not_imm8_mask:$c))),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0,
+                       (BITOP_I32 TT_XOR, 0, $x, 0, (MOV_IMM32 imm:$c)), 0, $x)>;
+
 // The same on 16 bits: (x < 0) ? m : 0 from and(sra(x, 15), m) and
 // srl(sra(x, 15), 16 - k).
 def agx_imm8_16 : ImmLeaf<i16, [{ return isUInt<8>(Imm); }]>;
