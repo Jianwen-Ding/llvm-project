@@ -4947,6 +4947,65 @@ static bool rebaseLoopIndices(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXReluZeroSelects(
+    "agx-relu-zero-selects", cl::init(true), cl::Hidden,
+    cl::desc("maximum(x, +0)'s portable zero select dropped where maxnum(x, "
+             "+0) is x > 0 ? x : +0"));
+
+/// AIR has no maximum: the portable lowering of MLIR's arith.maximumf(x, 0)
+/// (relu) is maxnum(x, +0), then select(x == 0, +0, ...) for -0 (maxnum may
+/// give either zero) and the NaN select. maxnum(x, +0) as x > 0 ? x : +0
+/// (one fcmpsel, as it is lowered anyway) is +0 wherever x == 0, and so is
+/// a minnum of it with a constant above zero (relu6's min(..., 6)): the
+/// zero select's arms then agree and it goes (L15-E399).
+static bool reluZeroSelects(Function &F) {
+  if (!AGXReluZeroSelects)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<SelectInst *, 8> Selects;
+  for (Instruction &I : instructions(F))
+    if (auto *Sel = dyn_cast<SelectInst>(&I);
+        Sel && Sel->getType()->isFPOrFPVectorTy() &&
+        match(Sel->getTrueValue(), m_PosZeroFP()))
+      Selects.push_back(Sel);
+  bool Changed = false;
+  for (SelectInst *Sel : Selects) {
+    Value *X;
+    if (!match(Sel->getCondition(),
+               m_SpecificFCmp(FCmpInst::FCMP_OEQ, m_Value(X), m_AnyZeroFP())))
+      continue;
+    // M = maxnum(x, +0), or minnum(M, c), c > 0
+    Value *M = Sel->getFalseValue(), *Max = M;
+    const APFloat *C;
+    if (match(M, m_Intrinsic<Intrinsic::minnum>(m_Value(Max), m_APFloat(C))) ||
+        match(M, m_Intrinsic<Intrinsic::minnum>(m_APFloat(C), m_Value(Max)))) {
+      if (C->isNegative() || C->isZero() || C->isNaN())
+        continue;
+    }
+    auto *MaxI = dyn_cast<IntrinsicInst>(Max);
+    if (!MaxI || MaxI->getIntrinsicID() != Intrinsic::maxnum)
+      continue;
+    Value *A = MaxI->getArgOperand(0), *B = MaxI->getArgOperand(1);
+    if (!match(B, m_PosZeroFP()))
+      std::swap(A, B);
+    if (A != X || !match(B, m_PosZeroFP()))
+      continue;
+    // the max as the select (once for all its users: any is allowed), of
+    // x frozen (it is used twice; alive2: an undef x otherwise)
+    IRBuilder<> IB(MaxI);
+    Value *FA = IB.CreateFreeze(A);
+    Value *Gt = IB.CreateFCmpOGT(FA, B);
+    Value *NewMax = IB.CreateSelect(Gt, FA, B);
+    NewMax->takeName(MaxI);
+    MaxI->replaceAllUsesWith(NewMax);
+    MaxI->eraseFromParent();
+    Sel->replaceAllUsesWith(Sel->getFalseValue());
+    Sel->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNeverNaNTests(
     "agx-never-nan-tests", cl::init(true), cl::Hidden,
     cl::desc("Fold NaN tests of values no execution makes a NaN (a running "
@@ -5198,6 +5257,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= foldNeverNaNTests(F);
   Changed |= zeroSignFreeMinMax(F);
   Changed |= rebaseLoopIndices(F);
+  Changed |= reluZeroSelects(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)

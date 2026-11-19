@@ -45,6 +45,7 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `conv3x3` | a 3 x 3 convolution, its loops fully unrolled (known grid, no loops left) |
 | `cluster_reduce` | `gpu.subgroup_reduce` over clusters of 8 and 4 lanes |
 | `reduce_f16_i64` | `gpu.subgroup_reduce` of f16 (whole SIMD-group and clusters of 8) and of i64 |
+| `relu6_vec4` | ReLU6 of `vector<4xf32>` by `arith.maximumf` / `arith.minimumf` |
 | `fir_taps` | an FIR filter with a runtime tap count: x[i + k] and w[k] in a loop over k |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.
