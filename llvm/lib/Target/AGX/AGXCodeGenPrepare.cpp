@@ -5006,6 +5006,10 @@ static bool reluZeroSelects(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXExactDyadicI16(
+    "agx-exact-dyadic-i16", cl::init(true), cl::Hidden,
+    cl::desc("Build exact dyadic sums in 16 bits where they fit"));
+
 static cl::opt<bool> AGXExactDyadicSums(
     "agx-exact-dyadic-sums", cl::init(true), cl::Hidden,
     cl::desc("Float sums of converted small integers times dyadic constants "
@@ -5028,6 +5032,9 @@ struct DyadicSums {
   const DataLayout &DL;
   DenseMap<Value *, std::optional<Dyadic>> Memo;
   SmallPtrSet<Instruction *, 16> Tree;
+  /// The integer type the N are built in (i16 where every scaled value
+  /// fits: 16-bit halves of registers).
+  IntegerType *Ty = nullptr;
   explicit DyadicSums(const DataLayout &DL) : DL(DL) {}
 
   static bool fits(int64_t Lo, int64_t Hi, int E) {
@@ -5163,24 +5170,24 @@ struct DyadicSums {
     using namespace PatternMatch;
     Dyadic D = *Memo.lookup(V);
     if (D.Zero)
-      return B.getInt32(0);
+      return ConstantInt::get(Ty, 0);
     auto Scaled = [&](Value *N, int From) {
       return From == E ? N : B.CreateShl(N, From - E);
     };
     if (auto *C = dyn_cast<ConstantFP>(V))
-      return Scaled(B.getInt32(int32_t(D.Lo)), D.E);
+      return Scaled(ConstantInt::get(Ty, D.Lo, /*IsSigned=*/true), D.E);
     auto *I = cast<Instruction>(V);
     if (isa<UIToFPInst>(I) || isa<SIToFPInst>(I)) {
       Value *X = I->getOperand(0);
-      Value *N = isa<UIToFPInst>(I) ? B.CreateZExtOrTrunc(X, B.getInt32Ty())
-                                    : B.CreateSExtOrTrunc(X, B.getInt32Ty());
+      Value *N = isa<UIToFPInst>(I) ? B.CreateZExtOrTrunc(X, Ty)
+                                    : B.CreateSExtOrTrunc(X, Ty);
       return Scaled(N, 0);
     }
     Value *X, *Y, *Z;
     auto Prod = [&](Value *A, Value *Bv) -> std::pair<Value *, int> {
       Dyadic DA = *Memo.lookup(A), DB = *Memo.lookup(Bv);
       if (DA.Zero || DB.Zero)
-        return {B.getInt32(0), E};
+        return {ConstantInt::get(Ty, 0), E};
       return {B.CreateMul(build(B, A, DA.E), build(B, Bv, DB.E)), DA.E + DB.E};
     };
     if (match(I, m_FMul(m_Value(X), m_Value(Y)))) {
@@ -5256,10 +5263,27 @@ static bool exactDyadicSums(Function &F) {
       if (TLo < Min || THi > Max)
         continue;
     }
+    // i16 where every value scaled to the root's exponent (its own for a
+    // product's operands, which are not scaled) and the result fit 15 bits
+    int64_t Need = std::max(std::abs(TLo), std::abs(THi));
+    for (auto &[Val, MD] : DS.Memo)
+      if (MD && !MD->Zero) {
+        int Shift = std::max(0, MD->E - D->E);
+        int64_t M = std::max(std::abs(MD->Lo), std::abs(MD->Hi));
+        Need = Shift > 16 ? INT64_MAX : std::max(Need, M << Shift);
+      }
+    bool Narrow = AGXExactDyadicI16 && Need < (int64_t(1) << 15) &&
+                  all_of(DS.Tree, [](Instruction *T) {
+                    return !isa<UIToFPInst, SIToFPInst>(T) ||
+                           T->getOperand(0)->getType()->getIntegerBitWidth() <= 16;
+                  });
+    DS.Ty = Narrow ? Type::getInt16Ty(F.getContext())
+                   : Type::getInt32Ty(F.getContext());
     IRBuilder<> B(Conv);
     Value *N = DS.build(B, V, D->E);
     Value *R = D->E >= 0 ? B.CreateShl(N, D->E) : B.CreateLShr(N, -D->E);
-    R = B.CreateTrunc(R, Conv->getType());
+    R = TLo < 0 ? B.CreateSExtOrTrunc(R, Conv->getType())
+                : B.CreateZExtOrTrunc(R, Conv->getType());
     Conv->replaceAllUsesWith(R);
     Conv->eraseFromParent();
     RecursivelyDeleteTriviallyDeadInstructions(V);

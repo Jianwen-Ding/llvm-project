@@ -3,7 +3,9 @@
 ; Float sums of converted bytes times dyadic constants (a blur's weights 1/16,
 ; 1/8, 1/4) are exact: every partial sum is an integer times 2^-4 below 2^24,
 ; so the float operations round nothing. Converted back to an integer they
-; are the integer sum, shifted: (a + 2 b + 4 c + 8) >> 4 (L15-E401).
+; are the integer sum, shifted: (a + 2 b + 4 c + 8) >> 4 (L15-E401), in 16
+; bits where every scaled value fits (L15-E402; @wide's 16-bit inputs take
+; i32).
 ; @weight03's 0.3 is not dyadic, @used's sum is stored as a float as well,
 ; @negative's sum of signed bytes may be negative at a negative exponent:
 ; each keeps its float arithmetic.
@@ -14,7 +16,7 @@ declare i16 @llvm.fptosi.sat.i16.f32(float)
 ; CHECK-LABEL: @blur(
 ; CHECK-NOT:   fma
 ; CHECK-NOT:   uitofp
-; CHECK:       lshr i32 {{.*}}, 4
+; CHECK:       lshr i16 {{.*}}, 4
 ; CHECK:       ret void
 define void @blur(ptr addrspace(1) %p) {
   %a = load i8, ptr addrspace(1) %p
@@ -66,6 +68,23 @@ define void @negative(ptr addrspace(1) %p) {
   %fa = sitofp i8 %a to float
   %s0 = fmul float %fa, 6.250000e-02
   %i = fptosi float %s0 to i32
+  store i32 %i, ptr addrspace(1) %p
+  ret void
+}
+
+; CHECK-LABEL: @wide(
+; CHECK-NOT:   fma
+; CHECK:       lshr i32 {{.*}}, 1
+; CHECK:       ret void
+define void @wide(ptr addrspace(1) %p) {
+  %a = load i16, ptr addrspace(1) %p
+  %q1 = getelementptr i16, ptr addrspace(1) %p, i32 1
+  %b = load i16, ptr addrspace(1) %q1
+  %fa = uitofp i16 %a to float
+  %fb = uitofp i16 %b to float
+  %s0 = call float @llvm.fma.f32(float %fa, float 5.000000e-01, float 0.0)
+  %s1 = call float @llvm.fma.f32(float %fb, float 5.000000e-01, float %s0)
+  %i = fptoui float %s1 to i32
   store i32 %i, ptr addrspace(1) %p
   ret void
 }
