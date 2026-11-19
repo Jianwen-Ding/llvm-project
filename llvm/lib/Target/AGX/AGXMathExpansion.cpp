@@ -39,6 +39,11 @@ static cl::opt<bool> ExpMagicRound(
     cl::desc("exp's n = round(x / ln 2) by adding and subtracting 1.5 2^23, "
              "its integer the sum's low bits (no rint or convert)"));
 
+static cl::opt<bool> ExpNaNThroughScale(
+    "agx-exp-nan-through-scale", cl::init(true), cl::Hidden,
+    cl::desc("exp without the +inf select: no NaN select, the NaN's sum "
+             "bits adding nothing to the scale"));
+
 static cl::opt<bool> TanhDoubledClamp(
     "agx-tanh-doubled-clamp", cl::init(true), cl::Hidden,
     cl::desc("tanh's 2 min(|x|, 9) as min(|x| + |x|, 18)"));
@@ -124,6 +129,9 @@ class MathBuilder {
   bool bfloatResult() const { return NarrowResult && !HalfResult; }
 
 public:
+  // f32 arithmetic's NaN is 0x7fc00000 (no canonical-nan feature).
+  bool NativeNaN = false;
+
   MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false,
               bool HalfResult = false, bool NarrowResult = false)
       : B(B), Ty(Ty), NoDenormals(NoDenormals), HalfResult(HalfResult),
@@ -547,6 +555,11 @@ public:
         R = sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
       if (!NoUnderflow)
         R = sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
+      // A NaN v comes from a NaN argument, whose sum t + 1.5 2^23 is then
+      // the NaN 0x7fc00000, 0 shifted by 23: s is v's bits, which no +inf
+      // select overrides (L15-E472).
+      if (MagicBits && NoOverflow && NativeNaN && ExpNaNThroughScale)
+        return R;
       return sel(B.CreateFCmpUNO(V, V), V, R);
     }
     if (!I)
@@ -893,9 +906,10 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                        ArrayRef<Value *> Args, bool FlushF32,
-                       bool ExpNoOverflow) {
+                       bool ExpNoOverflow, bool NativeNaN) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
+                   M.NativeNaN = NativeNaN;
                    switch (ID) {
                    case Intrinsic::tan:
                      return M.tan(A[0]);

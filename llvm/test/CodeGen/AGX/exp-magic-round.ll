@@ -64,3 +64,23 @@ define agx_kernel void @neg_alone(ptr addrspace(1) %p) {
 declare i32 @llvm.agx.thread.position.in.grid.x()
 declare float @llvm.exp.f32(float)
 declare float @llvm.sin.f32(float)
+
+; An exponential below a maximum (no +inf select) needs no NaN select: a NaN
+; argument's sum is 0x7fc00000, which adds 0 to the scale's exponent, so the
+; result is the polynomial's NaN (L15-E472). With PTX's canonical NaN
+; (0x7fffffff) it would not, and the select stays.
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -mattr=+canonical-nan < %s | FileCheck %s --check-prefix=CNAN
+; CHECK-LABEL: below_max:
+; CHECK-NOT: fcmpsel eq
+; CHECK: stop
+; CNAN-LABEL: below_max:
+; CNAN: fcmpsel eq
+define agx_kernel void @below_max(ptr addrspace(1) %p) {
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %q = getelementptr float, ptr addrspace(1) %p, i32 %t
+  %x = load float, ptr addrspace(1) %q, align 4
+  %y = call float @llvm.exp.f32(float %x), !agx.exp.below.max !0
+  store float %y, ptr addrspace(1) %q, align 4
+  ret void
+}
+!0 = !{}

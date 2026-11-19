@@ -1,4 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -mattr=+canonical-nan -O3 < %s | FileCheck %s --check-prefix=CNAN
 
 ; tanh's exponential of 2 min(|x|, 9), in [0, 18] or a NaN, needs no clamp
 ; of its argument to [-104, 89] (bit-identical on the simulator's
@@ -15,14 +16,15 @@ define agx_kernel void @th(ptr addrspace(1) %p, float %x) {
 }
 declare float @llvm.tanh.f32(float)
 
-; Nor the scale's +inf and +0 selects (its n is in [0, 26]): the one select
-; left after the exponential is its NaN select (fcmpsel eq), then the small
-; argument's polynomial (L15-E274).
+; Nor the scale's +inf and +0 selects (its n is in [0, 26]) (L15-E274), nor
+; its NaN select: a NaN argument's 1.5 2^23 sum adds 0 to the scale's
+; exponent (L15-E472; with PTX's canonical NaN the select stays).
 ; CHECK-LABEL: th2:
 ; CHECK-NOT: icmpsel
-; CHECK: fcmpsel eq
-; CHECK-NOT: icmpsel
+; CHECK-NOT: fcmpsel eq
 ; CHECK: stop
+; CNAN-LABEL: th2:
+; CNAN: fcmpsel eq
 define agx_kernel void @th2(ptr addrspace(1) %p, float %x) {
   %r = call float @llvm.tanh.f32(float %x)
   store float %r, ptr addrspace(1) %p

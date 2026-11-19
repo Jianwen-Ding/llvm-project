@@ -172,8 +172,10 @@ bool canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx);
 /// expansion need not keep denormal operands.
 /// \p ExpNoOverflow: exp's argument is known not to reach its overflow
 /// (a softmax's x - max), so no clamp above and no +inf select.
+/// \p NativeNaN: f32 arithmetic's NaN is 0x7fc00000 (no canonical-nan).
 Value *expandMath(IRBuilderBase &B, Intrinsic::ID ID, ArrayRef<Value *> Args,
-                  bool FlushF32 = false, bool ExpNoOverflow = false);
+                  bool FlushF32 = false, bool ExpNoOverflow = false,
+                  bool NativeNaN = false);
 Value *expandMath(IRBuilderBase &B, StringRef Fn, Value *X);
 
 /// Whether a device memory access must reach memory shared with the host while

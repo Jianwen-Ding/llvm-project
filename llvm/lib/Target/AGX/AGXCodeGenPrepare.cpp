@@ -8340,7 +8340,8 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
       B.setFastMathFlags(II->getFastMathFlags());
       SmallVector<Value *, 2> Args(II->args());
       Value *R = AGX::expandMath(B, II->getIntrinsicID(), Args,
-                                 !ST.hasIEEEFP32(), ExpNoOverflow.count(II));
+                                 !ST.hasIEEEFP32(), ExpNoOverflow.count(II),
+                                 !ST.hasCanonicalNaN());
       R->takeName(II);
       II->replaceAllUsesWith(R);
       ExpNoOverflow.erase(II);
