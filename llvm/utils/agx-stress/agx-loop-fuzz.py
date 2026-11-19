@@ -68,7 +68,7 @@ def gen(seed):
             ctrip=R.choice([None, None, None, 8, 16, 64, 96, 256]),
             # the running maximum's kind: maximumnum, or maximum / minimum
             # (NaN-propagating, -0 below +0: E444's deferred NaN and zeros)
-            fop=R.choice(['maximumnum', 'maximumnum', 'maximum', 'minimum']),
+            fop=R.choice(['maximumnum', 'maximumnum', 'maximum', 'minimum', 'minimumnum']),
             # the running maximum also used in the loop: compared with the
             # value (no zero's sign reaches the hash: E446 gives it the
             # deferred value) or its bits hashed (a zero's sign does)
@@ -77,7 +77,7 @@ def gen(seed):
     for p in loops:
         if p['ctrip']:
             p.update(step=1, exact=False, vstep=False)
-        if not p['fmax'] or (p['fuse'] == 'bits' and p['fop'] != 'maximumnum'):
+        if not p['fmax'] or (p['fuse'] == 'bits' and p['fop'] not in ('maximumnum', 'minimumnum')):
             p['fuse'] = None   # (bits only of default NaNs)
     return loops
 
@@ -117,6 +117,20 @@ def twin_step(p):
     return p['step'] if p['tsame'] and not p.get('vstep') else p['step'] * 2 + 1
 
 
+def minimumnum(x, y):
+    """minimumnum of two float bit patterns (no denormals), then the default NaN where it is one."""
+    if isnan(x) and isnan(y):
+        return 0x7fffffff
+    if isnan(x):
+        return y
+    if isnan(y):
+        return x
+    fx, fy = (struct.unpack('<f', struct.pack('<I', v))[0] for v in (x, y))
+    if fx == fy:
+        return x | y          # (-0 below +0)
+    return x if fx < fy else y
+
+
 def maximum(x, y, mn=False):
     """maximum (minimum) of two float bit patterns (no denormals): a NaN if either is one, -0 below +0, then
     the default NaN where it is one."""
@@ -137,6 +151,7 @@ def emit(loops):
          'declare i32 @llvm.agx.thread.position.in.grid.x()',
          'declare i32 @llvm.umin.i32(i32, i32)',
          'declare float @llvm.maximumnum.f32(float, float)',
+         'declare float @llvm.minimumnum.f32(float, float)',
          'declare float @llvm.maximum.f32(float, float)',
          'declare float @llvm.minimum.f32(float, float)', '',
          'define agx_kernel void @k(ptr addrspace(1) %in, ptr addrspace(1) %out) {',
@@ -182,7 +197,8 @@ def emit(loops):
         if p['fmax']:
             # a running maximumnum then the PTX front end's default NaN where it is one (E388's fold)
             if p['fstart'] == 'num':
-                fs = '-3.000000e+38'
+                # (+3e38 for a running minimum)
+                fs = '3.000000e+38' if p.get('fop', '').startswith('minimum') else '-3.000000e+38'
             else:
                 L += sanitize(q + 'fa', '%a') + ['  %%%sfs = bitcast i32 %%%sfa to float' % (q, q)]
                 fs = '%%%sfs' % q
@@ -252,9 +268,9 @@ def emit(loops):
             h = '%%%sh7' % q
         def fmax_ops():
             F = sanitize(q + 'fv', '%%%sv' % q) + ['  %%%sff = bitcast i32 %%%sfv to float' % (q, q)]
-            if p.get('fop', 'maximumnum') == 'maximumnum':
+            if p.get('fop', 'maximumnum') in ('maximumnum', 'minimumnum'):
                 # (the PTX front end's default NaN after each step)
-                F += ['  %%%sft = call float @llvm.maximumnum.f32(float %s, float %%%sff)' % (q, fm, q),
+                F += ['  %%%sft = call float @llvm.%s.f32(float %s, float %%%sff)' % (q, p.get('fop', 'maximumnum'), fm, q),
                       '  %%%sfu = fcmp uno float %%%sft, 0.000000e+00' % (q, q),
                       '  %%%sfn = select i1 %%%sfu, float 0x7FFFFFFFE0000000, float %%%sft' % (q, q, q)]
             else:
@@ -291,7 +307,7 @@ def emit(loops):
             if p['fmax']:
                 L.append('  %%%sfr = phi float [ %%%sfh, %%%shead ]' % (q, q, q))
         if p['fmax']:
-            if p.get('fop', 'maximumnum') != 'maximumnum':
+            if p.get('fop', 'maximumnum') not in ('maximumnum', 'minimumnum'):
                 L += ['  %%%sfru = fcmp uno float %%%sfr, 0.000000e+00' % (q, q),
                       '  %%%sfrc = select i1 %%%sfru, float 0x7FFFFFFFE0000000, float %%%sfr' % (q, q, q)]
                 fr = '%%%sfrc' % q
@@ -323,7 +339,8 @@ def model(loops, tid, a, b, inp):
             t = ((t + 1) * s) & M
         # wide counters compare 64-bit values, i32 ones may wrap (not here: t + s < 2^32)
         acc, c, d = a, 0, 0
-        fm = 0xff61b1e6 if p['fstart'] == 'num' else san(a)   # -3e38
+        fm = (0x7f61b1e6 if p.get('fop', '').startswith('minimum') else 0xff61b1e6) \
+            if p['fstart'] == 'num' else san(a)   # -+3e38
         first = True
         while True:
             if p['guarded']:
@@ -342,7 +359,8 @@ def model(loops, tid, a, b, inp):
             if p.get('twin'):
                 h ^= d
                 d = (d + twin_step(p)) & M
-            fmop = {'maximumnum': maximumnum, 'maximum': maximum, 'minimum': minimum}[p.get('fop', 'maximumnum')]
+            fmop = {'maximumnum': maximumnum, 'minimumnum': minimumnum, 'maximum': maximum,
+                    'minimum': minimum}[p.get('fop', 'maximumnum')]
             if p.get('fuse'):
                 fm = fmop(fm, san(v))
                 if p['fuse'] == 'cmp':
@@ -359,7 +377,7 @@ def model(loops, tid, a, b, inp):
                     break
         res.append((j * 65536 + tid, acc, j))
         if p['fmax']:
-            if p.get('fop', 'maximumnum') != 'maximumnum' and isnan(fm):
+            if p.get('fop', 'maximumnum') not in ('maximumnum', 'minimumnum') and isnan(fm):
                 fm = 0x7fffffff   # (the default NaN of the store's select)
             res.append((j * 65536 + N + tid, fm, j))
     return res
