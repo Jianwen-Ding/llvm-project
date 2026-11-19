@@ -1,12 +1,13 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rebase-compares=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-masked-tail-exits=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rebase-compares=0 -agx-masked-tail-exits=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; MLIR's causal_rowmax (convert-gpu-to-air, opt -O2): an attention row's
 ; mask j <= row over j = lane + c, c = 0, 32, ..., beside the load's index
 ; base + lane + c. The mask compares the index with row + base (neither
 ; passes 2^32 by the bounds), so j's add goes, and the counter c, then the
 ; exit test's only, merges into the index (L15-E447): the first loop is its
-; load, the compare-select, the index's add, the maximum and the exit test.
+; load, the compare-select, the index's add, the maximum and the exit test
+; (without L15-E476's bound for the mask, which adds to the preheader).
 
 ; CHECK-LABEL: causal_rowmax:
 ; CHECK:       if_fcmp

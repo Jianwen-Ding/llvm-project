@@ -7437,6 +7437,276 @@ static bool speculateThreadgroupLoads(Function &F) {
   return !Safe.empty();
 }
 
+static cl::opt<bool> AGXMaskedTailExits(
+    "agx-masked-tail-exits", cl::init(true), cl::Hidden,
+    cl::desc("A loop whose reductions take an identity once a mask on an "
+             "increasing index holds (a causal mask) exits there"));
+
+/// A loop whose only side effects are loads, and whose values carried
+/// around it (other than its induction) are reductions that a mask leaves
+/// unchanged, P' = op(P, select(m, identity, x)) or P' = select(m, P, y),
+/// where m is a compare of an increasing recurrence with a loop invariant
+/// that, once true, stays true (j > k, j >= k: a causal mask's j > row),
+/// leaves the loop as soon as the next iteration would be masked: those
+/// iterations change nothing (L15-E476).
+static bool maskedTailExits(Function &F) {
+  if (!AGXMaskedTailExits)
+    return false;
+  using namespace PatternMatch;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  if (LI.empty())
+    return false;
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  const DataLayout &DL = F.getDataLayout();
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    if (!L->isInnermost() || L->getNumBlocks() != 1)
+      continue;
+    BasicBlock *BB = L->getHeader();
+    auto *Br = dyn_cast<CondBrInst>(BB->getTerminator());
+    if (!Br || !L->getExitBlock() || !L->getLoopPredecessor() ||
+        pred_size(BB) != 2)
+      continue;
+    bool ContinueOnTrue = Br->getSuccessor(0) == BB;
+    // only loads
+    if (any_of(*BB, [](Instruction &I) {
+          return I.mayWriteToMemory() || I.mayThrow() ||
+                 (isa<CallBase>(I) && !isa<IntrinsicInst>(I)) ||
+                 (I.mayReadFromMemory() && !isa<LoadInst>(I)) ||
+                 (isa<LoadInst>(I) && !cast<LoadInst>(I).isSimple());
+        }))
+      continue;
+    // m: icmp of an increasing recurrence with an invariant, true from
+    // some iteration on; the recurrence and the compare as (A, K, Pred)
+    // with Pred(A, K) the mask
+    auto MaskOf = [&](Value *C) -> std::optional<std::tuple<Value *, Value *,
+                                                            CmpPredicate>> {
+      auto *Cmp = dyn_cast<ICmpInst>(C);
+      if (!Cmp || Cmp->getParent() != BB)
+        return std::nullopt;
+      Value *A = Cmp->getOperand(0), *K = Cmp->getOperand(1);
+      CmpPredicate P = Cmp->getCmpPredicate();
+      if (L->isLoopInvariant(A)) {
+        std::swap(A, K);
+        P = CmpInst::getSwappedPredicate(P);
+      }
+      if (!L->isLoopInvariant(K) || !A->getType()->isIntegerTy())
+        return std::nullopt;
+      bool Signed = ICmpInst::isSigned(P);
+      if (P != ICmpInst::ICMP_UGT && P != ICmpInst::ICMP_UGE &&
+          P != ICmpInst::ICMP_SGT && P != ICmpInst::ICMP_SGE)
+        return std::nullopt;
+      auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
+      if (!AR || AR->getLoop() != L || !AR->isAffine())
+        return std::nullopt;
+      auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+      if (!Step || !Step->getAPInt().isStrictlyPositive())
+        return std::nullopt;
+      // not wrapping: SCEV's flag, or the IR's: the induction phi, or an
+      // add of it and an invariant, with nuw (nsw) on the add and on the
+      // induction's increment (a wrap would be poison, which the reduction
+      // then carries anyway)
+      auto NoWrap = [&](Value *V) {
+        auto *O = dyn_cast<OverflowingBinaryOperator>(V);
+        return O && (Signed ? O->hasNoSignedWrap() : O->hasNoUnsignedWrap());
+      };
+      auto IVNoWrap = [&](Value *V) {
+        auto *Phi = dyn_cast<PHINode>(V);
+        if (!Phi || Phi->getParent() != BB)
+          return false;
+        Value *Inc = Phi->getIncomingValueForBlock(BB);
+        return NoWrap(Inc) &&
+               (cast<Instruction>(Inc)->getOperand(0) == Phi ||
+                cast<Instruction>(Inc)->getOperand(1) == Phi);
+      };
+      bool Monotone =
+          (Signed ? AR->hasNoSignedWrap() : AR->hasNoUnsignedWrap()) ||
+          IVNoWrap(A);
+      if (!Monotone)
+        if (auto *Add = dyn_cast<BinaryOperator>(A);
+            Add && Add->getOpcode() == Instruction::Add && NoWrap(Add))
+          for (unsigned Op = 0; Op < 2; ++Op)
+            if (IVNoWrap(Add->getOperand(Op)) &&
+                L->isLoopInvariant(Add->getOperand(1 - Op)))
+              Monotone = true;
+      if (!Monotone)
+        return std::nullopt;
+      return std::make_tuple(A, K, P);
+    };
+    // the reductions
+    std::optional<std::tuple<Value *, Value *, CmpPredicate>> Mask;
+    Value *MaskCond = nullptr;
+    auto SameMask = [&](Value *C) {
+      auto M = MaskOf(C);
+      if (!M)
+        return false;
+      if (!Mask) {
+        Mask = M;
+        MaskCond = C;
+        return true;
+      }
+      return C == MaskCond;
+    };
+    // x is P's identity under op where the mask holds
+    auto Identity = [&](Instruction *Op, PHINode *P, Value *I) {
+      Value *Init = P->getIncomingValueForBlock(L->getLoopPredecessor());
+      auto *CF = dyn_cast<ConstantFP>(I);
+      auto InitIs = [&](FPClassTest Never) {
+        return computeKnownFPClass(Init, DL, Never).isKnownNever(Never);
+      };
+      if (Op->getOpcode() == Instruction::FAdd)
+        return CF && CF->isZero() &&
+               (CF->isNegative() || InitIs(fcNegZero));
+      if (auto *II = dyn_cast<IntrinsicInst>(Op)) {
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::maximum:
+          return CF && CF->isInfinity() && CF->isNegative();
+        case Intrinsic::minimum:
+          return CF && CF->isInfinity() && !CF->isNegative();
+        case Intrinsic::maxnum:
+          return CF && CF->isInfinity() && CF->isNegative() && InitIs(fcNan);
+        case Intrinsic::minnum:
+          return CF && CF->isInfinity() && !CF->isNegative() && InitIs(fcNan);
+        default:
+          return false;
+        }
+      }
+      if (Op->getOpcode() == Instruction::Add ||
+          Op->getOpcode() == Instruction::Or ||
+          Op->getOpcode() == Instruction::Xor)
+        return match(I, m_Zero());
+      return false;
+    };
+    bool OK = true;
+    PHINode *IV = nullptr;
+    for (PHINode &P : BB->phis()) {
+      Value *Next = P.getIncomingValueForBlock(BB);
+      auto *NI = dyn_cast<Instruction>(Next);
+      if (!NI || NI->getParent() != BB) {
+        OK = false;
+        break;
+      }
+      // the induction (or another recurrence): left alone, but its value
+      // after the loop would change
+      if (SE.isSCEVable(P.getType()) && isa<SCEVAddRecExpr>(SE.getSCEV(&P))) {
+        for (User *U : NI->users())
+          if (cast<Instruction>(U)->getParent() != BB)
+            OK = false;
+        for (User *U : P.users())
+          if (cast<Instruction>(U)->getParent() != BB)
+            OK = false;
+        IV = &P;
+        continue;
+      }
+      // P' = select(m, P, y)
+      if (auto *S = dyn_cast<SelectInst>(NI);
+          S && S->getTrueValue() == &P && SameMask(S->getCondition()))
+        continue;
+      // P' = op(P, select(m, identity, x)), op commutative here
+      bool Found = false;
+      if (NI->getNumOperands() >= 2) {
+        for (unsigned Idx = 0; Idx < 2 && !Found; ++Idx) {
+          if (NI->getOperand(Idx) != &P)
+            continue;
+          auto *S = dyn_cast<SelectInst>(NI->getOperand(1 - Idx));
+          if (!S || !SameMask(S->getCondition()))
+            continue;
+          Found = Identity(NI, &P, S->getTrueValue());
+        }
+      }
+      if (!Found) {
+        OK = false;
+        break;
+      }
+    }
+    if (!OK || !Mask || !IV)
+      continue;
+    // after the loop only the reductions' values (theirs at the early exit
+    // are their final ones)
+    SmallPtrSet<Value *, 8> Finals;
+    for (PHINode &P : BB->phis())
+      Finals.insert(P.getIncomingValueForBlock(BB));
+    if (any_of(*BB, [&](Instruction &I) {
+          return !Finals.contains(&I) && any_of(I.users(), [&](User *U) {
+                   return cast<Instruction>(U)->getParent() != BB;
+                 });
+        }))
+      continue;
+    // The exit: continue while iv.next < UB (unsigned), iv.next = iv + s
+    // nuw; the mask A > K (or A >= K), A = iv or iv + c (nuw), c and K
+    // invariant: the next iteration is unmasked while iv.next + c <= K, so
+    // UB becomes umin(UB, (K + 1) - c) (saturating; K - c for >=), computed
+    // before the loop: the exit stays one compare of the induction, for
+    // SCEV and the indices' rebasing.
+    auto [A, K, Pred] = *Mask;
+    if (ICmpInst::isSigned(Pred) || !ContinueOnTrue)
+      continue;
+    auto *Exit = dyn_cast<ICmpInst>(Br->getCondition());
+    if (!Exit || Exit->getPredicate() != ICmpInst::ICMP_ULT ||
+        !Exit->hasOneUse())
+      continue;
+    auto *IVNext = dyn_cast<BinaryOperator>(Exit->getOperand(0));
+    Value *UB = Exit->getOperand(1);
+    if (!IVNext || IVNext != IV->getIncomingValueForBlock(BB) ||
+        IVNext->getOpcode() != Instruction::Add ||
+        !IVNext->hasNoUnsignedWrap() || !L->isLoopInvariant(UB) ||
+        UB->getType() != A->getType())
+      continue;
+    Value *Off = nullptr;
+    if (A == IV)
+      Off = ConstantInt::get(A->getType(), 0);
+    else if (auto *Add = dyn_cast<BinaryOperator>(A);
+             Add && Add->getOpcode() == Instruction::Add &&
+             Add->hasNoUnsignedWrap())
+      for (unsigned Op = 0; Op < 2 && !Off; ++Op)
+        if (Add->getOperand(Op) == IV &&
+            L->isLoopInvariant(Add->getOperand(1 - Op)))
+          Off = Add->getOperand(1 - Op);
+    if (!Off)
+      continue;
+    BasicBlock *PH = L->getLoopPredecessor();
+    for (Value *V : {K, Off, UB})
+      if (auto *VI = dyn_cast<Instruction>(V); VI && !DT.dominates(VI, PH->getTerminator()))
+        Off = nullptr;
+    if (!Off)
+      continue;
+    IRBuilder<> B(PH->getTerminator());
+    // max(K - c, 0) (+ 1 for >), the subtraction in the narrower type
+    // where K and c are zero extensions of it (exact; extended), the + 1
+    // in the wide type, saturating (K - c at the wide maximum masks
+    // nothing: the bound is then the maximum, as UB is at most)
+    Value *KN = K, *OffN = Off, *X;
+    if (match(K, m_ZExt(m_Value(X)))) {
+      Type *NT = X->getType();
+      Value *Y;
+      if (match(Off, m_ZExt(m_Value(Y))) && Y->getType() == NT) {
+        KN = X;
+        OffN = Y;
+      } else if (auto *CI = dyn_cast<ConstantInt>(Off);
+                 CI && CI->getValue().isIntN(NT->getIntegerBitWidth())) {
+        KN = X;
+        OffN = ConstantInt::get(
+            NT, CI->getValue().trunc(NT->getIntegerBitWidth()));
+      }
+    }
+    Value *Lim = B.CreateBinaryIntrinsic(Intrinsic::usub_sat, KN, OffN);
+    if (KN != K)
+      Lim = B.CreateZExt(Lim, K->getType());
+    if (Pred == ICmpInst::ICMP_UGT)
+      Lim = B.CreateBinaryIntrinsic(Intrinsic::uadd_sat, Lim,
+                                    ConstantInt::get(K->getType(), 1));
+    Value *NewUB = B.CreateBinaryIntrinsic(Intrinsic::umin, UB, Lim,
+                                           nullptr, "unmasked.bound");
+    Exit->setOperand(1, NewUB);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static void markExpsBelowLoopMax(Function &F);
 
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
@@ -7465,6 +7735,9 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
   Changed |= AGX::narrowBoundedI64(F);
+  // (after the indices are rebased and narrowed, which need the loops' own
+  // exit compares)
+  Changed |= maskedTailExits(F);
   Changed |= narrowSignedCompares(F);
   Changed |= narrowTruncatedOps(F);
   Changed |= halfFromFloat(F);
