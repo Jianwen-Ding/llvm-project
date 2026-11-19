@@ -7077,6 +7077,8 @@ static bool speculateThreadgroupLoads(Function &F) {
   return !Safe.empty();
 }
 
+static void markExpsBelowLoopMax(Function &F);
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -7086,6 +7088,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
   bool Changed = diagnoseDoubles(F);
+  // (first: the loops' maxima as the front end wrote them)
+  markExpsBelowLoopMax(F);
   Changed |= mergeSameConditionIfs(F);
   Changed |= mergePhiOperations(F);
   Changed |= signedWideMuls(F);
@@ -7602,6 +7606,48 @@ static bool disjointIterations(const SCEV *P, const Loop *L,
 /// iterations overlapping): each x is a value the maximum took in, so x - m is at most 0 (or a
 /// denormal where the maximum's comparison flushes) or a NaN, and e^(x - m)
 /// does not overflow (a softmax's or cross-entropy's second pass).
+/// m where M decodes the SIMD-group's signed maximum of m's order-preserving
+/// integer encoding (MLIR's maximumf subgroup reduction), with a NaN m
+/// encoded as 0x7fc00000, above every number:
+///   M = float((r < 0 ? 0x7fffffff : 0) ^ r), r = simd.reduce(c, smax),
+///   c = m uno m ? 0x7fc00000 : (b < 0 ? 0x7fffffff : 0) ^ b, b = bits(m).
+/// M is then a NaN or the largest lane's m, at least this lane's own.
+static Value *orderedSIMDMaxOf(Value *M) {
+  using namespace PatternMatch;
+  auto Ord = [](Value *V) -> Value * {
+    Value *X, *Y;
+    if (match(V, m_c_Xor(m_Select(m_SpecificICmp(ICmpInst::ICMP_SLT,
+                                                 m_Value(X), m_Zero()),
+                                  m_SpecificInt(0x7fffffff), m_Zero()),
+                         m_Value(Y))) &&
+        X == Y)
+      return X;
+    return nullptr;
+  };
+  Value *E;
+  if (!M->getType()->isFloatTy() || !match(M, m_BitCast(m_Value(E))))
+    return nullptr;
+  auto *R = dyn_cast_or_null<IntrinsicInst>(Ord(E));
+  if (!R || R->getIntrinsicID() != Intrinsic::agx_simd_reduce ||
+      !match(R->getArgOperand(1), m_SpecificInt(AGX::SIMD_SMAX)))
+    return nullptr;
+  Value *Cond, *C;
+  if (!match(R->getArgOperand(0),
+             m_Select(m_Value(Cond), m_SpecificInt(0x7fc00000), m_Value(C))))
+    return nullptr;
+  Value *B = Ord(C), *Mv;
+  if (!B || !match(B, m_BitCast(m_Value(Mv))) || !Mv->getType()->isFloatTy())
+    return nullptr;
+  // (uno with itself or with a number)
+  CmpPredicate P;
+  Value *O;
+  if (!match(Cond, m_FCmp(P, m_Specific(Mv), m_Value(O))) ||
+      P != FCmpInst::FCMP_UNO ||
+      !(O == Mv || (isa<ConstantFP>(O) && !cast<ConstantFP>(O)->isNaN())))
+    return nullptr;
+  return Mv;
+}
+
 static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
                             ScalarEvolution &SE) {
   using namespace PatternMatch;
@@ -7615,6 +7661,8 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
       R && R->getIntrinsicID() == Intrinsic::agx_simd_reduce &&
       match(R->getArgOperand(1), m_SpecificInt(AGX::SIMD_FMAX)))
     M = R->getArgOperand(0);
+  else if (Value *Mv = orderedSIMDMaxOf(M))
+    M = Mv;
   // L1's value after it, or (a phi) another where L1 did not run, which L2
   // then does not either (the same guard): the exponential only runs in L2.
   PHINode *Exit = dyn_cast<PHINode>(M);
@@ -7643,7 +7691,11 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
   LoadInst *V = nullptr;
   for (unsigned I = 0; I < 2; ++I) {
     auto *Phi = dyn_cast<PHINode>(U->getArgOperand(I));
-    auto *Ld = dyn_cast<LoadInst>(U->getArgOperand(1 - I));
+    // (or the frozen load, the same value: a load reads no poison here)
+    Value *A = U->getArgOperand(1 - I);
+    if (auto *Fr = dyn_cast<FreezeInst>(A))
+      A = Fr->getOperand(0);
+    auto *Ld = dyn_cast<LoadInst>(A);
     if (Phi && Ld && Phi->getParent() == L1->getHeader() &&
         Phi->getIncomingValueForBlock(Latch1) == U)
       P = Phi, V = Ld;
@@ -7744,6 +7796,30 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
         return false;
   }
   return true;
+}
+
+/// The exps expBelowLoopMax finds, marked (!agx.exp.below.max) at the start
+/// of the pass: the deferred maximum reductions rewrite the loop's maximum
+/// that it matches (L15-E450).
+static void markExpsBelowLoopMax(Function &F) {
+  if (!AGXExpBelowLoopMax)
+    return;
+  SmallVector<IntrinsicInst *, 4> Exps;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I);
+        II && II->getIntrinsicID() == Intrinsic::exp)
+      Exps.push_back(II);
+  if (Exps.empty())
+    return;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  for (IntrinsicInst *II : Exps)
+    if (expBelowLoopMax(II, LI, SE))
+      II->setMetadata("agx.exp.below.max", MDNode::get(F.getContext(), {}));
 }
 
 static cl::opt<bool> AGXReciprocalAboveOne(
@@ -7914,7 +7990,8 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
       AssumptionCache AC(F);
       ScalarEvolution SE(F, TLI, AC, DT, LI);
       for (IntrinsicInst *II : Exps)
-        if (expBelowLoopMax(II, LI, SE))
+        if (II->getMetadata("agx.exp.below.max") ||
+            expBelowLoopMax(II, LI, SE))
           ExpNoOverflow.insert(II);
     }
   }
