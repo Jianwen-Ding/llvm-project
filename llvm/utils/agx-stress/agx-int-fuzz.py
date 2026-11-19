@@ -134,7 +134,24 @@ def gen(seed):
         body.append(f'  {r} = add i32 {a[0]}, {c}'); ops.append((r,32,('add',a[0],c)))
         prev=r; r=nv()
       r=prev
-    elif k<0.98 and len(vals)>=2:
+    elif k<0.98 and w==32:
+      # a 64-bit trip umin(c - zext(x & m), k) or umax (MLIR's loop bound of
+      # a lane: umin(n - lane, n)), whose subtraction may borrow or not
+      # (L15-E435), truncated or kept 64-bit
+      src=('%t' if R.random()<0.5 else a[0])
+      if src=='%t' and not any(o[0]=='%t' for o in ops):
+        ops.insert(0,('%t',32,('tid',)))
+      m1=R.choice([31,1023,0xffff]); c0=R.choice([5,1000,1023,1024,2000,0x10000]); k1=R.choice([7,1000,1023,0x10000,(1<<33)-1])
+      fn=R.choice(['umin','umin','umax']); ma=nv(); za=nv(); xs=nv(); um=nv()
+      decl.add(f'declare i64 @llvm.{fn}.i64(i64, i64)')
+      body+=[f'  {ma} = and i32 {src}, {m1}', f'  {za} = zext i32 {ma} to i64', f'  {xs} = sub i64 {c0}, {za}',
+             f'  {um} = call i64 @llvm.{fn}.i64(i64 {xs}, i64 {k1})']
+      ops+=[(ma,32,('and',src,m1)),(za,64,('zext',ma,32)),(xs,64,('sub',c0,za)),(um,64,(fn,xs,k1))]
+      if R.random()<0.5:
+        body.append(f'  {r} = trunc i64 {um} to i32'); ops.append((r,32,('trunc',um)))
+      else:
+        r=um; w=64
+    elif k<0.985 and len(vals)>=2:
       # an and / or of two compares into a select
       b=pick(w); c1=nv(); c2=nv(); c=nv(); x=pick(w); y=pick(w)
       p1,p2=R.choice(['slt','ult','eq','ne','sgt']),R.choice(['sle','ugt','eq','ne','uge']); lg=R.choice(['and','or'])

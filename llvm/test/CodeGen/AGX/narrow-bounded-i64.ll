@@ -41,4 +41,36 @@ define agx_kernel void @unbounded(ptr addrspace(1) %o) {
   ret void
 }
 
+; A lane's trip umin(1000 - zext(lane), 1000): the subtraction cannot borrow
+; (1000 is at least the lane's bound, 31), and the umin of a value never
+; above 1000 is the value (L15-E435). @borrow's 1000 - tx, tx < 1024, may
+; borrow: it stays 64-bit.
+declare i32 @llvm.agx.thread.index.in.simdgroup()
+declare i64 @llvm.umin.i64(i64, i64)
+
+; CHECK-LABEL: @lane_trip(
+; CHECK:       sub nuw i32 1000,
+; CHECK-NOT:   umin
+; CHECK:       ret void
+define agx_kernel void @lane_trip(ptr addrspace(1) %o) {
+  %l = call i32 @llvm.agx.thread.index.in.simdgroup()
+  %lz = zext i32 %l to i64
+  %s = sub nsw i64 1000, %lz
+  %u = call i64 @llvm.umin.i64(i64 %s, i64 1000)
+  store i64 %u, ptr addrspace(1) %o, align 8
+  ret void
+}
+
+; CHECK-LABEL: @borrow(
+; CHECK:       sub nsw i64 1000,
+; CHECK:       ret void
+define agx_kernel void @borrow(ptr addrspace(1) %o) #0 {
+  %tx = call i32 @llvm.agx.thread.position.in.threadgroup.x()
+  %tz = zext i32 %tx to i64
+  %s = sub nsw i64 1000, %tz
+  %u = call i64 @llvm.umin.i64(i64 %s, i64 1000)
+  store i64 %u, ptr addrspace(1) %o, align 8
+  ret void
+}
+
 attributes #0 = { "agx-threads-per-threadgroup"="1024,1,1" "agx-upper-bounds:air.threadgroup_position_in_grid"="64,64,0" }

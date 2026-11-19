@@ -5531,6 +5531,11 @@ static bool exactDyadicSums(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNarrowBoundedSubMinMax(
+    "agx-narrow-bounded-sub-minmax", cl::init(true), cl::Hidden,
+    cl::desc("Also subtractions that cannot borrow and umin / umax in "
+             "agx-narrow-bounded-i64's trees"));
+
 static cl::opt<bool> AGXNarrowBoundedI64(
     "agx-narrow-bounded-i64", cl::init(true), cl::Hidden,
     cl::desc("64-bit arithmetic of zero-extended 32-bit values that stays "
@@ -5600,12 +5605,28 @@ bool AGX::narrowBoundedI64(Function &F) {
           if (CI && CI->getZExtValue() < 32)
             R = A->lshr(CI->getZExtValue());
           break;
+        case Instruction::Sub:
+          // (no borrow: a's least value at least b's bound; L15-E435)
+          if (AGXNarrowBoundedSubMinMax &&
+              SE.getUnsignedRangeMin(SE.getSCEV(BO->getOperand(0)))
+                  .zext(128)
+                  .uge(*C))
+            R = *A;
+          break;
         default:
           break;
         }
       }
       if (R && !R->ult(Top))
         R.reset();
+    } else if (auto *II = dyn_cast<IntrinsicInst>(V);
+               II && AGXNarrowBoundedSubMinMax &&
+               (II->getIntrinsicID() == Intrinsic::umin ||
+                II->getIntrinsicID() == Intrinsic::umax)) {
+      std::optional<APInt> A = Bound(II->getArgOperand(0), Depth + 1);
+      std::optional<APInt> C = Bound(II->getArgOperand(1), Depth + 1);
+      if (A && C)
+        R = (II->getIntrinsicID() == Intrinsic::umin) == A->ult(*C) ? *A : *C;
     }
     BoundOf[V] = R;
     return R;
@@ -5621,7 +5642,21 @@ bool AGX::narrowBoundedI64(Function &F) {
       N = ConstantInt::get(I32, C->getZExtValue());
     else if (auto *Z = dyn_cast<ZExtInst>(V))
       N = Z->getOperand(0);
-    else {
+    else if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      IRBuilder<> IB(II);
+      Value *A = Build(II->getArgOperand(0), IB),
+            *C = Build(II->getArgOperand(1), IB);
+      // (umin(a, c) of an a never above the constant c is a: a trip
+      // umin(n - lane, n))
+      auto *CC = dyn_cast<ConstantInt>(II->getArgOperand(1));
+      std::optional<APInt> BA = Bound(II->getArgOperand(0), 0);
+      if (II->getIntrinsicID() == Intrinsic::umin && CC && BA &&
+          BA->ule(CC->getValue().zext(128)))
+        N = A;
+      else
+        N = IB.CreateBinaryIntrinsic(II->getIntrinsicID(), A, C, nullptr,
+                                     II->getName() + ".n32");
+    } else {
       auto *BO = cast<BinaryOperator>(V);
       IRBuilder<> IB(BO);
       Value *A = Build(BO->getOperand(0), IB), *C = Build(BO->getOperand(1), IB);
@@ -5637,10 +5672,11 @@ bool AGX::narrowBoundedI64(Function &F) {
     Built[V] = N;
     return N;
   };
-  SmallVector<BinaryOperator *, 16> Roots;
+  SmallVector<Instruction *, 16> Roots;
   for (Instruction &I : instructions(F)) {
-    auto *BO = dyn_cast<BinaryOperator>(&I);
-    if (!BO || BO->getType() != I64 || !Narrowable(BO, 0))
+    Instruction *BO = &I;
+    if ((!isa<BinaryOperator>(BO) && !isa<IntrinsicInst>(BO)) ||
+        BO->getType() != I64 || !Narrowable(BO, 0))
       continue;
     // a root: some user is not narrowable itself; not an address's index,
     // a GEP's or an integer address's (b + x, the PTX front end's): the DAG
@@ -5658,7 +5694,7 @@ bool AGX::narrowBoundedI64(Function &F) {
       Roots.push_back(BO);
   }
   bool Changed = false;
-  for (BinaryOperator *R : Roots) {
+  for (Instruction *R : Roots) {
     IRBuilder<> B(R);
     Value *N = Build(R, B);
     IRBuilder<> ZB(R->getNextNode());
