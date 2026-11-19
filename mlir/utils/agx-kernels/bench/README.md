@@ -56,5 +56,6 @@ the kernel's, as memory at VA).
 | `xent_rows` | cross-entropy per row of 1000 logits by a SIMD-group: maximumf, the sum of exponentials, lane 0's log and label |
 | `colsum` | a thread per column of a 512 x 1024 matrix: a strided loop of a constant trip, unrolled by 8 |
 | `rowmax_vec4` | a thread's maximumf over a row of 256 floats in vector<4xf32> steps: NaN and zero signs deferred to the loop's exit |
+| `softmax_f16` | row softmax of f16 logits in f32 by a SIMD-group: extended loads, maximumf, the sum of exponentials and the f16 normalized write |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

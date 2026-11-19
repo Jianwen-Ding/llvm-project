@@ -303,3 +303,120 @@ entry:
   store float %35, ptr addrspace(1) %37, align 4
   ret void
 }
+
+; @softmax_f16: the loops extend their f16 loads to float; the maximum of the
+; extensions bounds the second loop's extensions (L15-E461). (The third loop
+; stores to y, which may alias x: its exp keeps the bound.)
+; CHECK-LABEL: softmax_f16:
+; CHECK:       simd_max.s
+; CHECK:       Loop Header
+; CHECK-NOT:   icmpsel sgt
+; CHECK:       jmp_exec_any
+; OFF-LABEL:   softmax_f16:
+; OFF:         simd_max.s
+; OFF:         Loop Header
+; OFF:         icmpsel sgt
+define agx_kernel void @softmax_f16(ptr addrspace(1) nofree readonly captures(none) %0, ptr addrspace(1) nofree writeonly captures(none) %1) #2 {
+entry:
+  %2 = tail call i32 @llvm.agx.thread.index.in.simdgroup()
+  %3 = tail call i32 @llvm.agx.threadgroup.position.in.grid.x()
+  %4 = zext i32 %2 to i64
+  %5 = icmp ult i32 %2, 1024
+  %6 = sub nsw i64 1024, %4
+  %7 = tail call i64 @llvm.umin.i64(i64 %6, i64 1024)
+  %8 = trunc nuw nsw i64 %7 to i32
+  %9 = select i1 %5, i32 %8, i32 0
+  %.not = icmp eq i32 %9, 0
+  br i1 %.not, label %._crit_edge, label %.lr.ph
+
+.lr.ph:                                           ; preds = %entry
+  %10 = shl i32 %3, 10
+  %invariant.op = add i32 %2, %10
+  %11 = zext nneg i32 %9 to i64
+  br label %12
+
+12:                                               ; preds = %.lr.ph, %12
+  %indvars.iv = phi i64 [ 0, %.lr.ph ], [ %indvars.iv.next, %12 ]
+  %13 = phi float [ -inf, %.lr.ph ], [ %.nan, %12 ]
+  %14 = trunc nuw nsw i64 %indvars.iv to i32
+  %.reass = add i32 %invariant.op, %14
+  %15 = zext i32 %.reass to i64
+  %16 = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %0, i64 %15
+  %17 = load half, ptr addrspace(1) %16, align 2
+  %.fr17 = freeze half %17
+  %18 = fpext half %.fr17 to float
+  %.nan = tail call float @llvm.maximum.f32(float %13, float %18)
+  %indvars.iv.next = add nuw nsw i64 %indvars.iv, 32
+  %19 = icmp samesign ult i64 %indvars.iv.next, %11
+  br i1 %19, label %12, label %._crit_edge
+
+._crit_edge:                                      ; preds = %12, %entry
+  %.lcssa5 = phi float [ -inf, %entry ], [ %.nan, %12 ]
+  %20 = fcmp uno float %.lcssa5, 0.000000e+00
+  %21 = bitcast float %.lcssa5 to i32
+  %isneg = icmp slt i32 %21, 0
+  %22 = select i1 %isneg, i32 2147483647, i32 0
+  %23 = xor i32 %22, %21
+  %24 = select i1 %20, i32 2143289344, i32 %23
+  %25 = tail call i32 @llvm.agx.simd.reduce.i32(i32 %24, i32 22)
+  %isneg4 = icmp slt i32 %25, 0
+  %26 = select i1 %isneg4, i32 2147483647, i32 0
+  %27 = xor i32 %26, %25
+  %28 = bitcast i32 %27 to float
+  br i1 %.not, label %._crit_edge8, label %.lr.ph7
+
+.lr.ph7:                                          ; preds = %._crit_edge
+  %29 = shl i32 %3, 10
+  %invariant.op10 = add i32 %2, %29
+  %30 = zext nneg i32 %9 to i64
+  br label %31
+
+31:                                               ; preds = %.lr.ph7, %31
+  %indvars.iv21 = phi i64 [ 0, %.lr.ph7 ], [ %indvars.iv.next22, %31 ]
+  %32 = phi float [ 0.000000e+00, %.lr.ph7 ], [ %40, %31 ]
+  %33 = trunc nuw nsw i64 %indvars.iv21 to i32
+  %.reass11 = add i32 %invariant.op10, %33
+  %34 = zext i32 %.reass11 to i64
+  %35 = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %0, i64 %34
+  %36 = load half, ptr addrspace(1) %35, align 2
+  %37 = fpext half %36 to float
+  %38 = fsub float %37, %28
+  %39 = tail call float @llvm.exp.f32(float %38)
+  %40 = fadd float %32, %39
+  %indvars.iv.next22 = add nuw nsw i64 %indvars.iv21, 32
+  %41 = icmp samesign ult i64 %indvars.iv.next22, %30
+  br i1 %41, label %31, label %._crit_edge8
+
+._crit_edge8:                                     ; preds = %31, %._crit_edge
+  %.lcssa = phi float [ 0.000000e+00, %._crit_edge ], [ %40, %31 ]
+  %42 = tail call float @llvm.agx.simd.reduce.f32(float %.lcssa, i32 1)
+  %43 = fdiv float 1.000000e+00, %42
+  br i1 %.not, label %._crit_edge14, label %.lr.ph13
+
+.lr.ph13:                                         ; preds = %._crit_edge8
+  %44 = shl i32 %3, 10
+  %invariant.op15 = add i32 %2, %44
+  %45 = zext nneg i32 %9 to i64
+  br label %46
+
+46:                                               ; preds = %.lr.ph13, %46
+  %indvars.iv23 = phi i64 [ 0, %.lr.ph13 ], [ %indvars.iv.next24, %46 ]
+  %47 = trunc nuw nsw i64 %indvars.iv23 to i32
+  %.reass16 = add i32 %invariant.op15, %47
+  %48 = zext i32 %.reass16 to i64
+  %49 = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %0, i64 %48
+  %50 = load half, ptr addrspace(1) %49, align 2
+  %51 = fpext half %50 to float
+  %52 = fsub float %51, %28
+  %53 = tail call float @llvm.exp.f32(float %52)
+  %54 = fmul float %43, %53
+  %55 = fptrunc float %54 to half
+  %56 = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %1, i64 %48
+  store half %55, ptr addrspace(1) %56, align 2
+  %indvars.iv.next24 = add nuw nsw i64 %indvars.iv23, 32
+  %57 = icmp samesign ult i64 %indvars.iv.next24, %45
+  br i1 %57, label %46, label %._crit_edge14
+
+._crit_edge14:                                    ; preds = %46, %._crit_edge8
+  ret void
+}

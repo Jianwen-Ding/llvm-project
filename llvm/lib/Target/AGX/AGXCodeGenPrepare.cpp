@@ -7643,6 +7643,11 @@ static Value *stripSinglePhis(Value *V) {
   return V;
 }
 
+static cl::opt<bool> AGXExpExtendedLoads(
+    "agx-exp-extended-loads", cl::init(true), cl::Hidden,
+    cl::desc("agx-exp-below-loop-max also where both loops extend their "
+             "loads (halves) to float"));
+
 static cl::opt<bool> AGXExpMaskedMax(
     "agx-exp-masked-max", cl::init(true), cl::Hidden,
     cl::desc("agx-exp-below-loop-max also for a maximum of select(c, -inf, "
@@ -7798,6 +7803,13 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
               U->getIntrinsicID() == Intrinsic::maximum))
     return false;
   Loop *L1 = LI.getLoopFor(U->getParent());
+  // (or both extensions of loads, the same exact map of the loaded values:
+  // a row of halves, L15-E461)
+  bool XExt = false;
+  if (auto *E2 = dyn_cast<FPExtInst>(X); E2 && AGXExpExtendedLoads) {
+    X = E2->getOperand(0);
+    XExt = true;
+  }
   auto *L2Load = dyn_cast<LoadInst>(X);
   if (!L1 || !L2Load || !L2Load->isSimple())
     return false;
@@ -7840,7 +7852,14 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
         C = nullptr;
       }
     }
-    auto *Ld = dyn_cast<LoadInst>(A);
+    bool AExt = false;
+    if (auto *E1 = dyn_cast<FPExtInst>(A); E1 && AGXExpExtendedLoads) {
+      A = E1->getOperand(0);
+      AExt = true;
+      if (auto *Fr = dyn_cast<FreezeInst>(A))
+        A = Fr->getOperand(0);
+    }
+    auto *Ld = AExt == XExt ? dyn_cast<LoadInst>(A) : nullptr;
     if (Phi && Ld && Phi->getParent() == L1->getHeader() &&
         Phi->getIncomingValueForBlock(Latch1) == U)
       P = Phi, V = Ld, Mask = C, MaskOnTrue = OnTrue;
