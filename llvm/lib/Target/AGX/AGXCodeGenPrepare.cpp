@@ -7066,7 +7066,8 @@ static cl::opt<bool> AGXOnlineSoftmaxExp(
     cl::desc("exp(a - max(a, b)) and exp(b - max(a, b)) as one exponential "
              "and 1 + (x - x) for the other"));
 
-/// e^(a - u) and e^(b - u), u = maximum(a, b) (or maximumnum, nsz or not):
+/// e^(a - u) and e^(b - u), u = maximum(a, b) (or maximumnum or maxnum, which
+/// return an operand too and drop one NaN; nsz or not; L15-E466 for maxnum):
 /// an online softmax's rescale e^(m - m') and new term e^(v - m'). Where
 /// b > a, u is b and b - u is b - b, +0 or (b infinite) a NaN, whose
 /// exponential is 1 or a NaN, 1 + (b - u) exactly (the simulator's NaNs of
@@ -7093,7 +7094,8 @@ static bool onlineSoftmaxExps(Function &F) {
       continue;
     auto *UI = dyn_cast<IntrinsicInst>(U);
     if (!UI || (UI->getIntrinsicID() != Intrinsic::maximum &&
-                UI->getIntrinsicID() != Intrinsic::maximumnum))
+                UI->getIntrinsicID() != Intrinsic::maximumnum &&
+                UI->getIntrinsicID() != Intrinsic::maxnum))
       continue;
     Value *B = UI->getArgOperand(0) == A ? UI->getArgOperand(1)
                : UI->getArgOperand(1) == A ? UI->getArgOperand(0)

@@ -30,3 +30,22 @@ define agx_kernel void @pair(ptr addrspace(1) %p, float %a, float %b) {
   store float %s, ptr addrspace(1) %p
   ret void
 }
+
+; maxnum (C's fmaxf) likewise: it returns an operand and drops one NaN
+; (L15-E466).
+declare float @llvm.maxnum.f32(float, float)
+; CHECK-LABEL: @pair_maxnum(
+; CHECK:       fcmp ogt float %b, %a
+; CHECK:       @llvm.roundeven.f32
+; CHECK-NOT:   @llvm.roundeven.f32
+; CHECK:       ret void
+define agx_kernel void @pair_maxnum(ptr addrspace(1) %p, float %a, float %b) {
+  %u = call float @llvm.maxnum.f32(float %a, float %b)
+  %da = fsub float %a, %u
+  %db = fsub float %b, %u
+  %ea = call float @llvm.exp.f32(float %da)
+  %eb = call float @llvm.exp.f32(float %db)
+  %s = fadd float %ea, %eb
+  store float %s, ptr addrspace(1) %p
+  ret void
+}
