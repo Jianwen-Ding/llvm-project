@@ -275,7 +275,8 @@ static cl::opt<unsigned> GuardVersioningMin(
 ///   if (g1 && g2 && ...) loop without the tests; else the loop
 /// Both compute the same; the copy runs only where its dropped tests hold.
 static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
-                          DominatorTree &DT, ScalarEvolution &SE) {
+                          DominatorTree &DT, ScalarEvolution &SE,
+                          DenseMap<BasicBlock *, CallInst *> &Ballots) {
   if (L.getLoopPreheader() && L.getExitBlock() && !L.hasDedicatedExits())
     formDedicatedExitBlocks(&L, &DT, &LI, nullptr, /*PreserveLCSSA=*/false);
   BasicBlock *Pre = L.getLoopPreheader();
@@ -335,12 +336,15 @@ static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
   // The same for the whole SIMD-group: the copy only where every active
   // thread may run it, so that no SIMD-group runs both loops (one with a
   // thread at the border runs the original alone).
+  auto *GuardBallot = cast<CallInst>(
+      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {All}));
   All = B.CreateICmpEQ(
-      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {All}),
+      GuardBallot,
       B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {B.getTrue()}));
   Instruction *Old = Check->getTerminator();
   B.CreateCondBr(All, NewPH, PH);
   Old->eraseFromParent();
+  Ballots[cast<BasicBlock>(VMap[L.getHeader()])] = GuardBallot;
   // The copy enters every guarded block.
   for (const Guard &G : Guards) {
     auto *Br = cast<CondBrInst>(VMap[G.Br]);
@@ -386,6 +390,11 @@ static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
   return true;
 }
 
+static cl::opt<bool> AGXTapBasesInGuards(
+    "agx-tap-bases-in-guards", cl::init(true), cl::Hidden,
+    cl::desc("For a guard-free copy, fold the tap bases' fit tests into its "
+             "own test instead of a third copy"));
+
 static cl::opt<unsigned> TapBasesMin(
     "agx-tap-bases-min", cl::init(3), cl::Hidden,
     cl::desc("Distinct invariant k_j of device accesses at inttoptr(k_j + "
@@ -405,7 +414,8 @@ static cl::opt<unsigned> TapBasesMin(
 ///   if (all fit) loop from one base; else the loop
 /// (L15-E395).
 static bool versionTapBases(Loop &L, Function &F, LoopInfo &LI,
-                            DominatorTree &DT, ScalarEvolution &SE) {
+                            DominatorTree &DT, ScalarEvolution &SE,
+                            CallInst *GuardBallot = nullptr) {
   if (!TapBasesMin)
     return false;
   // (versionGuards' copy shares its exit block with the loop it copies)
@@ -545,49 +555,73 @@ static bool versionTapBases(Loop &L, Function &F, LoopInfo &LI,
     if (T.K == K0 && T.C % int64_t(Elt))
       return false;
 
-  formLCSSA(L, DT, &LI, &SE);
-  Exiting = L.getExitingBlock();
-  Exit = L.getExitBlock();
-  BasicBlock *Check = L.getLoopPreheader();
-  BasicBlock *PH = SplitBlock(Check, Check->getTerminator(), &DT, &LI, nullptr,
-                              Check->getName() + ".taps");
-  ValueToValueMapTy VMap;
-  SmallVector<BasicBlock *, 16> NewBlocks;
-  cloneLoopWithPreheader(PH, Check, &L, VMap, ".onebase", &LI, &DT, NewBlocks);
-  remapInstructionsInBlocks(NewBlocks, VMap);
-  auto *NewPH = cast<BasicBlock>(VMap[PH]);
-  auto *NewExiting = cast<BasicBlock>(VMap[Exiting]);
-  for (PHINode &Phi : Exit->phis()) {
-    Value *V = Phi.getIncomingValueForBlock(Exiting);
-    Value *NV = VMap.lookup(V);
-    Phi.addIncoming(NV ? NV : V, NewExiting);
-  }
   // each (k_j - k_0 + c) / e exact and 32 bits
-  IRBuilder<> B(Check->getTerminator());
   unsigned Shift = Log2_64(Elt);
   std::map<std::pair<Value *, int64_t>, Value *> Index;
-  Value *All = B.getTrue();
-  for (const Tap &T : Taps) {
-    if (T.K == K0 || Index.count({T.K, T.C}))
-      continue;
-    Value *D = B.CreateAdd(B.CreateSub(T.K, K0), B.getInt64(T.C));
-    Value *Q = B.CreateAShr(D, Shift);
-    Value *Q32 = B.CreateTrunc(Q, B.getInt32Ty());
-    Value *Fits = B.CreateICmpEQ(B.CreateSExt(Q32, B.getInt64Ty()), Q);
-    if (Shift)
-      Fits = B.CreateAnd(
-          Fits, B.CreateICmpEQ(B.CreateAnd(D, Elt - 1), B.getInt64(0)));
-    All = B.CreateAnd(All, Fits);
-    Index[{T.K, T.C}] = Q32;
+  auto Checks = [&](IRBuilder<> &B) {
+    Value *All = B.getTrue();
+    for (const Tap &T : Taps) {
+      if (T.K == K0 || Index.count({T.K, T.C}))
+        continue;
+      Value *D = B.CreateAdd(B.CreateSub(T.K, K0), B.getInt64(T.C));
+      Value *Q = B.CreateAShr(D, Shift);
+      Value *Q32 = B.CreateTrunc(Q, B.getInt32Ty());
+      Value *Fits = B.CreateICmpEQ(B.CreateSExt(Q32, B.getInt64Ty()), Q);
+      if (Shift)
+        Fits = B.CreateAnd(
+            Fits, B.CreateICmpEQ(B.CreateAnd(D, Elt - 1), B.getInt64(0)));
+      All = B.CreateAnd(All, Fits);
+      Index[{T.K, T.C}] = Q32;
+    }
+    return All;
+  };
+  // A versionGuards copy, whose own test already sends the SIMD-groups
+  // that fail it to the loop it copies: the fit tests join that test and the
+  // copy is rewritten in place (no third copy, whose pointers would count
+  // in the kernel's registers: conv3x3, L15-E408).
+  ValueToValueMapTy VMap;
+  BasicBlock *NewHeader;
+  if (GuardBallot && AGXTapBasesInGuards &&
+      all_of(Taps, [&](const Tap &T) {
+        auto *KI = dyn_cast<Instruction>(T.K);
+        return !KI || DT.dominates(KI, GuardBallot);
+      })) {
+    IRBuilder<> B(GuardBallot);
+    Value *All = Checks(B);
+    GuardBallot->setArgOperand(0,
+                               B.CreateAnd(GuardBallot->getArgOperand(0), All));
+    for (const Tap &T : Taps)
+      VMap[T.Ptr] = T.Ptr;
+    NewHeader = L.getHeader();
+  } else {
+    formLCSSA(L, DT, &LI, &SE);
+    Exiting = L.getExitingBlock();
+    Exit = L.getExitBlock();
+    BasicBlock *Check = L.getLoopPreheader();
+    BasicBlock *PH = SplitBlock(Check, Check->getTerminator(), &DT, &LI,
+                                nullptr, Check->getName() + ".taps");
+    SmallVector<BasicBlock *, 16> NewBlocks;
+    cloneLoopWithPreheader(PH, Check, &L, VMap, ".onebase", &LI, &DT,
+                           NewBlocks);
+    remapInstructionsInBlocks(NewBlocks, VMap);
+    auto *NewPH = cast<BasicBlock>(VMap[PH]);
+    auto *NewExiting = cast<BasicBlock>(VMap[Exiting]);
+    for (PHINode &Phi : Exit->phis()) {
+      Value *V = Phi.getIncomingValueForBlock(Exiting);
+      Value *NV = VMap.lookup(V);
+      Phi.addIncoming(NV ? NV : V, NewExiting);
+    }
+    IRBuilder<> B(Check->getTerminator());
+    Value *All = Checks(B);
+    All = B.CreateICmpEQ(
+        B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {All}),
+        B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {B.getTrue()}));
+    Instruction *Old = Check->getTerminator();
+    B.CreateCondBr(All, NewPH, PH);
+    Old->eraseFromParent();
+    NewHeader = cast<BasicBlock>(VMap[L.getHeader()]);
   }
-  All = B.CreateICmpEQ(
-      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {All}),
-      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {B.getTrue()}));
-  Instruction *Old = Check->getTerminator();
-  B.CreateCondBr(All, NewPH, PH);
-  Old->eraseFromParent();
   // the copy's accesses from one base, inttoptr(k_0 + p) where p is
-  auto *NewHeader = cast<BasicBlock>(VMap[L.getHeader()]);
   Value *NewStep = VMap.lookup(Step);
   if (!NewStep)
     NewStep = Step;
@@ -645,13 +679,14 @@ bool AGXAlignmentVersioning::runOnFunction(Function &F) {
   }
   for (Loop *L : Loops)
     Changed |= versionLoop(*L, F, LI, DT, SE);
+  DenseMap<BasicBlock *, CallInst *> Ballots;
   if (GuardVersioningMin) {
     SmallVector<Loop *, 4> Inner;
     for (Loop *L : LI.getLoopsInPreorder())
       if (L->isInnermost() && L->getNumBlocks() > 1)
         Inner.push_back(L);
     for (Loop *L : Inner)
-      Changed |= versionGuards(*L, F, LI, DT, SE);
+      Changed |= versionGuards(*L, F, LI, DT, SE, Ballots);
   }
   if (TapBasesMin) {
     SmallVector<Loop *, 4> Inner;
@@ -660,7 +695,8 @@ bool AGXAlignmentVersioning::runOnFunction(Function &F) {
       if (L->isInnermost() && L->getNumBlocks() == 1)
         Inner.push_back(L);
     for (Loop *L : Inner)
-      Changed |= versionTapBases(*L, F, LI, DT, SE);
+      Changed |= versionTapBases(*L, F, LI, DT, SE,
+                                 Ballots.lookup(L->getHeader()));
   }
   return Changed;
 }
