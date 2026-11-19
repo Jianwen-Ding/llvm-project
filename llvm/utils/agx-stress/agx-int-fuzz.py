@@ -4,7 +4,8 @@
 Each seed generates a random kernel of 10-28 integer operations on i8 / i16 / i32 / i64 values (add, sub, mul,
 and, or, xor with registers and constants; shifts by constants and masked registers; icmp of every predicate
 into selects; smin / smax / umin / umax; udiv / urem / sdiv / srem by constants; ctpop / ctlz / cttz /
-bitreverse / bswap / abs; fshl / fshr; the four saturating adds; trunc / zext / sext), compiles it with llc,
+bitreverse / bswap / abs; fshl / fshr; the four saturating adds; trunc / zext / sext; runs of additions of wide
+constants K + i d to one value), compiles it with llc,
 runs it with agx_run on 1024 threads of random words (40% boundary values) and compares every output word with
 the model's (EXPERIMENTS.md L15-E376).
 
@@ -93,6 +94,18 @@ def gen(seed):
       b=pick(32); e=R.choice(['zext','sext']); x=nv(); y=nv(); p_=nv(); h=nv()
       body+=[f'  {x} = {e} i32 {a[0]} to i64', f'  {y} = {e} i32 {b[0]} to i64', f'  {p_} = mul i64 {x}, {y}', f'  {h} = lshr i64 {p_}, 32', f'  {r} = trunc i64 {h} to i32']
       ops+=[(x,64,(e,a[0],32)),(y,64,(e,b[0],32)),(p_,64,('mul',x,y)),(h,64,('lshr',p_,32)),(r,32,('trunc',h))]
+    elif k<0.97 and w==32:
+      # additions of wide constants K + i d to one value (chained by their
+      # differences, L15-E420), each an output
+      K=R.choice([123456789,-1640531527,8192,1000,-70000,0x7fff0000]); d=R.choice([1,200,-3,0x9E3779B9-(1<<32),8192,K])
+      prev=None
+      for i in range(R.randint(2,3)):
+        c=((K+i*d+(1<<31))&M[32])-(1<<31)
+        if prev is not None:
+          vals.append((prev,32))
+        body.append(f'  {r} = add i32 {a[0]}, {c}'); ops.append((r,32,('add',a[0],c)))
+        prev=r; r=nv()
+      r=prev
     elif k<0.98 and len(vals)>=2:
       # an and / or of two compares into a select
       b=pick(w); c1=nv(); c2=nv(); c=nv(); x=pick(w); y=pick(w)

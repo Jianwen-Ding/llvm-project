@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
+#include "llvm/ADT/MapVector.h"
 #include "AGXInstrInfo.h"
 #include "AGXRegisterInfo.h"
 #include "AGXSubtarget.h"
@@ -86,6 +87,159 @@ FunctionPass *llvm::createAGXFoldOperandsPass() {
 
 /// Memory base registers encode uniform pairs below u128 only.
 static constexpr unsigned MaxUniformBaseHalf = 0x100;
+
+static cl::opt<bool> AGXChainConstantAdds(
+    "agx-chain-constant-adds", cl::init(true), cl::Hidden,
+    cl::desc("b + c_j as (b + c_i) + (c_j - c_i) where the difference is an "
+             "immediate or another wide constant's register, so that c_j's "
+             "mov_imm goes"));
+
+/// Additions of wide constants (mov_imm) to one base in a block, b + c_1,
+/// b + c_2, ...: each after the first as an earlier sum plus the difference
+/// (mod 2^32, exact) where that is an 8-bit immediate, a negated one, or the
+/// register of a constant mov_imm'd before it in the block or the entry
+/// block, when then every use of c_j's mov_imm goes and the mov_imm with
+/// it. Philox's key schedule k0 + r 0x9E3779B9 (a mov_imm and an iadd a
+/// round: one iadd), transpose_smem's row offsets b + 8192 k (L15-E420).
+static bool chainConstantAdds(MachineFunction &MF, MachineRegisterInfo &MRI,
+                              const AGXInstrInfo *TII) {
+  if (!AGXChainConstantAdds)
+    return false;
+  auto ConstOf = [&](const MachineOperand &O) -> std::optional<uint32_t> {
+    if (!O.isReg() || !O.getReg().isVirtual() || O.getSubReg())
+      return std::nullopt;
+    MachineInstr *D = MRI.getVRegDef(O.getReg());
+    if (!D || D->getOpcode() != AGX::MOV_IMM32 || !D->getOperand(1).isImm())
+      return std::nullopt;
+    return uint32_t(D->getOperand(1).getImm());
+  };
+  struct Add {
+    MachineInstr *MI;
+    unsigned KOp; // the constant's operand (2 or 4)
+    uint32_t C;
+  };
+  struct Rewrite {
+    MachineInstr *MI;
+    Register Prev, DR;
+    int64_t Imm;
+  };
+  // Over the function: each constant register's rewrites, and those that
+  // cannot all be rewritten.
+  MapVector<Register, SmallVector<Rewrite, 2>> Plan;
+  DenseSet<Register> Blocked;
+  MachineBasicBlock &Entry = MF.front();
+  for (MachineBasicBlock &MBB : MF) {
+    // (base register, subregister) -> its additions, in order
+    MapVector<std::pair<Register, unsigned>, SmallVector<Add, 4>> Groups;
+    for (MachineInstr &MI : MBB) {
+      if (MI.getOpcode() != AGX::IADD_I32 || !MI.getOperand(1).isImm() ||
+          MI.getOperand(1).getImm() || !MI.getOperand(3).isImm() ||
+          MI.getOperand(3).getImm() || !MI.getOperand(5).isImm() ||
+          MI.getOperand(5).getImm())
+        continue;
+      for (unsigned K : {4u, 2u}) {
+        unsigned B = K == 4 ? 2 : 4;
+        std::optional<uint32_t> C = ConstOf(MI.getOperand(K));
+        const MachineOperand &BO = MI.getOperand(B);
+        if (!C || !BO.isReg() || ConstOf(BO))
+          continue;
+        Groups[{BO.getReg(), BO.getSubReg()}].push_back({&MI, K, *C});
+        break;
+      }
+    }
+    for (auto &[Base, Adds] : Groups) {
+      if (Adds.size() < 2)
+        continue;
+      // The constants' registers usable at an addition: mov_imm'd earlier
+      // in this block or in the entry block.
+      auto RegFor = [&](uint32_t D, MachineInstr *At) -> Register {
+        for (const Add &A : Adds) {
+          Register R = A.MI->getOperand(A.KOp).getReg();
+          MachineInstr *Def = MRI.getVRegDef(R);
+          if (uint32_t(Def->getOperand(1).getImm()) != D)
+            continue;
+          if (Def->getParent() == &Entry && &MBB != &Entry)
+            return R;
+          if (Def->getParent() == &MBB) {
+            for (MachineInstr &I : MBB) {
+              if (&I == Def)
+                return R;
+              if (&I == At)
+                break;
+            }
+          }
+        }
+        return Register();
+      };
+      // (the constants that may go: those of the second addition on)
+      DenseSet<Register> Candidates;
+      for (unsigned J = 1; J < Adds.size(); ++J)
+        Candidates.insert(Adds[J].MI->getOperand(Adds[J].KOp).getReg());
+      // The first addition's constant stays.
+      Blocked.insert(Adds[0].MI->getOperand(Adds[0].KOp).getReg());
+      for (unsigned J = 1; J < Adds.size(); ++J) {
+        Register KJ = Adds[J].MI->getOperand(Adds[J].KOp).getReg();
+        bool Found = false;
+        // The nearest earlier sum first; a difference register that stays
+        // (not itself one that may go) before one that may.
+        for (bool AnyReg : {false, true})
+          for (unsigned I = J; I-- > 0 && !Found;) {
+            uint32_t D = Adds[J].C - Adds[I].C;
+            int64_t Imm = 0;
+            Register DR;
+            if (isUInt<8>(D))
+              Imm = D;
+            else if (isUInt<8>(uint32_t(-D)) && D)
+              Imm = -int64_t(uint32_t(-D));
+            else if ((DR = RegFor(D, Adds[J].MI)) && DR != KJ &&
+                     (AnyReg || !Candidates.contains(DR)))
+              ;
+            else
+              continue;
+            Plan[KJ].push_back(
+                {Adds[J].MI, Adds[I].MI->getOperand(0).getReg(), DR, Imm});
+            Found = true;
+          }
+        if (!Found)
+          Blocked.insert(KJ);
+      }
+    }
+  }
+  // A register some rewrite reads as its difference stays.
+  for (auto &[KJ, Rewrites] : Plan)
+    for (const Rewrite &R : Rewrites)
+      if (R.DR)
+        Blocked.insert(R.DR);
+  bool Changed = false;
+  for (auto &[KJ, Rewrites] : Plan) {
+    if (Blocked.contains(KJ))
+      continue;
+    unsigned Uses = 0;
+    for (MachineInstr &U : MRI.use_nodbg_instructions(KJ))
+      (void)U, ++Uses;
+    if (Uses != Rewrites.size())
+      continue;
+    for (const Rewrite &R : Rewrites) {
+      MachineInstr *MI = R.MI;
+      MachineInstrBuilder NB =
+          BuildMI(*MI->getParent(), MI, MI->getDebugLoc(),
+                  TII->get(R.Imm < 0 ? AGX::ISUB_I32 : AGX::IADD_I32),
+                  MI->getOperand(0).getReg())
+              .addImm(0)
+              .addReg(R.Prev)
+              .addImm(0);
+      if (R.DR)
+        NB.addReg(R.DR);
+      else
+        NB.addImm(R.Imm < 0 ? -R.Imm : R.Imm);
+      NB.addImm(0);
+      MI->eraseFromParent();
+    }
+    MRI.getVRegDef(KJ)->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
 
 bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
@@ -503,5 +657,6 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
         }
       }
   }
+  Changed |= chainConstantAdds(MF, MRI, TII);
   return Changed;
 }
