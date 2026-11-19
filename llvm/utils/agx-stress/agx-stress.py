@@ -13,7 +13,7 @@ buffer with a Python model of the kernel:
   generic3       the same with private memory as a third choice;
   sunk-scan      a SIMD-group add scan by shuffles up whose last add only feeds the last thread's store of the total
                  (sunk into that branch: the recognized scan must stay with its shuffles, L15-E365);
-  fuzz-*         the differential fuzzers beside this script (agx-int / fp / half / f64 / mem / simd / cf / loop-fuzz.py),
+  fuzz-*         the differential fuzzers beside this script (agx-int / fp / half / f64 / mem / simd / cf / loop / exact-fuzz.py),
                  --fuzz-seeds seeds of each (default 100; 0 skips them).
 
   agx-stress.py --llc build/bin/llc --run path/to/agx_run [--objcopy build/bin/llvm-objcopy] [--only NAME]
@@ -289,7 +289,7 @@ def main():
                 failed += bool(bad)
                 print("%-24s %-9s %s" % (name, chip, status))
     here = os.path.dirname(os.path.abspath(__file__))
-    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf", "loop"):
+    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf", "loop", "exact"):
         name = "fuzz-" + fz
         if a.fuzz_seeds <= 0 or (a.only and a.only != name):
             continue
