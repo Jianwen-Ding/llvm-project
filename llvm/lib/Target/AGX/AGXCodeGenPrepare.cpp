@@ -6410,6 +6410,11 @@ static cl::opt<bool> AGXReciprocalAboveOne(
     cl::desc("1 / (e^x + c), c >= 1, as the reciprocal step without the "
              "division's scaling and NaN select"));
 
+static cl::opt<bool> AGXQuotientAboveOne(
+    "agx-quotient-above-one", cl::init(true), cl::Hidden,
+    cl::desc("(c' - e) / (e + c), e an exponential of a non-positive value, "
+             "as Markstein's quotient step without the division's scaling"));
+
 static cl::opt<bool> AGXReciprocalConverted(
     "agx-reciprocal-converted", cl::init(true), cl::Hidden,
     cl::desc("1 / (a converted 32-bit integer or widened half) as the "
@@ -6469,6 +6474,61 @@ static bool reciprocalsAboveOne(Function &F) {
       continue;
     Divs.push_back({&I, false});
   }
+  // n / d, d = e + c and n = c' - e or e + c' (c, c' in [1, 2^20]), e an
+  // exponential of a value that is not positive: d in [1, 2^21], n zero or
+  // at least 2^-24 in magnitude (1 - e is exact near e = 1), so with y the
+  // correctly rounded 1 / d (E282's step) Markstein's q0 = n y, r = n - d q0
+  // (exact), q = q0 + r y is the correctly rounded quotient, no value near a
+  // denormal: rcp, five fmas (L15-E409; tanh's (1 - e) / (1 + e)).
+  SmallVector<Instruction *, 4> Quots;
+  if (AGXQuotientAboveOne) {
+    auto Bounded = [](const APFloat *C) {
+      return C->isFinite() && C->compare(APFloat(1.0f)) != APFloat::cmpLessThan &&
+             C->compare(APFloat(0x1p20f)) != APFloat::cmpGreaterThan;
+    };
+    auto NonPositiveExp = [&](Value *E) {
+      auto *II = dyn_cast<IntrinsicInst>(E);
+      if (!II || (II->getIntrinsicID() != Intrinsic::exp &&
+                  II->getIntrinsicID() != Intrinsic::exp2 &&
+                  II->getIntrinsicID() != Intrinsic::exp10 &&
+                  II->getIntrinsicID() != Intrinsic::agx_exp2))
+        return false;
+      KnownFPClass K = computeKnownFPClass(
+          II->getArgOperand(0), fcAllFlags, SimplifyQuery(F.getDataLayout()));
+      return K.cannotBeOrderedGreaterThanZero();
+    };
+    for (Instruction &I : instructions(F)) {
+      Value *Nm, *D, *E, *E2;
+      const APFloat *C, *C2;
+      if (!I.getType()->isFloatTy() ||
+          !match(&I, m_FDiv(m_Value(Nm), m_Value(D))) ||
+          cast<FPMathOperator>(I).getFastMathFlags().any() ||
+          !match(D, m_c_FAdd(m_Value(E), m_APFloat(C))) || !Bounded(C) ||
+          !NonPositiveExp(E))
+        continue;
+      if (!((match(Nm, m_FSub(m_APFloat(C2), m_Value(E2))) ||
+             match(Nm, m_c_FAdd(m_Value(E2), m_APFloat(C2)))) &&
+            E2 == E && Bounded(C2)))
+        continue;
+      Quots.push_back(&I);
+    }
+  }
+  for (Instruction *I : Quots) {
+    IRBuilder<> B(I);
+    Value *N = I->getOperand(0), *D = I->getOperand(1);
+    Type *Ty = D->getType();
+    Value *ND = B.CreateFNeg(D);
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
+    Value *E = B.CreateIntrinsic(Intrinsic::fma, {Ty},
+                                 {ND, Y0, ConstantFP::get(Ty, 1.0)});
+    Value *Y = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {E, Y0, Y0});
+    Value *Q0 = B.CreateFMul(N, Y);
+    Value *R = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {ND, Q0, N});
+    Value *Q = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {R, Y, Q0});
+    Q->takeName(I);
+    I->replaceAllUsesWith(Q);
+    I->eraseFromParent();
+  }
   for (auto [I, Sqrt] : Divs) {
     IRBuilder<> B(I);
     Value *D = I->getOperand(1);
@@ -6485,7 +6545,7 @@ static bool reciprocalsAboveOne(Function &F) {
     I->replaceAllUsesWith(R);
     I->eraseFromParent();
   }
-  return !Divs.empty();
+  return !Divs.empty() || !Quots.empty();
 }
 
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
