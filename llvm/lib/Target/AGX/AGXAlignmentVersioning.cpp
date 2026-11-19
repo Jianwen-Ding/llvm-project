@@ -29,6 +29,7 @@
 
 #include "AGX.h"
 #include "Utils/AGXBaseInfo.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -42,6 +43,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
@@ -383,6 +385,231 @@ static bool versionGuards(Loop &L, Function &F, LoopInfo &LI,
   return true;
 }
 
+static cl::opt<unsigned> TapBasesMin(
+    "agx-tap-bases-min", cl::init(5), cl::Hidden,
+    cl::desc("Device accesses at inttoptr(k_j + p), p stepped by an "
+             "innermost loop and the k_j invariant, a loop must have to get "
+             "a copy addressing them from one base (0: off)"));
+
+/// The PTX front end's accesses at integer addresses inttoptr(k_j + p): a
+/// convolution's taps, p the channel's offset stepped each iteration and
+/// k_j = in + 4 (row_j + x) for each tap's row and column. Loop strength
+/// reduction keeps a 64-bit pointer for each k_j, each stepped by a 64-bit
+/// add. Where every k_j - k_0 is a multiple of the access's element size e
+/// whose quotient fits 32 signed bits, the access is at the one stepped base
+/// inttoptr(k_0 + p) plus sext(i32 (k_j - k_0) / e) elements, an index
+/// register. A copy of the loop does so where that holds for the whole
+/// SIMD-group (a ballot, as versionGuards):
+///   if (all fit) loop from one base; else the loop
+/// (L15-E395).
+static bool versionTapBases(Loop &L, Function &F, LoopInfo &LI,
+                            DominatorTree &DT, ScalarEvolution &SE) {
+  if (!TapBasesMin)
+    return false;
+  // (versionGuards' copy shares its exit block with the loop it copies)
+  if (L.getLoopPreheader() && L.getExitBlock() && !L.hasDedicatedExits())
+    formDedicatedExitBlocks(&L, &DT, &LI, nullptr, /*PreserveLCSSA=*/false);
+  BasicBlock *Pre = L.getLoopPreheader();
+  BasicBlock *Exiting = L.getExitingBlock(), *Exit = L.getExitBlock();
+  if (!Pre || !Exiting || !Exit || !L.hasDedicatedExits() ||
+      !L.isLoopSimplifyForm())
+    return false;
+  // An access point: the inttoptr, or a constant-offset GEP of it, whose
+  // users are all accesses at it.
+  struct Tap {
+    Instruction *Ptr;
+    Value *K;
+    int64_t C; // bytes past k_j + p
+  };
+  auto Accesses = [](Instruction *Ptr, uint64_t &Elt, const DataLayout &DL) {
+    Elt = 0;
+    for (User *U : Ptr->users()) {
+      Type *Ty;
+      if (auto *Ld = dyn_cast<LoadInst>(U);
+          Ld && Ld->isSimple() && Ld->getPointerOperand() == Ptr)
+        Ty = Ld->getType();
+      else if (auto *St = dyn_cast<StoreInst>(U);
+               St && St->isSimple() && St->getPointerOperand() == Ptr)
+        Ty = St->getValueOperand()->getType();
+      else
+        return false;
+      uint64_t E = DL.getTypeStoreSize(Ty->getScalarType()).getFixedValue();
+      if (Elt && E != Elt)
+        return false;
+      Elt = E;
+    }
+    return Elt == 1 || Elt == 2 || Elt == 4 || Elt == 8;
+  };
+  // the access points of each stepped p
+  MapVector<Value *, SmallVector<Tap, 8>> Groups;
+  const DataLayout &DL = F.getDataLayout();
+  uint64_t Elt = 0;
+  for (BasicBlock *BB : L.blocks())
+    for (Instruction &I : *BB) {
+      auto *P = dyn_cast<IntToPtrInst>(&I);
+      if (!P || P->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+        continue;
+      auto *A = dyn_cast<BinaryOperator>(P->getOperand(0));
+      if (!A || A->getOpcode() != Instruction::Add || !L.contains(A) ||
+          !A->getType()->isIntegerTy(64))
+        continue;
+      Value *K = A->getOperand(0), *V = A->getOperand(1);
+      if (!L.isLoopInvariant(K))
+        std::swap(K, V);
+      if (!L.isLoopInvariant(K) || L.isLoopInvariant(V))
+        continue;
+      if (auto *KI = dyn_cast<Instruction>(K);
+          KI && !DT.dominates(KI, Pre->getTerminator()))
+        continue;
+      SmallVector<Tap, 4> Points;
+      bool OK = true;
+      for (User *U : P->users()) {
+        if (isa<LoadInst>(U) || isa<StoreInst>(U))
+          continue;
+        auto *G = dyn_cast<GetElementPtrInst>(U);
+        APInt Off(64, 0);
+        uint64_t E;
+        if (!G || G->getPointerOperand() != P ||
+            !G->accumulateConstantOffset(DL, Off) || !Accesses(G, E, DL) ||
+            (Elt && E != Elt)) {
+          OK = false;
+          break;
+        }
+        Elt = E;
+        Points.push_back({G, K, Off.getSExtValue()});
+      }
+      bool Direct = any_of(P->users(), [](User *U) {
+        return isa<LoadInst>(U) || isa<StoreInst>(U);
+      });
+      if (!OK)
+        continue;
+      if (Direct) {
+        // (the inttoptr's own accesses, its GEPs aside)
+        for (User *U : P->users()) {
+          Type *Ty = nullptr;
+          if (auto *Ld = dyn_cast<LoadInst>(U))
+            Ty = Ld->isSimple() && Ld->getPointerOperand() == P ? Ld->getType()
+                                                                 : nullptr;
+          else if (auto *St = dyn_cast<StoreInst>(U))
+            Ty = St->isSimple() && St->getPointerOperand() == P
+                     ? St->getValueOperand()->getType()
+                     : nullptr;
+          else
+            continue;
+          if (!Ty) {
+            OK = false;
+            break;
+          }
+          uint64_t T = DL.getTypeStoreSize(Ty->getScalarType()).getFixedValue();
+          if (Elt && T != Elt) {
+            OK = false;
+            break;
+          }
+          Elt = T;
+        }
+        if (!OK)
+          continue;
+        Points.push_back({P, K, 0});
+      }
+      auto &G = Groups[V];
+      G.append(Points.begin(), Points.end());
+    }
+  if (Elt != 1 && Elt != 2 && Elt != 4 && Elt != 8)
+    return false;
+  // the group with the most distinct bases, and at least TapBasesMin
+  Value *Step = nullptr;
+  SmallVector<Tap, 8> Taps;
+  unsigned Best = 0;
+  for (auto &[V, G] : Groups) {
+    SmallPtrSet<Value *, 8> Ks;
+    for (const Tap &T : G)
+      Ks.insert(T.K);
+    if (Ks.size() >= TapBasesMin && Ks.size() > Best)
+      Best = Ks.size(), Step = V, Taps = G;
+  }
+  if (!Step)
+    return false;
+  Value *K0 = Taps.front().K;
+  for (const Tap &T : Taps)
+    if (T.K == K0 && T.C % int64_t(Elt))
+      return false;
+
+  formLCSSA(L, DT, &LI, &SE);
+  Exiting = L.getExitingBlock();
+  Exit = L.getExitBlock();
+  BasicBlock *Check = L.getLoopPreheader();
+  BasicBlock *PH = SplitBlock(Check, Check->getTerminator(), &DT, &LI, nullptr,
+                              Check->getName() + ".taps");
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 16> NewBlocks;
+  cloneLoopWithPreheader(PH, Check, &L, VMap, ".onebase", &LI, &DT, NewBlocks);
+  remapInstructionsInBlocks(NewBlocks, VMap);
+  auto *NewPH = cast<BasicBlock>(VMap[PH]);
+  auto *NewExiting = cast<BasicBlock>(VMap[Exiting]);
+  for (PHINode &Phi : Exit->phis()) {
+    Value *V = Phi.getIncomingValueForBlock(Exiting);
+    Value *NV = VMap.lookup(V);
+    Phi.addIncoming(NV ? NV : V, NewExiting);
+  }
+  // each (k_j - k_0 + c) / e exact and 32 bits
+  IRBuilder<> B(Check->getTerminator());
+  unsigned Shift = Log2_64(Elt);
+  std::map<std::pair<Value *, int64_t>, Value *> Index;
+  Value *All = B.getTrue();
+  for (const Tap &T : Taps) {
+    if (T.K == K0 || Index.count({T.K, T.C}))
+      continue;
+    Value *D = B.CreateAdd(B.CreateSub(T.K, K0), B.getInt64(T.C));
+    Value *Q = B.CreateAShr(D, Shift);
+    Value *Q32 = B.CreateTrunc(Q, B.getInt32Ty());
+    Value *Fits = B.CreateICmpEQ(B.CreateSExt(Q32, B.getInt64Ty()), Q);
+    if (Shift)
+      Fits = B.CreateAnd(
+          Fits, B.CreateICmpEQ(B.CreateAnd(D, Elt - 1), B.getInt64(0)));
+    All = B.CreateAnd(All, Fits);
+    Index[{T.K, T.C}] = Q32;
+  }
+  All = B.CreateICmpEQ(
+      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {All}),
+      B.CreateIntrinsic(Intrinsic::agx_simd_ballot, {}, {B.getTrue()}));
+  Instruction *Old = Check->getTerminator();
+  B.CreateCondBr(All, NewPH, PH);
+  Old->eraseFromParent();
+  // the copy's accesses from one base, inttoptr(k_0 + p) where p is
+  auto *NewHeader = cast<BasicBlock>(VMap[L.getHeader()]);
+  Value *NewStep = VMap.lookup(Step);
+  if (!NewStep)
+    NewStep = Step;
+  IRBuilder<> HB(&*NewHeader->getFirstInsertionPt());
+  if (auto *SI = dyn_cast<Instruction>(NewStep); SI && !isa<PHINode>(SI))
+    HB.SetInsertPoint(SI->getNextNode());
+  Type *PtrTy = PointerType::get(F.getContext(), AGX::DEVICE_ADDRESS);
+  Value *Base = HB.CreateIntToPtr(HB.CreateAdd(K0, NewStep), PtrTy, "onebase");
+  Type *EltTy = HB.getIntNTy(8 * Elt);
+  SmallVector<Instruction *, 8> Dead;
+  for (const Tap &T : Taps) {
+    auto *NP = cast<Instruction>(VMap[T.Ptr]);
+    IRBuilder<> PB(NP);
+    Value *R;
+    if (T.K == K0)
+      R = T.C ? PB.CreateGEP(PB.getInt8Ty(), Base, PB.getInt64(T.C)) : Base;
+    else
+      R = PB.CreateGEP(EltTy, Base,
+                       PB.CreateSExt(Index[{T.K, T.C}], PB.getInt64Ty()));
+    NP->replaceAllUsesWith(R);
+    Dead.push_back(NP);
+  }
+  // (with the inttoptrs and additions only they used: loop strength
+  // reduction would keep a pointer for each)
+  SmallVector<WeakTrackingVH, 8> Gone(Dead.begin(), Dead.end());
+  for (WeakTrackingVH &V : Gone)
+    if (auto *I = dyn_cast_or_null<Instruction>(V))
+      RecursivelyDeleteTriviallyDeadInstructions(I);
+  DT.recalculate(F);
+  SE.forgetLoop(&L);
+  return true;
+}
+
 bool AGXAlignmentVersioning::runOnFunction(Function &F) {
   if (!EnableAlignmentVersioning || skipFunction(F))
     return false;
@@ -414,6 +641,15 @@ bool AGXAlignmentVersioning::runOnFunction(Function &F) {
         Inner.push_back(L);
     for (Loop *L : Inner)
       Changed |= versionGuards(*L, F, LI, DT, SE);
+  }
+  if (TapBasesMin) {
+    SmallVector<Loop *, 4> Inner;
+    // (single blocks: versionGuards' copies, not the loops they guard)
+    for (Loop *L : LI.getLoopsInPreorder())
+      if (L->isInnermost() && L->getNumBlocks() == 1)
+        Inner.push_back(L);
+    for (Loop *L : Inner)
+      Changed |= versionTapBases(*L, F, LI, DT, SE);
   }
   return Changed;
 }
