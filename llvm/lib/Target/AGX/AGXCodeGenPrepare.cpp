@@ -5292,6 +5292,147 @@ static bool exactDyadicSums(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNarrowBoundedI64(
+    "agx-narrow-bounded-i64", cl::init(true), cl::Hidden,
+    cl::desc("64-bit arithmetic of zero-extended 32-bit values that stays "
+             "below 2^32 (positions' known bounds) computed in 32 bits"));
+
+/// MLIR's index arithmetic of positions is 64-bit: zext(by) << 16 +
+/// ((zext(sg) << 14) & m) | ... Where every node of such a tree (zext of
+/// i32 leaves, constants; shl / add / or / and / mul / lshr) is below 2^32
+/// (AGX::scevUpperBound: the positions' bounds, E391's upper_bounds among
+/// them), it is the zero extension of the same tree in i32: no 64-bit
+/// shifts, masks and adds (L15-E405). (Not as range attributes on the
+/// positions, which the DAG's address folds then use: E391.)
+static bool narrowBoundedI64(Function &F) {
+  if (!AGXNarrowBoundedI64)
+    return false;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  Type *I64 = Type::getInt64Ty(F.getContext());
+  Type *I32 = Type::getInt32Ty(F.getContext());
+  // an upper bound on each node: constants, zext leaves by scalar evolution
+  // (the positions' bounds), and the operations' own (and: the smaller
+  // operand's; or: the sum's)
+  DenseMap<Value *, std::optional<APInt>> BoundOf;
+  std::function<std::optional<APInt>(Value *, unsigned)> Bound =
+      [&](Value *V, unsigned Depth) -> std::optional<APInt> {
+    if (V->getType() != I64 || Depth > 12)
+      return std::nullopt;
+    if (auto It = BoundOf.find(V); It != BoundOf.end())
+      return It->second;
+    std::optional<APInt> R;
+    APInt Top = APInt(128, 1).shl(32);
+    if (auto *C = dyn_cast<ConstantInt>(V)) {
+      if (C->getValue().isIntN(32))
+        R = C->getValue().zext(128);
+    } else if (auto *Z = dyn_cast<ZExtInst>(V)) {
+      if (Z->getSrcTy()->isIntegerTy(32)) {
+        std::optional<APInt> B =
+            AGX::scevUpperBound(SE.getSCEV(Z->getOperand(0)), SE, F);
+        R = B && B->ult(Top) ? *B : Top - 1;
+      }
+    } else if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      std::optional<APInt> A = Bound(BO->getOperand(0), Depth + 1);
+      std::optional<APInt> C = Bound(BO->getOperand(1), Depth + 1);
+      auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (A && C) {
+        switch (BO->getOpcode()) {
+        case Instruction::Add:
+        case Instruction::Or:
+          R = *A + *C;
+          break;
+        case Instruction::And:
+          R = A->ult(*C) ? *A : *C;
+          break;
+        case Instruction::Mul:
+          R = *A * *C;
+          break;
+        case Instruction::Shl:
+          if (CI && CI->getZExtValue() < 32)
+            R = A->shl(CI->getZExtValue());
+          break;
+        case Instruction::LShr:
+          if (CI && CI->getZExtValue() < 32)
+            R = A->lshr(CI->getZExtValue());
+          break;
+        default:
+          break;
+        }
+      }
+      if (R && !R->ult(Top))
+        R.reset();
+    }
+    BoundOf[V] = R;
+    return R;
+  };
+  auto Narrowable = [&](Value *V, unsigned) { return Bound(V, 0).has_value(); };
+  DenseMap<Value *, Value *> Built;
+  std::function<Value *(Value *, IRBuilder<> &)> Build = [&](Value *V,
+                                                             IRBuilder<> &B) {
+    if (Value *N = Built.lookup(V))
+      return N;
+    Value *N;
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      N = ConstantInt::get(I32, C->getZExtValue());
+    else if (auto *Z = dyn_cast<ZExtInst>(V))
+      N = Z->getOperand(0);
+    else {
+      auto *BO = cast<BinaryOperator>(V);
+      IRBuilder<> IB(BO);
+      Value *A = Build(BO->getOperand(0), IB), *C = Build(BO->getOperand(1), IB);
+      // (no wrap: every node is below 2^32)
+      auto *NB = BinaryOperator::Create(BO->getOpcode(), A, C,
+                                        BO->getName() + ".n32", BO->getIterator());
+      if (isa<OverflowingBinaryOperator>(NB))
+        NB->setHasNoUnsignedWrap(true);
+      if (auto *PD = dyn_cast<PossiblyDisjointInst>(NB))
+        PD->setIsDisjoint(cast<PossiblyDisjointInst>(BO)->isDisjoint());
+      N = NB;
+    }
+    Built[V] = N;
+    return N;
+  };
+  SmallVector<BinaryOperator *, 16> Roots;
+  for (Instruction &I : instructions(F)) {
+    auto *BO = dyn_cast<BinaryOperator>(&I);
+    if (!BO || BO->getType() != I64 || !Narrowable(BO, 0))
+      continue;
+    // a root: some user is not narrowable itself; not an address's index,
+    // a GEP's or an integer address's (b + x, the PTX front end's): the DAG
+    // folds zext(x) << s into the access's scaled index
+    auto AddressUse = [](User *U) {
+      if (isa<GetElementPtrInst, IntToPtrInst>(U))
+        return true;
+      auto *A = dyn_cast<BinaryOperator>(U);
+      return A && (A->getOpcode() == Instruction::Add ||
+                   A->getOpcode() == Instruction::Or ||
+                   A->getOpcode() == Instruction::Sub);
+    };
+    if (any_of(BO->users(), [&](User *U) { return !Narrowable(U, 0); }) &&
+        none_of(BO->users(), AddressUse))
+      Roots.push_back(BO);
+  }
+  bool Changed = false;
+  for (BinaryOperator *R : Roots) {
+    IRBuilder<> B(R);
+    Value *N = Build(R, B);
+    IRBuilder<> ZB(R->getNextNode());
+    Value *Z = ZB.CreateZExt(N, I64, R->getName() + ".z");
+    if (auto *ZI = dyn_cast<ZExtInst>(Z))
+      ZI->setNonNeg(false);
+    R->replaceUsesWithIf(Z, [&](Use &U) {
+      return !Narrowable(U.getUser(), 0) || U.getUser() == Z;
+    });
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNeverNaNTests(
     "agx-never-nan-tests", cl::init(true), cl::Hidden,
     cl::desc("Fold NaN tests of values no execution makes a NaN (a running "
@@ -5545,6 +5686,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
+  Changed |= narrowBoundedI64(F);
   // (before the matrix FMAs become i64 operands, which the fold does not see through)
   Changed |= foldLaneIdentities(F);
   // (before the scan recognition, which matches the folded segment tests)

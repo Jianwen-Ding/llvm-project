@@ -1073,6 +1073,10 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
     case Intrinsic::agx_thread_position_in_threadgroup_z:
     case Intrinsic::agx_thread_index_in_threadgroup:
       return APInt(128, 1023);
+    // (32 lanes; at most 1024 threads, 32 SIMD-groups, a threadgroup)
+    case Intrinsic::agx_thread_index_in_simdgroup:
+    case Intrinsic::agx_simdgroup_index_in_threadgroup:
+      return APInt(128, 31);
     case Intrinsic::agx_threadgroup_position_in_grid_x:
     case Intrinsic::agx_threadgroup_position_in_grid_y:
     case Intrinsic::agx_threadgroup_position_in_grid_z:
