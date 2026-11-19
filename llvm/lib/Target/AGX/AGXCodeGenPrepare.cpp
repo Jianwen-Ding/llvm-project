@@ -6484,6 +6484,173 @@ static bool halfFromFloat(Function &F) {
   return !Roots.empty();
 }
 
+static cl::opt<bool> AGXDeferredMinMax(
+    "agx-deferred-minmax-reductions", cl::init(true), cl::Hidden,
+    cl::desc("A loop's running llvm.maximum / minimum as an ordered compare-"
+             "select, a NaN carried beside it and a flag for zeros of the "
+             "result's sign, combined after the loop"));
+
+/// A loop's running m = maximum(m, v) (minimum likewise, of float or float
+/// vectors) used only by itself in the loop: maximum's NaN result and its
+/// -0 below +0 are deferred to the loop's exits (L15-E444). In the loop
+///   m' = v > m ? v : m      (a NaN v leaves m),
+///   n' = v uno v ? v : n    (the last NaN seen, the initial value at first),
+///   z' = smax(z, bits(v))   (smin for minimum),
+/// three instructions for maximum's five (compare-select, the and of the
+/// bits, its flush, the equal select and the NaN select); after the loop
+///   r = n uno n ? n : (m == 0 && z >= 0 (z < 0) ? +0 (-0) : m),
+/// which is maximum's value: a NaN if one was seen, else the largest, of
+/// the zeros +0 if one was seen (a zero m means every value is at most a
+/// zero or a denormal, which the compares flush: a clear sign among their
+/// bits, z >= 0, is a +0 or positive denormal, and maximum gives +0 or
+/// that denormal either way). MLIR's maximumf row maxima (torch-mlir's softmax).
+static bool deferredMinMaxReductions(Function &F) {
+  if (!AGXDeferredMinMax)
+    return false;
+  using namespace PatternMatch;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *H = L->getHeader(), *Pre = L->getLoopPreheader(),
+               *Latch = L->getLoopLatch();
+    if (!Pre || !Latch)
+      continue;
+    SmallVector<PHINode *, 4> Phis;
+    for (PHINode &P : H->phis())
+      if (P.getType()->getScalarType()->isFloatTy() &&
+          P.getNumIncomingValues() == 2)
+        Phis.push_back(&P);
+    for (PHINode *P : Phis) {
+      auto *U = dyn_cast<IntrinsicInst>(P->getIncomingValueForBlock(Latch));
+      if (!U || (U->getIntrinsicID() != Intrinsic::maximum &&
+                 U->getIntrinsicID() != Intrinsic::minimum) ||
+          !L->contains(U) || !DT.dominates(U->getParent(), Latch))
+        continue;
+      bool Max = U->getIntrinsicID() == Intrinsic::maximum;
+      // the chain P -> m1 = op(P, v1) -> ... -> U = op(m_k-1, v_k), each
+      // link's only user the next (an unrolled loop's running maximum)
+      SmallVector<IntrinsicInst *, 4> Chain;
+      SmallVector<Value *, 4> Vs;
+      Value *X = P;
+      bool Bad = false;
+      while (true) {
+        if (X != U && !X->hasOneUse()) {
+          Bad = true;
+          break;
+        }
+        auto *C = X == U ? nullptr : dyn_cast<IntrinsicInst>(X->user_back());
+        if (X == U)
+          break;
+        if (!C || C->getIntrinsicID() != U->getIntrinsicID() ||
+            !L->contains(C) || Chain.size() > 16) {
+          Bad = true;
+          break;
+        }
+        Value *V = C->getArgOperand(0) == X ? C->getArgOperand(1)
+                                            : C->getArgOperand(0);
+        if (V == X || (C->getArgOperand(0) != X && C->getArgOperand(1) != X)) {
+          Bad = true;
+          break;
+        }
+        Chain.push_back(C);
+        Vs.push_back(V);
+        X = C;
+      }
+      if (Bad || Chain.empty() || Chain.back() != U)
+        continue;
+      // U's other users: the phi, and instructions outside the loop (phis,
+      // the result then on the edges that bring U, or plain users)
+      bool OK = true;
+      for (User *Us : U->users()) {
+        auto *I = cast<Instruction>(Us);
+        if (I != P && L->contains(I))
+          OK = false;
+      }
+      if (!OK)
+        continue;
+      Type *Ty = P->getType();
+      Type *ITy = Ty->getWithNewType(Type::getInt32Ty(F.getContext()));
+      Value *Init = P->getIncomingValueForBlock(Pre);
+      IRBuilder<> PB(Pre->getTerminator());
+      // z: the signed integer maximum (minimum) of the values' bits: where
+      // the result is a zero, every value seen is at most a zero or
+      // denormal, and z >= 0 (z < 0) says one of them had a clear (set) sign
+      auto Bits = [&](IRBuilder<> &B, Value *X) {
+        return B.CreateBitCast(X, ITy);
+      };
+      PHINode *M = PHINode::Create(Ty, 2, P->getName() + ".m", P->getIterator());
+      PHINode *N = PHINode::Create(Ty, 2, P->getName() + ".nan", P->getIterator());
+      PHINode *Z = PHINode::Create(ITy, 2, P->getName() + ".z", P->getIterator());
+      Value *M2 = M, *N2 = N, *Z2 = Z;
+      for (unsigned K = 0; K < Chain.size(); ++K) {
+        IRBuilder<> B(Chain[K]);
+        Value *V = Vs[K];
+        Value *Cmp = Max ? B.CreateFCmpOGT(V, M2) : B.CreateFCmpOLT(V, M2);
+        M2 = B.CreateSelect(Cmp, V, M2, P->getName() + ".m.next");
+        N2 = B.CreateSelect(B.CreateFCmpUNO(V, V), V, N2,
+                            P->getName() + ".nan.next");
+        Value *VB = Bits(B, V);
+        Z2 = B.CreateSelect(Max ? B.CreateICmpSGT(VB, Z2) : B.CreateICmpSLT(VB, Z2),
+                            VB, Z2, P->getName() + ".z.next");
+      }
+      M->addIncoming(Init, Pre);
+      M->addIncoming(M2, Latch);
+      N->addIncoming(Init, Pre);
+      N->addIncoming(N2, Latch);
+      Z->addIncoming(Bits(PB, Init), Pre);
+      Z->addIncoming(Z2, Latch);
+      // the result at a point after U
+      auto Result = [&](IRBuilder<> &RB, Value *MV, Value *NV,
+                        Value *ZV) -> Value * {
+        Value *Zero = ConstantFP::get(Ty, Max ? 0.0 : -0.0);
+        Value *IsZero = RB.CreateFCmpOEQ(MV, ConstantFP::get(Ty, 0.0));
+        Value *Seen = Max ? RB.CreateICmpSGE(ZV, Constant::getNullValue(ITy))
+                          : RB.CreateICmpSLT(ZV, Constant::getNullValue(ITy));
+        Value *R = RB.CreateSelect(RB.CreateAnd(IsZero, Seen), Zero, MV);
+        return RB.CreateSelect(RB.CreateFCmpUNO(NV, NV), NV, R,
+                               U->getName() + ".r");
+      };
+      SmallVector<Instruction *, 4> Users;
+      for (User *Us : U->users())
+        if (Us != P)
+          Users.push_back(cast<Instruction>(Us));
+      for (Instruction *I : Users) {
+        if (auto *LP = dyn_cast<PHINode>(I)) {
+          // a phi after the loop (LCSSA's, or one that also takes the value
+          // of a path around the loop): the result on each edge bringing U,
+          // in a block of its own (not in the loop's exiting block)
+          SmallVector<BasicBlock *, 2> Ins;
+          for (unsigned K = 0; K < LP->getNumIncomingValues(); ++K)
+            if (LP->getIncomingValue(K) == U &&
+                !llvm::is_contained(Ins, LP->getIncomingBlock(K)))
+              Ins.push_back(LP->getIncomingBlock(K));
+          for (BasicBlock *In : Ins) {
+            BasicBlock *E = SplitEdge(In, LP->getParent(), &DT, &LI);
+            IRBuilder<> RB(E->getTerminator());
+            Value *R = Result(RB, M2, N2, Z2);
+            for (unsigned K = 0; K < LP->getNumIncomingValues(); ++K)
+              if (LP->getIncomingBlock(K) == E)
+                LP->setIncomingValue(K, R);
+          }
+          continue;
+        }
+        IRBuilder<> RB(I);
+        Value *R = Result(RB, M2, N2, Z2);
+        I->replaceUsesOfWith(U, R);
+      }
+      for (IntrinsicInst *C : reverse(Chain)) {
+        C->replaceAllUsesWith(PoisonValue::get(Ty));
+        C->eraseFromParent();
+      }
+      P->replaceAllUsesWith(PoisonValue::get(Ty));
+      P->eraseFromParent();
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXNarrowTruncatedOps(
     "agx-narrow-truncated-ops", cl::init(true), cl::Hidden,
     cl::desc("A 64-bit add, sub, mul, and, or, xor or shl whose every user "
@@ -6681,6 +6848,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= signedWideMuls(F);
   // (before the min / max flushes, which hide the NaN selects' operands)
   Changed |= foldNeverNaNTests(F);
+  Changed |= deferredMinMaxReductions(F);
   Changed |= zeroSignFreeMinMax(F);
   Changed |= rebaseLoopIndices(F);
   Changed |= reluZeroSelects(F);

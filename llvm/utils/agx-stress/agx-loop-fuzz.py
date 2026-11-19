@@ -66,6 +66,9 @@ def gen(seed):
             # a constant trip in steps of 1 (opt unrolls it: LSR's counter
             # then counts down by the factor, E439)
             ctrip=R.choice([None, None, None, 8, 16, 64, 96, 256]),
+            # the running maximum's kind: maximumnum, or maximum / minimum
+            # (NaN-propagating, -0 below +0: E444's deferred NaN and zeros)
+            fop=R.choice(['maximumnum', 'maximumnum', 'maximum', 'minimum']),
         ))
     for p in loops:
         if p['ctrip']:
@@ -108,11 +111,28 @@ def twin_step(p):
     return p['step'] if p['tsame'] and not p.get('vstep') else p['step'] * 2 + 1
 
 
+def maximum(x, y, mn=False):
+    """maximum (minimum) of two float bit patterns (no denormals): a NaN if either is one, -0 below +0, then
+    the default NaN where it is one."""
+    if isnan(x) or isnan(y):
+        return 0x7fffffff
+    fx, fy = (struct.unpack('<f', struct.pack('<I', v))[0] for v in (x, y))
+    if fx == fy:
+        return (x | y) if mn else (x & y)
+    return (x if fx < fy else y) if mn else (x if fx > fy else y)
+
+
+def minimum(x, y):
+    return maximum(x, y, True)
+
+
 def emit(loops):
     L = ['target triple = "agx"', '',
          'declare i32 @llvm.agx.thread.position.in.grid.x()',
          'declare i32 @llvm.umin.i32(i32, i32)',
-         'declare float @llvm.maximumnum.f32(float, float)', '',
+         'declare float @llvm.maximumnum.f32(float, float)',
+         'declare float @llvm.maximum.f32(float, float)',
+         'declare float @llvm.minimum.f32(float, float)', '',
          'define agx_kernel void @k(ptr addrspace(1) %in, ptr addrspace(1) %out) {',
          'entry:',
          '  %tid = call i32 @llvm.agx.thread.position.in.grid.x()',
@@ -228,11 +248,16 @@ def emit(loops):
               '  %%%scn = add nuw %s %s, %s' % (q, ty, c,
                                                 (('%%%ssv64' % q) if p['wide'] else s) if p.get('vstep') else str(s))]
         if p['fmax']:
-            L += sanitize(q + 'fv', '%%%sv' % q) + [
-                '  %%%sff = bitcast i32 %%%sfv to float' % (q, q),
-                '  %%%sft = call float @llvm.maximumnum.f32(float %s, float %%%sff)' % (q, fm, q),
-                '  %%%sfu = fcmp uno float %%%sft, 0.000000e+00' % (q, q),
-                '  %%%sfn = select i1 %%%sfu, float 0x7FFFFFFFE0000000, float %%%sft' % (q, q, q)]
+            L += sanitize(q + 'fv', '%%%sv' % q) + ['  %%%sff = bitcast i32 %%%sfv to float' % (q, q)]
+            if p.get('fop', 'maximumnum') == 'maximumnum':
+                # (the PTX front end's default NaN after each step)
+                L += ['  %%%sft = call float @llvm.maximumnum.f32(float %s, float %%%sff)' % (q, fm, q),
+                      '  %%%sfu = fcmp uno float %%%sft, 0.000000e+00' % (q, q),
+                      '  %%%sfn = select i1 %%%sfu, float 0x7FFFFFFFE0000000, float %%%sft' % (q, q, q)]
+            else:
+                # (maximum / minimum bare in the loop, as MLIR's maximumf: the
+                # default NaN only for the store)
+                L.append('  %%%sfn = call float @llvm.%s.f32(float %s, float %%%sff)' % (q, p['fop'], fm, q))
         if p['guarded']:
             L += ['  %%%sgo = icmp %s %s %%%scn, %s' % (q, pred, ty, q, tripv),
                   '  br i1 %%%sgo, label %%%sbody, label %%%sexit' % (q, q, q)]
@@ -248,7 +273,13 @@ def emit(loops):
             if p['fmax']:
                 L.append('  %%%sfr = phi float [ %%%sfh, %%%shead ]' % (q, q, q))
         if p['fmax']:
-            L += ['  %%%sfb = bitcast float %%%sfr to i32' % (q, q),
+            if p.get('fop', 'maximumnum') != 'maximumnum':
+                L += ['  %%%sfru = fcmp uno float %%%sfr, 0.000000e+00' % (q, q),
+                      '  %%%sfrc = select i1 %%%sfru, float 0x7FFFFFFFE0000000, float %%%sfr' % (q, q, q)]
+                fr = '%%%sfrc' % q
+            else:
+                fr = '%%%sfr' % q
+            L += ['  %%%sfb = bitcast float %s to i32' % (q, fr),
                   '  %%%sfo = add i32 %%tid, %d' % (q, j * 65536 + N),
                   '  %%%sfp = getelementptr inbounds i32, ptr addrspace(1) %%out, i32 %%%sfo' % (q, q),
                   '  store i32 %%%sfb, ptr addrspace(1) %%%sfp, align 4' % (q, q)]
@@ -294,13 +325,15 @@ def model(loops, tid, a, b, inp):
                 h ^= d
                 d = (d + twin_step(p)) & M
             acc = (h + v) & M
-            fm = maximumnum(fm, san(v))
+            fm = {'maximumnum': maximumnum, 'maximum': maximum, 'minimum': minimum}[p.get('fop', 'maximumnum')](fm, san(v))
             c += s
             if p['guarded']:
                 if not ((c != t) if p['exact'] else (c < t)):
                     break
         res.append((j * 65536 + tid, acc, j))
         if p['fmax']:
+            if p.get('fop', 'maximumnum') != 'maximumnum' and isnan(fm):
+                fm = 0x7fffffff   # (the default NaN of the store's select)
             res.append((j * 65536 + N + tid, fm, j))
     return res
 
