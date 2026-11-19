@@ -1040,6 +1040,21 @@ static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
                                       : Fits(C->getAPInt().zext(128));
   if (auto *Z = dyn_cast<SCEVZeroExtendExpr>(S))
     return upperBound(Z->getOperand(), SE, F, Depth + 1);
+  // (a truncation is at most its operand and its width's maximum; an
+  // unsigned minimum at most any of its operands)
+  if (auto *T = dyn_cast<SCEVTruncateExpr>(S)) {
+    APInt Max = APInt::getMaxValue(T->getType()->getScalarSizeInBits()).zext(128);
+    std::optional<APInt> B = upperBound(T->getOperand(), SE, F, Depth + 1);
+    return B && B->ult(Max) ? *B : Max;
+  }
+  if (auto *MM = dyn_cast<SCEVUMinExpr>(S)) {
+    std::optional<APInt> R;
+    for (const SCEV *Op : MM->operands())
+      if (std::optional<APInt> B = upperBound(Op, SE, F, Depth + 1))
+        if (!R || B->ult(*R))
+          R = B;
+    return R;
+  }
   if (auto *U = dyn_cast<SCEVUnknown>(S)) {
     auto *II = dyn_cast<IntrinsicInst>(U->getValue());
     if (!II)
@@ -1113,6 +1128,106 @@ static std::optional<APInt> lowerBound(const SCEV *S, ScalarEvolution &SE,
     R = Add ? R + *B : R * *B;
   }
   return R;
+}
+
+static cl::opt<bool> AGXMergeUpCounters(
+    "agx-merge-up-counters", cl::init(true), cl::Hidden,
+    cl::desc("Exit on an index rather than on a counter up from zero that "
+             "only the exit test uses"));
+
+/// The up-counting form of mergeDownCounter: c = 0, s, 2s, ... with c' = c +
+/// s used only by the latch's exit test c' <u n (or c' != n), beside an
+/// index i = i0, i0 + s, ... stepped by the same s (an MLIR loop from the
+/// lane in steps of 32 after narrowing: the counter against the trip, the
+/// index for the address). Then i' = i0 + c' (mod 2^32) at every iteration,
+/// so the test is i' != i0 + n, exactly; for <u, i0 + c' and i0 + n must not
+/// wrap: c' stays below n + s, so upperBound(i0) + upperBound(n) + s < 2^32
+/// suffices. Where i0 is unbounded (a threadgroup position) and s is a
+/// power of two, c' <u n is c' != t for t, the first multiple of s at or
+/// above max(n, 1), so i' != i0 + t. One add an iteration fewer, and a register (L15-E386).
+static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
+                           const Function &F) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch || !C.getType()->isIntegerTy(32) ||
+      C.getNumIncomingValues() != 2 ||
+      !match(C.getIncomingValueForBlock(Pre), m_Zero()))
+    return false;
+  auto *Cn = dyn_cast<BinaryOperator>(C.getIncomingValueForBlock(Latch));
+  const APInt *S;
+  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_APInt(S))) || S->isZero() ||
+      S->isNegative() || Cn->getParent() != Latch || !C.hasOneUse())
+    return false;
+  ICmpInst *Cmp = nullptr;
+  for (User *U : Cn->users()) {
+    if (U == &C)
+      continue;
+    auto *I = dyn_cast<ICmpInst>(U);
+    if (Cmp || !I || I->getOperand(0) != Cn || !I->hasOneUse() ||
+        I->user_back() != Latch->getTerminator() ||
+        (I->getPredicate() != ICmpInst::ICMP_ULT && !I->isEquality()))
+      return false;
+    Cmp = I;
+  }
+  if (!Cmp)
+    return false;
+  Value *N = Cmp->getOperand(1);
+  if (!L.isLoopInvariant(N))
+    return false;
+  for (PHINode &I : L.getHeader()->phis()) {
+    if (&I == &C || !I.getType()->isIntegerTy(32) ||
+        I.getNumIncomingValues() != 2)
+      continue;
+    auto *In = dyn_cast<BinaryOperator>(I.getIncomingValueForBlock(Latch));
+    const APInt *T;
+    if (!In || !match(In, m_Add(m_Specific(&I), m_APInt(T))) || *T != *S ||
+        In->getParent() != Latch || !In->comesBefore(Latch->getTerminator()))
+      continue;
+    Value *I0 = I.getIncomingValueForBlock(Pre);
+    ICmpInst::Predicate Pred = Cmp->getPredicate();
+    bool RoundUp = false;
+    if (!Cmp->isEquality()) {
+      // (upperBound's or scalar evolution's range, the smaller)
+      auto Bound = [&](Value *V) {
+        const SCEV *X = SE.getSCEV(V);
+        APInt R = SE.getUnsignedRangeMax(X).zext(128);
+        std::optional<APInt> B = upperBound(X, SE, F);
+        return B && B->ult(R) ? *B : R;
+      };
+      std::optional<APInt> BI = Bound(I0), BN = Bound(N);
+      APInt Top = APInt(128, 1).shl(32);
+      if (!BN || !(*BN + S->zext(128)).ult(Top))
+        continue;
+      if (!BI || !(*BI + *BN + S->zext(128)).ult(Top)) {
+        // i0 + n may wrap: exit where c' first reaches n, at
+        // t = s * ceil(max(n, 1) / s), i' != i0 + t (exact mod 2^32).
+        if (!S->isPowerOf2())
+          continue;
+        RoundUp = true;
+        Pred = ICmpInst::ICMP_NE;
+      }
+    }
+    IRBuilder<> PB(Pre->getTerminator());
+    Value *Trip = N;
+    if (RoundUp) {
+      Value *One = ConstantInt::get(N->getType(), 1);
+      Trip = PB.CreateBinaryIntrinsic(Intrinsic::umax, N, One);
+      Trip = PB.CreateAnd(
+          PB.CreateNUWAdd(Trip, ConstantInt::get(N->getType(), *S - 1)),
+          ConstantInt::get(N->getType(), -*S));
+    }
+    Value *End = PB.CreateAdd(I0, Trip);
+    IRBuilder<> B(Latch->getTerminator());
+    Value *NewCmp = B.CreateICmp(Pred, In, End);
+    Cmp->replaceAllUsesWith(NewCmp);
+    Cmp->eraseFromParent();
+    Cn->replaceAllUsesWith(PoisonValue::get(Cn->getType()));
+    Cn->eraseFromParent();
+    C.eraseFromParent();
+    SE.forgetLoop(&L);
+    return true;
+  }
+  return false;
 }
 
 /// In a loop, device accesses at B[zext(X + C_k)] (an unrolled column walk:
@@ -1389,6 +1504,17 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
           Counters.push_back(&Phi);
       for (PHINode *Phi : Counters)
         if (mergeDownCounter(*Phi, *L, SE)) {
+          Changed = true;
+          break;
+        }
+    }
+    if (AGXMergeUpCounters && L->isInnermost()) {
+      SmallVector<PHINode *, 4> Counters;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isIntegerTy(32))
+          Counters.push_back(&Phi);
+      for (PHINode *Phi : Counters)
+        if (mergeUpCounter(*Phi, *L, SE, F)) {
           Changed = true;
           break;
         }
