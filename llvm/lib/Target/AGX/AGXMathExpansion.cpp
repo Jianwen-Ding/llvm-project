@@ -39,6 +39,11 @@ static cl::opt<bool> ExpMagicRound(
     cl::desc("exp's n = round(x / ln 2) by adding and subtracting 1.5 2^23, "
              "its integer the sum's low bits (no rint or convert)"));
 
+static cl::opt<bool> SinCosMagicRound(
+    "agx-sincos-magic-round", cl::init(true), cl::Hidden,
+    cl::desc("sin / cos's j = round(2 x / pi) likewise, the quadrant the "
+             "sum's low bits"));
+
 static cl::opt<bool> NegatedClamp(
     "agx-exp-negated-clamp",
     cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
@@ -775,7 +780,19 @@ public:
   /// |x| below 2^22, then Cephes' sinf and cosf polynomials by quadrant.
   /// Beyond that the hardware's reduction (afn) is used.
   std::pair<Value *, Value *> sinAndCos(Value *X) {
-    Value *J = call(Intrinsic::roundeven, {mul(X, k(M_2_PI))});
+    Value *T = mul(X, k(M_2_PI));
+    Value *J, *QBits = nullptr;
+    if (SinCosMagicRound) {
+      // Where |x| < 2^22 (the expansion's range; beyond, the hardware's is
+      // taken) |t| < 2^22: j = t + 1.5 2^23 - 1.5 2^23 rounds to even as
+      // rint does, and the sum's bits are 0x4b400000 + j, whose low two
+      // bits are the quadrant's (L15-E470).
+      Value *M = add(T, k(12582912.0));
+      J = sub(M, k(12582912.0));
+      QBits = B.CreateBitCast(M, intTy());
+    } else {
+      J = call(Intrinsic::roundeven, {T});
+    }
     Value *NJ = B.CreateFNeg(J);
     Value *R = fma(NJ, k(1.57079637050628662109375), X);
     R = fma(NJ, k(-4.371139000189375e-8), R);
@@ -784,7 +801,7 @@ public:
     if (!(NarrowResult && NarrowSinCosReduction))
       R = fma(NJ, k(-1.7151245100059780e-15), R);
     Value *Small = lt(abs(X), 4194304.0);
-    Value *Q = B.CreateFPToSI(sel(Small, J, k(0.0)), intTy());
+    Value *Q = QBits ? QBits : B.CreateFPToSI(sel(Small, J, k(0.0)), intTy());
     auto [S, C] = sinCosPolys(R);
     // sin: quadrants 1 and 3 take the cosine, 2 and 3 the minus sign; cos
     // is a quadrant ahead.

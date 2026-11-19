@@ -33,7 +33,7 @@ declare half @llvm.sin.f16(half)
 ; polynomials), rounded to bfloat: the hardware's reduction lost small
 ; results (up to 256 ulp off below 16).
 ; CHECK-LABEL: sbf:
-; CHECK: rint
+; CHECK: mov_imm {{r[0-9]+}}, 1262485504
 ; CHECK: fmadd32
 define agx_kernel void @sbf(ptr addrspace(1) %p, bfloat %x) {
   %r = call bfloat @llvm.sin.bf16(bfloat %x)
