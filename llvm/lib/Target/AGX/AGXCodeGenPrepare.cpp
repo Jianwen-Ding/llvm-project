@@ -6368,6 +6368,26 @@ static bool narrowTruncatedOps(Function &F) {
     });
   };
   bool Changed = false, Again = true;
+  // (the trees that earlier narrowing left dead, and truncations of i32
+  // extensions, would keep operations' other users)
+  SmallVector<WeakTrackingVH, 16> Dead;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Value *X;
+    if (I.getType()->isIntegerTy(32) &&
+        match(&I, m_Trunc(m_ZExtOrSExt(m_Value(X)))) &&
+        X->getType()->isIntegerTy(32)) {
+      Value *E = I.getOperand(0);
+      I.replaceAllUsesWith(X);
+      I.eraseFromParent();
+      Dead.push_back(E);
+      Changed = true;
+    } else if (isInstructionTriviallyDead(&I)) {
+      Dead.push_back(&I);
+    }
+  }
+  for (WeakTrackingVH &V : Dead)
+    if (auto *I = dyn_cast_or_null<Instruction>(V))
+      Changed |= RecursivelyDeleteTriviallyDeadInstructions(I);
   while (Again) {
     Again = false;
     SmallVector<BinaryOperator *, 8> Ops;
