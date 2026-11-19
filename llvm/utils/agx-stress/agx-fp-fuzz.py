@@ -3,7 +3,7 @@
 
 Each seed generates a random kernel of 8-22 operations on f32 values: fadd / fsub / fmul (with registers and the
 constants -0.5, 3, 0.1, inf), fma, fcmp of all fourteen predicates into selects, maximumnum / minimumnum, fneg /
-fabs / copysign, sitofp / uitofp and fptosi.sat / fptoui.sat. It runs on 512 threads of floats over the whole
+fabs / copysign, sitofp / uitofp and fptosi.sat / fptoui.sat, and maximum / minimum (also nsz, L15-E452). It runs on 512 threads of floats over the whole
 exponent range with 35% special values (zeros, denormals, normals at the edges, infinities, quiet and signalling
 NaNs) and every output word is compared with the model's. The model is the hardware's, as the simulator's
 recorded semantics give it: denormal sources read as zero and results below the smallest normal flushed (the
@@ -141,8 +141,10 @@ def gen(seed):
       p=R.choice(PRED); c=nv(); x=R.choice(fv); y=R.choice(fv)
       body+=[f'  {c} = fcmp {p} float {a}, {b}', f'  {r} = select i1 {c}, float {x}, float {y}']; ops.append((r,'fsel',p,a,b,x,y)); fv.append(r)
     elif k<0.73:
-      fn=R.choice(['maximumnum','minimumnum']); decl.add(f'declare float @llvm.{fn}.f32(float, float)')
-      body.append(f'  {r} = call float @llvm.{fn}.f32(float {a}, float {b})'); ops.append((r,fn,a,b)); fv.append(r)
+      # (maximum / minimum, also nsz: one fcmpsel, L15-E452)
+      fn=R.choice(['maximumnum','minimumnum','maximum','minimum']); decl.add(f'declare float @llvm.{fn}.f32(float, float)')
+      nsz=fn in ('maximum','minimum') and R.random()<0.4
+      body.append(f'  {r} = call {"nsz " if nsz else ""}float @llvm.{fn}.f32(float {a}, float {b})'); ops.append((r,fn+('_nsz' if nsz else ''),a,b)); fv.append(r)
     elif k<0.81:
       fn=R.choice(['fneg','fabs','copysign'])
       if fn=='fneg': body.append(f'  {r} = fneg float {a}'); ops.append((r,'fneg',a))
@@ -198,6 +200,14 @@ def evaluate(ops,outs,ins,N):
           # flushed zero or an operand as it is (folds of min(x, min(x, y)),
           # select(c, x, x)): not checked
           if op[2]!=op[3] and daz(A)==0 and daz(B)==0 and ((A|B)&0x7fffff): m=0xffffffff
+        elif k in ('maximum','minimum','maximum_nsz','minimum_nsz'):
+          A,B=g(op[2]),g(op[3])
+          if isnanb(A) or isnanb(B): v=0x7fc00000
+          else:
+            v=maxnumber(A,B,k.startswith('maximum'),op[2]==op[3])
+            if op[2]!=op[3] and daz(A)==0 and daz(B)==0 and ((A|B)&0x7fffff): m=0xffffffff
+            # (nsz: either zero for two of different signs)
+            if k.endswith('_nsz') and op[2]!=op[3] and daz(A)==0 and daz(B)==0: m|=0x80000000
         elif k in ('sitofp','uitofp'): v=sitofp(e[op[2]],k=='sitofp')
         elif k in ('fptosi','fptoui'): v=fptoi_sat(g(op[2]),k=='fptosi')
       e[r]=v&0xffffffff; dc[r]=m

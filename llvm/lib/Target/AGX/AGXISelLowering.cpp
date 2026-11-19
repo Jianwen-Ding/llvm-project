@@ -3520,6 +3520,12 @@ static cl::opt<bool> SelectMinimumMaximum(
     cl::desc("minimum / maximum as unordered compare-selects"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> NaNPropSelect(
+    "agx-nanprop-select",
+    cl::desc("minimum / maximum's compare-select and NaN select as one "
+             "fcmpsel with a NaN-losing condition on swapped operands"),
+    cl::init(true), cl::Hidden);
+
 /// minimum / maximum (NaN if either operand is one, -0 below +0) as
 /// select(a ugt b, a, b) for maximum (ult for minimum): a NaN a is taken by
 /// the unordered comparison, a NaN b by one more select (any NaN operand is
@@ -3544,7 +3550,15 @@ static SDValue lowerFMinimumMaximum(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
   // (agx-tv: maximum(-denormal, -0) is -0, not the denormal).
   if (Zeros && CB && Max == !CB->isNegative())
     Zeros = false;
-  SDValue R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, CC), A, B);
+  // (with a NaN b possible: the select of a NaN b in the one compare-select,
+  // whose "n" conditions make a NaN lose, on (b, a): L15-E452)
+  bool NaNSelect = !(CB && !CB->isNaN());
+  bool OneSelect = NaNSelect && NaNPropSelect && (VT == MVT::f32 || VT == MVT::f16);
+  SDValue R =
+      OneSelect
+          ? DAG.getNode(Max ? AGXISD::FMAX_NANPROP : AGXISD::FMIN_NANPROP, DL,
+                        VT, A, B)
+          : DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, CC), A, B);
   if (Zeros) {
     EVT IntVT = VT.changeTypeToInteger();
     // Equal to a zero b (a = +-0 or a denormal the comparison flushes): the
@@ -3568,7 +3582,7 @@ static SDValue lowerFMinimumMaximum(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
     R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, ISD::SETOEQ), Eq,
                       R);
   }
-  if (!(CB && !CB->isNaN()))
+  if (NaNSelect && !OneSelect)
     R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, B, B, ISD::SETUO), B, R);
   return R;
 }

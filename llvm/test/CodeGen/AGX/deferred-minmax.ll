@@ -1,22 +1,33 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-deferred-minmax-nan-in-m=0 < %s | FileCheck %s --check-prefix=CARRY
 
-; A loop's running llvm.maximum used only by itself: an ordered compare-
-; select, the last NaN seen and the signed maximum of the values' bits in
-; the loop, maximum's NaN and +0 decided after it (L15-E444). @twice's
-; running value has another use in the loop: it stays.
+; A loop's running llvm.maximum used only by itself: in the loop maximum
+; without the order of zeros (nsz: one fcmpsel, which keeps a NaN: L15-E453)
+; and the signed maximum of the values' bits, maximum's +0 decided after it
+; (L15-E444; before E453 an ordered compare-select and the last NaN seen beside
+; it, CARRY). @twice's running value has another use in the loop: it stays.
 
 declare float @llvm.maximum.f32(float, float)
 
 ; CHECK-LABEL: @rowmax(
 ; CHECK:       loop:
-; CHECK-NOT:   @llvm.maximum
-; CHECK:       fcmp ogt float
-; CHECK:       fcmp uno float
+; CHECK:       call nsz float @llvm.maximum.f32(float %m.m, float %v)
+; CHECK-NOT:   fcmp uno
 ; CHECK:       icmp sgt i32
 ; CHECK:       done:
 ; CHECK:       icmp sge i32
-; CHECK:       fcmp uno float
+; CHECK-NOT:   fcmp uno float
 ; CHECK:       ret void
+; CARRY-LABEL: @rowmax(
+; CARRY:       loop:
+; CARRY-NOT:   @llvm.maximum
+; CARRY:       fcmp ogt float
+; CARRY:       fcmp uno float
+; CARRY:       icmp sgt i32
+; CARRY:       done:
+; CARRY:       icmp sge i32
+; CARRY:       fcmp uno float
+; CARRY:       ret void
 define agx_kernel void @rowmax(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {
 entry:
   br label %loop
@@ -54,8 +65,8 @@ done:
   ret void
 }
 
-; An nsz maximum (no zero sign to keep) lowers to its compare-select and NaN
-; select already: it stays (L15-E445).
+; An nsz maximum (no zero sign to keep) lowers to one fcmpsel already: it
+; stays (L15-E445, E452).
 ; CHECK-LABEL: @nsz(
 ; CHECK:       call nsz float @llvm.maximum.f32
 define agx_kernel void @nsz(ptr addrspace(1) %x, ptr addrspace(1) %o, i32 %n) {

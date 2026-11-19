@@ -1277,6 +1277,16 @@ def : Pat<(f16 (fminnum f16:$a, f16:$b)),
           (FCMPSEL_F16 FC_LTN, 0, $a, 0, $b, 0, $a, 0, $b)>;
 def : Pat<(f16 (fmaxnum f16:$a, f16:$b)),
           (FCMPSEL_F16 FC_GTN, 0, $a, 0, $b, 0, $a, 0, $b)>;
+// ltn(b, a) is b < a, or a NaN a against a number b: a is taken where it is
+// larger or a NaN, b otherwise (b a NaN or both NaNs). Likewise gtn.
+def : Pat<(f32 (AGXfmax_nanprop f32:$a, f32:$b)),
+          (FCMPSEL_F32 FC_LTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
+def : Pat<(f32 (AGXfmin_nanprop f32:$a, f32:$b)),
+          (FCMPSEL_F32 FC_GTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
+def : Pat<(f16 (AGXfmax_nanprop f16:$a, f16:$b)),
+          (FCMPSEL_F16 FC_LTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
+def : Pat<(f16 (AGXfmin_nanprop f16:$a, f16:$b)),
+          (FCMPSEL_F16 FC_GTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
 
 //===----------------------------------------------------------------------===//
 // Floating point arithmetic

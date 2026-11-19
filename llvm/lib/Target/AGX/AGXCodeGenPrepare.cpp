@@ -6686,6 +6686,12 @@ static cl::opt<bool> AGXDeferredMinMaxNum(
              "minimumnum from a number, its zero-sign-free uses in the loop "
              "taking the deferred value"));
 
+static cl::opt<bool> AGXDeferredNaNInM(
+    "agx-deferred-minmax-nan-in-m", cl::init(true), cl::Hidden,
+    cl::desc("agx-deferred-minmax-reductions' running value as maximum / "
+             "minimum without the order of zeros (one fcmpsel that keeps a "
+             "NaN), no NaN carried beside it"));
+
 static bool deferredMinMaxReductions(Function &F) {
   if (!AGXDeferredMinMax)
     return false;
@@ -6722,6 +6728,7 @@ static bool deferredMinMaxReductions(Function &F) {
           continue;
       }
       bool Max = ID == Intrinsic::maximum || ID == Intrinsic::maximumnum;
+      bool NaNInM = !Num && AGXDeferredNaNInM;
       // (the uses in the loop besides the chain, for Num: zero-sign free)
       std::optional<ThreadgroupAccesses> TGA;
       ZeroSignFree ZSF(TGA);
@@ -6818,10 +6825,21 @@ static bool deferredMinMaxReductions(Function &F) {
           MK.push_back(M2);
           continue;
         }
-        Value *Cmp = Max ? B.CreateFCmpOGT(V, M2) : B.CreateFCmpOLT(V, M2);
-        M2 = B.CreateSelect(Cmp, V, M2, P->getName() + ".m.next");
-        N2 = B.CreateSelect(B.CreateFCmpUNO(V, V), V, N2,
-                            P->getName() + ".nan.next");
+        if (NaNInM) {
+          // m' = maximum(m, v) without the order of zeros: one fcmpsel
+          // whose "n" condition makes a number lose to a NaN (the last NaN
+          // seen, as maximum's chain gives), a v equal to m taken
+          // (L15-E453)
+          auto *MM = cast<Instruction>(B.CreateBinaryIntrinsic(
+              ID, M2, V, nullptr, P->getName() + ".m.next"));
+          MM->setHasNoSignedZeros(true);
+          M2 = MM;
+        } else {
+          Value *Cmp = Max ? B.CreateFCmpOGT(V, M2) : B.CreateFCmpOLT(V, M2);
+          M2 = B.CreateSelect(Cmp, V, M2, P->getName() + ".m.next");
+          N2 = B.CreateSelect(B.CreateFCmpUNO(V, V), V, N2,
+                              P->getName() + ".nan.next");
+        }
         Value *VB = Bits(B, V);
         Z2 = B.CreateSelect(Max ? B.CreateICmpSGT(VB, Z2) : B.CreateICmpSLT(VB, Z2),
                             VB, Z2, P->getName() + ".z.next");
@@ -6841,7 +6859,7 @@ static bool deferredMinMaxReductions(Function &F) {
         Value *Seen = Max ? RB.CreateICmpSGE(ZV, Constant::getNullValue(ITy))
                           : RB.CreateICmpSLT(ZV, Constant::getNullValue(ITy));
         Value *R = RB.CreateSelect(RB.CreateAnd(IsZero, Seen), Zero, MV);
-        if (Num)
+        if (Num || NaNInM)
           return R;
         return RB.CreateSelect(RB.CreateFCmpUNO(NV, NV), NV, R,
                                U->getName() + ".r");
@@ -6884,7 +6902,7 @@ static bool deferredMinMaxReductions(Function &F) {
       }
       P->replaceAllUsesWith(PoisonValue::get(Ty));
       P->eraseFromParent();
-      if (Num) {
+      if (Num || NaNInM) {
         N->replaceAllUsesWith(PoisonValue::get(Ty));
         N->eraseFromParent();
       }
