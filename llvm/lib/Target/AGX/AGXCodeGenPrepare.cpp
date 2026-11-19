@@ -7236,6 +7236,19 @@ static bool combineDeferredMinMax(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXOtherBaseExps(
+    "agx-other-base-exps", cl::init(true), cl::Hidden,
+    cl::desc("exp2 and exp10 in the online softmax and below-maximum "
+             "rewrites of exp"));
+
+/// exp, or (L15-E484) exp2 / exp10: b^x is 1 at x = +-0 and a NaN at a NaN
+/// as e^x is, and only its overflow clamp needs x above 0.
+static bool isExpOfAnyBase(Intrinsic::ID ID) {
+  return ID == Intrinsic::exp ||
+         (AGXOtherBaseExps &&
+          (ID == Intrinsic::exp2 || ID == Intrinsic::exp10));
+}
+
 static cl::opt<bool> AGXOnlineSoftmaxExp(
     "agx-online-softmax-exp", cl::init(true), cl::Hidden,
     cl::desc("exp(a - max(a, b)) and exp(b - max(a, b)) as one exponential "
@@ -7261,7 +7274,7 @@ static bool onlineSoftmaxExps(Function &F) {
   SmallPtrSet<IntrinsicInst *, 8> Taken;
   for (Instruction &I : instructions(F)) {
     auto *E1 = dyn_cast<IntrinsicInst>(&I);
-    if (!E1 || E1->getIntrinsicID() != Intrinsic::exp ||
+    if (!E1 || !isExpOfAnyBase(E1->getIntrinsicID()) ||
         !E1->getType()->isFloatTy() || E1->hasApproxFunc() || Taken.count(E1))
       continue;
     Value *A, *U;
@@ -7285,7 +7298,7 @@ static bool onlineSoftmaxExps(Function &F) {
         continue;
       for (User *Us2 : Us->users())
         if (auto *II = dyn_cast<IntrinsicInst>(Us2);
-            II && II->getIntrinsicID() == Intrinsic::exp &&
+            II && II->getIntrinsicID() == E1->getIntrinsicID() &&
             II->getParent() == E1->getParent() && !II->hasApproxFunc() &&
             II != E1 && !Taken.count(II))
           E2 = II;
@@ -7305,7 +7318,7 @@ static bool onlineSoftmaxExps(Function &F) {
     Value *C = Bld.CreateFCmpOGT(B, A);
     Value *X = Bld.CreateSelect(C, FA, FB);
     auto *E = cast<Instruction>(
-        Bld.CreateUnaryIntrinsic(Intrinsic::exp, X, E1, "exp.one"));
+        Bld.CreateUnaryIntrinsic(E1->getIntrinsicID(), X, E1, "exp.one"));
     E->setMetadata("agx.exp.below.max", MDNode::get(F.getContext(), {}));
     Value *One = ConstantFP::get(E->getType(), 1.0);
     Value *EA = Bld.CreateSelect(C, E, Bld.CreateFAdd(One, FA));
@@ -8747,7 +8760,7 @@ static void markExpsBelowLoopMax(Function &F) {
   SmallVector<IntrinsicInst *, 4> Exps;
   for (Instruction &I : instructions(F))
     if (auto *II = dyn_cast<IntrinsicInst>(&I);
-        II && II->getIntrinsicID() == Intrinsic::exp)
+        II && isExpOfAnyBase(II->getIntrinsicID()))
       Exps.push_back(II);
   if (Exps.empty())
     return;
@@ -9033,7 +9046,7 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
     SmallVector<IntrinsicInst *, 4> Exps;
     for (Instruction &I : instructions(F))
       if (auto *II = dyn_cast<IntrinsicInst>(&I);
-          II && II->getIntrinsicID() == Intrinsic::exp)
+          II && isExpOfAnyBase(II->getIntrinsicID()))
         Exps.push_back(II);
     if (!Exps.empty()) {
       DominatorTree DT(F);

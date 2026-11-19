@@ -61,6 +61,7 @@ the kernel's, as memory at VA).
 | `online_softmax` | one-pass softmax normalizer (log-sum-exp) of 1024-float rows by a SIMD-group: a running maximumf whose old and new values rescale the running sum, merged across lanes |
 | `online_softmax_vec4` | the same by a thread per row in vector<4xf32> steps: four running maximumf / sums combined by vector reductions |
 | `online_softmax_maxnum` | online_softmax with `arith.maxnumf` (C's fmaxf) for the running maximum and its subgroup reduction |
+| `online_softmax_exp2` | online_softmax with `math.exp2` (base-2 exponentials, as attention kernels with log2(e) in their scale) |
 | `attn_decode_f16` | one query per head attending over 512 cached f16 keys and values (128 dims, four per lane): vector<4xf16> loads, the score by gpu.subgroup_reduce add, an online maximumf softmax rescaling the weighted sum of values |
 | `rope_f32` | rotary position embedding (1024 tokens x 64 pairs): a thread per pair, the angle position * inv_freq through precise math.cos and math.sin |
 | `rmsnorm_f16` | RMSNorm of f16 rows by a SIMD-group: vector<4xf16> loads, the sum of squares in f32, rsqrt, the f16 weighted write |

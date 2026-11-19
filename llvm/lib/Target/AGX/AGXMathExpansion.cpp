@@ -112,6 +112,11 @@ static cl::opt<bool> Exp2DirectReduction(
     cl::desc("precise exp2 reduced by n = roundeven(x) directly"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> Exp2BelowMax(
+    "agx-exp2-below-max",
+    cl::desc("2^x and 10^x of x at most 0 (below a maximum): no upper clamp"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> NarrowSinCosReduction(
     "agx-narrow-sincos-reduction",
     cl::desc("bfloat sin / cos: pi / 2 in two parts"),
@@ -194,6 +199,13 @@ public:
   Value *expPrecise(Value *X, bool NoOverflow = false) {
     return expHiLo(X, nullptr, /*Bounded=*/false,
                    (ExpMaxDifference && NoOverflow) || noExpOverflow(X));
+  }
+
+  /// Whether 2^x / 10^x's x is known below a maximum (the caller's analysis
+  /// or noExpOverflow's form).
+  static bool belowMax(Value *X, bool NoOverflow) {
+    return Exp2BelowMax && ExpMaxDifference &&
+           (NoOverflow || noExpOverflow(X));
   }
 
   /// x = a - max(a, b) (maxnum, maximumnum or maximum, either order, or a
@@ -667,8 +679,10 @@ public:
     }
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
+    // (Bounded with a low part and NoOverflow: 2^x / 10^x below a maximum,
+    // hi <= 0 and so n <= 0, the scaled e^r below 2: L15-E484.)
     Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N,
-                     NoOverflow && !Lo,
+                     NoOverflow && (!Lo || Bounded),
                      NonNegative ||
                          (NoOverflow && !Bounded && !Lo && FlushedUnderflow),
                      MagicBits, !Lo && !Bounded ? C : nullptr);
@@ -689,8 +703,15 @@ public:
   /// to 0: no infinity whose product error would be a NaN, and the same
   /// result for every float x as clamping e^(hi + lo) (checked exhaustively
   /// for 2^x and 10^x, flushing and not). A NaN stays one.
-  Value *clampArg(Value *X, double Lo, double Hi) {
+  /// \p BelowMax: x is at most 0, a denormal or a NaN (below a maximum), so
+  /// only the lower clamp is needed (L15-E484).
+  Value *clampArg(Value *X, double Lo, double Hi, bool BelowMax = false) {
     Value *Y;
+    if (BelowMax) {
+      if (NegatedClamp && match(X, m_FNeg(m_Value(Y))))
+        return B.CreateFNeg(sel(gt(Y, -Lo), k(-Lo), Y));
+      return sel(lt(X, Lo), k(Lo), X);
+    }
     // -y: y clamped to the mirrored bounds, then negated (as in expHiLo),
     // so that the negation folds into the multiplications that follow.
     if (NegatedClamp && match(X, m_FNeg(m_Value(Y))))
@@ -698,11 +719,12 @@ public:
     return sel(gt(X, Hi), k(Hi), sel(lt(X, Lo), k(Lo), X));
   }
 
-  Value *exp2Precise(Value *X) {
+  Value *exp2Precise(Value *X, bool NoOverflow = false) {
     // 2^x = e^(x ln 2), with x ln 2 as a rounded product and its error.
     // (Up to 128, where 2^x overflows: n = 128 at most, which the exponent
     // addition of ldexp needs.)
-    X = clampArg(X, -151.0, 128.0);
+    bool BelowMax = belowMax(X, NoOverflow);
+    X = clampArg(X, -151.0, 128.0, BelowMax);
     if (Exp2DirectReduction) {
       // n = roundeven(x), f = x - n exact in [-1/2, 1/2], e^(f ln 2) with
       // f ln 2 as a rounded product and its error (L15-E340)
@@ -716,16 +738,17 @@ public:
     Value *Hi = mul(X, k(M_LN2));
     Value *Lo = fma(X, k(M_LN2), B.CreateFNeg(Hi));
     Lo = fma(X, k(M_LN2 - (double)(float)M_LN2), Lo);
-    return expHiLo(Hi, Lo, /*Bounded=*/true);
+    return expHiLo(Hi, Lo, /*Bounded=*/true, BelowMax);
   }
-  Value *exp10Precise(Value *X) {
+  Value *exp10Precise(Value *X, bool NoOverflow = false) {
     constexpr double LN10 = 2.302585092994045684;
     // (Up to 38.6, past 10^x's overflow at 38.53: n = 128 at most.)
-    X = clampArg(X, -46.0, 38.6);
+    bool BelowMax = belowMax(X, NoOverflow);
+    X = clampArg(X, -46.0, 38.6, BelowMax);
     Value *Hi = mul(X, k(LN10));
     Value *Lo = fma(X, k(LN10), B.CreateFNeg(Hi));
     Lo = fma(X, k(LN10 - (double)(float)LN10), Lo);
-    return expHiLo(Hi, Lo, /*Bounded=*/true);
+    return expHiLo(Hi, Lo, /*Bounded=*/true, BelowMax);
   }
 
   /// A positive finite x as 2^e * (1 + f), 1 + f in [sqrt(1/2), sqrt(2)),
@@ -987,9 +1010,9 @@ Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                    case Intrinsic::exp:
                      return M.expPrecise(A[0], ExpNoOverflow);
                    case Intrinsic::exp2:
-                     return M.exp2Precise(A[0]);
+                     return M.exp2Precise(A[0], ExpNoOverflow);
                    case Intrinsic::exp10:
-                     return M.exp10Precise(A[0]);
+                     return M.exp10Precise(A[0], ExpNoOverflow);
                    case Intrinsic::log:
                      return M.logPrecise(A[0]);
                    case Intrinsic::log2:
