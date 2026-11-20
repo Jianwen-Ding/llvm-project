@@ -6,10 +6,11 @@
 ; the region keeps its original order (L15-E239), but with its ready device
 ; loads first (no barrier or threadgroup access in it), whose registers still
 ; let its threadgroups of 32 in: the keys' and values' loads ahead of each
-; key's work instead of waited for one by one (L15-E498).
+; key's work instead of waited for one by one (L15-E498). (75 and 51 since
+; L15-E513's shared fma, 77 and 53 before.)
 
-; CHECK: general purpose registers: 77 x 32-bit
-; OFF: general purpose registers: 53 x 32-bit
+; CHECK: general purpose registers: 75 x 32-bit
+; OFF: general purpose registers: 51 x 32-bit
 
 target datalayout = "e-m:e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-i1:8-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-v16:16-v32:32-v64:64-v96:32-v128:128-n16:32:64-S32-A5-G1"
 target triple = "agx"

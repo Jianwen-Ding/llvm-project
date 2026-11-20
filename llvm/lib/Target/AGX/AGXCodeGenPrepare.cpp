@@ -7503,6 +7503,11 @@ static cl::opt<bool> AGXOnlineSoftmaxExp(
     cl::desc("exp(a - max(a, b)) and exp(b - max(a, b)) as one exponential "
              "and 1 + (x - x) for the other"));
 
+static cl::opt<bool> AGXOnlineSoftmaxShared(
+    "agx-online-softmax-shared-one", cl::init(true), cl::Hidden,
+    cl::desc("agx-online-softmax-exp's trivial side as u 0 + 1, one for "
+             "both, for maximum and exp"));
+
 /// e^(a - u) and e^(b - u), u = maximum(a, b) (or maximumnum or maxnum, which
 /// return an operand too and drop one NaN; nsz or not; L15-E466 for maxnum):
 /// an online softmax's rescale e^(m - m') and new term e^(v - m'). Where
@@ -7570,8 +7575,23 @@ static bool onlineSoftmaxExps(Function &F) {
         Bld.CreateUnaryIntrinsic(E1->getIntrinsicID(), X, E1, "exp.one"));
     E->setMetadata("agx.exp.below.max", MDNode::get(F.getContext(), {}));
     Value *One = ConstantFP::get(E->getType(), 1.0);
-    Value *EA = Bld.CreateSelect(C, E, Bld.CreateFAdd(One, FA));
-    Value *EB = Bld.CreateSelect(C, Bld.CreateFAdd(One, FB), E);
+    // With maximum (a NaN in, a NaN out) the trivial side's 1 + (x - u) is
+    // u 0 + 1 on both sides: 1, or a NaN where u is infinite or a NaN, as
+    // x - u is then (b > a: u = b; else u = a, a tie's other zero, or a
+    // NaN): one fma for two additions. (Not for exp2: online_softmax_exp2
+    // lost two resident groups. The argument as -|b - a|, also exact, lost
+    // on every kernel: its exponentials overlap and take registers.)
+    // L15-E513.
+    auto *UI = cast<IntrinsicInst>(FA->getOperand(1));
+    Value *Triv =
+        AGXOnlineSoftmaxShared && UI->getIntrinsicID() == Intrinsic::maximum &&
+                E1->getIntrinsicID() == Intrinsic::exp
+            ? Bld.CreateIntrinsic(Intrinsic::fma, {E->getType()},
+                                  {UI, ConstantFP::get(E->getType(), 0.0),
+                                   One})
+            : nullptr;
+    Value *EA = Bld.CreateSelect(C, E, Triv ? Triv : Bld.CreateFAdd(One, FA));
+    Value *EB = Bld.CreateSelect(C, Triv ? Triv : Bld.CreateFAdd(One, FB), E);
     E1->replaceAllUsesWith(EA);
     E2->replaceAllUsesWith(EB);
     E1->eraseFromParent();
