@@ -7658,7 +7658,9 @@ static bool onlineSoftmaxExps(Function &F) {
          NeverNaN(A, 0));
     Value *Triv =
         AGXOnlineSoftmaxShared && Shared &&
-                E1->getIntrinsicID() == Intrinsic::exp
+                (E1->getIntrinsicID() == Intrinsic::exp ||
+                 (E1->getIntrinsicID() == Intrinsic::exp2 &&
+                  AGX::uniformConstantsEnabled()))
             ? Bld.CreateIntrinsic(Intrinsic::fma, {E->getType()},
                                   {UI, ConstantFP::get(E->getType(), 0.0),
                                    One})
