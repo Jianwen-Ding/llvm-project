@@ -51,6 +51,63 @@ static cl::opt<bool> ExperimentalLeafCalls(
 
 bool llvm::agxExperimentalLeafCallsEnabled() { return ExperimentalLeafCalls; }
 
+static cl::opt<bool> AGXWideHalfLoads(
+    "agx-wide-half-loads", cl::init(true), cl::Hidden,
+    cl::desc("Load 4-byte aligned vectors of 8 16-bit elements as one "
+             "16-byte access"));
+
+static cl::opt<bool> AGXWideHalfLoadsDivergent(
+    "agx-wide-half-loads-divergent", cl::init(true), cl::Hidden,
+    cl::desc("-agx-wide-half-loads only for a thread's own row, in a block "
+             "that stores nothing"));
+
+/// Whether a 16-byte load of 8 16-bit elements gains on two 8-byte ones: in
+/// a block that stores nothing to device memory and whose device loads are
+/// all of the thread's own (their addresses the thread's position's), a row
+/// sum's. Rows that store as they load (widen_f16, rowcopy_f16) and blocks
+/// that also read a vector every lane reads alike (gemv_f16's x, hdot_dyn's
+/// w; its row alone 16 bytes wide lost more) lost 1-4% with many groups
+/// resident (L15-E585).
+static bool wideHalfLoad(const LoadSDNode *L) {
+  auto *PI = dyn_cast_or_null<Instruction>(L->getMemOperand()->getValue());
+  if (!PI)
+    return false;
+  auto ThreadDependent = [](const Value *P) {
+    SmallPtrSet<const Value *, 32> Seen;
+    SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
+    while (!Work.empty()) {
+      auto [V, Depth] = Work.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      if (auto *C = dyn_cast<CallBase>(V)) {
+        if (const Function *F = C->getCalledFunction();
+            F && F->getName().starts_with("llvm.agx.thread."))
+          return true;
+        continue;
+      }
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || Depth >= 12)
+        continue;
+      for (const Value *Op : I->operands())
+        Work.push_back({Op, Depth + 1});
+    }
+    return false;
+  };
+  bool Loads = false;
+  for (const Instruction &I : *PI->getParent()) {
+    if (auto *S = dyn_cast<StoreInst>(&I);
+        S && S->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+      return false;
+    if (auto *LI = dyn_cast<LoadInst>(&I);
+        LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
+      if (!ThreadDependent(LI->getPointerOperand()))
+        return false;
+      Loads = true;
+    }
+  }
+  return Loads;
+}
+
 static cl::opt<bool> AGXPairedHalfStores(
     "agx-paired-half-stores", cl::Hidden, cl::init(true),
     cl::desc("Store 4-byte aligned pairs of 16-bit elements as one 32-bit "
@@ -138,6 +195,10 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // pair, whose halves are the elements (ReplaceNodeResults)
   setOperationAction(ISD::LOAD, {MVT::v2i16, MVT::v4i16, MVT::v2f16, MVT::v4f16},
                      Custom);
+  // (and 8: one 16-byte access, not an 8-byte access of the i16 format and a
+  // second through a pointer of its own, L15-E585)
+  if (AGXWideHalfLoads)
+    setOperationAction(ISD::LOAD, {MVT::v8i16, MVT::v8f16}, Custom);
   // and stores: one 32-bit store per pair, its halves the elements
   // (lowerVectorStore), not a 16-bit store each
   if (AGXPairedHalfStores)
@@ -1222,11 +1283,15 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
       (L->getAddressSpace() == AGX::DEVICE_ADDRESS ||
        L->getAddressSpace() == AGX::THREADGROUP_ADDRESS) &&
       (L->getValueType(0) == MVT::v2i16 || L->getValueType(0) == MVT::v4i16 ||
-       L->getValueType(0) == MVT::v2f16 || L->getValueType(0) == MVT::v4f16)) {
+       L->getValueType(0) == MVT::v2f16 || L->getValueType(0) == MVT::v4f16 ||
+       (AGXWideHalfLoads && (L->getValueType(0) == MVT::v8i16 ||
+                             L->getValueType(0) == MVT::v8f16) &&
+        (!AGXWideHalfLoadsDivergent || wideHalfLoad(L))))) {
     SDLoc DL(N);
     EVT VT = L->getValueType(0);
     unsigned Words = VT.getVectorNumElements() / 2;
-    EVT WordsVT = Words == 1 ? EVT(MVT::i32) : EVT(MVT::v2i32);
+    EVT WordsVT = Words == 1 ? EVT(MVT::i32)
+                             : EVT(MVT::getVectorVT(MVT::i32, Words));
     SDValue Load = DAG.getLoad(WordsVT, DL, L->getChain(), L->getBasePtr(),
                                L->getMemOperand());
     SmallVector<SDValue, 4> Elts;
