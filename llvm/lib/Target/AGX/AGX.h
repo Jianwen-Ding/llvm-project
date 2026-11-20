@@ -76,6 +76,9 @@ bool signBitCompares();
 /// Whether x << 16 is x's low half under a zero half, not a bfi
 /// (-agx-shl16-halves).
 bool shl16Halves();
+/// Whether x >> 31 (arithmetic) is a compare-select of x < 0 with a uniform
+/// -1, with -agx-uniform-constants (-agx-sign-splat-compares).
+bool signSplatCompares();
 /// Gives the special register reads of F their range return attributes (see
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
 /// With ForAnalysis (ranges the caller takes off again), also the kernel's

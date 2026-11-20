@@ -2741,6 +2741,16 @@ def agx_sign_shift : PatLeaf<(i32 imm), [{
 }]>;
 def : Pat<(i32 (srl i32:$x, agx_sign_shift)),
           (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0, (i32 0))>;
+// and its splat, x >> 31 (arithmetic), x < 0 ? -1 : 0, where -1 is a
+// uniform (with the constants in uniforms; in a register otherwise: a mov_imm
+// held for it), not an asr on the shared unit (L15-E562)
+def agx_sign_splat : PatLeaf<(i32 imm), [{
+  return N->getZExtValue() == 31 && llvm::AGX::uniformConstantsEnabled() &&
+         llvm::AGX::signSplatCompares();
+}]>;
+def : Pat<(i32 (sra i32:$x, agx_sign_splat)),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (MOV_IMM32 -1), 0,
+                       (i32 0))>;
 def : Pat<(AGXif (i32 (srl i32:$x, (i32 31))), bb:$t),
           (AGX_IF (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0,
                                (i32 0)), bb:$t)>;
