@@ -183,6 +183,12 @@ static cl::opt<bool> AGXDeviceUnrollSomeStrided(
     cl::desc("agx-device-unroll-strided's factor also where only some of a "
              "loop's device loads are strided"));
 
+static cl::opt<unsigned> AGXDeviceUnrollStoreLight(
+    "agx-device-unroll-store-light", cl::init(8), cl::Hidden,
+    cl::desc("Iterations a device-load loop that stores words and loads at "
+             "most two words an iteration is unrolled by (0: the store "
+             "factor)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollStreams(
     "agx-device-unroll-streams", cl::init(8), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
@@ -418,19 +424,36 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
                                    const DataLayout &DL, unsigned Trips,
                                    bool &DeviceLoads) {
   bool Narrow = true, Stores = false, Strided = true, Word = true,
-       Vectors = true, SomeStrided = false;
+       Vectors = true, SomeStrided = false, Store32 = true, Light = true;
+  unsigned NumLoads = 0;
   DeviceLoads = false;
   // The pointer bases the device loads step through (a dot product's two
   // rows): L15-E506.
   SmallPtrSet<const SCEV *, 4> Streams;
   for (const BasicBlock *BB : L->blocks())
     for (const Instruction &I : *BB) {
-      if (auto *SI = dyn_cast<StoreInst>(&I))
-        Stores |= SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+      if (auto *SI = dyn_cast<StoreInst>(&I);
+          SI && SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
+        Stores = true;
+        Store32 &= DL.getTypeStoreSize(SI->getValueOperand()->getType()) == 4;
+      }
+      // (light arithmetic: no call but a multiply-add, a maximum / minimum
+      // or an absolute value)
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        auto *II = dyn_cast<IntrinsicInst>(CB);
+        Light &= II && (II->getIntrinsicID() == Intrinsic::fma ||
+                        II->getIntrinsicID() == Intrinsic::fmuladd ||
+                        II->getIntrinsicID() == Intrinsic::maxnum ||
+                        II->getIntrinsicID() == Intrinsic::minnum ||
+                        II->getIntrinsicID() == Intrinsic::maximum ||
+                        II->getIntrinsicID() == Intrinsic::minimum ||
+                        II->getIntrinsicID() == Intrinsic::fabs);
+      }
       auto *LI = dyn_cast<LoadInst>(&I);
       if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
         continue;
       DeviceLoads = true;
+      ++NumLoads;
       Narrow &= DL.getTypeStoreSize(LI->getType()) <= 2;
       Word &= DL.getTypeStoreSize(LI->getType()) <= 4;
       Vectors &= LI->getType()->isVectorTy();
@@ -450,6 +473,14 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
     return 0;
   if (Narrow && Divides(AGXDeviceUnrollNarrow))
     return AGXDeviceUnrollNarrow;
+  // (a row loop of at most two word loads, word stores and light
+  // arithmetic, 256 trips or more: 16 iterations' loads held 32 registers,
+  // 8 keep the groups, L15-E564; byte stores, three loads, transcendental
+  // or shared-unit work, a column and 128 trips lost at 8)
+  if (AGXDeviceUnrollStoreLight && !Narrow && Stores && Store32 && Word &&
+      Light && !SomeStrided && NumLoads <= 2 && Trips >= 256 &&
+      Divides(AGXDeviceUnrollStoreLight))
+    return AGXDeviceUnrollStoreLight;
   if (!Narrow && Stores && Divides(AGXDeviceUnrollStore))
     return AGXDeviceUnrollStore;
   if (!Narrow && !Stores && Strided && Divides(AGXDeviceUnrollStrided))
