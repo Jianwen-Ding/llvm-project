@@ -8469,6 +8469,61 @@ static bool maskedTailExits(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXByteFloatsALU(
+    "agx-byte-floats-alu", cl::init(true), cl::Hidden,
+    cl::desc("A signed byte's float as (b ^ 0x6480) read as a half less "
+             "1152, on the ALU, instead of the shared unit's convert"));
+
+/// sitofp(i8 b) to float or half: the 16-bit b ^ 0x6480, b's high byte zero,
+/// is the half 1024 + (b ^ 128) = 1152 + s (s the signed byte, exact: one
+/// unit apart in [1024, 2048)), and less 1152 it is s exactly. An xor and a
+/// 16-bit subtraction on the ALU instead of convert s8_to_f, which issues on
+/// the shared integer-multiply / bit-field / convert unit (one per two
+/// schedulers): gemv_q8f's weights (L15-E533).
+static bool byteFloatsALU(Function &F) {
+  if (!AGXByteFloatsALU)
+    return false;
+  bool Changed = false;
+  std::optional<DominatorTree> DT;
+  std::optional<LoopInfo> LI;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *C = dyn_cast<SIToFPInst>(&I);
+    if (!C || !C->getOperand(0)->getType()->isIntegerTy(8) ||
+        !(C->getType()->isFloatTy() || C->getType()->isHalfTy()))
+      continue;
+    // (in a loop, whose two constants are hoisted: alone they are two
+    // mov_imm, four instructions for the convert's one)
+    if (!LI) {
+      DT.emplace(F);
+      LI.emplace(*DT);
+    }
+    if (!LI->getLoopFor(C->getParent()))
+      continue;
+    // (only where every user reads a half source, a float's extension
+    // folded: float arithmetic; a store or other use would take a
+    // conversion of its own, three ALU instructions for the convert's one)
+    if (!all_of(C->users(), [](User *U) {
+          if (auto *II = dyn_cast<IntrinsicInst>(U))
+            return II->getIntrinsicID() == Intrinsic::fma ||
+                   II->getIntrinsicID() == Intrinsic::fmuladd;
+          unsigned Op = cast<Instruction>(U)->getOpcode();
+          return Op == Instruction::FAdd || Op == Instruction::FSub ||
+                 Op == Instruction::FMul;
+        }))
+      continue;
+    IRBuilder<> B(C);
+    Value *Z = B.CreateZExt(C->getOperand(0), B.getInt16Ty());
+    Value *H = B.CreateBitCast(B.CreateXor(Z, 0x6480), B.getHalfTy());
+    Value *S = B.CreateFSub(H, ConstantFP::get(B.getHalfTy(), 1152.0));
+    Value *R = C->getType()->isHalfTy() ? S : B.CreateFPExt(S, C->getType());
+    R->takeName(C);
+    C->replaceAllUsesWith(R);
+    C->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 static void markExpsBelowLoopMax(Function &F);
 
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
@@ -8497,6 +8552,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= relativeIndexSelects(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
+  // (after: exactDyadicSums takes converted bytes' sums as integer ones)
+  Changed |= byteFloatsALU(F);
   Changed |= AGX::narrowBoundedI64(F);
   // (after the indices are rebased and narrowed, which need the loops' own
   // exit compares)
