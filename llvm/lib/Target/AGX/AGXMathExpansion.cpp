@@ -85,6 +85,11 @@ static cl::opt<bool> SinCosSharedOdd(
     cl::desc("cos's polynomial select by sin's odd quadrant, its operands "
              "swapped, not by (q + 1) & 1"));
 
+static cl::opt<bool> TanQuotientSigns(
+    "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
+    cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
+             "the odd quadrant's, without the two halves' signs"));
+
 static cl::opt<bool> NegatedClamp(
     "agx-exp-negated-clamp",
     cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
@@ -498,7 +503,12 @@ public:
     // reduction, E350), every half and bfloat input's tangent the same
     // (L15-E353; the hardware's sin and cos were not)
     if (NarrowResult && NarrowSinCosReduction) {
-      auto [S, C] = sinAndCos(X);
+      auto [S, C] = sinAndCos(X, TanQuotientSigns);
+      return div(S, C);
+    }
+    // (float: the expansions sin and cos get, as one)
+    if (TanQuotientSigns && !NarrowResult) {
+      auto [S, C] = sinAndCos(X, true);
       return div(S, C);
     }
     return div(call(Intrinsic::sin, {X}), call(Intrinsic::cos, {X}));
@@ -979,7 +989,12 @@ public:
   /// sin(x) and cos(x): x - j pi / 2 with pi / 2 in three parts, exact for
   /// |x| below 2^22, then Cephes' sinf and cosf polynomials by quadrant.
   /// Beyond that the hardware's reduction (afn) is used.
-  std::pair<Value *, Value *> sinAndCos(Value *X) {
+  /// \p ForQuotient: a numerator and denominator whose quotient is
+  /// sin(x) / cos(x), signs left out: sin's sign is bit 1 of q and cos's bit
+  /// 1 of q + 1, which differ exactly where q is odd, so the quotient is
+  /// -(c / s) there and s / c elsewhere, and (-c) / s is -(c / s) exactly
+  /// (L15-E503).
+  std::pair<Value *, Value *> sinAndCos(Value *X, bool ForQuotient = false) {
     Value *T = mul(X, k(M_2_PI));
     Value *J, *QBits = nullptr;
     if (SinCosMagicRound) {
@@ -1016,12 +1031,17 @@ public:
       Value *V = Swap ? sel(Odd, S, C) : sel(Odd, C, S);
       return sel(Minus, B.CreateFNeg(V), V);
     };
-    Value *Sin = Quadrant(Q, false), *Cos = Quadrant(Q, true);
     auto Hw = [&](Intrinsic::ID ID) {
       Value *V = B.CreateIntrinsic(ID, {Ty}, {X});
       cast<Instruction>(V)->setHasApproxFunc(true);
       return V;
     };
+    if (ForQuotient) {
+      Value *Odd = B.CreateICmpNE(B.CreateAnd(Q, ki(1)), ki(0));
+      return {sel(Small, sel(Odd, B.CreateFNeg(C), S), Hw(Intrinsic::sin)),
+              sel(Small, sel(Odd, S, C), Hw(Intrinsic::cos))};
+    }
+    Value *Sin = Quadrant(Q, false), *Cos = Quadrant(Q, true);
     return {sel(Small, Sin, Hw(Intrinsic::sin)),
             sel(Small, Cos, Hw(Intrinsic::cos))};
   }
