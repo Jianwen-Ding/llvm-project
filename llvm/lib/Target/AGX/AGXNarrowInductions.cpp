@@ -1303,6 +1303,56 @@ static bool mergeCongruentCounters(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXNarrowOffsetCompares(
+    "agx-narrow-offset-compares", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit unsigned compare of zext(x) + c with a constant as "
+             "the 32-bit compare of x with the constant minus c where x + c "
+             "stays in [0, 2^32)"));
+
+/// zext(x) + c <u k (or another unsigned or equality compare; x an i32, c
+/// and k constants) with x + c in [0, 2^32) for every x of its range: the
+/// 32-bit compare of x with k - c, where that is in [0, 2^32). Loop
+/// strength reduction writes an unrolled loop's exit test i | 12 < 1020 as
+/// zext(i') - 4 <u 1020 on the 32-bit counter i' = i + 16 once that is
+/// narrowed, a 64-bit subtraction and compare (five instructions) where
+/// i' <u 1024 is the branch's own (L15-E496).
+static bool narrowOffsetCompares(Function &F, ScalarEvolution &SE) {
+  if (!AGXNarrowOffsetCompares)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *Cmp = dyn_cast<ICmpInst>(&I);
+    Value *X;
+    const APInt *C, *K;
+    if (!Cmp || !(Cmp->isUnsigned() || Cmp->isEquality()) ||
+        !Cmp->getOperand(0)->getType()->isIntegerTy(64) ||
+        !match(Cmp->getOperand(0), m_Add(m_ZExt(m_Value(X)), m_APInt(C))) ||
+        !match(Cmp->getOperand(1), m_APInt(K)) ||
+        !X->getType()->isIntegerTy(32))
+      continue;
+    ConstantRange R = SE.getUnsignedRange(SE.getSCEV(X)).zeroExtend(128);
+    APInt C128 = C->sext(128), K128 = K->zext(128);
+    APInt Top = APInt(128, 1).shl(32);
+    APInt Lo = R.getUnsignedMin() + C128, Hi = R.getUnsignedMax() + C128;
+    APInt NK = K128 - C128;
+    if (R.isFullSet() || Lo.isNegative() || !Hi.ult(Top) || NK.isNegative() ||
+        !NK.ult(Top))
+      continue;
+    IRBuilder<> B(Cmp);
+    Value *N = B.CreateICmp(Cmp->getPredicate(), X,
+                            ConstantInt::get(X->getType(), NK.trunc(32)));
+    N->takeName(Cmp);
+    Value *Old = Cmp->getOperand(0);
+    Cmp->replaceAllUsesWith(N);
+    Cmp->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+    SE.forgetValue(X);
+    Changed = true;
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXRebaseCompares(
     "agx-rebase-compares", cl::init(true), cl::Hidden,
     cl::desc("A compare of an induction value with an invariant on another "
@@ -1868,13 +1918,16 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
     Changed |= AGX::narrowBoundedI64(F);
   // (on the final 32-bit compares, with analyses of the function as it now
   // is: the splits added blocks)
-  if (AGXRebaseCompares) {
+  if (AGXRebaseCompares || AGXNarrowOffsetCompares) {
     DominatorTree DT2(F);
     LoopInfo LI2(DT2);
     TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
     TargetLibraryInfo TLI(TLII, &F);
     AssumptionCache AC(F);
     ScalarEvolution SE2(F, TLI, AC, DT2, LI2);
+    Changed |= narrowOffsetCompares(F, SE2);
+    if (!AGXRebaseCompares)
+      return Changed;
     for (Loop *L : LI2.getLoopsInPreorder()) {
       if (!rebaseCompares(*L, SE2, F) || !AGXMergeUpCounters)
         continue;
