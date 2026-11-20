@@ -86,6 +86,7 @@ the kernel's, as memory at VA).
 | `row_dot_dyn` | Row dot products with a vector over a runtime length n (512 in the cost run), a thread per row |
 | `quant_dyn` | Row quantization to int8 over a runtime length n (256 in the cost run), a thread per row: byte stores |
 | `widen_dyn` | f16 rows widened to f32 with a scale over a runtime length n (256 in the cost run), a thread per row: 2-byte loads |
+| `softmax_dyn` | Softmax of rows of a runtime length n (64 in the cost run), a thread per row: max, sum of exponentials, normalized store |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 

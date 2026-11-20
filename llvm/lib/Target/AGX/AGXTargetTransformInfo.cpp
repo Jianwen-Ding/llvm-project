@@ -194,6 +194,15 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeStoresNarrow(
     cl::desc("-agx-device-unroll-runtime-stores also for 1- and 2-byte "
              "accesses (and roundeven)"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeExp(
+    "agx-device-unroll-runtime-exp", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
+             "of exponentials"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeExpStores(
+    "agx-device-unroll-runtime-exp-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for exponentials"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -626,7 +635,7 @@ void AGXTTIImpl::getUnrollingPreferences(
     // transcendental work hide their loads behind it, and lost (xent_rows).
     if (!Trips && DeviceLoads && AGXDeviceUnrollRuntime >= 2) {
       unsigned Insts = 0, Far = 0;
-      bool Light = true, Gather = false;
+      bool Light = true, Gather = false, Exps = false, Other = false;
       for (const Instruction &I : *L->getHeader()) {
         ++Insts;
         if (isa<StoreInst>(I) || (isa<CallBase>(I) && !isa<IntrinsicInst>(I)))
@@ -682,9 +691,17 @@ void AGXTTIImpl::getUnrollingPreferences(
           case Intrinsic::fma:
           case Intrinsic::fmuladd:
             break;
+          case Intrinsic::exp:
+          case Intrinsic::exp2:
+            Exps = true;
+            Light = false;
+            break;
           default:
             Light = false;
+            Other = true;
           }
+        if (isa<CallBase>(I) && !isa<IntrinsicInst>(I))
+          Other = true;
         if (I.getOpcode() == Instruction::FDiv || I.isAtomic())
           Light = false;
       }
@@ -713,7 +730,10 @@ void AGXTTIImpl::getUnrollingPreferences(
                      II->getIntrinsicID() == Intrinsic::minimum ||
                      II->getIntrinsicID() == Intrinsic::fabs ||
                      (AGXDeviceUnrollRuntimeStoresNarrow &&
-                      II->getIntrinsicID() == Intrinsic::roundeven);
+                      II->getIntrinsicID() == Intrinsic::roundeven) ||
+                     (AGXDeviceUnrollRuntimeExpStores &&
+                      (II->getIntrinsicID() == Intrinsic::exp ||
+                       II->getIntrinsicID() == Intrinsic::exp2));
             return !isa<CallBase>(I) && !I.isAtomic() &&
                    I.getOpcode() != Instruction::FDiv;
           })) {
@@ -777,8 +797,17 @@ void AGXTTIImpl::getUnrollingPreferences(
         auto *LI = dyn_cast<LoadInst>(&I);
         return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
       });
-      if (Light && !Far && Insts <= 24 && AGXDeviceUnrollRuntimeContiguous >= 2 &&
-          RowPerThread()) {
+      // (exponentials too, a softmax's sum, with -agx-device-unroll-runtime-exp:
+      // its loads are a thread's own row's)
+      bool LightOrExp =
+          Light || (AGXDeviceUnrollRuntimeExp && Exps && !Other &&
+                    none_of(*L->getHeader(), [](const Instruction &I) {
+                      return isa<StoreInst>(I) || I.isAtomic() ||
+                             I.getOpcode() == Instruction::FDiv;
+                    }));
+      if (LightOrExp && !Far && Insts <= 48 &&
+          AGXDeviceUnrollRuntimeContiguous >= 2 && RowPerThread() &&
+          (Light ? Insts <= 24 : true)) {
         UP.Partial = UP.Runtime = true;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             RowLoads == 1 ? 2 * AGXDeviceUnrollRuntimeContiguous
