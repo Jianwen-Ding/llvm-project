@@ -80,6 +80,11 @@ static cl::opt<bool> SinCosMagicRound(
     cl::desc("sin / cos's j = round(2 x / pi) likewise, the quadrant the "
              "sum's low bits"));
 
+static cl::opt<bool> SinCosSharedOdd(
+    "agx-sincos-shared-odd", cl::init(true), cl::Hidden,
+    cl::desc("cos's polynomial select by sin's odd quadrant, its operands "
+             "swapped, not by (q + 1) & 1"));
+
 static cl::opt<bool> NegatedClamp(
     "agx-exp-negated-clamp",
     cl::desc("e^-y clamps y and negates the clamp"), cl::init(true),
@@ -1000,13 +1005,18 @@ public:
     auto [S, C] = sinCosPolys(R);
     // sin: quadrants 1 and 3 take the cosine, 2 and 3 the minus sign; cos
     // is a quadrant ahead.
-    auto Quadrant = [&](Value *Q) {
-      Value *Odd = B.CreateICmpNE(B.CreateAnd(Q, ki(1)), ki(0));
-      Value *Minus = B.CreateICmpNE(B.CreateAnd(Q, ki(2)), ki(0));
-      Value *V = sel(Odd, C, S);
+    auto Quadrant = [&](Value *Q, bool Ahead) {
+      Value *Q1 = Ahead ? B.CreateAdd(Q, ki(1)) : Q;
+      // (q + 1 is odd where q is not: cos's select by q's test, its operands
+      // swapped, one test for both of sincos's halves; the backend does not
+      // see through the add)
+      bool Swap = Ahead && SinCosSharedOdd;
+      Value *Odd = B.CreateICmpNE(B.CreateAnd(Swap ? Q : Q1, ki(1)), ki(0));
+      Value *Minus = B.CreateICmpNE(B.CreateAnd(Q1, ki(2)), ki(0));
+      Value *V = Swap ? sel(Odd, S, C) : sel(Odd, C, S);
       return sel(Minus, B.CreateFNeg(V), V);
     };
-    Value *Sin = Quadrant(Q), *Cos = Quadrant(B.CreateAdd(Q, ki(1)));
+    Value *Sin = Quadrant(Q, false), *Cos = Quadrant(Q, true);
     auto Hw = [&](Intrinsic::ID ID) {
       Value *V = B.CreateIntrinsic(ID, {Ty}, {X});
       cast<Instruction>(V)->setHasApproxFunc(true);
