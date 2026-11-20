@@ -219,6 +219,22 @@ void AGXTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
       [this](ModulePassManager &MPM, OptimizationLevel) {
         MPM.addPass(AGXLowerAIRPass(*this));
       });
+  // Unrolled straight-line runs of device accesses versioned on their
+  // buffers not overlapping, after the last unrolling (L15-E528).
+  PB.registerOptimizerLastEPCallback(
+      [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
+        if (Level != OptimizationLevel::O0)
+          MPM.addPass(
+              createModuleToFunctionPassAdaptor(AGXAliasVersioningPass()));
+      });
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, FunctionPassManager &FPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name != "agx-alias-version")
+          return false;
+        FPM.addPass(AGXAliasVersioningPass());
+        return true;
+      });
   PB.registerPipelineParsingCallback(
       [this](StringRef Name, ModulePassManager &MPM,
              ArrayRef<PassBuilder::PipelineElement>) {

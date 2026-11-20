@@ -149,6 +149,14 @@ void initializeAGXAsmPrinterPass(PassRegistry &);
 class TargetMachine;
 
 /// Compiles a module described by !air.kernel (AIR) as AGX kernels.
+/// Straight-line runs of device accesses versioned on their buffers not
+/// overlapping, in opt after unrolling (L15-E528).
+class AGXAliasVersioningPass
+    : public OptionalPassInfoMixin<AGXAliasVersioningPass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 class AGXLowerAIRPass : public RequiredPassInfoMixin<AGXLowerAIRPass> {
   const TargetMachine &TM;
 
