@@ -142,6 +142,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollTranscendental(
+    "agx-device-unroll-transcendental", cl::init(8), cl::Hidden,
+    cl::desc("Unroll factor of device-load loops with exponentials that no "
+             "other factor takes (0: the default)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntime(
     "agx-device-unroll-runtime", cl::init(4), cl::Hidden,
     cl::desc("Unroll a light device-load loop of a runtime trip count this "
@@ -446,6 +451,21 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
       (Vectors || !AGXDeviceUnrollStreamsVectors) &&
       Divides(AGXDeviceUnrollStreams))
     return AGXDeviceUnrollStreams;
+  // (a loop of exponentials: their work between the loads takes an unroll
+  // of 8 without the registers that cost groups, online_softmax_vec4,
+  // L15-E542)
+  // (with the constants in uniforms only: their registers held, the
+  // unroll cost more than it hid, online_softmax_vec4 +0.9%)
+  if (AGXDeviceUnrollTranscendental && AGX::uniformConstantsEnabled() &&
+      any_of(L->blocks(), [](const BasicBlock *BB) {
+        return any_of(*BB, [](const Instruction &I) {
+          auto *II = dyn_cast<IntrinsicInst>(&I);
+          return II && (II->getIntrinsicID() == Intrinsic::exp ||
+                        II->getIntrinsicID() == Intrinsic::exp2);
+        });
+      }) &&
+      Divides(AGXDeviceUnrollTranscendental))
+    return AGXDeviceUnrollTranscendental;
   return AGXDeviceUnroll;
 }
 

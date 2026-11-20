@@ -94,7 +94,9 @@ def optimize(a, chip, tmp, features):
     mattr = ["-mattr=" + features] if features else []
     cpu = [] if chip is None else ["-mcpu=" + chip]
     optimized = os.path.join(tmp, (chip or "shared") + features + ".opt.bc")
-    subprocess.run([a.opt, "-mtriple=agx", *cpu, *mattr, "-O3", a.portable, "-o", optimized], check=True)
+    # (opt's AGX unrolling choices see the constants' mode too)
+    uc = ["-agx-uniform-constants"] if a.uniform_constants else []
+    subprocess.run([a.opt, "-mtriple=agx", *cpu, *mattr, "-O3", *uc, a.portable, "-o", optimized], check=True)
     return optimized
 
 

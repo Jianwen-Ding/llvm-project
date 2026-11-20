@@ -50,7 +50,8 @@ def cost(bindir, costbin, ll, tmp, cpu, args, optimize=True):
   llc, opt = os.path.join(bindir, 'llc'), os.path.join(bindir, 'opt')
   air, agx = os.path.join(tmp, 'air.ll'), os.path.join(tmp, 'agx.ll')
   run([llc, '-mtriple=air', '-air-portable', ll, '-o', air])
-  passes = ['-O3'] if optimize else ['-passes=agx-lower-air']
+  passes = (['-O3'] if optimize else ['-passes=agx-lower-air']) + \
+      (['-agx-uniform-constants'] if UNIFORM_CONSTANTS else [])
   run([opt, '-mtriple=agx', '-mcpu=' + cpu] + passes + ['-S', air, '-o', agx])
   # (agx-build-fatbin.py's wide constants in uniforms, which the runtime
   # preloads: L15-E540)
