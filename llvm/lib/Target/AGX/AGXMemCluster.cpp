@@ -72,9 +72,9 @@ static cl::opt<bool> AGXLoadsAfterStores(
              "program order in a thread's row loop of light work"));
 
 static cl::opt<unsigned> AGXLoadsAfterStoresWork(
-    "agx-sched-loads-after-stores-work", cl::Hidden, cl::init(3),
-    cl::desc("-agx-sched-loads-after-stores' most instructions for each "
-             "device access"));
+    "agx-sched-loads-after-stores-work", cl::Hidden, cl::init(125),
+    cl::desc("-agx-sched-loads-after-stores' most instructions for every 4 "
+             "bytes accessed, in hundredths"));
 
 namespace {
 
@@ -167,9 +167,11 @@ static bool threadRowAddress(const Value *P) {
 
 /// A region whose device loads should stay after the device stores before
 /// them (L15-E589): a loop over a thread's own rows (every store's address
-/// a thread position times 16 or more), of light work (at most
-/// -agx-sched-loads-after-stores-work instructions besides its device
-/// accesses for each), that loads at most 2.5 times the bytes it stores.
+/// a thread position times 16 or more), of light work (at most 1.25
+/// instructions besides its device accesses for every 4 bytes they access,
+/// -agx-sched-loads-after-stores-work; per access, L15-E591, its 16-byte
+/// stores of halves would have counted twice as much), that loads at most
+/// 2.5 times the bytes it stores.
 /// With many SIMD-groups resident, its next loads ahead of its last stores
 /// stalled the core's memory pipelines (row_scale's tput -28%, gather_rows
 /// -38%, widen_f16 -27% kept after them, fewer registers besides); columns
@@ -196,12 +198,16 @@ static bool loadsAfterStores(ScheduleDAGInstrs *DAG) {
         return false;
     }
     Loads += K == DeviceLoad;
-    Work += K < 0 && !MI.isCopy() && !MI.isTerminator();
+    // (not the register tuples and halves a vector's pieces make)
+    Work += K < 0 && !MI.isCopyLike() && !MI.isRegSequence() &&
+            !MI.isInsertSubreg() && !MI.isExtractSubreg() &&
+            !MI.isImplicitDef() && !MI.isTerminator();
   }
   // (and loading at most 2.5 times the bytes it stores: three rows into one,
   // row_norm_apply, and floats into bytes, to_u8 / quant_rows, lost 1-6%)
   return Stores && Loads &&
-         Work <= AGXLoadsAfterStoresWork * (Loads + Stores) &&
+         400 * uint64_t(Work) <=
+             AGXLoadsAfterStoresWork * (LoadBytes + StoreBytes) &&
          2 * LoadBytes <= 5 * StoreBytes;
 }
 

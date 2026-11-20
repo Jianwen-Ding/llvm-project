@@ -117,6 +117,11 @@ static bool wideHalfLoad(const LoadSDNode *L) {
   return Loads;
 }
 
+static cl::opt<bool> AGXWideHalfStores(
+    "agx-wide-half-stores", cl::init(true), cl::Hidden,
+    cl::desc("Store 4-byte aligned vectors of 8 16-bit elements as one "
+             "16-byte store of words"));
+
 static cl::opt<bool> AGXPairedHalfStores(
     "agx-paired-half-stores", cl::Hidden, cl::init(true),
     cl::desc("Store 4-byte aligned pairs of 16-bit elements as one 32-bit "
@@ -213,6 +218,9 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   if (AGXPairedHalfStores)
     setOperationAction(ISD::STORE,
                        {MVT::v2i16, MVT::v4i16, MVT::v2f16, MVT::v4f16}, Custom);
+  // (and 8: one 16-byte store of words, L15-E591)
+  if (AGXPairedHalfStores && AGXWideHalfStores)
+    setOperationAction(ISD::STORE, {MVT::v8i16, MVT::v8f16}, Custom);
 
   //===--------------------------------------------------------------------===//
   // Integer operations
@@ -1401,7 +1409,8 @@ SDValue AGXTargetLowering::lowerVectorStore(SDValue Op,
   // Pairs of 16-bit elements, 4-byte aligned: a 32-bit word each, whose
   // halves are the elements (a register's halves, no instruction to pack).
   if ((VT == MVT::v2i16 || VT == MVT::v4i16 || VT == MVT::v2f16 ||
-       VT == MVT::v4f16) &&
+       VT == MVT::v4f16 ||
+       (AGXWideHalfStores && (VT == MVT::v8i16 || VT == MVT::v8f16))) &&
       !S->isTruncatingStore() && !S->isIndexed() && S->isSimple() &&
       S->getAlign() >= Align(4) &&
       (S->getAddressSpace() == AGX::DEVICE_ADDRESS ||
@@ -1422,9 +1431,11 @@ SDValue AGXTargetLowering::lowerVectorStore(SDValue Op,
     if (Words == 1)
       return DAG.getStore(S->getChain(), DL, W[0], S->getBasePtr(),
                           S->getMemOperand());
-    return DAG.getMemIntrinsicNode(vectorNode(false, 2), DL,
-                                   DAG.getVTList(MVT::Other),
-                                   {S->getChain(), W[0], W[1], S->getBasePtr()},
+    SmallVector<SDValue, 6> Ops{S->getChain()};
+    Ops.append(W.begin(), W.end());
+    Ops.push_back(S->getBasePtr());
+    return DAG.getMemIntrinsicNode(vectorNode(false, Words), DL,
+                                   DAG.getVTList(MVT::Other), Ops,
                                    S->getMemoryVT(), S->getMemOperand());
   }
   if (S->isTruncatingStore() || S->isIndexed() || !isVectorAccess(VT, S))

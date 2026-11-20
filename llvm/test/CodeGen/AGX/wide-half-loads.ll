@@ -23,11 +23,16 @@
 ; ALL: i32, xyzw
 ; ALL: i32, xyzw
 
-; A row of halves stored as halves (L15-E590): one 16-byte load.
+; A row of halves stored as halves (L15-E590): one 16-byte load, and one
+; 16-byte store of words (L15-E591).
 ; CHECK-LABEL: hcopy:
 ; CHECK: device_load 0, i32, xyzw
 ; CHECK-NOT: device_load
-; CHECK: device_store
+; CHECK: device_store 0, i32, xyzw
+; CHECK-NOT: device_store
+; CHECK: stop
+; OFF-LABEL: hcopy:
+; OFF: device_store 0, i32, xyzw
 
 ; A block that stores floats: two 8-byte halves.
 ; CHECK-LABEL: widen:
