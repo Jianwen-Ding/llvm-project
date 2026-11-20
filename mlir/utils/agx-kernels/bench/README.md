@@ -82,6 +82,8 @@ the kernel's, as memory at VA).
 | `dot_i8_scalar` | int8 row dot products with an int8 vector in i32, a thread per row of 512: scalar byte loads, sign-extended products |
 | `row_scale_dyn` | Rows scaled by a vector over a runtime length n (512 in the cost run), a thread per row |
 | `row_axpy_dyn` | a x + y over rows of a runtime length n (512 in the cost run), a thread per row |
+| `row_sum_dyn` | Row sums over a runtime length n (512 in the cost run), a thread per row |
+| `row_dot_dyn` | Row dot products with a vector over a runtime length n (512 in the cost run), a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 

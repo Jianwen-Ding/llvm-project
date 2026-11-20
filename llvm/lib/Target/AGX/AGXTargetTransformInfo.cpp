@@ -183,6 +183,12 @@ static cl::opt<bool> AGXDeviceUnrollSomeStrided(
     cl::desc("agx-device-unroll-strided's factor also where only some of a "
              "loop's device loads are strided"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeContiguous(
+    "agx-device-unroll-runtime-contiguous", cl::init(4), cl::Hidden,
+    cl::desc("Iterations a runtime-trip loop over a thread's row (contiguous "
+             "loads, no stores, light arithmetic) is unrolled by, twice that "
+             "for one load an iteration (0: none)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -704,6 +710,69 @@ void AGXTTIImpl::getUnrollingPreferences(
         UP.Partial = UP.Runtime = true;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             AGXDeviceUnrollRuntimeStores;
+        UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      }
+      // A thread's own row of a runtime length (a row sum): its loads start
+      // at the thread position times a row's bytes, each thread's lines
+      // its own, unrolled with a remainder for their loads in flight
+      // (L15-E566). Not a filter's taps (x[i + k], the threads' loads one
+      // line: fir_taps lost, E536).
+      auto RowPerThread = [&]() {
+        for (const Instruction &I : *L->getHeader()) {
+          auto *LI = dyn_cast<LoadInst>(&I);
+          if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+            continue;
+          auto *G = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+          if (!G || G->getNumIndices() != 1)
+            continue;
+          const Value *Idx = G->getOperand(1);
+          if (auto *E = dyn_cast<CastInst>(Idx);
+              E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+            Idx = E->getOperand(0);
+          auto *AR = dyn_cast<SCEVAddRecExpr>(
+              SE.getSCEV(const_cast<Value *>(Idx)));
+          if (!AR || AR->getLoop() != L)
+            continue;
+          SmallVector<const SCEV *, 4> Terms;
+          if (auto *A = dyn_cast<SCEVAddExpr>(AR->getStart()))
+            Terms.append(A->operands().begin(), A->operands().end());
+          else
+            Terms.push_back(AR->getStart());
+          for (const SCEV *T : Terms) {
+            auto *M = dyn_cast<SCEVMulExpr>(T);
+            if (!M || M->getNumOperands() != 2)
+              continue;
+            auto *C = dyn_cast<SCEVConstant>(M->getOperand(0));
+            const SCEV *X = M->getOperand(1);
+            while (auto *Cast = dyn_cast<SCEVCastExpr>(X))
+              X = Cast->getOperand();
+            auto *U = dyn_cast<SCEVUnknown>(X);
+            auto *Call = U ? dyn_cast<IntrinsicInst>(U->getValue()) : nullptr;
+            if (C && Call &&
+                (Call->getIntrinsicID() ==
+                     Intrinsic::agx_thread_position_in_grid_x ||
+                 Call->getIntrinsicID() ==
+                     Intrinsic::agx_thread_position_in_grid_y) &&
+                C->getAPInt().getZExtValue() *
+                        DL.getTypeAllocSize(G->getSourceElementType()) >=
+                    64)
+              return true;
+          }
+        }
+        return false;
+      };
+      // (8 for a row's one load an iteration, a sum: row_sum_dyn 354.4 at 4,
+      // 311.3 at 8; 4 for two, a dot: row_dot_dyn 488.3 at 4, 744.4 at 8)
+      unsigned RowLoads = count_if(*L->getHeader(), [](const Instruction &I) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+      });
+      if (Light && !Far && Insts <= 24 && AGXDeviceUnrollRuntimeContiguous >= 2 &&
+          RowPerThread()) {
+        UP.Partial = UP.Runtime = true;
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount =
+            RowLoads == 1 ? 2 * AGXDeviceUnrollRuntimeContiguous
+                          : unsigned(AGXDeviceUnrollRuntimeContiguous);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       if (Light && Far && Insts <= 24) {
