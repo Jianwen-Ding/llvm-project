@@ -90,6 +90,7 @@ the kernel's, as memory at VA).
 | `layernorm_dyn` | LayerNorm over rows of a runtime length n (256 in the cost run), a thread per row: mean, variance, normalize with gamma / beta |
 | `cond_store` | A thread's row of 256 copied where above a threshold: a conditional store in the loop |
 | `col_scale_dyn` | Columns scaled by a vector down a runtime length n (256 in the cost run), a thread per column |
+| `gelu_dyn` | tanh-GELU over rows of a runtime length n (512 in the cost run), a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 

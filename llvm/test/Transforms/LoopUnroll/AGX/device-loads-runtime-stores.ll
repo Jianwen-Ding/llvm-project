@@ -2,6 +2,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-stores=0 -S < %s | FileCheck %s --check-prefix=OFF
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-stores-narrow=0 -S < %s | FileCheck %s --check-prefix=WORDS
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns=0 -S < %s | FileCheck %s --check-prefix=NOCOL
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-tanh-stores=0 -S < %s | FileCheck %s --check-prefix=NOTANH
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -124,3 +125,31 @@ loop:
 exit:
   ret void
 }
+
+; tanh too, a GELU row (L15-E577).
+; CHECK-LABEL: @gelu(
+; CHECK-COUNT-4: call float @llvm.tanh.f32
+; CHECK: .epil
+; NOTANH-LABEL: @gelu(
+; NOTANH: call float @llvm.tanh.f32
+; NOTANH-NOT: call float @llvm.tanh.f32
+; NOTANH: ret void
+define void @gelu(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %n) {
+entry:
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %i
+  %v = load float, ptr addrspace(1) %px, align 4
+  %t = call float @llvm.tanh.f32(float %v)
+  %o = fmul float %v, %t
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %i
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+declare float @llvm.tanh.f32(float)

@@ -213,6 +213,10 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeColumns(
     cl::desc("-agx-device-unroll-runtime-stores also for far accesses where "
              "the trip count does not depend on the thread (a column)"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeTanhStores(
+    "agx-device-unroll-runtime-tanh-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for tanh"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -783,7 +787,9 @@ void AGXTTIImpl::getUnrollingPreferences(
                       II->getIntrinsicID() == Intrinsic::roundeven) ||
                      (AGXDeviceUnrollRuntimeExpStores &&
                       (II->getIntrinsicID() == Intrinsic::exp ||
-                       II->getIntrinsicID() == Intrinsic::exp2));
+                       II->getIntrinsicID() == Intrinsic::exp2)) ||
+                     (AGXDeviceUnrollRuntimeTanhStores &&
+                      II->getIntrinsicID() == Intrinsic::tanh);
             return !isa<CallBase>(I) && !I.isAtomic() &&
                    I.getOpcode() != Instruction::FDiv;
           })) {
