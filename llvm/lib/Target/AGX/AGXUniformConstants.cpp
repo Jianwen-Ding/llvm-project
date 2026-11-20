@@ -45,6 +45,8 @@ static cl::opt<bool> AGXUniformConstants(
     cl::desc("Preload the wide 32-bit constants of kernels into uniform "
              "registers (.agx.kernels extension 6) instead of mov_imm"));
 
+bool llvm::AGX::uniformConstantsEnabled() { return AGXUniformConstants; }
+
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.

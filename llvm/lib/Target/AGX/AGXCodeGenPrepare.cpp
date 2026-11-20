@@ -7674,8 +7674,11 @@ static bool onlineSoftmaxExps(Function &F) {
     // more register for nothing).
     if (AGXOnlineSoftmaxAbsArg && Shared &&
         E1->getIntrinsicID() == Intrinsic::exp &&
-        ChainPairs.lookup({E1->getParent(), ChainRoot(A)}) <=
-            AGXOnlineSoftmaxAbsArgMaxChain) {
+        // (with the constants in uniforms, the exponentials running ahead
+        // hold no coefficient registers: no limit, L15-E541)
+        (AGX::uniformConstantsEnabled() ||
+         ChainPairs.lookup({E1->getParent(), ChainRoot(A)}) <=
+             AGXOnlineSoftmaxAbsArgMaxChain)) {
       IRBuilder<> EB(E);
       Value *D = EB.CreateFSub(B, A);
       Value *NX = EB.CreateFNeg(EB.CreateUnaryIntrinsic(Intrinsic::fabs, D));

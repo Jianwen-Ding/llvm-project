@@ -64,6 +64,9 @@ FunctionPass *createAGXAlignmentVersioningPass();
 FunctionPass *createAGXNarrowInductionsPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
+/// Whether wide constants go to preloaded uniforms (-agx-uniform-constants):
+/// then they hold no general purpose registers.
+bool uniformConstantsEnabled();
 /// Gives the special register reads of F their range return attributes (see
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
 /// With ForAnalysis (ranges the caller takes off again), also the kernel's
