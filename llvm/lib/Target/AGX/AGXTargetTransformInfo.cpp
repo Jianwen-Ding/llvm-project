@@ -142,6 +142,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<bool> AGXDeviceUnrollCarriedSelect(
+    "agx-device-unroll-carried-select", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-argmax also for a carried value kept by "
+             "selects on one compare"));
+
 static cl::opt<unsigned> AGXDeviceUnrollArgMax(
     "agx-device-unroll-argmax", cl::init(16), cl::Hidden,
     cl::desc("Iterations a device-load arg-max / arg-min loop (a carried "
@@ -476,9 +481,13 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
         return any_of(P.users(), [&](const User *U) {
           auto *Sel = dyn_cast<SelectInst>(U);
           auto *C = Sel ? dyn_cast<CmpInst>(Sel->getCondition()) : nullptr;
-          // (the compare also selects the index)
+          // (the compare also selects the index; or, a conditional count
+          // and sum, the value kept where the compare fails: L15-E555)
           return C && !C->hasOneUse() &&
-                 (C->getOperand(0) == &P || C->getOperand(1) == &P);
+                 (C->getOperand(0) == &P || C->getOperand(1) == &P ||
+                  (AGXDeviceUnrollCarriedSelect &&
+                   (Sel->getTrueValue() == &P ||
+                    Sel->getFalseValue() == &P)));
         });
       }) &&
       Divides(AGXDeviceUnrollArgMax))
