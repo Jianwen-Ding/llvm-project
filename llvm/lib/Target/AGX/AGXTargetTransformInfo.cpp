@@ -142,6 +142,12 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollArgMax(
+    "agx-device-unroll-argmax", cl::init(16), cl::Hidden,
+    cl::desc("Iterations a device-load arg-max / arg-min loop (a carried "
+             "value selected on a compare against it, and an index) is "
+             "unrolled by (0: no such rule)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollFullMaxSize(
     "agx-device-unroll-full-max-size", cl::init(1024), cl::Hidden,
     cl::desc("Trips times the loop's instructions above which "
@@ -461,6 +467,22 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
       (Vectors || !AGXDeviceUnrollStreamsVectors) &&
       Divides(AGXDeviceUnrollStreams))
     return AGXDeviceUnrollStreams;
+  // An arg-max / arg-min (a carried value chosen by a select on a compare
+  // against it, the index beside it): its compare-selects of 4 iterations
+  // leave it waiting on each 16-byte load; 16 keep 4 in flight
+  // (argmax_rows, L15-E552; a sum's carried adds lost, rowsum +16%).
+  if (AGXDeviceUnrollArgMax && !Narrow && !Stores &&
+      any_of(L->getHeader()->phis(), [](const PHINode &P) {
+        return any_of(P.users(), [&](const User *U) {
+          auto *Sel = dyn_cast<SelectInst>(U);
+          auto *C = Sel ? dyn_cast<CmpInst>(Sel->getCondition()) : nullptr;
+          // (the compare also selects the index)
+          return C && !C->hasOneUse() &&
+                 (C->getOperand(0) == &P || C->getOperand(1) == &P);
+        });
+      }) &&
+      Divides(AGXDeviceUnrollArgMax))
+    return AGXDeviceUnrollArgMax;
   // (a loop of exponentials: their work between the loads takes an unroll
   // of 8 without the registers that cost groups, online_softmax_vec4,
   // L15-E542)
