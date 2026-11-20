@@ -153,6 +153,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStreamsWord(
     cl::desc("agx-device-unroll-streams' factor where every device load is "
              "of 4 bytes at most (0: the same)"));
 
+static cl::opt<bool> AGXDeviceUnrollStreamsVectors(
+    "agx-device-unroll-streams-vectors", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-streams only for loops whose device loads are "
+             "all vectors"));
+
 static cl::opt<unsigned> AGXDeviceUnroll(
     "agx-device-unroll", cl::init(4), cl::Hidden,
     cl::desc("Iterations a single-block loop that loads device memory, of a "
@@ -365,7 +370,8 @@ static std::optional<APInt> deviceLoadStride(const LoadInst &LI, const Loop *L,
 static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
                                    const DataLayout &DL, unsigned Trips,
                                    bool &DeviceLoads) {
-  bool Narrow = true, Stores = false, Strided = true, Word = true;
+  bool Narrow = true, Stores = false, Strided = true, Word = true,
+       Vectors = true;
   DeviceLoads = false;
   // The pointer bases the device loads step through (a dot product's two
   // rows): L15-E506.
@@ -380,6 +386,7 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
       DeviceLoads = true;
       Narrow &= DL.getTypeStoreSize(LI->getType()) <= 2;
       Word &= DL.getTypeStoreSize(LI->getType()) <= 4;
+      Vectors &= LI->getType()->isVectorTy();
       if (const SCEV *P = SE.getSCEV(const_cast<Value *>(LI->getPointerOperand()));
           isa<SCEVAddRecExpr>(P) &&
           cast<SCEVAddRecExpr>(P)->getLoop() == L)
@@ -404,9 +411,11 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
   // (loads of a word at most: 16, as their iterations' loads are a fourth
   // of a 16-byte vector's, L15-E507)
   if (!Narrow && !Stores && Streams.size() >= 2 && Word &&
+      (Vectors || !AGXDeviceUnrollStreamsVectors) &&
       Divides(AGXDeviceUnrollStreamsWord))
     return AGXDeviceUnrollStreamsWord;
   if (!Narrow && !Stores && Streams.size() >= 2 &&
+      (Vectors || !AGXDeviceUnrollStreamsVectors) &&
       Divides(AGXDeviceUnrollStreams))
     return AGXDeviceUnrollStreams;
   return AGXDeviceUnroll;
