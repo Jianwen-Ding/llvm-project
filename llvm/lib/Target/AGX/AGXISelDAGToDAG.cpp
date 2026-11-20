@@ -16,7 +16,10 @@
 #include "AGXSubtarget.h"
 #include "AGXTargetMachine.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
@@ -41,6 +44,10 @@ namespace {
 
 class AGXDAGToDAGISel : public SelectionDAGISel {
   const AGXSubtarget *Subtarget = nullptr;
+  // The function's loops, for patterns that pay only where a value they
+  // need is hoisted out of one (L15-E559).
+  std::unique_ptr<DominatorTree> DT;
+  std::unique_ptr<LoopInfo> Loops;
 
 public:
   AGXDAGToDAGISel() = delete;
@@ -48,8 +55,34 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     Subtarget = &MF.getSubtarget<AGXSubtarget>();
-    return SelectionDAGISel::runOnMachineFunction(MF);
+    Function &F = const_cast<Function &>(MF.getFunction());
+    DT = std::make_unique<DominatorTree>(F);
+    Loops = std::make_unique<LoopInfo>(*DT);
+    bool Changed = SelectionDAGISel::runOnMachineFunction(MF);
+    Loops.reset();
+    DT.reset();
+    return Changed;
   }
+
+  /// Whether the block being selected is in a loop.
+  bool inLoop() const {
+    const BasicBlock *BB = FuncInfo->MBB ? FuncInfo->MBB->getBasicBlock()
+                                         : nullptr;
+    return Loops && BB && Loops->getLoopFor(BB);
+  }
+
+  // The block's 32-bit shifts left by 16 (each, as a zero half carried
+  // through a loop, holds a register across it).
+  unsigned NumShl16 = 0;
+  void PreprocessISelDAG() override {
+    NumShl16 = 0;
+    for (SDNode &N : CurDAG->allnodes())
+      if (N.getOpcode() == ISD::SHL && N.getValueType(0) == MVT::i32)
+        if (auto *C = dyn_cast<ConstantSDNode>(N.getOperand(1));
+            C && C->getZExtValue() == 16)
+          ++NumShl16;
+  }
+  bool fewShl16() const;
 
 private:
 #include "AGXGenDAGISel.inc"
@@ -104,6 +137,15 @@ private:
   void selectVectorStore(SDNode *N, unsigned NumElts);
   void selectTextureSample(SDNode *N);
 };
+
+static cl::opt<unsigned> AGXShl16HalvesMax(
+    "agx-shl16-halves-max", cl::init(4), cl::Hidden,
+    cl::desc("Shifts left by 16 a loop block may have for them to be a zero "
+             "half carried through the loop (more: bfi)"));
+
+bool AGXDAGToDAGISel::fewShl16() const {
+  return NumShl16 <= AGXShl16HalvesMax;
+}
 
 class AGXDAGToDAGISelLegacy : public SelectionDAGISelLegacy {
 public:

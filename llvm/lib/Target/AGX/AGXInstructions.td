@@ -505,6 +505,17 @@ def : Pat<(i32 (or (srl i32:$lo, (i32 16)), (shl i32:$hi, (i32 16)))),
                                (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
 def : Pat<(i32 (or (i32 (zext i16:$lo)), (and i32:$hi, (i32 -65536)))),
           (REG_SEQUENCE GPR32, $lo, lo16, (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+// x << 16 alone, in a loop: x's low half under a zero half, two moves of
+// the ALU's (the zero one hoisted out of the loop) instead of a bfi of the
+// shared unit's (a bfloat's widening: L15-E559; outside loops, two moves for
+// the bfi, axpy_bf16 lost).
+def agx_shift16 : PatLeaf<(i32 imm), [{
+  return N->getZExtValue() == 16 && llvm::AGX::shl16Halves() && inLoop() &&
+         fewShl16();
+}]>;
+def : Pat<(i32 (shl i32:$a, agx_shift16)),
+          (REG_SEQUENCE GPR32, (MOV_IMM16 0), lo16,
+                               (i16 (EXTRACT_SUBREG $a, lo16)), hi16)>;
 
 def : Pat<(i32 (sext_inreg i32:$a, i16)),
           (IADD_I32_FROM16 MOD_SX, (EXTRACT_SUBREG $a, lo16), 0, (i16 0), 0)>;

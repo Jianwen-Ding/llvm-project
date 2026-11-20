@@ -61,6 +61,13 @@ static cl::opt<bool> AGXSignBitCompares(
 
 bool llvm::AGX::signBitCompares() { return AGXSignBitCompares; }
 
+static cl::opt<bool> AGXShl16Halves(
+    "agx-shl16-halves", cl::init(true), cl::Hidden,
+    cl::desc("x << 16 as x's low half under a zero half (two moves), not a "
+             "bfi (the shared unit's)"));
+
+bool llvm::AGX::shl16Halves() { return AGXShl16Halves; }
+
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.

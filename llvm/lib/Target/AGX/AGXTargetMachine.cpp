@@ -89,6 +89,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXDAGToDAGISelLegacyPass(PR);
   initializeAGXFoldOperandsPass(PR);
   initializeAGXLoadLanesPass(PR);
+  initializeAGXInvariantHalvesPassPass(PR);
   initializeAGXUniformConstantsPassPass(PR);
   initializeAGXHoistFromElseFlowPass(PR);
   initializeAGXSinkRematPass(PR);
@@ -918,6 +919,9 @@ void AGXPassConfig::addMachineSSAOptimization() {
   addPass(createAGXHoistFromElseFlowPass());
   if (AGXSinkRematEnabled)
     addPass(createAGXSinkRematPass());
+  // (a loop's values of a 16-bit value under a zero half carried through it,
+  // the zero half set once: L15-E559)
+  addPass(createAGXInvariantHalvesPass());
   // (last in SSA form: a load's lanes allocated until its first use)
   addPass(createAGXLoadLanesLivePass());
 }

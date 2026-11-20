@@ -73,6 +73,9 @@ bool lowMaskAndInUniforms();
 /// Whether x >> 31 (logical) is a compare-select of x < 0, not a bfeil
 /// (-agx-sign-bit-compares).
 bool signBitCompares();
+/// Whether x << 16 is x's low half under a zero half, not a bfi
+/// (-agx-shl16-halves).
+bool shl16Halves();
 /// Gives the special register reads of F their range return attributes (see
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
 /// With ForAnalysis (ranges the caller takes off again), also the kernel's
@@ -109,6 +112,7 @@ FunctionPass *createAGXISelDag(AGXTargetMachine &TM);
 // Machine passes.
 FunctionPass *createAGXFoldOperandsPass();
 FunctionPass *createAGXLoadLanesLivePass();
+FunctionPass *createAGXInvariantHalvesPass();
 FunctionPass *createAGXUniformConstantsPass();
 FunctionPass *createAGXHoistFromElseFlowPass();
 FunctionPass *createAGXSinkRematPass();
@@ -147,6 +151,7 @@ void initializeAGXLowerGenericAddressesPass(PassRegistry &);
 void initializeAGXDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeAGXFoldOperandsPass(PassRegistry &);
 void initializeAGXLoadLanesPass(PassRegistry &);
+void initializeAGXInvariantHalvesPassPass(PassRegistry &);
 void initializeAGXUniformConstantsPassPass(PassRegistry &);
 void initializeAGXHoistFromElseFlowPass(PassRegistry &);
 void initializeAGXSinkRematPass(PassRegistry &);

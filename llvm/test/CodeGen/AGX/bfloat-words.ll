@@ -82,47 +82,51 @@ define agx_kernel void @ext4_mul(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 define agx_kernel void @bfdot_loop(ptr addrspace(1) noalias readonly captures(none) %w, ptr addrspace(1) noalias readonly captures(none) %x, ptr addrspace(1) noalias nofree writeonly captures(none) %y, i32 %n) local_unnamed_addr {
 ; CHECK-LABEL: bfdot_loop:
 ; CHECK:         // uniform registers: 20 x 16-bit (threadgroups_per_grid at u7)
-; CHECK-NEXT:    // general purpose registers: 14 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 15 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0: // %entry
 ; CHECK-NEXT:    mov_imm r0l, 0
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    mov_imm r5, 0
+; CHECK-NEXT:    mov_imm r8, 0
 ; CHECK-NEXT:    mov_imm r3, 0
 ; CHECK-NEXT:    imadd r2, u6, r1, 0
 ; CHECK-NEXT:    mov_imm r4, -65536
+; CHECK-NEXT:    mov_imm r5, 0
+; CHECK-NEXT:    mov_imm r6, 0
+; CHECK-NEXT:    mov_imm r7, 0
+; CHECK-NEXT:    mov_imm r9, 0
 ; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
 ; CHECK-NEXT:  .LBB2_1: // %loop
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
-; CHECK-NEXT:    iadd r6, r2, r3
-; CHECK-NEXT:    device_load 0, i16, xyzw, r8l_r8h_r9l_r9h, u2_u3, r3, signed
-; CHECK-NEXT:    device_load 1, i16, xyzw, r6l_r6h_r7l_r7h, u0_u1, r6, signed
+; CHECK-NEXT:    iadd r10, r2, r3
+; CHECK-NEXT:    device_load 0, i16, xyzw, r12l_r12h_r13l_r13h, u2_u3, r3, signed
+; CHECK-NEXT:    device_load 1, i16, xyzw, r10l_r10h_r11l_r11h, u0_u1, r10, signed
 ; CHECK-NEXT:    iadd r3, r3, 4
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    bfi r12, 0, r8, 16
+; CHECK-NEXT:    bitop 0101, r7h, r12l, 0
 ; CHECK-NEXT:    wait 1
-; CHECK-NEXT:    bfi r10, 0, r6, 16
-; CHECK-NEXT:    and r6, r6, r4
-; CHECK-NEXT:    and r8, r8, r4
+; CHECK-NEXT:    bitop 0101, r5h, r10l, 0
+; CHECK-NEXT:    and r10, r10, r4
+; CHECK-NEXT:    and r12, r12, r4
+; CHECK-NEXT:    fmul32 r14, r5, r7
+; CHECK-NEXT:    bitop 0101, r6h, r11l, 0
+; CHECK-NEXT:    bitop 0101, r9h, r13l, 0
 ; CHECK-NEXT:    fmul32 r10, r10, r12
-; CHECK-NEXT:    bfi r11, 0, r7, 16
-; CHECK-NEXT:    bfi r13, 0, r9, 16
-; CHECK-NEXT:    fmul32 r6, r6, r8
-; CHECK-NEXT:    fadd32 r5, r5, r10
-; CHECK-NEXT:    and r7, r7, r4
-; CHECK-NEXT:    and r9, r9, r4
-; CHECK-NEXT:    fmul32 r8, r11, r13
-; CHECK-NEXT:    fadd32 r5, r5, r6
-; CHECK-NEXT:    fmul32 r6, r7, r9
-; CHECK-NEXT:    fadd32 r5, r5, r8
-; CHECK-NEXT:    fadd32 r5, r5, r6
-; CHECK-NEXT:    fadd32 r5, r5, 0.0
+; CHECK-NEXT:    fadd32 r8, r8, r14
+; CHECK-NEXT:    and r11, r11, r4
+; CHECK-NEXT:    and r13, r13, r4
+; CHECK-NEXT:    fmul32 r12, r6, r9
+; CHECK-NEXT:    fadd32 r8, r8, r10
+; CHECK-NEXT:    fmul32 r10, r11, r13
+; CHECK-NEXT:    fadd32 r8, r8, r12
+; CHECK-NEXT:    fadd32 r8, r8, r10
+; CHECK-NEXT:    fadd32 r8, r8, 0.0
 ; CHECK-NEXT:    while_icmp r0l, ult, r3, u6, 1
 ; CHECK-NEXT:    jmp_exec_any .LBB2_1
 ; CHECK-NEXT:  // %bb.2: // %exit
 ; CHECK-NEXT:    pop_exec r0l, 1
-; CHECK-NEXT:    device_store 0, i32, x, r5, u4_u5, r1, signed
+; CHECK-NEXT:    device_store 0, i32, x, r8, u4_u5, r1, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap
