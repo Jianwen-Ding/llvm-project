@@ -74,6 +74,23 @@ static cl::opt<bool> VersionByteLoads(
     "agx-align-version-byte-loads", cl::init(true), cl::Hidden,
     cl::desc("Raise scalar byte loads' alignment too"));
 
+static cl::opt<bool> VersionMaskBytes(
+    "agx-align-version-mask-bytes", cl::init(true), cl::Hidden,
+    cl::desc("Raise scalar byte loads' alignment where their values are only "
+             "compared (a mask's)"));
+
+/// Whether a byte load's value is only compared, extended or not (a mask's
+/// bytes for a select, L15-E593).
+static bool maskBytes(const Instruction &I) {
+  return !I.use_empty() && all_of(I.users(), [](const User *U) {
+    if (isa<ICmpInst>(U))
+      return true;
+    auto *C = dyn_cast<CastInst>(U);
+    return C && (isa<SExtInst>(C) || isa<ZExtInst>(C)) && !C->use_empty() &&
+           all_of(C->users(), [](const User *V) { return isa<ICmpInst>(V); });
+  });
+}
+
 /// Whether a byte load's value only goes, extended, into integer arithmetic
 /// (an int8 dot product's products): no bytes in 16-bit halves that a float
 /// conversion or a compare reads (q8_matvec, a byte mask's select lost).
@@ -245,7 +262,8 @@ static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
     if (getLoadStoreType(&I)->getScalarSizeInBits() < 16 &&
         !(VersionByteVectors && getLoadStoreType(&I)->isVectorTy()) &&
         !(VersionByteStores && isa<StoreInst>(I)) &&
-        !(VersionByteLoads && isa<LoadInst>(I) && integerBytes(I)))
+        !(VersionByteLoads && isa<LoadInst>(I) && integerBytes(I)) &&
+        !(VersionMaskBytes && isa<LoadInst>(I) && maskBytes(I)))
       continue;
     auto [Base, Off] = baseAndOffset(Ptr, SE);
     if (!Base)

@@ -4,6 +4,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning-elements=0 < %s | FileCheck %s --check-prefix=ONE
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-bytes-half-lanes=0 < %s | FileCheck %s --check-prefix=NOLANE
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-byte-pairs=0 < %s | FileCheck %s --check-prefix=NOPAIR
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-align-version-mask-bytes=0 < %s | FileCheck %s --check-prefix=NOMASK
 
 ; A loop over a half row known aligned to 2 bytes only: a copy for a 4-byte
 ; aligned base (a test of the kernel argument, uniform) whose loads at
@@ -92,6 +93,219 @@ l:
   br i1 %c, label %l, label %exit
 exit:
   store i32 %t3, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+; Bytes that are only compared (a mask for a select) are versioned too
+; (L15-E593): aligned, four load as one access (sixteen an iteration, as
+; a row loop's unrolled copies).
+; CHECK-LABEL: mask_select:
+; CHECK: and {{r[0-9]+}}, {{[ru][0-9]+}}, 3
+; CHECK: device_load {{[0-9]}}, i8, xyzw,
+; NOMASK-LABEL: mask_select:
+; NOMASK-NOT: i8, xyzw
+; NOMASK: stop
+define agx_kernel void @mask_select(ptr addrspace(1) %c, ptr addrspace(1) noalias %a, ptr addrspace(1) noalias %b, ptr addrspace(1) noalias %y) {
+entry:
+  br label %l
+l:
+  %i = phi i32 [ 0, %entry ], [ %i1, %l ]
+  %k0 = add i32 %i, 0
+  %z0 = zext i32 %k0 to i64
+  %gc0 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z0
+  %ga0 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z0
+  %gb0 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z0
+  %gy0 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z0
+  %m0 = load i8, ptr addrspace(1) %gc0, align 1
+  %av0 = load float, ptr addrspace(1) %ga0, align 4
+  %bv0 = load float, ptr addrspace(1) %gb0, align 4
+  %t0 = icmp ne i8 %m0, 0
+  %o0 = select i1 %t0, float %av0, float %bv0
+  store float %o0, ptr addrspace(1) %gy0, align 4
+  %k1 = add i32 %i, 1
+  %z1 = zext i32 %k1 to i64
+  %gc1 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z1
+  %ga1 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z1
+  %gb1 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z1
+  %gy1 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z1
+  %m1 = load i8, ptr addrspace(1) %gc1, align 1
+  %av1 = load float, ptr addrspace(1) %ga1, align 4
+  %bv1 = load float, ptr addrspace(1) %gb1, align 4
+  %t1 = icmp ne i8 %m1, 0
+  %o1 = select i1 %t1, float %av1, float %bv1
+  store float %o1, ptr addrspace(1) %gy1, align 4
+  %k2 = add i32 %i, 2
+  %z2 = zext i32 %k2 to i64
+  %gc2 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z2
+  %ga2 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z2
+  %gb2 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z2
+  %gy2 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z2
+  %m2 = load i8, ptr addrspace(1) %gc2, align 1
+  %av2 = load float, ptr addrspace(1) %ga2, align 4
+  %bv2 = load float, ptr addrspace(1) %gb2, align 4
+  %t2 = icmp ne i8 %m2, 0
+  %o2 = select i1 %t2, float %av2, float %bv2
+  store float %o2, ptr addrspace(1) %gy2, align 4
+  %k3 = add i32 %i, 3
+  %z3 = zext i32 %k3 to i64
+  %gc3 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z3
+  %ga3 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z3
+  %gb3 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z3
+  %gy3 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z3
+  %m3 = load i8, ptr addrspace(1) %gc3, align 1
+  %av3 = load float, ptr addrspace(1) %ga3, align 4
+  %bv3 = load float, ptr addrspace(1) %gb3, align 4
+  %t3 = icmp ne i8 %m3, 0
+  %o3 = select i1 %t3, float %av3, float %bv3
+  store float %o3, ptr addrspace(1) %gy3, align 4
+  %k4 = add i32 %i, 4
+  %z4 = zext i32 %k4 to i64
+  %gc4 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z4
+  %ga4 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z4
+  %gb4 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z4
+  %gy4 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z4
+  %m4 = load i8, ptr addrspace(1) %gc4, align 1
+  %av4 = load float, ptr addrspace(1) %ga4, align 4
+  %bv4 = load float, ptr addrspace(1) %gb4, align 4
+  %t4 = icmp ne i8 %m4, 0
+  %o4 = select i1 %t4, float %av4, float %bv4
+  store float %o4, ptr addrspace(1) %gy4, align 4
+  %k5 = add i32 %i, 5
+  %z5 = zext i32 %k5 to i64
+  %gc5 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z5
+  %ga5 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z5
+  %gb5 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z5
+  %gy5 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z5
+  %m5 = load i8, ptr addrspace(1) %gc5, align 1
+  %av5 = load float, ptr addrspace(1) %ga5, align 4
+  %bv5 = load float, ptr addrspace(1) %gb5, align 4
+  %t5 = icmp ne i8 %m5, 0
+  %o5 = select i1 %t5, float %av5, float %bv5
+  store float %o5, ptr addrspace(1) %gy5, align 4
+  %k6 = add i32 %i, 6
+  %z6 = zext i32 %k6 to i64
+  %gc6 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z6
+  %ga6 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z6
+  %gb6 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z6
+  %gy6 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z6
+  %m6 = load i8, ptr addrspace(1) %gc6, align 1
+  %av6 = load float, ptr addrspace(1) %ga6, align 4
+  %bv6 = load float, ptr addrspace(1) %gb6, align 4
+  %t6 = icmp ne i8 %m6, 0
+  %o6 = select i1 %t6, float %av6, float %bv6
+  store float %o6, ptr addrspace(1) %gy6, align 4
+  %k7 = add i32 %i, 7
+  %z7 = zext i32 %k7 to i64
+  %gc7 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z7
+  %ga7 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z7
+  %gb7 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z7
+  %gy7 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z7
+  %m7 = load i8, ptr addrspace(1) %gc7, align 1
+  %av7 = load float, ptr addrspace(1) %ga7, align 4
+  %bv7 = load float, ptr addrspace(1) %gb7, align 4
+  %t7 = icmp ne i8 %m7, 0
+  %o7 = select i1 %t7, float %av7, float %bv7
+  store float %o7, ptr addrspace(1) %gy7, align 4
+  %k8 = add i32 %i, 8
+  %z8 = zext i32 %k8 to i64
+  %gc8 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z8
+  %ga8 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z8
+  %gb8 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z8
+  %gy8 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z8
+  %m8 = load i8, ptr addrspace(1) %gc8, align 1
+  %av8 = load float, ptr addrspace(1) %ga8, align 4
+  %bv8 = load float, ptr addrspace(1) %gb8, align 4
+  %t8 = icmp ne i8 %m8, 0
+  %o8 = select i1 %t8, float %av8, float %bv8
+  store float %o8, ptr addrspace(1) %gy8, align 4
+  %k9 = add i32 %i, 9
+  %z9 = zext i32 %k9 to i64
+  %gc9 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z9
+  %ga9 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z9
+  %gb9 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z9
+  %gy9 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z9
+  %m9 = load i8, ptr addrspace(1) %gc9, align 1
+  %av9 = load float, ptr addrspace(1) %ga9, align 4
+  %bv9 = load float, ptr addrspace(1) %gb9, align 4
+  %t9 = icmp ne i8 %m9, 0
+  %o9 = select i1 %t9, float %av9, float %bv9
+  store float %o9, ptr addrspace(1) %gy9, align 4
+  %k10 = add i32 %i, 10
+  %z10 = zext i32 %k10 to i64
+  %gc10 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z10
+  %ga10 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z10
+  %gb10 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z10
+  %gy10 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z10
+  %m10 = load i8, ptr addrspace(1) %gc10, align 1
+  %av10 = load float, ptr addrspace(1) %ga10, align 4
+  %bv10 = load float, ptr addrspace(1) %gb10, align 4
+  %t10 = icmp ne i8 %m10, 0
+  %o10 = select i1 %t10, float %av10, float %bv10
+  store float %o10, ptr addrspace(1) %gy10, align 4
+  %k11 = add i32 %i, 11
+  %z11 = zext i32 %k11 to i64
+  %gc11 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z11
+  %ga11 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z11
+  %gb11 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z11
+  %gy11 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z11
+  %m11 = load i8, ptr addrspace(1) %gc11, align 1
+  %av11 = load float, ptr addrspace(1) %ga11, align 4
+  %bv11 = load float, ptr addrspace(1) %gb11, align 4
+  %t11 = icmp ne i8 %m11, 0
+  %o11 = select i1 %t11, float %av11, float %bv11
+  store float %o11, ptr addrspace(1) %gy11, align 4
+  %k12 = add i32 %i, 12
+  %z12 = zext i32 %k12 to i64
+  %gc12 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z12
+  %ga12 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z12
+  %gb12 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z12
+  %gy12 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z12
+  %m12 = load i8, ptr addrspace(1) %gc12, align 1
+  %av12 = load float, ptr addrspace(1) %ga12, align 4
+  %bv12 = load float, ptr addrspace(1) %gb12, align 4
+  %t12 = icmp ne i8 %m12, 0
+  %o12 = select i1 %t12, float %av12, float %bv12
+  store float %o12, ptr addrspace(1) %gy12, align 4
+  %k13 = add i32 %i, 13
+  %z13 = zext i32 %k13 to i64
+  %gc13 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z13
+  %ga13 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z13
+  %gb13 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z13
+  %gy13 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z13
+  %m13 = load i8, ptr addrspace(1) %gc13, align 1
+  %av13 = load float, ptr addrspace(1) %ga13, align 4
+  %bv13 = load float, ptr addrspace(1) %gb13, align 4
+  %t13 = icmp ne i8 %m13, 0
+  %o13 = select i1 %t13, float %av13, float %bv13
+  store float %o13, ptr addrspace(1) %gy13, align 4
+  %k14 = add i32 %i, 14
+  %z14 = zext i32 %k14 to i64
+  %gc14 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z14
+  %ga14 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z14
+  %gb14 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z14
+  %gy14 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z14
+  %m14 = load i8, ptr addrspace(1) %gc14, align 1
+  %av14 = load float, ptr addrspace(1) %ga14, align 4
+  %bv14 = load float, ptr addrspace(1) %gb14, align 4
+  %t14 = icmp ne i8 %m14, 0
+  %o14 = select i1 %t14, float %av14, float %bv14
+  store float %o14, ptr addrspace(1) %gy14, align 4
+  %k15 = add i32 %i, 15
+  %z15 = zext i32 %k15 to i64
+  %gc15 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z15
+  %ga15 = getelementptr inbounds float, ptr addrspace(1) %a, i64 %z15
+  %gb15 = getelementptr inbounds float, ptr addrspace(1) %b, i64 %z15
+  %gy15 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z15
+  %m15 = load i8, ptr addrspace(1) %gc15, align 1
+  %av15 = load float, ptr addrspace(1) %ga15, align 4
+  %bv15 = load float, ptr addrspace(1) %gb15, align 4
+  %t15 = icmp ne i8 %m15, 0
+  %o15 = select i1 %t15, float %av15, float %bv15
+  store float %o15, ptr addrspace(1) %gy15, align 4
+  %i1 = add i32 %i, 16
+  %c1 = icmp ult i32 %i1, 1024
+  br i1 %c1, label %l, label %x
+x:
   ret void
 }
 
