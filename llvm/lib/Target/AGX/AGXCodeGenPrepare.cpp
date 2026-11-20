@@ -8486,10 +8486,44 @@ static bool byteFloatsALU(Function &F) {
   bool Changed = false;
   std::optional<DominatorTree> DT;
   std::optional<LoopInfo> LI;
+  const DataLayout &DL = F.getDataLayout();
   for (Instruction &I : make_early_inc_range(instructions(F))) {
-    auto *C = dyn_cast<SIToFPInst>(&I);
-    if (!C || !C->getOperand(0)->getType()->isIntegerTy(8) ||
-        !(C->getType()->isFloatTy() || C->getType()->isHalfTy()))
+    auto *C = dyn_cast<CastInst>(&I);
+    if (!C || !(isa<SIToFPInst>(C) || isa<UIToFPInst>(C)) ||
+        !(C->getType()->isFloatTy() || C->getType()->isHalfTy()) ||
+        !C->getOperand(0)->getType()->isIntegerTy() ||
+        C->getOperand(0)->getType()->getIntegerBitWidth() > 32)
+      continue;
+    // the operand as U + K, U below 1024 by its known bits (a nibble, a
+    // byte's zero extension: q4 weights' (q & 15) - 8): the half
+    // U | 0x6400 is 1024 + U, less 1024 - K it is U + K exactly (integers
+    // to 2048 are halves) (L15-E534)
+    Value *U = C->getOperand(0);
+    int64_t K = 0;
+    {
+      using namespace PatternMatch;
+      const APInt *KC;
+      if (match(U, m_Add(m_Value(U), m_APInt(KC))) &&
+          KC->getSignificantBits() <= 12)
+        K = KC->getSExtValue();
+      else
+        U = C->getOperand(0);
+    }
+    // (U + K, its sum in U's type: neither wraps there; for sitofp U's sign
+    // clear, for uitofp the sum not negative)
+    KnownBits KB = computeKnownBits(U, DL);
+    unsigned W = U->getType()->getIntegerBitWidth();
+    int64_t MaxU = int64_t(KB.getMaxValue().getZExtValue());
+    bool Small = MaxU < 1024 && K >= -1024 && K <= 1024;
+    if (Small && isa<SIToFPInst>(C))
+      Small = !KB.Zero.isZero() && KB.countMinLeadingZeros() >= 1 &&
+              MaxU + K <= (int64_t(1) << (W - 1)) - 1 &&
+              K >= -(int64_t(1) << (W - 1));
+    else if (Small)
+      Small = K >= 0 && MaxU + K <= int64_t((uint64_t(1) << W) - 1);
+    bool SignedByte = isa<SIToFPInst>(C) &&
+                      C->getOperand(0)->getType()->isIntegerTy(8);
+    if (!SignedByte && !Small)
       continue;
     // (in a loop, whose two constants are hoisted: alone they are two
     // mov_imm, four instructions for the convert's one)
@@ -8512,9 +8546,16 @@ static bool byteFloatsALU(Function &F) {
         }))
       continue;
     IRBuilder<> B(C);
-    Value *Z = B.CreateZExt(C->getOperand(0), B.getInt16Ty());
-    Value *H = B.CreateBitCast(B.CreateXor(Z, 0x6480), B.getHalfTy());
-    Value *S = B.CreateFSub(H, ConstantFP::get(B.getHalfTy(), 1152.0));
+    Value *S;
+    if (Small && !SignedByte) {
+      Value *Z = B.CreateZExtOrTrunc(U, B.getInt16Ty());
+      Value *H = B.CreateBitCast(B.CreateOr(Z, 0x6400), B.getHalfTy());
+      S = B.CreateFSub(H, ConstantFP::get(B.getHalfTy(), 1024.0 - K));
+    } else {
+      Value *Z = B.CreateZExt(C->getOperand(0), B.getInt16Ty());
+      Value *H = B.CreateBitCast(B.CreateXor(Z, 0x6480), B.getHalfTy());
+      S = B.CreateFSub(H, ConstantFP::get(B.getHalfTy(), 1152.0));
+    }
     Value *R = C->getType()->isHalfTy() ? S : B.CreateFPExt(S, C->getType());
     R->takeName(C);
     C->replaceAllUsesWith(R);

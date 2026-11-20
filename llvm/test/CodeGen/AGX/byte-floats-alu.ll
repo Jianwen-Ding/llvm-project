@@ -61,3 +61,42 @@ define agx_kernel void @alone(ptr addrspace(1) %a, ptr addrspace(1) %o) {
   store float %g, ptr addrspace(1) %po
   ret void
 }
+
+; A value below 1024 by its known bits plus a constant (q4 weights' nibble
+; less 8, L15-E534): the half U | 0x6400 is 1024 + U, less 1024 - K it is
+; U + K exactly.
+; CHECK-LABEL: nibbles:
+; CHECK-NOT: convert
+; CHECK: or {{r[0-9]+}}l, {{r[0-9]+}}l, {{r[0-9]+}}l
+; CHECK: fadd16
+; CHECK: device_store
+define agx_kernel void @nibbles(ptr addrspace(1) %a, ptr addrspace(1) %w, ptr addrspace(1) %o) {
+entry:
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %base = mul i32 %i, 256
+  br label %loop
+loop:
+  %j = phi i32 [ 0, %entry ], [ %j1, %loop ]
+  %acc = phi float [ 0.0, %entry ], [ %a2, %loop ]
+  %ij = add i32 %base, %j
+  %pa = getelementptr i8, ptr addrspace(1) %a, i32 %ij
+  %q = load i8, ptr addrspace(1) %pa
+  %pw = getelementptr float, ptr addrspace(1) %w, i32 %j
+  %wv = load float, ptr addrspace(1) %pw
+  %qz = zext i8 %q to i32
+  %lo = and i32 %qz, 15
+  %lo8 = add nsw i32 %lo, -8
+  %flo = sitofp i32 %lo8 to float
+  %hi = lshr i32 %qz, 4
+  %hi8 = add nsw i32 %hi, -8
+  %fhi = sitofp i32 %hi8 to float
+  %a1 = call float @llvm.fma.f32(float %flo, float %wv, float %acc)
+  %a2 = call float @llvm.fma.f32(float %fhi, float %wv, float %a1)
+  %j1 = add i32 %j, 1
+  %c = icmp ult i32 %j1, 256
+  br i1 %c, label %loop, label %exit
+exit:
+  %po = getelementptr float, ptr addrspace(1) %o, i32 %i
+  store float %a2, ptr addrspace(1) %po
+  ret void
+}
