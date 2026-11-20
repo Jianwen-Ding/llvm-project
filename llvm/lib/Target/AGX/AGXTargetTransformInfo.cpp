@@ -158,6 +158,12 @@ static cl::opt<bool> AGXDeviceUnrollStreamsVectors(
     cl::desc("agx-device-unroll-streams only for loops whose device loads are "
              "all vectors"));
 
+static cl::opt<bool> AGXDeviceUnrollKeepLoop(
+    "agx-device-unroll-keep-loop", cl::init(true), cl::Hidden,
+    cl::desc("A device-load loop of a loop-carried maximum / minimum and more "
+             "than 16 trips stays a loop: its factor at most half the trip "
+             "count, no full unrolling"));
+
 static cl::opt<unsigned> AGXDeviceUnroll(
     "agx-device-unroll", cl::init(4), cl::Hidden,
     cl::desc("Iterations a single-block loop that loads device memory, of a "
@@ -439,10 +445,30 @@ void AGXTTIImpl::getUnrollingPreferences(
     unsigned Trips = SE.getSmallConstantTripCount(L);
     bool DeviceLoads = false;
     unsigned F = deviceUnrollFactor(L, SE, DL, Trips, DeviceLoads);
+    // A loop-carried maximum / minimum (whose selects
+    // deferredMinMaxReductions rewrites only in a loop) stays a loop: not
+    // unrolled whole, by the factor or LoopUnroll's own full unrolling
+    // (L15-E511).
+    bool MinMax =
+        AGXDeviceUnrollKeepLoop && Trips > 16 &&
+        any_of(L->getHeader()->phis(), [](const PHINode &P) {
+          return any_of(P.users(), [](const User *U) {
+            auto *II = dyn_cast<IntrinsicInst>(U);
+            return II && (II->getIntrinsicID() == Intrinsic::maximum ||
+                          II->getIntrinsicID() == Intrinsic::minimum);
+          });
+        });
+    // (Short loops, 16 trips at most, still whole: newk's logsoftmax and
+    // softmax_f16 of 4 lost as loops.)
+    if (MinMax && F >= Trips && Trips > 16)
+      F = Trips / 2;
+
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
       UP.Partial = true;
       UP.MaxCount = F;
       UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      if (MinMax)
+        UP.FullUnrollMaxCount = F;
     }
     return;
   }

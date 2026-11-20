@@ -2403,6 +2403,107 @@ static bool narrowI32BoundsLoop(scf::ForOp loop, IRRewriter &rewriter) {
   return false;
 }
 
+/// The values [lo, hi] an index takes, where it is built from constants,
+/// lane and thread positions (their upper_bound, the subgroup size 32 or the
+/// known threadgroup size) by additions and multiplications by constants, all
+/// non-negative.
+static std::optional<std::pair<int64_t, int64_t>> indexRange(Value v,
+                                                             int depth = 0) {
+  if (depth > 8)
+    return std::nullopt;
+  if (std::optional<int64_t> c = getConstantIntValue(v))
+    return *c >= 0 ? std::optional(std::make_pair(*c, *c)) : std::nullopt;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+  if (auto lane = dyn_cast<gpu::LaneIdOp>(op)) {
+    int64_t n = 32;
+    if (std::optional<APInt> b = lane.getUpperBound())
+      n = std::min<int64_t>(n, b->getZExtValue());
+    return std::make_pair(int64_t(0), n - 1);
+  }
+  if (auto tid = dyn_cast<gpu::ThreadIdOp>(op)) {
+    std::optional<int64_t> n;
+    if (std::optional<APInt> b = tid.getUpperBound())
+      n = b->getZExtValue();
+    if (std::optional<uint32_t> bs = gpu::getKnownDimensionSizeAround(
+            tid, gpu::DimensionKind::Block, tid.getDimension()))
+      n = n ? std::min<int64_t>(*n, *bs) : int64_t(*bs);
+    if (!n || *n < 1)
+      return std::nullopt;
+    return std::make_pair(int64_t(0), *n - 1);
+  }
+  if (isa<arith::AddIOp, arith::MulIOp>(op)) {
+    auto a = indexRange(op->getOperand(0), depth + 1);
+    auto b = a ? indexRange(op->getOperand(1), depth + 1) : std::nullopt;
+    if (!b || a->second > (int64_t(1) << 31) || b->second > (int64_t(1) << 31))
+      return std::nullopt;
+    if (isa<arith::AddIOp>(op))
+      return std::make_pair(a->first + b->first, a->second + b->second);
+    return std::make_pair(a->first * b->first, a->second * b->second);
+  }
+  return std::nullopt;
+}
+
+/// An scf.for over index from a lb of values [lo, hi] (indexRange) to a
+/// constant ub by a constant step, where every lb gives the same trip count
+/// T = ceil((ub - lb) / step) > 0: a loop over k from 0 to T by 1, iv = lb +
+/// k * step (the same iterations in the same order). Its trip count is then
+/// a constant LLVM sees (a lane-strided row loop, `scf.for %j = %lane to
+/// %c1024 step %c32`, runs 32 times for every lane), which the AGX unroller
+/// needs (L15-E511).
+static void constantTripLoops(gpu::GPUModuleOp m) {
+  SmallVector<scf::ForOp> loops;
+  m.walk([&](scf::ForOp loop) {
+    if (loop.getInductionVar().getType().isIndex() && !loop.getUnsignedCmp())
+      loops.push_back(loop);
+  });
+  IRRewriter rewriter(m.getContext());
+  for (scf::ForOp loop : loops) {
+    std::optional<int64_t> ub = getConstantIntValue(loop.getUpperBound());
+    std::optional<int64_t> step = getConstantIntValue(loop.getStep());
+    if (!ub || !step || *step <= 0 || *ub <= 0 || *ub > (int64_t(1) << 31) ||
+        getConstantIntValue(loop.getLowerBound()))
+      continue;
+    // (an iv compared, a window's j <= row, keeps its loop: LLVM bounds the
+    // iterations by it)
+    if (any_of(loop.getInductionVar().getUsers(),
+               [](Operation *u) { return isa<arith::CmpIOp>(u); }))
+      continue;
+    std::optional<std::pair<int64_t, int64_t>> r =
+        indexRange(loop.getLowerBound());
+    if (!r || r->second >= *ub)
+      continue;
+    auto trips = [&](int64_t lb) { return (*ub - lb + *step - 1) / *step; };
+    int64_t t = trips(r->first);
+    if (t != trips(r->second) || t < 2)
+      continue;
+    Location loc = loop.getLoc();
+    rewriter.setInsertionPoint(loop);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value count = arith::ConstantIndexOp::create(rewriter, loc, t);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    auto newLoop = scf::ForOp::create(rewriter, loc, zero, count, one,
+                                      loop.getInitArgs());
+    Block *body = newLoop.getBody();
+    if (!body->empty())
+      rewriter.eraseOp(body->getTerminator());
+    rewriter.setInsertionPointToStart(body);
+    // (lb + k step <= hi + (T - 1) step < ub: no wrap)
+    auto flags = arith::IntegerOverflowFlags::nuw |
+                 arith::IntegerOverflowFlags::nsw;
+    Value offset = arith::MulIOp::create(rewriter, loc,
+                                         newLoop.getInductionVar(),
+                                         loop.getStep(), flags);
+    Value iv = arith::AddIOp::create(rewriter, loc, loop.getLowerBound(),
+                                     offset, flags);
+    SmallVector<Value> args{iv};
+    llvm::append_range(args, newLoop.getRegionIterArgs());
+    rewriter.mergeBlocks(loop.getBody(), body, args);
+    rewriter.replaceOp(loop, newLoop.getResults());
+  }
+}
+
 /// An scf.for over index whose offsets o = iv - lb are below a bound B <=
 /// 2^31 (loopOffsetBound) is a loop over o in i32, unsigned: from 0 to
 /// umin(ub - lb, B) (0 for ub <= lb) by umin(step, B), with iv = lb + o.
@@ -2767,6 +2868,8 @@ struct LowerGpuOpsToAIROpsPass final
         kernelBounds[f.getName()] = bounds;
     });
     ::approximateHalfFunctions = approximateHalfFunctions;
+    if (constantTripLoops)
+      ::constantTripLoops(m);
     if (narrowLoops)
       ::narrowLoops(m);
     if (narrowIndices)
