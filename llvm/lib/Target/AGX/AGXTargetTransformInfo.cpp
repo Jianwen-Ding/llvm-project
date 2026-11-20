@@ -142,8 +142,13 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollFullMaxSize(
+    "agx-device-unroll-full-max-size", cl::init(1024), cl::Hidden,
+    cl::desc("Trips times the loop's instructions above which "
+             "-agx-device-unroll-full-trips does not unroll it whole"));
+
 static cl::opt<unsigned> AGXDeviceUnrollFullTrips(
-    "agx-device-unroll-full-trips", cl::init(32), cl::Hidden,
+    "agx-device-unroll-full-trips", cl::init(64), cl::Hidden,
     cl::desc("Device-load loops of at most this many trips (not running "
              "maxima) unrolled whole (0: not)"));
 
@@ -522,8 +527,12 @@ void AGXTTIImpl::getUnrollingPreferences(
                       II->getIntrinsicID() == Intrinsic::minimum);
       });
     });
+    // (and not past -agx-device-unroll-full-max-size instructions whole:
+    // a thread's 64-float row softmax, 64 trips, took 2521 machine
+    // instructions, L15-E551)
     if (!MinMax && !NumMinMax && DeviceLoads && Trips &&
-        Trips <= AGXDeviceUnrollFullTrips && F >= 2 && F < Trips)
+        Trips <= AGXDeviceUnrollFullTrips && F >= 2 && F < Trips &&
+        uint64_t(Trips) * L->getHeader()->size() <= AGXDeviceUnrollFullMaxSize)
       F = Trips;
 
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {

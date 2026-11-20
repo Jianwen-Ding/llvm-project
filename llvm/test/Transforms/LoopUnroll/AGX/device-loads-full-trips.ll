@@ -1,10 +1,12 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-full-trips=0 -S < %s | FileCheck %s --check-prefix=OFF
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-full-max-size=100 -S < %s | FileCheck %s --check-prefix=OFF
 
-; A device-load loop of at most 32 trips is unrolled whole (L15-E545): a row
-; pass of a SIMD-group's lane (32 trips, a 128-byte stride) that a later pass,
-; also whole, reads again takes its loads' and exponentials' values. Before,
-; the strided factor (16) left it a loop.
+; A device-load loop of at most 64 trips (32 until L15-E551) is unrolled whole
+; (L15-E545): a row pass of a SIMD-group's lane (32 trips, a 128-byte stride)
+; that a later pass, also whole, reads again takes its loads' and
+; exponentials' values. Before, the strided factor (16) left it a loop. Not
+; past 1024 instructions whole (trips times the loop's).
 
 ; CHECK-LABEL: @sum_exp(
 ; CHECK-NOT: br i1
