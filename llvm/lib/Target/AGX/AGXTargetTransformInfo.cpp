@@ -142,6 +142,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<bool> AGXDeviceUnrollSomeStrided(
+    "agx-device-unroll-some-strided", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-strided's factor also where only some of a "
+             "loop's device loads are strided"));
+
 static cl::opt<unsigned> AGXDeviceUnrollStreams(
     "agx-device-unroll-streams", cl::init(8), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
@@ -377,7 +382,7 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
                                    const DataLayout &DL, unsigned Trips,
                                    bool &DeviceLoads) {
   bool Narrow = true, Stores = false, Strided = true, Word = true,
-       Vectors = true;
+       Vectors = true, SomeStrided = false;
   DeviceLoads = false;
   // The pointer bases the device loads step through (a dot product's two
   // rows): L15-E506.
@@ -397,9 +402,11 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
           isa<SCEVAddRecExpr>(P) &&
           cast<SCEVAddRecExpr>(P)->getLoop() == L)
         Streams.insert(SE.getPointerBase(P));
-      if (Strided) {
+      {
         std::optional<APInt> S = deviceLoadStride(*LI, L, SE, DL);
-        Strided = S && S->ugt(64);
+        bool Far = S && S->ugt(64);
+        Strided &= Far;
+        SomeStrided |= Far;
       }
     }
   auto Divides = [&](unsigned F) { return F && Trips >= F && Trips % F == 0; };
@@ -410,6 +417,11 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
   if (!Narrow && Stores && Divides(AGXDeviceUnrollStore))
     return AGXDeviceUnrollStore;
   if (!Narrow && !Stores && Strided && Divides(AGXDeviceUnrollStrided))
+    return AGXDeviceUnrollStrided;
+  // (a strided load beside contiguous ones: a naive matrix product's column
+  // of B beside A's row, L15-E535)
+  if (AGXDeviceUnrollSomeStrided && !Narrow && !Stores && SomeStrided &&
+      Divides(AGXDeviceUnrollStrided))
     return AGXDeviceUnrollStrided;
   // Two or more streams (no stores): a dot product's iteration is two loads
   // and a multiply-add per element, so 4 iterations' loads still leave it
