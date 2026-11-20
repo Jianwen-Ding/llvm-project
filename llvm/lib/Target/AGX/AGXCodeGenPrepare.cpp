@@ -41,6 +41,7 @@
 #include "AGXMachineFunctionInfo.h"
 #include "AGXSubtarget.h"
 #include "llvm/ADT/GenericUniformityImpl.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -9305,6 +9306,77 @@ static bool onlyFlushingUses(Value *V) {
   return true;
 }
 
+static cl::opt<bool> AGXRareHardwareBranch(
+    "agx-rare-hardware-branch", cl::init(true), cl::Hidden,
+    cl::desc("the expansions' hardware fallbacks (sin and cos past 2^22) in "
+             "a block run only where a thread needs them"));
+
+static cl::opt<unsigned> AGXRareFallbacksMin(
+    "agx-rare-fallbacks-min", cl::init(2), cl::Hidden,
+    cl::desc("fewest fallbacks of one condition in a block branched around"));
+
+/// The expansions' selects sel(c, a, h) whose h is a fallback for rare
+/// arguments (a call marked agx.rare: sin and cos's hardware reduction past
+/// 2^22) take h from a block branched to only where c is false: a SIMD-group
+/// whose threads all have c skips it (L15-E504). The selects of one block and
+/// condition share the block (sincos's two). After the SimplifyCFG before
+/// structurization, which would speculate h again (AGXRareFallbacks).
+static bool branchRareFallbacks(Function &F) {
+  MapVector<std::pair<BasicBlock *, Value *>, SmallVector<SelectInst *, 2>>
+      Groups;
+  for (Instruction &I : instructions(F)) {
+    auto *S = dyn_cast<SelectInst>(&I);
+    // (unused: the half of a sin or cos expansion not asked for, until dead
+    // code elimination)
+    if (!S || S->use_empty() || !S->getCondition()->getType()->isIntegerTy(1))
+      continue;
+    auto *H = dyn_cast<CallInst>(S->getFalseValue());
+    if (!H || !H->getMetadata("agx.rare") || !H->hasOneUse() ||
+        H->getParent() != S->getParent())
+      continue;
+    Groups[{S->getParent(), S->getCondition()}].push_back(S);
+  }
+  bool Changed = false;
+  for (auto &[Key, Sels] : Groups) {
+    // (one hardware sin or cos is 8 instructions, which AGXLowerControlFlow
+    // runs with an empty mask rather than jump over: the if would only add
+    // its own two)
+    if (Sels.size() < AGXRareFallbacksMin)
+      continue;
+    auto [BB, C] = Key;
+    SelectInst *First = Sels.front();
+    auto Before = [&](Value *V) {
+      auto *I = dyn_cast<Instruction>(V);
+      return !I || I->getParent() != BB || I->comesBefore(First);
+    };
+    if (!Before(C) || !all_of(Sels, [&](SelectInst *S) {
+          // (h moves to the new block: its operands must be there before)
+          return Before(S->getTrueValue()) &&
+                 all_of(cast<Instruction>(S->getFalseValue())->operands(),
+                        Before);
+        }))
+      continue;
+    BasicBlock *Tail = SplitBlock(BB, First);
+    BasicBlock *Rare =
+        BasicBlock::Create(F.getContext(), BB->getName() + ".rare", &F, Tail);
+    IRBuilder<>(Rare).CreateBr(Tail);
+    BB->getTerminator()->eraseFromParent();
+    IRBuilder<>(BB).CreateCondBr(C, Tail, Rare);
+    for (SelectInst *S : Sels) {
+      auto *H = cast<Instruction>(S->getFalseValue());
+      H->moveBefore(Rare->getTerminator()->getIterator());
+      PHINode *P = PHINode::Create(S->getType(), 2, S->getName(),
+                                   Tail->begin());
+      P->addIncoming(S->getTrueValue(), BB);
+      P->addIncoming(H, Rare);
+      S->replaceAllUsesWith(P);
+      S->eraseFromParent();
+    }
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
   bool Changed = expandRoundToInt(F);
   Changed |= expandPowI(F);
@@ -9461,4 +9533,28 @@ bool AGXCodeGenPrepare::fenceHostCoherentAccesses(Function &F) {
     B.CreateCall(Barrier, {B.getInt32(A), B.getInt32(Bv), B.getInt32(C)});
   }
   return true;
+}
+
+namespace {
+/// branchRareFallbacks as a pass of its own, after the SimplifyCFG before
+/// structurization.
+class AGXRareFallbacks : public FunctionPass {
+public:
+  static char ID;
+  AGXRareFallbacks() : FunctionPass(ID) {}
+  StringRef getPassName() const override { return "AGX Rare Fallbacks"; }
+  bool runOnFunction(Function &F) override {
+    return AGXRareHardwareBranch && !skipFunction(F) &&
+           branchRareFallbacks(F);
+  }
+};
+} // namespace
+
+char AGXRareFallbacks::ID = 0;
+
+INITIALIZE_PASS(AGXRareFallbacks, "agx-rare-fallbacks", "AGX Rare Fallbacks",
+                false, false)
+
+FunctionPass *llvm::createAGXRareFallbacksPass() {
+  return new AGXRareFallbacks();
 }

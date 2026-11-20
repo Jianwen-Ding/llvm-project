@@ -1034,12 +1034,18 @@ public:
     auto Hw = [&](Intrinsic::ID ID) {
       Value *V = B.CreateIntrinsic(ID, {Ty}, {X});
       cast<Instruction>(V)->setHasApproxFunc(true);
+      // (for |x| from 2^22 only: AGXCodeGenPrepare branches around it)
+      cast<Instruction>(V)->setMetadata("agx.rare",
+                                        MDNode::get(B.getContext(), {}));
       return V;
     };
     if (ForQuotient) {
       Value *Odd = B.CreateICmpNE(B.CreateAnd(Q, ki(1)), ki(0));
-      return {sel(Small, sel(Odd, B.CreateFNeg(C), S), Hw(Intrinsic::sin)),
-              sel(Small, sel(Odd, S, C), Hw(Intrinsic::cos))};
+      // (both before the selects of the range: AGXRareFallbacks moves the
+      // hardware's into one block)
+      Value *N = sel(Odd, B.CreateFNeg(C), S), *D = sel(Odd, S, C);
+      Value *HwN = Hw(Intrinsic::sin), *HwD = Hw(Intrinsic::cos);
+      return {sel(Small, N, HwN), sel(Small, D, HwD)};
     }
     Value *Sin = Quadrant(Q, false), *Cos = Quadrant(Q, true);
     return {sel(Small, Sin, Hw(Intrinsic::sin)),

@@ -77,6 +77,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXExpandWideAtomicsPass(PR);
   initializeAGXAnnotateControlFlowPass(PR);
   initializeAGXSinkAddressesPass(PR);
+  initializeAGXRareFallbacksPass(PR);
   initializeAGXThreadgroupAddressesPass(PR);
   initializeAGXHoistGuardedLoadsPass(PR);
   initializeAGXAlignmentVersioningPass(PR);
@@ -846,6 +847,9 @@ bool AGXPassConfig::addPreISel() {
         SimplifyCFGOptions()
             .bonusInstThreshold(AGXPreISelSimplifyCFG)
             .setSimplifyCondBranch(false)));
+  // After that SimplifyCFG, which would speculate the fallbacks again.
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAGXRareFallbacksPass());
   // Bring the CFG into the structured form AGXAnnotateControlFlow expects.
   addPass(createLowerSwitchPass());
   addPass(createFixIrreduciblePass());
