@@ -60,6 +60,12 @@ static cl::opt<bool> Exp2BoundsByArg(
              "clamps of x and no NaN select"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> HalfExpOverflowByArg(
+    "agx-half-exp-overflow-by-arg",
+    cl::desc("sinh / cosh's e^a / 2: +inf by a compare of a, no clamp and "
+             "no NaN select"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> ExpFlushedUnderflow(
     "agx-exp-flushed-underflow", cl::init(true), cl::Hidden,
     cl::desc("exp below a maximum whose users flush denormal operands: "
@@ -359,11 +365,20 @@ public:
     // One exponential: e^a / 2, or e^(a - ln 2) from 88 on, a - ln 2 as
     // (a - 0.693359375) + 2.12194440e-4 (the first exact for a >= 88: a
     // rounded a - ln 2 put the result up to 24 ulp off near the overflow).
+    // (Its +inf exactly from a = 89.4159927 (0x42b2d4fd), every float
+    // checked: by a compare of a, without the clamp at 89 and the NaN
+    // select, as E485's 2^x: L15-E486.)
+    ArgBounds AB;
+    if (HalfExpOverflowByArg && ExpNonNegative) {
+      AB = boundsByArg(A, 89.4159927368164, 0.0);
+      AB.Zero = false;
+    }
     Value *Lt = lt(A, 88.0);
     return mul(sel(Lt, k(0.5), k(1.0)),
                expHiLo(sel(Lt, A, sub(A, k(0.693359375))),
                        sel(Lt, k(0.0), k(2.12194440e-4)), /*Bounded=*/false,
-                       /*NoOverflow=*/false, /*NonNegative=*/ExpNonNegative));
+                       /*NoOverflow=*/false, /*NonNegative=*/ExpNonNegative,
+                       AB));
   }
 
   /// 0.25 / h for h = e^a / 2 >= 0.5 (or a NaN): 0.25 times the correctly
@@ -669,7 +684,7 @@ public:
     bool Unclamped = !Lo && !Bounded && !NoOverflow && ExpUnclamped &&
                      ExpOverflowByArg && ExpMagicRound && NativeNaN &&
                      NoDenormals && IntegerLdexp;
-    if (Unclamped) {
+    if (Unclamped || AB.Arg) {
       C = Hi;
     } else if (NoOverflow && !Bounded && !Lo && FlushedUnderflow) {
       // (E474's +0 bound as the clamp: there the scaled bits are 0x007fffxx,
