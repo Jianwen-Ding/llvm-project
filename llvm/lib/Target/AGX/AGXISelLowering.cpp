@@ -1825,6 +1825,11 @@ static cl::opt<bool> AGXSignedBytesALU16(
     cl::desc("A byte with a zero high byte sign-extended in a 16-bit "
              "register as (x ^ 128) - 128 on the ALU"));
 
+static cl::opt<bool> AGXSignedBytesHalfLanes(
+    "agx-signed-bytes-half-lanes", cl::init(true), cl::Hidden,
+    cl::desc("A byte in an extended 16-bit lane sign-extended in the 16-bit "
+             "register, for 32-bit users' 16-bit sources"));
+
 static cl::opt<bool> AGXShiftedFieldInsert(
     "agx-shifted-field-insert", cl::init(true), cl::Hidden,
     cl::desc("(x << s) | q, s above 4 and q zero in x's field, as one bfi "
@@ -2474,6 +2479,30 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     if (N->getValueType(0) != MVT::i32)
       return SDValue();
     SDValue X = N->getOperand(0);
+    // An extended 16-bit lane with a zero high byte (a byte of a vector
+    // load): (y ^ 128) - 128 in its 16-bit register and that sign-extended,
+    // which a 32-bit user's 16-bit source folds (imadd, iadd: L15-E487),
+    // instead of a copy to 32 bits first.
+    if (AGXSignedBytesHalfLanes &&
+        (X.getOpcode() == ISD::ANY_EXTEND ||
+         X.getOpcode() == ISD::ZERO_EXTEND) &&
+        X.getOperand(0).getValueType() == MVT::i16 &&
+        DCI.DAG.computeKnownBits(X.getOperand(0)).countMinLeadingZeros() >=
+            8 &&
+        // (only for users with such sources: a shift left folded the
+        // subtraction into its iadd's addend, 26 -> 29 instructions)
+        all_of(N->users(), [](const SDNode *U) {
+          return U->getOpcode() == ISD::MUL || U->getOpcode() == ISD::ADD ||
+                 U->getOpcode() == ISD::SUB;
+        })) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDLoc DL(N);
+      auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i16); };
+      SDValue F =
+          DAG.getNode(ISD::XOR, DL, MVT::i16, X.getOperand(0), C(128));
+      F = DAG.getNode(ISD::SUB, DL, MVT::i16, F, C(128));
+      return DAG.getNode(ISD::SIGN_EXTEND, DL, MVT::i32, F);
+    }
     unsigned P = 0;
     if (X.getOpcode() == ISD::SRL && isa<ConstantSDNode>(X.getOperand(1)) &&
         X.getConstantOperandVal(1) <= 24 && SharedByteBias &&

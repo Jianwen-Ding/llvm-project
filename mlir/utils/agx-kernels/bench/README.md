@@ -40,6 +40,7 @@ the kernel's, as memory at VA).
 | `conv1d` | a 3-tap filter of x[i], x[i + 1], x[i + 2] |
 | `hist` | a 256-bin histogram of low bytes by device atomics |
 | `dot_vec4` | row dot products by `vector<4xf32>` fma and a `vector.reduction` of the lanes |
+| `dot_i8` | int8 GEMV: a thread per row, `vector<4xi8>` loads sign-extended to i32 products summed in a vector<4xi32> |
 | `shfl_sum` | SIMD-group sums by an xor shuffle tree, one store per group |
 | `hash` | a 32-bit hash mix: multiplies, rotates of products, an xor shift |
 | `h2` | `vector<2xf16>` accesses split into halves (2-byte alignment) and f16 arithmetic |

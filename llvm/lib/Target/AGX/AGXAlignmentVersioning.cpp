@@ -66,6 +66,11 @@ static cl::opt<bool> CountVectorElements(
     cl::desc("Count a vector access as its elements towards "
              "-agx-alignment-versioning-min"));
 
+static cl::opt<bool> VersionByteVectors(
+    "agx-alignment-versioning-byte-vectors", cl::init(true), cl::Hidden,
+    cl::desc("Count vector-of-byte accesses too (their lanes extended in "
+             "place)"));
+
 namespace {
 
 class AGXAlignmentVersioning : public FunctionPass {
@@ -190,8 +195,13 @@ static void findRaises(Loop &L, ScalarEvolution &SE,
         Ptr->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
       continue;
     // Not of bytes: a 4-byte load leaves each in a 16-bit half, which a
-    // sign extension copies out first (dot_i8: 29 -> 33 GPRs, tput +6%).
-    if (getLoadStoreType(&I)->getScalarSizeInBits() < 16)
+    // sign extension copied out first (dot_i8: 29 -> 33 GPRs, tput +6%).
+    // Since L15-E487 a vector of bytes' lanes are extended in their halves
+    // (a 16-bit source of their user): those count. (Scalar bytes still not:
+    // q8_matvec's converted bytes 201.9 -> 217.8 tput, q4_matvec's 289.4 ->
+    // 293.2.)
+    if (getLoadStoreType(&I)->getScalarSizeInBits() < 16 &&
+        !(VersionByteVectors && getLoadStoreType(&I)->isVectorTy()))
       continue;
     auto [Base, Off] = baseAndOffset(Ptr, SE);
     if (!Base)

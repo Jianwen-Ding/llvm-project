@@ -1,6 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning-elements=0 < %s | FileCheck %s --check-prefix=ONE
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-bytes-half-lanes=0 < %s | FileCheck %s --check-prefix=NOLANE
 
 ; A loop over a half row known aligned to 2 bytes only: a copy for a 4-byte
 ; aligned base (a test of the kernel argument, uniform) whose loads at
@@ -182,3 +183,60 @@ done:
   ret void
 }
 declare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)
+
+; A vector of bytes counts (L15-E487): its lanes are sign-extended in their
+; 16-bit halves, the products' 16-bit sources, without a copy to 32 bits.
+; (Scalar bytes, the case above, still not.)
+; CHECK-LABEL: dot_i8:
+; CHECK: and {{r[0-9]+}}, {{r[0-9]+}}, 3
+; CHECK: %loop
+; CHECK: device_load {{[0-9]}}, i8, x,
+; CHECK: %loop.aligned
+; CHECK: device_load {{[0-9]}}, i8, xyzw,
+; CHECK: xor {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, 128
+; CHECK: isub {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, 128
+; CHECK: imadd {{r[0-9]+}}, {{r[0-9]+[lh]}}.sx, {{r[0-9]+[lh]}}.sx,
+; CHECK: stop
+; NOLANE-LABEL: dot_i8:
+; NOLANE: %loop.aligned
+; NOLANE: bitop 0101, {{r[0-9]+}}, {{r[0-9]+[lh]}}, 0
+; NOLANE-NOT: .sx
+; NOLANE: stop
+; OFF-LABEL: dot_i8:
+; OFF-NOT: i8, xyzw
+; OFF: stop
+define agx_kernel void @dot_i8(ptr addrspace(1) %a, ptr addrspace(1) %x, ptr addrspace(1) %y) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %t64 = zext i32 %t to i64
+  %row = shl nuw nsw i64 %t64, 10
+  %base = getelementptr i8, ptr addrspace(1) %a, i64 %row
+  br label %loop
+
+loop:
+  %j = phi i64 [ 0, %entry ], [ %j.next, %loop ]
+  %acc = phi <4 x i32> [ zeroinitializer, %entry ], [ %acc.next, %loop ]
+  %pa = getelementptr i8, ptr addrspace(1) %base, i64 %j
+  %va = load <4 x i8>, ptr addrspace(1) %pa, align 1
+  %px = getelementptr i8, ptr addrspace(1) %x, i64 %j
+  %vx = load <4 x i8>, ptr addrspace(1) %px, align 1
+  %ea = sext <4 x i8> %va to <4 x i32>
+  %ex = sext <4 x i8> %vx to <4 x i32>
+  %p = mul nsw <4 x i32> %ex, %ea
+  %acc.next = add <4 x i32> %p, %acc
+  %j.next = add nuw nsw i64 %j, 4
+  %c = icmp ult i64 %j.next, 1024
+  br i1 %c, label %loop, label %exit
+
+exit:
+  %s0 = extractelement <4 x i32> %acc.next, i64 0
+  %s1 = extractelement <4 x i32> %acc.next, i64 1
+  %s2 = extractelement <4 x i32> %acc.next, i64 2
+  %s3 = extractelement <4 x i32> %acc.next, i64 3
+  %s01 = add i32 %s0, %s1
+  %s23 = add i32 %s2, %s3
+  %s = add i32 %s01, %s23
+  %py = getelementptr i32, ptr addrspace(1) %y, i64 %t64
+  store i32 %s, ptr addrspace(1) %py, align 4
+  ret void
+}
