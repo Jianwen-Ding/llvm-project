@@ -94,6 +94,8 @@ the kernel's, as memory at VA).
 | `silu_dyn` | SiLU, x / (1 + exp(-x)), over rows of a runtime length n (512 in the cost run), a thread per row |
 | `log_dyn` | log(x) + x over rows of a runtime length n (512 in the cost run), a thread per row |
 | `sin_dyn` | sin(x) + x over rows of a runtime length n (512 in the cost run), a thread per row |
+| `sincos_rows` | sin(x) cos(2x) over rows of 256, a thread per row |
+| `logpow_rows` | log(x) + pow(x, 0.75) over rows of 256 positive floats, a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
