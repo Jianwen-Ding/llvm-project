@@ -183,6 +183,11 @@ static cl::opt<bool> AGXDeviceUnrollSomeStrided(
     cl::desc("agx-device-unroll-strided's factor also where only some of a "
              "loop's device loads are strided"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
+    "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
+    cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
+             "light arithmetic is unrolled by, with a remainder (0: none)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollStoreLight(
     "agx-device-unroll-store-light", cl::init(8), cl::Hidden,
     cl::desc("Iterations a device-load loop that stores words and loads at "
@@ -671,6 +676,35 @@ void AGXTTIImpl::getUnrollingPreferences(
           }
         if (I.getOpcode() == Instruction::FDiv || I.isAtomic())
           Light = false;
+      }
+      // A row loop that stores (y[j] = f(x[j], w[j])): its contiguous word
+      // accesses, light arithmetic, unrolled with a remainder so that alias
+      // versioning's copy has iterations' loads to issue together
+      // (L15-E565).
+      if (!Light && !Far && Insts <= 24 && AGXDeviceUnrollRuntimeStores >= 2 &&
+          all_of(*L->getHeader(), [&](const Instruction &I) {
+            if (auto *SI = dyn_cast<StoreInst>(&I))
+              return SI->isSimple() &&
+                     SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+                     DL.getTypeStoreSize(SI->getValueOperand()->getType()) == 4;
+            if (auto *LI = dyn_cast<LoadInst>(&I))
+              return LI->isSimple() &&
+                     DL.getTypeStoreSize(LI->getType()) == 4;
+            if (auto *II = dyn_cast<IntrinsicInst>(&I))
+              return II->getIntrinsicID() == Intrinsic::fma ||
+                     II->getIntrinsicID() == Intrinsic::fmuladd ||
+                     II->getIntrinsicID() == Intrinsic::maxnum ||
+                     II->getIntrinsicID() == Intrinsic::minnum ||
+                     II->getIntrinsicID() == Intrinsic::maximum ||
+                     II->getIntrinsicID() == Intrinsic::minimum ||
+                     II->getIntrinsicID() == Intrinsic::fabs;
+            return !isa<CallBase>(I) && !I.isAtomic() &&
+                   I.getOpcode() != Instruction::FDiv;
+          })) {
+        UP.Partial = UP.Runtime = true;
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount =
+            AGXDeviceUnrollRuntimeStores;
+        UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       if (Light && Far && Insts <= 24) {
         UP.Partial = UP.Runtime = true;

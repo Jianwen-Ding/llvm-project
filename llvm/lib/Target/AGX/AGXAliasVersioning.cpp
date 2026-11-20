@@ -84,6 +84,11 @@ static cl::opt<bool> AliasVersioningLoopRanges(
     "agx-alias-versioning-loop-ranges", cl::init(true), cl::Hidden,
     cl::desc("Analyze loops with the thread positions' bounds"));
 
+static cl::opt<bool> AliasVersioningLoopRangesRuntime(
+    "agx-alias-versioning-loop-ranges-runtime", cl::init(true), cl::Hidden,
+    cl::desc("-agx-alias-versioning-loop-ranges also for runtime trip counts "
+             "whose accesses step at most 16 bytes"));
+
 static cl::opt<bool> AliasVersioningStraightLine(
     "agx-alias-versioning-straight-line", cl::init(true), cl::Hidden,
     cl::desc("Also version a straight-line run of device loads and stores "
@@ -655,6 +660,11 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
     Changed |= formLCSSARecursively(*L, DT, &LI, &SE);
     LoopAccessInfo LAI(L, &SE, &TTI, &TLI, &AA, &DT, &LI, &AC);
     const RuntimePointerChecking *RPC = LAI.getRuntimePointerChecking();
+    LLVM_DEBUG(dbgs() << "agx-alias-version: LAA " << F.getName() << " "
+                      << LAI.canVectorizeMemory() << " "
+                      << (RPC ? int(RPC->Need) : -1) << " "
+                      << LAI.getNumRuntimePointerChecks() << " "
+                      << LAI.getPSE().getPredicate().isAlwaysTrue() << "\n");
     if (!LAI.canVectorizeMemory() || !RPC)
       return true;
     if (!RPC->Need || LAI.hasConvergentOp() ||
@@ -680,8 +690,43 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
   };
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   SmallVector<Loop *, 4> Unchecked;
+  // (a runtime trip count where the loop's accesses step at most 16 bytes:
+  // a row of a runtime length, not a grid-stride loop, L15-E565)
+  auto SmallSteps = [&](Loop *L) {
+    return all_of(L->blocks(), [&](BasicBlock *BB) {
+      return all_of(*BB, [&](Instruction &I) {
+        Value *P = getLoadStorePointerOperand(&I);
+        if (!P)
+          return true;
+        auto *G = dyn_cast<GetElementPtrInst>(P);
+        const SCEV *X = SE.getSCEV(P);
+        if (!isa<SCEVAddRecExpr>(X) && G && G->getNumIndices() == 1) {
+          Value *Idx = G->getOperand(1);
+          if (auto *E = dyn_cast<CastInst>(Idx);
+              E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+            Idx = E->getOperand(0);
+          const SCEV *XI = SE.getSCEV(Idx);
+          auto *AR = dyn_cast<SCEVAddRecExpr>(XI);
+          auto *C = AR && AR->getLoop() == L
+                        ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
+                        : nullptr;
+          return C && C->getAPInt().abs().getZExtValue() *
+                              F.getDataLayout().getTypeAllocSize(
+                                  G->getSourceElementType()) <=
+                          16;
+        }
+        auto *AR = dyn_cast<SCEVAddRecExpr>(X);
+        auto *C = AR && AR->getLoop() == L
+                      ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
+                      : nullptr;
+        return C && C->getAPInt().abs().ule(16);
+      });
+    });
+  };
   for (Loop *L : Loops)
-    if (Version(L, SE) && SE.getSmallConstantTripCount(L)) {
+    if (Version(L, SE) &&
+        (SE.getSmallConstantTripCount(L) ||
+         (AliasVersioningLoopRangesRuntime && SmallSteps(L)))) {
       LLVM_DEBUG(dbgs() << "agx-alias-version: unchecked "
                         << L->getHeader()->getName() << "\n");
       Unchecked.push_back(L);
