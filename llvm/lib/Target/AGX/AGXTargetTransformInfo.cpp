@@ -142,6 +142,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollFullTrips(
+    "agx-device-unroll-full-trips", cl::init(32), cl::Hidden,
+    cl::desc("Device-load loops of at most this many trips (not running "
+             "maxima) unrolled whole (0: not)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollTranscendental(
     "agx-device-unroll-transcendental", cl::init(8), cl::Hidden,
     cl::desc("Unroll factor of device-load loops with exponentials that no "
@@ -504,6 +509,22 @@ void AGXTTIImpl::getUnrollingPreferences(
     // softmax_f16 of 4 lost as loops.)
     if (MinMax && F >= Trips && Trips > 16)
       F = Trips / 2;
+    // (a short loop, at most 32 trips: whole, so that a later pass over the
+    // same data, also whole, takes its loads' and exponentials' values:
+    // L15-E545, softmax_f32v's third pass)
+    // (not a running maxnum / minnum either: online_softmax_exp2_maxnum lost)
+    bool NumMinMax = any_of(L->getHeader()->phis(), [](const PHINode &P) {
+      return any_of(P.users(), [](const User *U) {
+        auto *II = dyn_cast<IntrinsicInst>(U);
+        return II && (II->getIntrinsicID() == Intrinsic::maxnum ||
+                      II->getIntrinsicID() == Intrinsic::minnum ||
+                      II->getIntrinsicID() == Intrinsic::maximum ||
+                      II->getIntrinsicID() == Intrinsic::minimum);
+      });
+    });
+    if (!MinMax && !NumMinMax && DeviceLoads && Trips &&
+        Trips <= AGXDeviceUnrollFullTrips && F >= 2 && F < Trips)
+      F = Trips;
 
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
       UP.Partial = true;

@@ -69,6 +69,7 @@ the kernel's, as memory at VA).
 | `rope_f32` | rotary position embedding (1024 tokens x 64 pairs): a thread per pair, the angle position * inv_freq through precise math.cos and math.sin |
 | `rmsnorm_f16` | RMSNorm of f16 rows by a SIMD-group: vector<4xf16> loads, the sum of squares in f32, rsqrt, the f16 weighted write |
 | `layernorm_thread` | LayerNorm of 256-float rows, a thread per row: two passes for the mean and variance, then a loop that loads the row, gamma and beta and stores the normalized row |
+| `softmax_f32v` | Row softmax of 1024-float rows by a SIMD-group, a lane per 32 elements: max, sum of exponentials, then the normalized store, three passes over the same row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
