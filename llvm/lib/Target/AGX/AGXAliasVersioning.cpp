@@ -28,6 +28,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -88,6 +89,12 @@ static cl::opt<bool> AliasVersioningLoopRangesRuntime(
     "agx-alias-versioning-loop-ranges-runtime", cl::init(true), cl::Hidden,
     cl::desc("-agx-alias-versioning-loop-ranges also for runtime trip counts "
              "whose accesses step at most 16 bytes"));
+
+static cl::opt<unsigned> AliasVersioningBlocks(
+    "agx-alias-versioning-blocks", cl::init(20), cl::Hidden,
+    cl::desc("Blocks an innermost loop may have to be versioned, its copy's "
+             "loads of blocks every iteration runs moved to the header "
+             "(0: one block only)"));
 
 static cl::opt<bool> AliasVersioningStraightLine(
     "agx-alias-versioning-straight-line", cl::init(true), cl::Hidden,
@@ -165,10 +172,13 @@ static bool isCandidate(const Loop *L, const DataLayout &DL) {
   auto Narrow = [&](Type *Ty) {
     return DL.getTypeStoreSize(Ty->getScalarType()) < 4;
   };
-  if (!L->isInnermost() || L->getNumBlocks() != 1)
+  if (!L->isInnermost() ||
+      (L->getNumBlocks() != 1 &&
+       (!AliasVersioningBlocks || L->getNumBlocks() > AliasVersioningBlocks)))
     return false;
   bool Store = false, Load = false;
-  for (const Instruction &I : *L->getHeader()) {
+  for (const BasicBlock *BB : L->blocks())
+  for (const Instruction &I : *BB) {
     if (auto *CB = dyn_cast<CallBase>(&I)) {
       if (CB->isConvergent())
         return false;
@@ -277,7 +287,89 @@ static std::pair<unsigned, unsigned> work(Range &&Insts, const DataLayout &DL) {
 
 static std::pair<unsigned, unsigned> iterationWork(const Loop *L,
                                                    const DataLayout &DL) {
-  return work(*L->getHeader(), DL);
+  unsigned Words = 0, Math = 0;
+  for (const BasicBlock *BB : L->blocks()) {
+    auto [W, M] = work(*BB, DL);
+    Words += W;
+    Math += M;
+  }
+  return {Words, Math};
+}
+
+/// In the copy of a loop of several blocks for ranges not overlapping (a
+/// conditional store's), the loads of blocks every iteration runs moved up
+/// to the header, ahead of the stores no load may alias, with what their
+/// addresses are computed from: the unrolled copies' loads issue together,
+/// not each after the previous copy's store (L15-E573).
+static bool hoistLoads(Loop *L, DominatorTree &DT, AAResults &AA) {
+  BasicBlock *H = L->getHeader(), *Latch = L->getLoopLatch();
+  LLVM_DEBUG(dbgs() << "agx-alias-version: hoist " << H->getName() << " "
+                    << (Latch ? Latch->getName() : "-") << " "
+                    << L->getNumBlocks() << "\n");
+  if (!Latch || L->getNumBlocks() == 1)
+    return false;
+  SmallVector<StoreInst *, 8> Stores;
+  for (BasicBlock *BB : L->blocks())
+    for (Instruction &I : *BB)
+      if (auto *SI = dyn_cast<StoreInst>(&I))
+        Stores.push_back(SI);
+  Instruction *At = H->getTerminator();
+  // Whether V can be computed at At: defined outside the loop, or moved
+  // there with its operands (no memory, no side effects, no phi).
+  SmallVector<Instruction *, 8> Moves;
+  std::function<bool(Value *, unsigned)> Available = [&](Value *V,
+                                                         unsigned Depth) {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !L->contains(I) || DT.dominates(I, At))
+      return true;
+    if (Depth > 8 || isa<PHINode>(I) || I->mayReadOrWriteMemory() ||
+        I->mayHaveSideEffects() || !isSafeToSpeculativelyExecute(I))
+      return false;
+    for (Value *Op : I->operands())
+      if (!Available(Op, Depth + 1))
+        return false;
+    if (!is_contained(Moves, I))
+      Moves.push_back(I);
+    return true;
+  };
+  bool Changed = false;
+  for (BasicBlock *BB : L->getBlocks()) {
+    if (BB == H || !DT.dominates(BB, Latch))
+      continue;
+    for (Instruction &I : make_early_inc_range(*BB)) {
+      auto *LI = dyn_cast<LoadInst>(&I);
+      if (!LI || !LI->isSimple())
+        continue;
+      // (the copy's scopes: every scope of the load's in the store's
+      // noalias list, as LoopVersioning annotates them)
+      MDNode *Scopes = LI->getMetadata(LLVMContext::MD_alias_scope);
+      auto Disjoint = [&](StoreInst *SI) {
+        MDNode *NoAlias = SI->getMetadata(LLVMContext::MD_noalias);
+        return Scopes && NoAlias && Scopes->getNumOperands() &&
+               all_of(Scopes->operands(), [&](const MDOperand &S) {
+                 return is_contained(NoAlias->operands(), S);
+               });
+      };
+      MemoryLocation ML = MemoryLocation::get(LI);
+      if (any_of(Stores, [&](StoreInst *SI) {
+            return !Disjoint(SI) &&
+                   !AA.isNoAlias(ML, MemoryLocation::get(SI));
+          })) {
+        LLVM_DEBUG(dbgs() << "agx-alias-version: may alias " << *LI << "\n");
+        continue;
+      }
+      Moves.clear();
+      if (!Available(LI->getPointerOperand(), 0)) {
+        LLVM_DEBUG(dbgs() << "agx-alias-version: address " << *LI << "\n");
+        continue;
+      }
+      for (Instruction *M : Moves)
+        M->moveBefore(At->getIterator());
+      LI->moveBefore(At->getIterator());
+      Changed = true;
+    }
+  }
+  return Changed;
 }
 
 namespace {
@@ -655,7 +747,9 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
       if (!L->isLoopSimplifyForm())
         return false;
     }
-    if (!L->getUniqueExitBlock())
+    // (one exiting block: LoopVersioning's, a loop of several blocks with a
+    // break has more)
+    if (!L->getUniqueExitBlock() || !L->getExitingBlock())
       return false;
     Changed |= formLCSSARecursively(*L, DT, &LI, &SE);
     LoopAccessInfo LAI(L, &SE, &TTI, &TLI, &AA, &DT, &LI, &AC);
@@ -681,6 +775,8 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
     LoopVersioning LV(LAI, RPC->getChecks(), L, &LI, &DT, &SE);
     LV.versionLoop();
     LV.annotateLoopWithNoAlias();
+    if (AliasVersioningBlocks)
+      hoistLoads(L, DT, AA);
     // (the copy for overlapping ranges, which runs only when they do:
     // alignment versioning leaves it, L15-E547)
     addStringMetadataToLoop(LV.getNonVersionedLoop(),
