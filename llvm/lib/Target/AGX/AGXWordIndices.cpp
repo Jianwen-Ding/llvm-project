@@ -59,6 +59,10 @@ static cl::opt<bool> AGXWordIndicesOpt(
     cl::desc("Index a loop's word accesses by a counter of words beside its "
              "counter of bytes or halves"));
 
+static cl::opt<unsigned> AGXWordIndicesOffsets(
+    "agx-loop-word-indices-offsets", cl::init(1), cl::Hidden,
+    cl::desc("Most further offsets (an add each) for each base"));
+
 namespace {
 
 class AGXWordIndices : public FunctionPass {
@@ -318,7 +322,7 @@ bool AGXWordIndices::runOnFunction(Function &F) {
     // (an add for each further offset, against a 64-bit add for each base:
     // a run of 16 loads from one base kept its immediates, nested2d's
     // fifteen adds between them doubled its cycles)
-    Words &= Offsets.size() <= MinOff.size();
+    Words &= Offsets.size() <= AGXWordIndicesOffsets * MinOff.size();
     if (!Words)
       continue;
     IRBuilder<> B(Pre->getTerminator());
