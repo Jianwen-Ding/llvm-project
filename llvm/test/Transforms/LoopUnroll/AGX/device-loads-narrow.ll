@@ -54,10 +54,11 @@ exit:
   ret void
 }
 
-; A half and a float load: 4.
+; A half and a float load: not the narrow factor. (Their two bases of
+; loads of a word at most make it device-loads-streams.ll's 16, L15-E507.)
 define void @mixed512(ptr addrspace(1) %p, ptr addrspace(1) %q, ptr addrspace(1) %o) {
 ; CHECK-LABEL: @mixed512(
-; CHECK-COUNT-4: load float
+; CHECK-COUNT-16: load float
 ; CHECK-NOT: load float
 ; CHECK: br i1
 entry:

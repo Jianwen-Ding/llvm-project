@@ -1,0 +1,97 @@
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-streams=0 -agx-device-unroll-streams-word=0 -S < %s | FileCheck %s --check-prefix=FOUR
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-streams-word=0 -S < %s | FileCheck %s --check-prefix=EIGHT
+
+; A device-load loop (device-loads.ll) whose loads step through two or more
+; pointer bases, without stores (a dot product's row and vector), is
+; unrolled 8 times where 8 divides its trip count; a loop of one base (a row
+; sum) keeps 4 (L15-E506). Where every load is of 4 bytes at most, 16
+; (L15-E507).
+
+define void @dot256(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %o) {
+; CHECK-LABEL: @dot256(
+; CHECK-COUNT-16: load <4 x float>
+; CHECK-NOT: load <4 x float>
+; CHECK: br i1
+; EIGHT-LABEL: @dot256(
+; EIGHT-COUNT-16: load <4 x float>
+; EIGHT-NOT: load <4 x float>
+; FOUR-LABEL: @dot256(
+; FOUR-COUNT-8: load <4 x float>
+; FOUR-NOT: load <4 x float>
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %s = phi <4 x float> [ zeroinitializer, %entry ], [ %s1, %loop ]
+  %ga = getelementptr inbounds <4 x float>, ptr addrspace(1) %a, i64 %i
+  %gb = getelementptr inbounds <4 x float>, ptr addrspace(1) %b, i64 %i
+  %u = load <4 x float>, ptr addrspace(1) %ga, align 16
+  %v = load <4 x float>, ptr addrspace(1) %gb, align 16
+  %s1 = call <4 x float> @llvm.fma.v4f32(<4 x float> %u, <4 x float> %v, <4 x float> %s)
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, 256
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = extractelement <4 x float> %s1, i64 0
+  store float %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+define void @sum256(ptr addrspace(1) %a, ptr addrspace(1) %o) {
+; CHECK-LABEL: @sum256(
+; EIGHT-LABEL: @sum256(
+; EIGHT-COUNT-4: load <4 x float>
+; FOUR-LABEL: @sum256(
+; FOUR-COUNT-4: load <4 x float>
+; CHECK-COUNT-4: load <4 x float>
+; CHECK-NOT: load <4 x float>
+; CHECK: br i1
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %s = phi <4 x float> [ zeroinitializer, %entry ], [ %s1, %loop ]
+  %ga = getelementptr inbounds <4 x float>, ptr addrspace(1) %a, i64 %i
+  %u = load <4 x float>, ptr addrspace(1) %ga, align 16
+  %s1 = fadd <4 x float> %s, %u
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, 256
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = extractelement <4 x float> %s1, i64 0
+  store float %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+define void @dotf512(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %o) {
+; CHECK-LABEL: @dotf512(
+; CHECK-COUNT-32: load float
+; CHECK-NOT: load float
+; CHECK: br i1
+; EIGHT-LABEL: @dotf512(
+; EIGHT-COUNT-16: load float
+; EIGHT-NOT: load float
+; FOUR-LABEL: @dotf512(
+; FOUR-COUNT-8: load float
+; FOUR-NOT: load float
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %s = phi float [ 0.0, %entry ], [ %s1, %loop ]
+  %ga = getelementptr inbounds float, ptr addrspace(1) %a, i64 %i
+  %gb = getelementptr inbounds float, ptr addrspace(1) %b, i64 %i
+  %u = load float, ptr addrspace(1) %ga, align 4
+  %v = load float, ptr addrspace(1) %gb, align 4
+  %s1 = call float @llvm.fma.f32(float %u, float %v, float %s)
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, 512
+  br i1 %c, label %loop, label %exit
+exit:
+  store float %s1, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+declare float @llvm.fma.f32(float, float, float)
+declare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)

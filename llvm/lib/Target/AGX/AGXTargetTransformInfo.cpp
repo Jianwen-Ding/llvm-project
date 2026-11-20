@@ -142,6 +142,17 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollStreams(
+    "agx-device-unroll-streams", cl::init(8), cl::Hidden,
+    cl::desc("The factor of agx-device-unroll for loops whose device loads "
+             "step through two or more pointer bases, without stores, where "
+             "it divides the trip count (0: the same)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollStreamsWord(
+    "agx-device-unroll-streams-word", cl::init(16), cl::Hidden,
+    cl::desc("agx-device-unroll-streams' factor where every device load is "
+             "of 4 bytes at most (0: the same)"));
+
 static cl::opt<unsigned> AGXDeviceUnroll(
     "agx-device-unroll", cl::init(4), cl::Hidden,
     cl::desc("Iterations a single-block loop that loads device memory, of a "
@@ -354,8 +365,11 @@ static std::optional<APInt> deviceLoadStride(const LoadInst &LI, const Loop *L,
 static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
                                    const DataLayout &DL, unsigned Trips,
                                    bool &DeviceLoads) {
-  bool Narrow = true, Stores = false, Strided = true;
+  bool Narrow = true, Stores = false, Strided = true, Word = true;
   DeviceLoads = false;
+  // The pointer bases the device loads step through (a dot product's two
+  // rows): L15-E506.
+  SmallPtrSet<const SCEV *, 4> Streams;
   for (const BasicBlock *BB : L->blocks())
     for (const Instruction &I : *BB) {
       if (auto *SI = dyn_cast<StoreInst>(&I))
@@ -365,6 +379,11 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
         continue;
       DeviceLoads = true;
       Narrow &= DL.getTypeStoreSize(LI->getType()) <= 2;
+      Word &= DL.getTypeStoreSize(LI->getType()) <= 4;
+      if (const SCEV *P = SE.getSCEV(const_cast<Value *>(LI->getPointerOperand()));
+          isa<SCEVAddRecExpr>(P) &&
+          cast<SCEVAddRecExpr>(P)->getLoop() == L)
+        Streams.insert(SE.getPointerBase(P));
       if (Strided) {
         std::optional<APInt> S = deviceLoadStride(*LI, L, SE, DL);
         Strided = S && S->ugt(64);
@@ -379,6 +398,17 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
     return AGXDeviceUnrollStore;
   if (!Narrow && !Stores && Strided && Divides(AGXDeviceUnrollStrided))
     return AGXDeviceUnrollStrided;
+  // Two or more streams (no stores): a dot product's iteration is two loads
+  // and a multiply-add per element, so 4 iterations' loads still leave it
+  // waiting; one stream (a row sum, maximum or softmax) keeps 4.
+  // (loads of a word at most: 16, as their iterations' loads are a fourth
+  // of a 16-byte vector's, L15-E507)
+  if (!Narrow && !Stores && Streams.size() >= 2 && Word &&
+      Divides(AGXDeviceUnrollStreamsWord))
+    return AGXDeviceUnrollStreamsWord;
+  if (!Narrow && !Stores && Streams.size() >= 2 &&
+      Divides(AGXDeviceUnrollStreams))
+    return AGXDeviceUnrollStreams;
   return AGXDeviceUnroll;
 }
 
