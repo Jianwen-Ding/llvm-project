@@ -221,6 +221,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeDivStores(
     "agx-device-unroll-runtime-div-stores", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-stores also for divisions"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeMathStores(
+    "agx-device-unroll-runtime-math-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for log, log2, sin, cos "
+             "and sqrt"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -793,7 +798,13 @@ void AGXTTIImpl::getUnrollingPreferences(
                       (II->getIntrinsicID() == Intrinsic::exp ||
                        II->getIntrinsicID() == Intrinsic::exp2)) ||
                      (AGXDeviceUnrollRuntimeTanhStores &&
-                      II->getIntrinsicID() == Intrinsic::tanh);
+                      II->getIntrinsicID() == Intrinsic::tanh) ||
+                     (AGXDeviceUnrollRuntimeMathStores &&
+                      (II->getIntrinsicID() == Intrinsic::log ||
+                       II->getIntrinsicID() == Intrinsic::log2 ||
+                       II->getIntrinsicID() == Intrinsic::sin ||
+                       II->getIntrinsicID() == Intrinsic::cos ||
+                       II->getIntrinsicID() == Intrinsic::sqrt));
             return !isa<CallBase>(I) && !I.isAtomic() &&
                    (I.getOpcode() != Instruction::FDiv ||
                     AGXDeviceUnrollRuntimeDivStores);

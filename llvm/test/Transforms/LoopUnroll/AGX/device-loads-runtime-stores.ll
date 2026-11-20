@@ -4,6 +4,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns=0 -S < %s | FileCheck %s --check-prefix=NOCOL
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-tanh-stores=0 -S < %s | FileCheck %s --check-prefix=NOTANH
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-div-stores=0 -S < %s | FileCheck %s --check-prefix=NODIV
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-math-stores=0 -S < %s | FileCheck %s --check-prefix=NOMATH
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -184,3 +185,30 @@ exit:
   ret void
 }
 declare float @llvm.exp.f32(float)
+
+; sin (log, log2, cos, sqrt) too (L15-E579).
+; CHECK-LABEL: @sine(
+; CHECK-COUNT-4: call float @llvm.sin.f32
+; CHECK: .epil
+; NOMATH-LABEL: @sine(
+; NOMATH: call float @llvm.sin.f32
+; NOMATH-NOT: call float @llvm.sin.f32
+; NOMATH: ret void
+define void @sine(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %n) {
+entry:
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %i
+  %v = load float, ptr addrspace(1) %px, align 4
+  %o = call float @llvm.sin.f32(float %v)
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %i
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+declare float @llvm.sin.f32(float)
