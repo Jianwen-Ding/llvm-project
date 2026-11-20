@@ -3,8 +3,9 @@
 
 ; A device-load loop (device-loads.ll) that also stores to device memory (a
 ; row copy) is unrolled 16 times, and one whose loads all step more than 64
-; bytes an iteration (a column sum, at MLIR's zero-extended 32-bit index) 8
-; times, where that divides the trip count; 4 otherwise (L15-E235).
+; bytes an iteration (a column sum, at MLIR's zero-extended 32-bit index) 16
+; times (L15-E509; 8 in L15-E235), where that divides the trip count; 4
+; otherwise (L15-E235).
 
 define void @copy512(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 ; CHECK-LABEL: @copy512(
@@ -31,7 +32,7 @@ exit:
 
 define void @colsum256(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %col) {
 ; CHECK-LABEL: @colsum256(
-; CHECK-COUNT-8: load float
+; CHECK-COUNT-16: load float
 ; CHECK-NOT: load float
 ; CHECK: br i1
 ; FOUR-LABEL: @colsum256(

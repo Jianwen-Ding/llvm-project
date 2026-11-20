@@ -127,7 +127,7 @@ static cl::opt<unsigned> AGXThreadgroupUnroll(
              "contiguous loads become 16-byte ones, 1: no unrolling)"));
 
 static cl::opt<unsigned> AGXDeviceUnrollNarrow(
-    "agx-device-unroll-narrow", cl::init(16), cl::Hidden,
+    "agx-device-unroll-narrow", cl::init(32), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
              "are all of one or two bytes (0: the same)"));
 
@@ -137,7 +137,7 @@ static cl::opt<unsigned> AGXDeviceUnrollStore(
              "device memory, where it divides the trip count (0: the same)"));
 
 static cl::opt<unsigned> AGXDeviceUnrollStrided(
-    "agx-device-unroll-strided", cl::init(8), cl::Hidden,
+    "agx-device-unroll-strided", cl::init(16), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
