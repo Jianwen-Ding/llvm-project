@@ -70,6 +70,27 @@ static cl::opt<bool> SkipAliasFallback(
     "agx-align-version-skip-alias-fallback", cl::init(true), cl::Hidden,
     cl::desc("Leave alias versioning's copy for overlapping ranges"));
 
+static cl::opt<bool> VersionByteLoads(
+    "agx-align-version-byte-loads", cl::init(true), cl::Hidden,
+    cl::desc("Raise scalar byte loads' alignment too"));
+
+/// Whether a byte load's value only goes, extended, into integer arithmetic
+/// (an int8 dot product's products): no bytes in 16-bit halves that a float
+/// conversion or a compare reads (q8_matvec, a byte mask's select lost).
+static bool integerBytes(const Instruction &I) {
+  return !I.use_empty() && all_of(I.users(), [](const User *U) {
+    auto *C = dyn_cast<CastInst>(U);
+    return C && (isa<SExtInst>(C) || isa<ZExtInst>(C)) && !C->use_empty() &&
+           all_of(C->users(), [](const User *V) {
+             auto *B = dyn_cast<BinaryOperator>(V);
+             return B && B->getType()->isIntegerTy() &&
+                    (B->getOpcode() == Instruction::Mul ||
+                     B->getOpcode() == Instruction::Add ||
+                     B->getOpcode() == Instruction::Sub);
+           });
+  });
+}
+
 static cl::opt<bool> VersionByteStores(
     "agx-align-version-byte-stores", cl::init(true), cl::Hidden,
     cl::desc("Raise scalar byte stores' alignment too"));
@@ -218,10 +239,13 @@ static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
     // (a 16-bit source of their user): those count. (Scalar bytes still not:
     // q8_matvec's converted bytes 201.9 -> 217.8 tput, q4_matvec's 289.4 ->
     // 293.2.) Byte stores count: aligned, four go out as one access of the
-    // byte format from 16-bit halves (int8 quantization, masks: L15-E547).
+    // byte format from 16-bit halves (int8 quantization, masks: L15-E547);
+    // and bytes that only go, extended, into integer products and sums (an
+    // int8 dot product's, a load each: L15-E560).
     if (getLoadStoreType(&I)->getScalarSizeInBits() < 16 &&
         !(VersionByteVectors && getLoadStoreType(&I)->isVectorTy()) &&
-        !(VersionByteStores && isa<StoreInst>(I)))
+        !(VersionByteStores && isa<StoreInst>(I)) &&
+        !(VersionByteLoads && isa<LoadInst>(I) && integerBytes(I)))
       continue;
     auto [Base, Off] = baseAndOffset(Ptr, SE);
     if (!Base)
@@ -246,6 +270,9 @@ static bool versionLoop(Loop &L, Function &F, LoopInfo &LI, DominatorTree &DT,
     auto *VT = dyn_cast<FixedVectorType>(getLoadStoreType(R.I));
     Accesses += VT && CountVectorElements ? VT->getNumElements() : 1;
   }
+  LLVM_DEBUG(dbgs() << "agx-align-versioning: " << F.getName() << " "
+                    << L.getHeader()->getName() << " " << Accesses
+                    << " raises\n");
   if (Accesses < AlignmentVersioningMin)
     return false;
   for (Value *Base : Bases)
