@@ -73,6 +73,8 @@ the kernel's, as memory at VA).
 | `quant_rows` | Row quantization of 256-float rows to int8, a thread per row: scale, round, clamp to [-127, 127], byte stores |
 | `to_f16` | Scaled f32 rows to f16, a thread per row of 256: 2-byte stores |
 | `mask_rows` | Row masks of 256-float rows against a per-row threshold, a thread per row: one byte per element |
+| `where_rows` | Per-element select between two f32 rows on a byte mask, a thread per row of 256: byte loads |
+| `widen_f16` | f16 rows widened to f32 with a scale and bias, a thread per row of 256: 2-byte loads |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 

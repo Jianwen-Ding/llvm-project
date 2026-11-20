@@ -1,6 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version -agx-alias-versioning=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version -agx-alias-versioning-narrow-stores=0 < %s | FileCheck %s --check-prefix=OFFN
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version -agx-alias-versioning-narrow-loads=0 < %s | FileCheck %s --check-prefix=OFFL
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=ASM
 
 ; A loop that loads from some buffers and stores to another (L15-E527) runs
@@ -47,10 +48,14 @@
 ; OFFN-NOT: lver
 ; OFFN: ret void
 
-; Two-byte loads: alignment versioning copies such a loop: left.
+; Two-byte loads: versioned too, since alignment versioning leaves the copy
+; for overlapping ranges (L15-E550).
 ; CHECK-LABEL: define agx_kernel void @half_row(
-; CHECK-NOT: lver
-; CHECK: ret void
+; CHECK: .lver.check:
+; CHECK: load half, {{.*}} !alias.scope
+; OFFL-LABEL: define agx_kernel void @half_row(
+; OFFL-NOT: lver
+; OFFL: ret void
 
 ; 52 words loaded an iteration, which hoisted would cost registers: left.
 ; CHECK-LABEL: define agx_kernel void @wide_copy(
