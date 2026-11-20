@@ -9315,6 +9315,11 @@ static cl::opt<unsigned> AGXRareFallbacksMin(
     "agx-rare-fallbacks-min", cl::init(2), cl::Hidden,
     cl::desc("fewest fallbacks of one condition in a block branched around"));
 
+static cl::opt<bool> AGXRareFallbacksHoist(
+    "agx-rare-fallbacks-hoist", cl::init(true), cl::Hidden,
+    cl::desc("what follows a branched-around fallback's selects and needs "
+             "neither them nor a write before it, ahead of the branch"));
+
 /// The expansions' selects sel(c, a, h) whose h is a fallback for rare
 /// arguments (a call marked agx.rare: sin and cos's hardware reduction past
 /// 2^22) take h from a block branched to only where c is false: a SIMD-group
@@ -9356,6 +9361,33 @@ static bool branchRareFallbacks(Function &F) {
                         Before);
         }))
       continue;
+    // The rest of the block that needs neither the selects nor a write
+    // before it goes ahead of them, out of the join: a load of the tail
+    // starts before the branch, as the scheduler had it (L15-E505).
+    if (AGXRareFallbacksHoist) {
+      SmallPtrSet<Instruction *, 16> Stay(Sels.begin(), Sels.end());
+      bool Wrote = false;
+      SmallVector<Instruction *, 16> Hoist;
+      for (Instruction &I : make_range(std::next(First->getIterator()),
+                                       BB->getTerminator()->getIterator())) {
+        bool Needs = any_of(I.operands(), [&](Value *V) {
+          auto *OI = dyn_cast<Instruction>(V);
+          return OI && Stay.count(OI);
+        });
+        bool Effects = I.mayWriteToMemory() || I.mayHaveSideEffects() ||
+                       (isa<CallBase>(I) && cast<CallBase>(I).isConvergent());
+        Wrote |= Effects;
+        if (Needs || Effects || (Wrote && I.mayReadFromMemory()) ||
+            any_of(Sels, [&](SelectInst *S) {
+              return S->getFalseValue() == &I;
+            }))
+          Stay.insert(&I);
+        else
+          Hoist.push_back(&I);
+      }
+      for (Instruction *I : Hoist)
+        I->moveBefore(First->getIterator());
+    }
     BasicBlock *Tail = SplitBlock(BB, First);
     BasicBlock *Rare =
         BasicBlock::Create(F.getContext(), BB->getName() + ".rare", &F, Tail);
