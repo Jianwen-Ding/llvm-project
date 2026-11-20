@@ -73,10 +73,12 @@ static cl::opt<bool> AGXWideHalfLoadsDivergent(
 /// that also read a vector every lane reads alike (gemv_f16's x, hdot_dyn's
 /// w; its row alone 16 bytes wide lost more) lost 1-4% with many groups
 /// resident (L15-E585).
-static bool wideHalfLoad(const LoadSDNode *L) {
-  auto *PI = dyn_cast_or_null<Instruction>(L->getMemOperand()->getValue());
-  if (!PI)
+/// (the block's terms, for AGXWordIndices too)
+bool llvm::agxWideHalfLoadBlock(const BasicBlock &BB) {
+  if (!AGXWideHalfLoads)
     return false;
+  if (!AGXWideHalfLoadsDivergent)
+    return true;
   auto ThreadDependent = [](const Value *P) {
     SmallPtrSet<const Value *, 32> Seen;
     SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
@@ -99,7 +101,7 @@ static bool wideHalfLoad(const LoadSDNode *L) {
     return false;
   };
   bool Loads = false;
-  for (const Instruction &I : *PI->getParent()) {
+  for (const Instruction &I : BB) {
     // (a row of halves stored as it is loaded, rowcopy_f16, once E589 kept
     // its loads after its stores: L15-E590)
     if (auto *S = dyn_cast<StoreInst>(&I);
@@ -117,6 +119,11 @@ static bool wideHalfLoad(const LoadSDNode *L) {
   return Loads;
 }
 
+static bool wideHalfLoad(const LoadSDNode *L) {
+  auto *PI = dyn_cast_or_null<Instruction>(L->getMemOperand()->getValue());
+  return PI && agxWideHalfLoadBlock(*PI->getParent());
+}
+
 static cl::opt<bool> AGXWideHalfStores(
     "agx-wide-half-stores", cl::init(true), cl::Hidden,
     cl::desc("Store 4-byte aligned vectors of 8 16-bit elements as one "
@@ -126,6 +133,10 @@ static cl::opt<bool> AGXPairedHalfStores(
     "agx-paired-half-stores", cl::Hidden, cl::init(true),
     cl::desc("Store 4-byte aligned pairs of 16-bit elements as one 32-bit "
              "word each"));
+
+bool llvm::agxWideHalfStores() {
+  return AGXPairedHalfStores && AGXWideHalfStores;
+}
 
 #define DEBUG_TYPE "agx-lower"
 
@@ -1303,7 +1314,7 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
        L->getValueType(0) == MVT::v2f16 || L->getValueType(0) == MVT::v4f16 ||
        (AGXWideHalfLoads && (L->getValueType(0) == MVT::v8i16 ||
                              L->getValueType(0) == MVT::v8f16) &&
-        (!AGXWideHalfLoadsDivergent || wideHalfLoad(L))))) {
+        wideHalfLoad(L)))) {
     SDLoc DL(N);
     EVT VT = L->getValueType(0);
     unsigned Words = VT.getVectorNumElements() / 2;

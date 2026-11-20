@@ -23,6 +23,7 @@
 #include "llvm/Pass.h"
 
 namespace llvm {
+class BasicBlock;
 class Function;
 class SCEV;
 class ScalarEvolution;
@@ -62,6 +63,7 @@ FunctionPass *createAGXHoistGuardedLoadsPass();
 FunctionPass *createAGXAliasVersioningPass();
 FunctionPass *createAGXAlignmentVersioningPass();
 FunctionPass *createAGXNarrowInductionsPass();
+FunctionPass *createAGXWordIndicesPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
 /// Whether wide constants go to preloaded uniforms (-agx-uniform-constants):
@@ -127,6 +129,10 @@ FunctionPass *createAGXColdRegionsPass();
 std::unique_ptr<ScheduleDAGMutation> createAGXMemClusterMutation();
 /// Whether MI is a device load (one of AGXMemCluster's kinds).
 bool isAGXDeviceLoad(const MachineInstr &MI);
+/// Whether a 4-byte aligned <8 x half> / <8 x i16> device load in BB is one
+/// 16-byte access (L15-E585, E590), and such a store (L15-E591).
+bool agxWideHalfLoadBlock(const BasicBlock &BB);
+bool agxWideHalfStores();
 /// The post-RA machine scheduler: AGXMemClusterMutation, and cluster members
 /// kept together ahead of latency stalls.
 ScheduleDAGMI *createAGXPostRAScheduler(MachineSchedContext *C);
@@ -148,6 +154,7 @@ void initializeAGXHoistGuardedLoadsPass(PassRegistry &);
 void initializeAGXAliasVersioningPass(PassRegistry &);
 void initializeAGXAlignmentVersioningPass(PassRegistry &);
 void initializeAGXNarrowInductionsPass(PassRegistry &);
+void initializeAGXWordIndicesPass(PassRegistry &);
 void initializeAGXSpecialRegisterRangesPassPass(PassRegistry &);
 void initializeAGXVectorAccessesPass(PassRegistry &);
 void initializeAGXLowerGenericAddressesPass(PassRegistry &);

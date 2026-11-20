@@ -41,6 +41,7 @@ add_llvm_target(AGXCodeGen
   AGXAliasVersioning.cpp
   AGXAlignmentVersioning.cpp
   AGXNarrowInductions.cpp
+  AGXWordIndices.cpp
   AGXSpecialRegisterRanges.cpp
   AGXVectorAccesses.cpp
   AGXISelDAGToDAG.cpp

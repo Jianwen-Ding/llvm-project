@@ -83,6 +83,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXAliasVersioningPass(PR);
   initializeAGXAlignmentVersioningPass(PR);
   initializeAGXNarrowInductionsPass(PR);
+  initializeAGXWordIndicesPass(PR);
   initializeAGXSpecialRegisterRangesPassPass(PR);
   initializeAGXVectorAccessesPass(PR);
   initializeAGXLowerGenericAddressesPass(PR);
@@ -873,6 +874,10 @@ bool AGXPassConfig::addPreISel() {
   // 64-bit address arithmetic.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createAGXNarrowInductionsPass());
+  // Word accesses at a counter of bytes or halves indexed by a counter of
+  // words, once the counters are 32 bits (L15-E594).
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAGXWordIndicesPass());
   // The phis of an if's empty side (left by AGXCodeGenPrepare's merging of
   // || and && conditions) become selects, as SimplifyCFG folds two-entry
   // phis: an if is execution mask operations, which cost more than the
