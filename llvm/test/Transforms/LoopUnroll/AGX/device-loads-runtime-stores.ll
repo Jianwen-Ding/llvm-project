@@ -3,6 +3,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-stores-narrow=0 -S < %s | FileCheck %s --check-prefix=WORDS
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns=0 -S < %s | FileCheck %s --check-prefix=NOCOL
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-tanh-stores=0 -S < %s | FileCheck %s --check-prefix=NOTANH
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-div-stores=0 -S < %s | FileCheck %s --check-prefix=NODIV
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -153,3 +154,33 @@ exit:
   ret void
 }
 declare float @llvm.tanh.f32(float)
+
+; A division too, a SiLU row (L15-E578).
+; CHECK-LABEL: @silu(
+; CHECK-COUNT-4: fdiv float
+; CHECK: .epil
+; NODIV-LABEL: @silu(
+; NODIV: fdiv float
+; NODIV-NOT: fdiv float
+; NODIV: ret void
+define void @silu(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %n) {
+entry:
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %i
+  %v = load float, ptr addrspace(1) %px, align 4
+  %nv = fneg float %v
+  %ex = call float @llvm.exp.f32(float %nv)
+  %d = fadd float %ex, 1.0
+  %o = fdiv float %v, %d
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %i
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+declare float @llvm.exp.f32(float)

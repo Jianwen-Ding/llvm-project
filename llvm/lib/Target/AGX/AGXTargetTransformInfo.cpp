@@ -217,6 +217,10 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeTanhStores(
     "agx-device-unroll-runtime-tanh-stores", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-stores also for tanh"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeDivStores(
+    "agx-device-unroll-runtime-div-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for divisions"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -791,7 +795,8 @@ void AGXTTIImpl::getUnrollingPreferences(
                      (AGXDeviceUnrollRuntimeTanhStores &&
                       II->getIntrinsicID() == Intrinsic::tanh);
             return !isa<CallBase>(I) && !I.isAtomic() &&
-                   I.getOpcode() != Instruction::FDiv;
+                   (I.getOpcode() != Instruction::FDiv ||
+                    AGXDeviceUnrollRuntimeDivStores);
           })) {
         UP.Partial = UP.Runtime = true;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
