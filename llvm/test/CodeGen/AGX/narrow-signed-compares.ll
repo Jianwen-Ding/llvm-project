@@ -10,7 +10,7 @@ declare i32 @llvm.agx.thread.position.in.grid.x()
 
 ; CHECK-LABEL: @padded(
 ; CHECK:       icmp slt i32
-; CHECK:       icmp sgt i32
+; CHECK:       icmp {{sgt|ugt}} i32
 ; CHECK-NOT:   icmp {{.*}} i64
 ; CHECK:       ret void
 define agx_kernel void @padded(ptr addrspace(1) %o, i32 %n) #0 {

@@ -3763,34 +3763,47 @@ static cl::opt<bool> AGXRangedCompares(
 
 /// The range of V through additions, subtractions and masks by constants,
 /// from the ranges ValueTracking gives its leaves (a SIMD lane's [0, 32)).
+static cl::opt<bool> AGXRangedComparesBounds(
+    "agx-ranged-compares-bounds", cl::init(true), cl::Hidden,
+    cl::desc("Ranged compares with the positions' upper bounds and known "
+             "bits"));
+
 static ConstantRange rangeThroughOffsets(Value *V, const SimplifyQuery &SQ,
-                                         unsigned Depth = 0) {
+                                         unsigned Depth = 0,
+                                         bool KnownBits = false) {
   using namespace PatternMatch;
   unsigned W = V->getType()->getScalarSizeInBits();
   const APInt *C;
   Value *X;
   if (Depth < 6) {
     if (match(V, m_Add(m_Value(X), m_APInt(C))))
-      return rangeThroughOffsets(X, SQ, Depth + 1).add(ConstantRange(*C));
+      return rangeThroughOffsets(X, SQ, Depth + 1, KnownBits).add(ConstantRange(*C));
     if (match(V, m_Sub(m_Value(X), m_APInt(C))))
-      return rangeThroughOffsets(X, SQ, Depth + 1).sub(ConstantRange(*C));
+      return rangeThroughOffsets(X, SQ, Depth + 1, KnownBits).sub(ConstantRange(*C));
     if (match(V, m_Sub(m_APInt(C), m_Value(X))))
-      return ConstantRange(*C).sub(rangeThroughOffsets(X, SQ, Depth + 1));
+      return ConstantRange(*C).sub(rangeThroughOffsets(X, SQ, Depth + 1, KnownBits));
     if (match(V, m_And(m_Value(X), m_APInt(C))))
-      return rangeThroughOffsets(X, SQ, Depth + 1)
+      return rangeThroughOffsets(X, SQ, Depth + 1, KnownBits)
           .binaryAnd(ConstantRange(*C));
     if (match(V, m_Or(m_Value(X), m_APInt(C))))
-      return rangeThroughOffsets(X, SQ, Depth + 1).binaryOr(ConstantRange(*C));
+      return rangeThroughOffsets(X, SQ, Depth + 1, KnownBits).binaryOr(ConstantRange(*C));
     if (match(V, m_Xor(m_Value(X), m_APInt(C))))
-      return rangeThroughOffsets(X, SQ, Depth + 1)
+      return rangeThroughOffsets(X, SQ, Depth + 1, KnownBits)
           .binaryXor(ConstantRange(*C));
   }
   if (auto *CI = dyn_cast<ConstantInt>(V))
     return ConstantRange(CI->getValue());
   if (!V->getType()->isIntegerTy())
     return ConstantRange::getFull(W);
-  return computeConstantRange(V, /*ForSigned=*/false, SQ)
-      .intersectWith(computeConstantRange(V, /*ForSigned=*/true, SQ));
+  ConstantRange R =
+      computeConstantRange(V, /*ForSigned=*/false, SQ)
+          .intersectWith(computeConstantRange(V, /*ForSigned=*/true, SQ));
+  // (and its known bits: the or of two bounded positions, a padded
+  // stencil's (x' | y') <u W, whose range alone is full: L15-E491)
+  if (KnownBits)
+    R = R.intersectWith(ConstantRange::fromKnownBits(
+        computeKnownBits(V, SQ), /*IsSigned=*/false));
+  return R;
 }
 
 /// An integer compare of such a value against a constant (a shuffle's
@@ -3805,7 +3818,10 @@ static bool rangedCompares(Function &F) {
   // as after straight-line strength reduction: loop strength reduction makes
   // 64-bit offsets with them).
   SmallVector<WeakVH, 8> Ranged;
-  AGX::addSpecialRegisterRanges(F, &Ranged);
+  // (with the kernel's upper bounds of positions and the grid's, as for
+  // any analysis whose ranges are taken off again: L15-E491)
+  AGX::addSpecialRegisterRanges(F, &Ranged,
+                                /*ForAnalysis=*/AGXRangedComparesBounds);
   bool Changed = false;
   for (Instruction &I : make_early_inc_range(instructions(F))) {
     auto *Cmp = dyn_cast<ICmpInst>(&I);
@@ -3816,10 +3832,24 @@ static bool rangedCompares(Function &F) {
     SimplifyQuery Q = SQ.getWithInstruction(Cmp);
     ConstantRange R = rangeThroughOffsets(Cmp->getOperand(0), Q);
     ConstantRange K = rangeThroughOffsets(Cmp->getOperand(1), Q);
-    if (R.isFullSet() || K.isFullSet())
-      continue;
     std::optional<bool> Known;
-    if (R.icmp(Cmp->getPredicate(), K))
+    // (deciding it with known bits too: the or of two bounded positions;
+    // not for the rebasing below, whose x < c - k for a loop's x + k < c
+    // kept two congruent counters apart, L15-E431)
+    if (AGXRangedComparesBounds) {
+      ConstantRange RB = rangeThroughOffsets(Cmp->getOperand(0), Q, 0, true);
+      ConstantRange KB = rangeThroughOffsets(Cmp->getOperand(1), Q, 0, true);
+      if (!RB.isFullSet() && !KB.isFullSet()) {
+        if (RB.icmp(Cmp->getPredicate(), KB))
+          Known = true;
+        else if (RB.icmp(Cmp->getInversePredicate(), KB))
+          Known = false;
+      }
+    }
+    if (!Known && (R.isFullSet() || K.isFullSet()))
+      continue;
+    if (Known) {
+    } else if (R.icmp(Cmp->getPredicate(), K))
       Known = true;
     else if (R.icmp(Cmp->getInversePredicate(), K))
       Known = false;
