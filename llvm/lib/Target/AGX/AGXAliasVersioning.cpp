@@ -642,6 +642,10 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
     LoopVersioning LV(LAI, RPC->getChecks(), L, &LI, &DT, &SE);
     LV.versionLoop();
     LV.annotateLoopWithNoAlias();
+    // (the copy for overlapping ranges, which runs only when they do:
+    // alignment versioning leaves it, L15-E547)
+    addStringMetadataToLoop(LV.getNonVersionedLoop(),
+                            "llvm.loop.agx.alias.fallback");
     Changed = true;
   }
   if (Changed)

@@ -66,6 +66,14 @@ static cl::opt<bool> CountVectorElements(
     cl::desc("Count a vector access as its elements towards "
              "-agx-alignment-versioning-min"));
 
+static cl::opt<bool> SkipAliasFallback(
+    "agx-align-version-skip-alias-fallback", cl::init(true), cl::Hidden,
+    cl::desc("Leave alias versioning's copy for overlapping ranges"));
+
+static cl::opt<bool> VersionByteStores(
+    "agx-align-version-byte-stores", cl::init(true), cl::Hidden,
+    cl::desc("Raise scalar byte stores' alignment too"));
+
 static cl::opt<bool> VersionByteVectors(
     "agx-alignment-versioning-byte-vectors", cl::init(true), cl::Hidden,
     cl::desc("Count vector-of-byte accesses too (their lanes extended in "
@@ -209,9 +217,11 @@ static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
     // Since L15-E487 a vector of bytes' lanes are extended in their halves
     // (a 16-bit source of their user): those count. (Scalar bytes still not:
     // q8_matvec's converted bytes 201.9 -> 217.8 tput, q4_matvec's 289.4 ->
-    // 293.2.)
+    // 293.2.) Byte stores count: aligned, four go out as one access of the
+    // byte format from 16-bit halves (int8 quantization, masks: L15-E547).
     if (getLoadStoreType(&I)->getScalarSizeInBits() < 16 &&
-        !(VersionByteVectors && getLoadStoreType(&I)->isVectorTy()))
+        !(VersionByteVectors && getLoadStoreType(&I)->isVectorTy()) &&
+        !(VersionByteStores && isa<StoreInst>(I)))
       continue;
     auto [Base, Off] = baseAndOffset(Ptr, SE);
     if (!Base)
@@ -769,8 +779,12 @@ bool AGXAlignmentVersioning::runOnFunction(Function &F) {
     if (L->isLoopSimplifyForm() && L->getExitBlock())
       Loops.push_back(L);
   }
+  // (not alias versioning's copy for overlapping ranges, which runs only
+  // when they overlap: three copies instead of four, L15-E547)
   for (Loop *L : Loops)
-    Changed |= versionLoop(*L, F, LI, DT, SE);
+    if (!SkipAliasFallback ||
+        !findStringMetadataForLoop(L, "llvm.loop.agx.alias.fallback"))
+      Changed |= versionLoop(*L, F, LI, DT, SE);
   DenseMap<BasicBlock *, CallInst *> Ballots;
   if (GuardVersioningMin) {
     SmallVector<Loop *, 4> Inner;

@@ -1865,6 +1865,11 @@ static cl::opt<bool> NarrowTruthSelects(
     cl::desc("a truth value of selects between compares and 0 / 1 that only "
              "selects test, in 16 bits"));
 
+static cl::opt<bool> TruncatedCompares(
+    "agx-truncated-compares", cl::init(true), cl::Hidden,
+    cl::desc("a comparison's truth value truncated to 16 bits written as a "
+             "half by the compare-select"));
+
 static cl::opt<bool> SelectOfSelect(
     "agx-select-of-select",
     cl::desc("a select on an or / and of truth values as two nested "
@@ -2711,6 +2716,31 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                            DCI.DAG.getConstant(Mask >> Shift, DL, VT));
   }
   case ISD::TRUNCATE:
+    // A 16-bit truth value of a comparison of 32-bit values (the bytes of a
+    // mask that one store packs from 16-bit halves): the compare-select
+    // writes the half itself, not a 32-bit register that a move then copies
+    // the low half of (L15-E548).
+    if (TruncatedCompares && DCI.isAfterLegalizeDAG() &&
+        N->getValueType(0) == MVT::i16 &&
+        N->getOperand(0).getOpcode() == ISD::SETCC &&
+        N->getOperand(0).getValueType() == MVT::i32 &&
+        all_of(N->users(), [](const SDNode *U) {
+          // (only where stores take it: a half that other arithmetic
+          // reads is not forwarded, window_rowmax +3.7%)
+          return U->getOpcode() == AGXISD::STORE_V2_I8 ||
+                 U->getOpcode() == AGXISD::STORE_V4_I8 ||
+                 U->getOpcode() == ISD::STORE;
+        })) {
+      SDValue C = N->getOperand(0);
+      EVT OT = C.getOperand(0).getValueType();
+      if (OT == MVT::i32 || OT == MVT::f32) {
+        SelectionDAG &DAG = DCI.DAG;
+        SDLoc DL(N);
+        return DAG.getNode(AGXISD::TRUTH_SELECT, DL, MVT::i16, C,
+                           DAG.getConstant(1, DL, MVT::i16),
+                           DAG.getConstant(0, DL, MVT::i16));
+      }
+    }
     // The low half of a pair.
     if (N->getOperand(0).getOpcode() == ISD::BUILD_PAIR) {
       SDValue Lo = N->getOperand(0).getOperand(0);
