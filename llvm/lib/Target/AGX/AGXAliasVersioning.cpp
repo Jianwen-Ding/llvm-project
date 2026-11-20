@@ -76,6 +76,10 @@ static cl::opt<unsigned> AliasVersioningMathPerWord(
              "loaded above which a loop's latency is hidden behind its work "
              "and it is not versioned"));
 
+static cl::opt<bool> AliasVersioningLoopRanges(
+    "agx-alias-versioning-loop-ranges", cl::init(true), cl::Hidden,
+    cl::desc("Analyze loops with the thread positions' bounds"));
+
 static cl::opt<bool> AliasVersioningStraightLine(
     "agx-alias-versioning-straight-line", cl::init(true), cl::Hidden,
     cl::desc("Also version a straight-line run of device loads and stores "
@@ -609,7 +613,6 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
     return false;
   auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-  auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
   auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
   auto &TLI = getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
@@ -619,29 +622,37 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
   for (Loop *L : LI.getLoopsInPreorder())
     if (isCandidate(L, F.getDataLayout()))
       Loops.push_back(L);
+  if (Loops.empty())
+    return false;
   bool Changed = false;
-  for (Loop *L : Loops) {
+  // Versions L, analyzed with SE; whether LAA could not check its accesses
+  // (or not in few enough checks).
+  auto Version = [&](Loop *L, ScalarEvolution &SE) {
     auto [Words, Math] = iterationWork(L, F.getDataLayout());
     if (Words == 0 || Words > AliasVersioningMaxWords ||
         Math > AliasVersioningMathPerWord * Words)
-      continue;
+      return false;
     if (!L->isLoopSimplifyForm()) {
       Changed |= simplifyLoop(L, &DT, &LI, &SE, &AC, nullptr,
                               /*PreserveLCSSA=*/false);
       if (!L->isLoopSimplifyForm())
-        continue;
+        return false;
     }
     if (!L->getUniqueExitBlock())
-      continue;
+      return false;
     Changed |= formLCSSARecursively(*L, DT, &LI, &SE);
     LoopAccessInfo LAI(L, &SE, &TTI, &TLI, &AA, &DT, &LI, &AC);
     const RuntimePointerChecking *RPC = LAI.getRuntimePointerChecking();
-    if (!LAI.canVectorizeMemory() || !RPC || !RPC->Need ||
-        LAI.hasConvergentOp() ||
-        !LAI.getPSE().getPredicate().isAlwaysTrue() ||
-        LAI.getNumRuntimePointerChecks() == 0 ||
+    if (!LAI.canVectorizeMemory() || !RPC)
+      return true;
+    if (!RPC->Need || LAI.hasConvergentOp() ||
+        LAI.getNumRuntimePointerChecks() == 0)
+      return false;
+    // (predicates that its indices do not wrap, or too many checks: accesses
+    // whose bounds could not be compared, each in a group of its own)
+    if (!LAI.getPSE().getPredicate().isAlwaysTrue() ||
         LAI.getNumRuntimePointerChecks() > AliasVersioningMaxChecks)
-      continue;
+      return true;
     LLVM_DEBUG(dbgs() << "agx-alias-version: " << F.getName() << " "
                       << L->getHeader()->getName() << " "
                       << LAI.getNumRuntimePointerChecks() << " checks\n");
@@ -653,6 +664,45 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
     addStringMetadataToLoop(LV.getNonVersionedLoop(),
                             "llvm.loop.agx.alias.fallback");
     Changed = true;
+    return false;
+  };
+  auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+  SmallVector<Loop *, 4> Unchecked;
+  for (Loop *L : Loops)
+    if (Version(L, SE) && SE.getSmallConstantTripCount(L)) {
+      LLVM_DEBUG(dbgs() << "agx-alias-version: unchecked "
+                        << L->getHeader()->getName() << "\n");
+      Unchecked.push_back(L);
+    }
+  // A loop whose accesses LAA could not check (or only with predicates, or
+  // in too many checks), of a constant trip count,
+  // again with the thread positions' bounds (the kernel's too), for the
+  // analysis only, in a ScalarEvolution of this pass's own: a row's i32
+  // index zext({258 * r + 1, +, 16}) is then an add recurrence (a stencil's,
+  // L15-E553). Taken off again; a loop that reads a position itself (its
+  // copy would keep the bound) is left. (Every loop so analyzed changed the
+  // checks of loops versioned without, and a grid-stride loop of 4 trips
+  // lost: stride_loop's cycles 502 -> 610.)
+  if (AliasVersioningLoopRanges && !Unchecked.empty()) {
+    SmallVector<WeakVH, 8> Ranged;
+    AGX::addSpecialRegisterRanges(F, &Ranged, /*ForAnalysis=*/true);
+    SmallPtrSet<const Instruction *, 8> RangedCalls;
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<Instruction>(V))
+        RangedCalls.insert(CI);
+    {
+      ScalarEvolution OwnSE(F, TLI, AC, DT, LI);
+      for (Loop *L : Unchecked)
+        if (none_of(L->blocks(), [&](const BasicBlock *BB) {
+              return any_of(*BB, [&](const Instruction &I) {
+                return RangedCalls.contains(&I);
+              });
+            }))
+          Version(L, OwnSE);
+    }
+    for (WeakVH &V : Ranged)
+      if (auto *CI = dyn_cast_or_null<CallBase>(V))
+        CI->removeRetAttr(Attribute::Range);
   }
   if (Changed)
     SE.forgetAllLoops();
