@@ -131,11 +131,18 @@ FunctionPass *llvm::createAGXAliasVersioningPass() {
   return new AGXAliasVersioning();
 }
 
+static cl::opt<bool> AGXAliasNarrowStores(
+    "agx-alias-versioning-narrow-stores", cl::init(true), cl::Hidden,
+    cl::desc("Version loops whose stores, not loads, are of 1- or 2-byte "
+             "elements"));
+
 /// A single-block innermost loop with a device store and a device load, and
 /// no other memory operation (calls, threadgroup memory, atomics) nor a
-/// convergent one, which a divergent check must not duplicate. Accesses of
-/// 1- or 2-byte elements are left: alignment versioning copies such a loop
-/// again, and four copies cost more fetching than the loads gain (L15-E527).
+/// convergent one, which a divergent check must not duplicate. Loads of 1-
+/// or 2-byte elements are left: alignment versioning copies such a loop
+/// again, and four copies cost more fetching than the loads gain (L15-E527;
+/// rowcopy_f16 +13.9%). Narrow stores of wider loads (int8 quantization) are
+/// not (L15-E546).
 static bool isCandidate(const Loop *L, const DataLayout &DL) {
   auto Narrow = [&](Type *Ty) {
     return DL.getTypeStoreSize(Ty->getScalarType()) < 4;
@@ -160,7 +167,8 @@ static bool isCandidate(const Loop *L, const DataLayout &DL) {
     } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
       if (!SI->isSimple() ||
           SI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
-          Narrow(SI->getValueOperand()->getType()))
+          (Narrow(SI->getValueOperand()->getType()) &&
+           !AGXAliasNarrowStores))
         return false;
       Store = true;
     } else if (I.mayReadOrWriteMemory()) {

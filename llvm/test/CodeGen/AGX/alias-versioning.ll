@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version -agx-alias-versioning=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-alias-version -agx-alias-versioning-narrow-stores=0 < %s | FileCheck %s --check-prefix=OFFN
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=ASM
 
 ; A loop that loads from some buffers and stores to another (L15-E527) runs
@@ -36,7 +37,16 @@
 ; CHECK-NOT: lver
 ; CHECK: ret void
 
-; Two-byte elements: alignment versioning copies such a loop: left.
+; Byte stores of word loads (L15-E546): versioned too; only loads of 1- or
+; 2-byte elements make alignment versioning copy the loop again.
+; CHECK-LABEL: define agx_kernel void @quant_row(
+; CHECK: .lver.check:
+; CHECK: store i8 {{.*}} !alias.scope
+; OFFN-LABEL: define agx_kernel void @quant_row(
+; OFFN-NOT: lver
+; OFFN: ret void
+
+; Two-byte loads: alignment versioning copies such a loop: left.
 ; CHECK-LABEL: define agx_kernel void @half_row(
 ; CHECK-NOT: lver
 ; CHECK: ret void
@@ -48,6 +58,8 @@
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 declare float @llvm.exp.f32(float)
+declare float @llvm.maximum.f32(float, float)
+declare float @llvm.minimum.f32(float, float)
 
 define agx_kernel void @norm_apply(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %z, ptr addrspace(1) %y, float %m) {
 entry:
@@ -102,6 +114,29 @@ loop:
   store float %e, ptr addrspace(1) %py, align 4
   %j1 = add nuw nsw i32 %j, 1
   %c = icmp ult i32 %j1, 512
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+
+define agx_kernel void @quant_row(ptr addrspace(1) %x, ptr addrspace(1) %q, float %s) {
+entry:
+  %r = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = mul i32 %r, 256
+  br label %loop
+loop:
+  %j = phi i32 [ 0, %entry ], [ %j1, %loop ]
+  %i = add i32 %row, %j
+  %px = getelementptr float, ptr addrspace(1) %x, i32 %i
+  %v = load float, ptr addrspace(1) %px, align 4
+  %m = fmul float %v, %s
+  %c1 = call float @llvm.maximum.f32(float %m, float -127.0)
+  %c2 = call float @llvm.minimum.f32(float %c1, float 127.0)
+  %qi = fptosi float %c2 to i8
+  %pq = getelementptr i8, ptr addrspace(1) %q, i32 %i
+  store i8 %qi, ptr addrspace(1) %pq, align 1
+  %j1 = add nuw nsw i32 %j, 1
+  %c = icmp ult i32 %j1, 256
   br i1 %c, label %loop, label %exit
 exit:
   ret void
