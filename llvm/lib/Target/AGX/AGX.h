@@ -67,6 +67,9 @@ namespace AGX {
 /// Whether wide constants go to preloaded uniforms (-agx-uniform-constants):
 /// then they hold no general purpose registers.
 bool uniformConstantsEnabled();
+/// Whether x & (2^k - 1) is an and with the mask in a uniform where the
+/// constants are (-agx-low-mask-and-uniform), not a bfeil.
+bool lowMaskAndInUniforms();
 /// Gives the special register reads of F their range return attributes (see
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
 /// With ForAnalysis (ranges the caller takes off again), also the kernel's

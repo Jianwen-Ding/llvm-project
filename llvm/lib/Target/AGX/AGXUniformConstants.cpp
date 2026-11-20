@@ -47,6 +47,13 @@ static cl::opt<bool> AGXUniformConstants(
 
 bool llvm::AGX::uniformConstantsEnabled() { return AGXUniformConstants; }
 
+static cl::opt<bool> AGXLowMaskAndUniform(
+    "agx-low-mask-and-uniform", cl::init(true), cl::Hidden,
+    cl::desc("With -agx-uniform-constants, x & (2^k - 1) as an and with the "
+             "mask in a uniform, not a bfeil (the shared unit's)"));
+
+bool llvm::AGX::lowMaskAndInUniforms() { return AGXLowMaskAndUniform; }
+
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.

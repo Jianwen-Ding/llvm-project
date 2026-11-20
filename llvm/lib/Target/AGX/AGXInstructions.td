@@ -744,10 +744,14 @@ def : Pat<(i32 (srl AGXIntSrc32:$a, AGXIntSrc32:$s)),
 def : Pat<(i32 (sra AGXIntSrc32:$a, AGXIntSrc32:$s)),
           (ASR_I32 0, $a, 0, $s)>;
 // x & (2^k - 1) beyond the 8-bit immediates: bfeil keeps the low k bits
-// without a mov_imm for the mask, unless the mask has other uses.
+// without a mov_imm for the mask, unless the mask has other uses. Not with
+// the constants in uniforms: the mask one, the and the ALU's, not the
+// shared unit's (a double's high word's magnitude, f64 emulation's, L15-E557).
 def agx_low_mask32 : PatLeaf<(imm), [{
   uint32_t V = N->getZExtValue();
-  return N->hasOneUse() && V > 0xff && isMask_32(V) && V != ~0u;
+  return N->hasOneUse() && V > 0xff && isMask_32(V) && V != ~0u &&
+         !(llvm::AGX::uniformConstantsEnabled() &&
+           llvm::AGX::lowMaskAndInUniforms());
 }]>;
 def AGXMaskWidth : SDNodeXForm<imm, [{
   return CurDAG->getTargetConstant(llvm::popcount(uint32_t(N->getZExtValue())),
