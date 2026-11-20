@@ -61,6 +61,11 @@ static cl::opt<bool> AGXWideHalfLoadsHalfStores(
     cl::desc("-agx-wide-half-loads-divergent's block may store 16-bit "
              "elements"));
 
+static cl::opt<bool> AGXWideByteVectors(
+    "agx-wide-byte-vectors", cl::init(true), cl::Hidden,
+    cl::desc("Load a thread's row of 16 4-byte aligned bytes as one 16-byte "
+             "access of words, under -agx-wide-half-loads-divergent's terms"));
+
 static cl::opt<bool> AGXWideHalfLoadsDivergent(
     "agx-wide-half-loads-divergent", cl::init(true), cl::Hidden,
     cl::desc("-agx-wide-half-loads only for a thread's own row, in a block "
@@ -117,6 +122,15 @@ bool llvm::agxWideHalfLoadBlock(const BasicBlock &BB) {
     }
   }
   return Loads;
+}
+
+bool llvm::agxWideByteLoadBlock(const BasicBlock &BB) {
+  return AGXWideByteVectors && agxWideHalfLoadBlock(BB);
+}
+
+static bool wideByteLoad(const LoadSDNode *L) {
+  auto *PI = dyn_cast_or_null<Instruction>(L->getMemOperand()->getValue());
+  return PI && agxWideByteLoadBlock(*PI->getParent());
 }
 
 static bool wideHalfLoad(const LoadSDNode *L) {
@@ -224,6 +238,9 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // second through a pointer of its own, L15-E585)
   if (AGXWideHalfLoads)
     setOperationAction(ISD::LOAD, {MVT::v8i16, MVT::v8f16}, Custom);
+  // (and 16 bytes, L15-E596)
+  if (AGXWideByteVectors)
+    setOperationAction(ISD::LOAD, MVT::v16i8, Custom);
   // and stores: one 32-bit store per pair, its halves the elements
   // (lowerVectorStore), not a 16-bit store each
   if (AGXPairedHalfStores)
@@ -1301,6 +1318,33 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
       Elts.push_back(DAG.getBitcast(VT.getScalarType(), Load.getValue(I)));
     Results.push_back(DAG.getBuildVector(VT, DL, Elts));
     Results.push_back(Load.getValue(NumElts));
+    return;
+  }
+  // 16 bytes of a thread's own row, 4-byte aligned, under E585's terms
+  // (L15-E596, once E594 indexes them by words): one 16-byte access of
+  // words, its bytes shifted out (an int8 row sum's, folded into the
+  // extensions), not four 4-byte accesses of the byte format.
+  if (auto *L = dyn_cast<LoadSDNode>(N);
+      L && L->getValueType(0) == MVT::v16i8 &&
+      L->getExtensionType() == ISD::NON_EXTLOAD && !L->isIndexed() &&
+      L->isSimple() && L->getAlign() >= Align(4) &&
+      L->getAddressSpace() == AGX::DEVICE_ADDRESS && wideByteLoad(L)) {
+    SDLoc DL(N);
+    SDValue Load = DAG.getLoad(MVT::v4i32, DL, L->getChain(), L->getBasePtr(),
+                               L->getMemOperand());
+    SmallVector<SDValue, 16> Elts;
+    for (unsigned W = 0; W < 4; ++W) {
+      SDValue Word = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, MVT::i32, Load,
+                                 DAG.getVectorIdxConstant(W, DL));
+      for (unsigned B = 0; B < 4; ++B)
+        Elts.push_back(DAG.getNode(
+            ISD::TRUNCATE, DL, MVT::i8,
+            B ? DAG.getNode(ISD::SRL, DL, MVT::i32, Word,
+                            DAG.getConstant(8 * B, DL, MVT::i32))
+              : Word));
+    }
+    Results.push_back(DAG.getBuildVector(MVT::v16i8, DL, Elts));
+    Results.push_back(Load.getValue(1));
     return;
   }
   // Pairs of 16-bit elements: a 32-bit access each, its low half the first

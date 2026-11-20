@@ -147,6 +147,8 @@ static std::optional<Address> analyze(Instruction &I, Loop &L,
     if (Elem == 2 && Bytes == 16)
       One = isa<StoreInst>(I) ? agxWideHalfStores()
                               : agxWideHalfLoadBlock(*I.getParent());
+    if (Elem == 1 && Bytes == 16 && isa<LoadInst>(I))
+      One = agxWideByteLoadBlock(*I.getParent());
     if (!One)
       return std::nullopt;
   }

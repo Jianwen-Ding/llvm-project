@@ -132,6 +132,8 @@ bool isAGXDeviceLoad(const MachineInstr &MI);
 /// Whether a 4-byte aligned <8 x half> / <8 x i16> device load in BB is one
 /// 16-byte access (L15-E585, E590), and such a store (L15-E591).
 bool agxWideHalfLoadBlock(const BasicBlock &BB);
+/// And a 4-byte aligned <16 x i8> (L15-E596).
+bool agxWideByteLoadBlock(const BasicBlock &BB);
 bool agxWideHalfStores();
 /// The post-RA machine scheduler: AGXMemClusterMutation, and cluster members
 /// kept together ahead of latency stalls.
