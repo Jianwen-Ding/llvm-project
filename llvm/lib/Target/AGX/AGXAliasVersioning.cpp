@@ -71,7 +71,7 @@ static cl::opt<unsigned> AliasVersioningMaxWords(
              "hoisted, would cost the registers that keep groups resident)"));
 
 static cl::opt<unsigned> AliasVersioningMathPerWord(
-    "agx-alias-versioning-math-per-word", cl::init(4), cl::Hidden,
+    "agx-alias-versioning-math-per-word", cl::init(32), cl::Hidden,
     cl::desc("Arithmetic (a transcendental 16, a division 8) per 32-bit word "
              "loaded above which a loop's latency is hidden behind its work "
              "and it is not versioned"));
@@ -196,7 +196,8 @@ static bool endsRun(const Instruction &I) {
 /// The work of a loop iteration: (32-bit words loaded, arithmetic). Hoisted
 /// ahead of the stores, many words cost registers (and resident groups), and
 /// a loop with much arithmetic per word already hides its loads' latency
-/// behind it and the groups: neither gains from a copy (L15-E527).
+/// behind it and the groups: neither gains from a copy (L15-E527; one
+/// exponential a word, row_exp's, still did: L15-E549).
 template <typename Range>
 static std::pair<unsigned, unsigned> work(Range &&Insts, const DataLayout &DL) {
   unsigned Words = 0, Math = 0;

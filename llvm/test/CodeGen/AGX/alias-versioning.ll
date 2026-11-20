@@ -31,8 +31,9 @@
 ; ASM: device_store 0, i32, x,
 ; ASM-NEXT: device_load 0, i32, x,
 
-; A loop with much arithmetic per word it loads hides the loads' latency
-; behind it: left.
+; A loop with much arithmetic per word it loads (three exponentials) hides
+; the loads' latency behind it: left. One exponential a word is versioned
+; (L15-E549: row_exp's cycles 62435 -> 18045).
 ; CHECK-LABEL: define agx_kernel void @exp_row(
 ; CHECK-NOT: lver
 ; CHECK: ret void
@@ -110,8 +111,10 @@ loop:
   %v = load float, ptr addrspace(1) %px, align 4
   %d = fsub float %v, %m
   %e = call float @llvm.exp.f32(float %d)
+  %e1 = call float @llvm.exp.f32(float %e)
+  %e2 = call float @llvm.exp.f32(float %e1)
   %py = getelementptr float, ptr addrspace(1) %y, i32 %i
-  store float %e, ptr addrspace(1) %py, align 4
+  store float %e2, ptr addrspace(1) %py, align 4
   %j1 = add nuw nsw i32 %j, 1
   %c = icmp ult i32 %j1, 512
   br i1 %c, label %loop, label %exit
