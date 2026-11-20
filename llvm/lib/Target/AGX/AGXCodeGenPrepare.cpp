@@ -7510,6 +7510,16 @@ static cl::opt<bool> AGXOnlineSoftmaxSharedNum(
     cl::desc("agx-online-softmax-shared-one also for maxnum / maximumnum of a "
              "running value from a number"));
 
+static cl::opt<bool> AGXOnlineSoftmaxAbsArg(
+    "agx-online-softmax-abs-arg", cl::init(true), cl::Hidden,
+    cl::desc("agx-online-softmax-shared-one's exponent as -|b - a|, its clamp "
+             "a compare of |b - a|"));
+
+static cl::opt<unsigned> AGXOnlineSoftmaxAbsArgMaxChain(
+    "agx-online-softmax-abs-arg-max-chain", cl::init(8), cl::Hidden,
+    cl::desc("agx-online-softmax-abs-arg where a block's running maximum "
+             "chain has at most this many pairs"));
+
 static cl::opt<bool> AGXOnlineSoftmaxShared(
     "agx-online-softmax-shared-one", cl::init(true), cl::Hidden,
     cl::desc("agx-online-softmax-exp's trivial side as u 0 + 1, one for "
@@ -7569,6 +7579,28 @@ static bool onlineSoftmaxExps(Function &F) {
     Taken.insert(E1);
     Taken.insert(E2);
     Pairs.push_back({E1, E2});
+  }
+  // The pairs on each running maximum's chain in a block (the first link's
+  // running value, followed back through the chain's maxima): -|b - a|'s
+  // exponentials, which no longer wait for the link's maximum, ran ahead of
+  // a 16-link chain and took 14 more registers (online_softmax, a lane's
+  // elements one chain), not on 4- or 8-link ones (a vector's lanes, an
+  // attention decode's keys).
+  auto ChainRoot = [&](Value *V) {
+    for (unsigned Depth = 0; Depth < 64; ++Depth) {
+      auto *II = dyn_cast<IntrinsicInst>(V);
+      if (!II || (II->getIntrinsicID() != Intrinsic::maximum &&
+                  II->getIntrinsicID() != Intrinsic::maximumnum &&
+                  II->getIntrinsicID() != Intrinsic::maxnum))
+        return V;
+      V = II->getArgOperand(0);
+    }
+    return V;
+  };
+  DenseMap<std::pair<BasicBlock *, Value *>, unsigned> ChainPairs;
+  for (auto [E1, E2] : Pairs) {
+    auto *FA = cast<Instruction>(E1->getArgOperand(0));
+    ++ChainPairs[{E1->getParent(), ChainRoot(FA->getOperand(0))}];
   }
   for (auto [E1, E2] : Pairs) {
     IntrinsicInst *Late = E1->comesBefore(E2) ? E2 : E1;
@@ -7631,12 +7663,31 @@ static bool onlineSoftmaxExps(Function &F) {
                                   {UI, ConstantFP::get(E->getType(), 0.0),
                                    One})
             : nullptr;
+    // The argument as -|b - a| (L15-E529): b > a gives a - b, else b - u
+    // is b - a, or b - b where u = b (a tie, or a NaN a with maximum: a NaN
+    // then either way), so the same value but for zero signs (e^-0 = e^+0)
+    // and NaNs' (the simulator's arithmetic NaNs are its default one): where
+    // u is a NaN only with a (maximum) or never (a never-NaN a, Shared), as
+    // for the shared one. The expansion's clamp then compares |b - a| and
+    // selects b - a itself, one instruction less than the select and
+    // subtraction (E513 tried -|b - a| clamped as a value, which took one
+    // more register for nothing).
+    if (AGXOnlineSoftmaxAbsArg && Shared &&
+        E1->getIntrinsicID() == Intrinsic::exp &&
+        ChainPairs.lookup({E1->getParent(), ChainRoot(A)}) <=
+            AGXOnlineSoftmaxAbsArgMaxChain) {
+      IRBuilder<> EB(E);
+      Value *D = EB.CreateFSub(B, A);
+      Value *NX = EB.CreateFNeg(EB.CreateUnaryIntrinsic(Intrinsic::fabs, D));
+      cast<CallInst>(E)->setArgOperand(0, NX);
+    }
     Value *EA = Bld.CreateSelect(C, E, Triv ? Triv : Bld.CreateFAdd(One, FA));
     Value *EB = Bld.CreateSelect(C, Triv ? Triv : Bld.CreateFAdd(One, FB), E);
     E1->replaceAllUsesWith(EA);
     E2->replaceAllUsesWith(EB);
     E1->eraseFromParent();
     E2->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(X);
   }
   return !Pairs.empty();
 }

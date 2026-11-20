@@ -134,6 +134,11 @@ static cl::opt<bool> Exp2DirectReduction(
     cl::desc("precise exp2 reduced by n = roundeven(x) directly"),
     cl::init(false), cl::Hidden);
 
+static cl::opt<bool> AbsNegatedClamp(
+    "agx-exp-abs-negated-clamp", cl::init(true), cl::Hidden,
+    cl::desc("exp(-|y|) below a maximum: |y| clamped by the mirrored bound, "
+             "the select of y itself"));
+
 static cl::opt<bool> Exp2BelowMax(
     "agx-exp2-below-max",
     cl::desc("2^x and 10^x of x at most 0 (below a maximum): no upper clamp"),
@@ -729,6 +734,17 @@ public:
                      NoDenormals && IntegerLdexp;
     if (Unclamped || AB.Arg) {
       C = Hi;
+    } else if (NoOverflow && !Bounded && !Lo && AbsNegatedClamp &&
+               match(Hi, m_FNeg(m_FAbs(m_Value(Y))))) {
+      // -|y| (an online softmax's shared exponent, L15-E529): |y| above the
+      // mirrored bound selects it, else y itself, and -|that| is the clamped
+      // value: the compare takes y's .abs and the multiplication and fma
+      // its .neg.abs, so neither -|y| nor the select's operand needs an
+      // instruction of its own (a select's operand takes no modifier).
+      double Bound = FlushedUnderflow ? 87.3365478515625 : 104.0;
+      Value *AbsY = cast<Instruction>(Hi)->getOperand(0);
+      C = B.CreateFNeg(B.CreateUnaryIntrinsic(
+          Intrinsic::fabs, sel(gt(AbsY, Bound), k(Bound), Y)));
     } else if (NoOverflow && !Bounded && !Lo && FlushedUnderflow) {
       // (E474's +0 bound as the clamp: there the scaled bits are 0x007fffxx,
       // a denormal its users flush to the +0 the select gave: L15-E479)
