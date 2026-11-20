@@ -203,6 +203,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeExpStores(
     "agx-device-unroll-runtime-exp-stores", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-stores also for exponentials"));
 
+static cl::opt<unsigned> AGXDeviceUnrollBlocks(
+    "agx-device-unroll-blocks", cl::init(3), cl::Hidden,
+    cl::desc("Blocks an innermost device-load loop with a conditional device "
+             "store may have for E187's factors (0: one block only)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -576,7 +581,19 @@ void AGXTTIImpl::getUnrollingPreferences(
       return LI && LI->getPointerAddressSpace() == AGX::THREADGROUP_ADDRESS;
     });
   });
-  if (!ThreadgroupLoads && L->getNumBlocks() == 1) {
+  // (or a few blocks around a conditional store, y[j] = x[j] where x[j] > t:
+  // its loads one an iteration otherwise, L15-E572)
+  if (!ThreadgroupLoads &&
+      (L->getNumBlocks() == 1 ||
+       (AGXDeviceUnrollBlocks && L->isInnermost() &&
+        L->getNumBlocks() <= AGXDeviceUnrollBlocks &&
+        any_of(L->blocks(), [&](const BasicBlock *BB) {
+          return BB != L->getHeader() && any_of(*BB, [](const Instruction &I) {
+                   auto *SI = dyn_cast<StoreInst>(&I);
+                   return SI &&
+                          SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+                 });
+        })))) {
     // A loop that loads device memory, with a constant trip count the factor
     // divides (no remainder loop: static shapes): unrolled, its loads of
     // several iterations are in flight at once instead of one wait each
