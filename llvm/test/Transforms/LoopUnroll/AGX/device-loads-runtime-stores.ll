@@ -5,6 +5,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-tanh-stores=0 -S < %s | FileCheck %s --check-prefix=NOTANH
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-div-stores=0 -S < %s | FileCheck %s --check-prefix=NODIV
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-math-stores=0 -S < %s | FileCheck %s --check-prefix=NOMATH
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-stores=0 -S < %s | FileCheck %s --check-prefix=FOUR
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -37,10 +38,16 @@ exit:
   ret void
 }
 
-; Byte stores (int8 quantization, roundeven) likewise (L15-E567).
+; Byte stores (int8 quantization, roundeven) likewise (L15-E567), 8 times
+; for a row of bytes (L15-E599).
 ; CHECK-LABEL: @quant(
-; CHECK-COUNT-4: store i8
+; CHECK-COUNT-8: store i8
+; CHECK-NOT: store i8
 ; CHECK: .epil
+; FOUR-LABEL: @quant(
+; FOUR-COUNT-4: store i8
+; FOUR-NOT: store i8
+; FOUR: .epil
 ; WORDS-LABEL: @quant(
 ; WORDS: store i8
 ; WORDS-NOT: store i8

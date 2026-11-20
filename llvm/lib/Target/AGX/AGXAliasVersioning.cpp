@@ -88,7 +88,14 @@ static cl::opt<bool> AliasVersioningLoopRanges(
 static cl::opt<bool> AliasVersioningLoopRangesRuntime(
     "agx-alias-versioning-loop-ranges-runtime", cl::init(true), cl::Hidden,
     cl::desc("-agx-alias-versioning-loop-ranges also for runtime trip counts "
-             "whose accesses step at most 16 bytes"));
+             "whose accesses step at most -agx-alias-versioning-small-step "
+             "bytes"));
+
+static cl::opt<unsigned> AliasVersioningSmallStep(
+    "agx-alias-versioning-small-step", cl::init(64), cl::Hidden,
+    cl::desc("-agx-alias-versioning-loop-ranges-runtime's most bytes an "
+             "access steps an iteration (a row's, not a grid-stride loop's; "
+             "64 for E599's 8 times unrolled rows of floats into bytes)"));
 
 static cl::opt<unsigned> AliasVersioningBlocks(
     "agx-alias-versioning-blocks", cl::init(20), cl::Hidden,
@@ -810,13 +817,13 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
           return C && C->getAPInt().abs().getZExtValue() *
                               F.getDataLayout().getTypeAllocSize(
                                   G->getSourceElementType()) <=
-                          16;
+                          AliasVersioningSmallStep;
         }
         auto *AR = dyn_cast<SCEVAddRecExpr>(X);
         auto *C = AR && AR->getLoop() == L
                       ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
                       : nullptr;
-        return C && C->getAPInt().abs().ule(16);
+        return C && C->getAPInt().abs().ule(AliasVersioningSmallStep);
       });
     });
   };
