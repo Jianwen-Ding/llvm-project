@@ -189,6 +189,11 @@ static cl::opt<unsigned> AGXDeviceUnrollRuntimeContiguous(
              "loads, no stores, light arithmetic) is unrolled by, twice that "
              "for one load an iteration (0: none)"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeStoresNarrow(
+    "agx-device-unroll-runtime-stores-narrow", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for 1- and 2-byte "
+             "accesses (and roundeven)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -689,13 +694,16 @@ void AGXTTIImpl::getUnrollingPreferences(
       // (L15-E565).
       if (!Light && !Far && Insts <= 24 && AGXDeviceUnrollRuntimeStores >= 2 &&
           all_of(*L->getHeader(), [&](const Instruction &I) {
+            auto Size = [&](Type *Ty) {
+              unsigned B = DL.getTypeStoreSize(Ty);
+              return AGXDeviceUnrollRuntimeStoresNarrow ? B <= 4 : B == 4;
+            };
             if (auto *SI = dyn_cast<StoreInst>(&I))
               return SI->isSimple() &&
                      SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
-                     DL.getTypeStoreSize(SI->getValueOperand()->getType()) == 4;
+                     Size(SI->getValueOperand()->getType());
             if (auto *LI = dyn_cast<LoadInst>(&I))
-              return LI->isSimple() &&
-                     DL.getTypeStoreSize(LI->getType()) == 4;
+              return LI->isSimple() && Size(LI->getType());
             if (auto *II = dyn_cast<IntrinsicInst>(&I))
               return II->getIntrinsicID() == Intrinsic::fma ||
                      II->getIntrinsicID() == Intrinsic::fmuladd ||
@@ -703,7 +711,9 @@ void AGXTTIImpl::getUnrollingPreferences(
                      II->getIntrinsicID() == Intrinsic::minnum ||
                      II->getIntrinsicID() == Intrinsic::maximum ||
                      II->getIntrinsicID() == Intrinsic::minimum ||
-                     II->getIntrinsicID() == Intrinsic::fabs;
+                     II->getIntrinsicID() == Intrinsic::fabs ||
+                     (AGXDeviceUnrollRuntimeStoresNarrow &&
+                      II->getIntrinsicID() == Intrinsic::roundeven);
             return !isa<CallBase>(I) && !I.isAtomic() &&
                    I.getOpcode() != Instruction::FDiv;
           })) {
