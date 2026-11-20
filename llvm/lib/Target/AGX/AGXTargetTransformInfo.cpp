@@ -142,6 +142,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStrided(
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntime(
+    "agx-device-unroll-runtime", cl::init(4), cl::Hidden,
+    cl::desc("Unroll a light device-load loop of a runtime trip count this "
+             "many times, with a remainder loop (0: not)"));
+
 static cl::opt<bool> AGXDeviceUnrollSomeStrided(
     "agx-device-unroll-some-strided", cl::init(true), cl::Hidden,
     cl::desc("agx-device-unroll-strided's factor also where only some of a "
@@ -481,6 +486,66 @@ void AGXTTIImpl::getUnrollingPreferences(
       UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       if (MinMax)
         UP.FullUnrollMaxCount = F;
+    }
+    // A runtime trip count: a loop of light work per load and no stores
+    // (a matrix product's dot over K) unrolled with a remainder loop, its
+    // loads of several iterations in flight (L15-E536). Loops of
+    // transcendental work hide their loads behind it, and lost (xent_rows).
+    if (!Trips && DeviceLoads && AGXDeviceUnrollRuntime >= 2) {
+      unsigned Insts = 0, Far = 0;
+      bool Light = true;
+      for (const Instruction &I : *L->getHeader()) {
+        ++Insts;
+        if (isa<StoreInst>(I) || (isa<CallBase>(I) && !isa<IntrinsicInst>(I)))
+          Light = false;
+        // (a load that does not step by its own size: a column, a gather;
+        // contiguous loads' unrolled copies (an FIR's taps) only took
+        // registers)
+        if (auto *LI = dyn_cast<LoadInst>(&I);
+            LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
+          // (the pointer's step, or its GEP index's, an extended 32-bit one,
+          // times the element's size)
+          auto StepOf = [&](const SCEV *X) -> std::optional<APInt> {
+            auto *AR = dyn_cast<SCEVAddRecExpr>(X);
+            auto *C = AR && AR->getLoop() == L
+                          ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
+                          : nullptr;
+            if (!C)
+              return std::nullopt;
+            return C->getAPInt().sextOrTrunc(64);
+          };
+          const Value *Ptr = LI->getPointerOperand();
+          std::optional<APInt> Bytes = StepOf(SE.getSCEV(const_cast<Value *>(Ptr)));
+          if (auto *G = dyn_cast<GetElementPtrInst>(Ptr);
+              !Bytes && G && G->getNumIndices() == 1) {
+            const Value *Idx = G->getOperand(1);
+            if (auto *E = dyn_cast<CastInst>(Idx);
+                E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+              Idx = E->getOperand(0);
+            if (std::optional<APInt> St =
+                    StepOf(SE.getSCEV(const_cast<Value *>(Idx))))
+              Bytes = *St * DL.getTypeAllocSize(G->getSourceElementType());
+          }
+          Far += !Bytes || Bytes->abs().ugt(DL.getTypeStoreSize(LI->getType()));
+        }
+        // (light arithmetic only, and no running maximum / minimum, whose
+        // deferral, L15-E444, wants the loop: the causal / window rows lost)
+        if (auto *II = dyn_cast<IntrinsicInst>(&I))
+          switch (II->getIntrinsicID()) {
+          case Intrinsic::fma:
+          case Intrinsic::fmuladd:
+            break;
+          default:
+            Light = false;
+          }
+        if (I.getOpcode() == Instruction::FDiv || I.isAtomic())
+          Light = false;
+      }
+      if (Light && Far && Insts <= 24) {
+        UP.Partial = UP.Runtime = true;
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount = AGXDeviceUnrollRuntime;
+        UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      }
     }
     return;
   }
