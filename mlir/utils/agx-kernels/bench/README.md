@@ -28,6 +28,7 @@ the kernel's, as memory at VA).
 | `softmax_rows` | row softmax, a SIMD-group per row: strided loops with `gpu.subgroup_reduce maxnumf` / `add` and `math.exp` |
 | `layernorm_rows` | LayerNorm of 1024-float rows by a 256-thread threadgroup: `gpu.all_reduce` (the dialect's lowering), `math.rsqrt` |
 | `silu_f16x4` | f16 bias + SiLU on `vector<4xf16>` loads and stores, computed in f32 |
+| `gelu_erf` | exact GELU, 0.5 x (1 + erf(x / sqrt 2)), elementwise f32 (erf by the rational approximation) |
 | `saxpy_vec4` | grid-stride `y = a x + y` on `vector<4xf32>` loads and stores |
 | `stencil5_2d` | 5-point Jacobi step on a 2-D memref with a halo |
 | `histogram_atomic` | 256-bin byte histogram: `memref.atomic_rmw` into workgroup bins, then into device memory |

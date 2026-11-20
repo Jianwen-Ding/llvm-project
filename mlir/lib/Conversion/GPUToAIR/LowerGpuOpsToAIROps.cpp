@@ -2778,6 +2778,58 @@ struct LowerGpuOpsToAIROpsPass final
           isThreadgroupUniform(op.getOffset()))
         op->setAttr(kUniformOffsetAttr, UnitAttr::get(op.getContext()));
     });
+    // f32 erf's rational approximation P / Q: Q's denominators stay within
+    // a few binades of 1 where the result is used, so the hardware's
+    // reciprocal y0, y = y0 + y0 (1 - Q y0), q0 = P y, q = q0 + y (P - Q q0)
+    // gives the correctly rounded quotient that the general division does
+    // with its exponent scaling and special cases (every f32 input's erf
+    // checked the same, flushing: L15-E499). erf expanded here by upstream's
+    // patterns, the division they create noted.
+    if (erfReciprocalDivision) {
+      SmallVector<Operation *> erfs;
+      m.walk([&](math::ErfOp op) { erfs.push_back(op); });
+      struct Divisions : RewriterBase::Listener {
+        SmallVector<arith::DivFOp> divs;
+        void notifyOperationInserted(Operation *op,
+                                     OpBuilder::InsertPoint) override {
+          if (auto d = dyn_cast<arith::DivFOp>(op))
+            divs.push_back(d);
+        }
+      } listener;
+      if (!erfs.empty()) {
+        RewritePatternSet patterns(ctx);
+        populatePolynomialApproximateErfPattern(patterns);
+        populateMathF32ExpansionPatterns(
+            patterns, [](StringRef name) { return name == "math.erf"; },
+            /*benefit=*/2);
+        GreedyRewriteConfig config;
+        config.setListener(&listener);
+        config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+        (void)applyOpPatternsGreedily(erfs, std::move(patterns), config);
+      }
+      for (arith::DivFOp op : listener.divs) {
+        if (!getElementTypeOrSelf(op.getType()).isF32())
+          continue;
+        OpBuilder b(op);
+        Location loc = op.getLoc();
+        Type type = op.getType();
+        TypedAttr oneAttr = b.getF32FloatAttr(1.0f);
+        if (auto vt = dyn_cast<VectorType>(type))
+          oneAttr = DenseElementsAttr::get(vt, b.getF32FloatAttr(1.0f));
+        Value one = arith::ConstantOp::create(b, loc, type, oneAttr);
+        Value p = op.getLhs(), q = op.getRhs();
+        Value y0 = arith::DivFOp::create(b, loc, one, q,
+                                         arith::FastMathFlags::afn);
+        Value nq = arith::NegFOp::create(b, loc, q);
+        Value e = math::FmaOp::create(b, loc, nq, y0, one);
+        Value y = math::FmaOp::create(b, loc, e, y0, y0);
+        Value q0 = arith::MulFOp::create(b, loc, p, y);
+        Value r = math::FmaOp::create(b, loc, nq, q0, p);
+        Value res = math::FmaOp::create(b, loc, r, y, q0);
+        op.replaceAllUsesWith(res);
+        op.erase();
+      }
+    }
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);
