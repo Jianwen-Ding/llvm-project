@@ -280,6 +280,11 @@ static cl::opt<bool> AGXOriginalOrderLoadsFirst(
              "threadgroup accesses, issues a ready device load first where "
              "its registers still let the kernel's threadgroups in"));
 
+static cl::opt<unsigned> AGXSchedLoadsFirstMinGroups(
+    "agx-sched-loads-first-min-groups", cl::init(28), cl::Hidden,
+    cl::desc("agx-sched-original-order-loads-first's order dropped where it "
+             "leaves the core fewer SIMD-groups than this (and than before)"));
+
 namespace {
 /// Picks the region's instructions in their order before the first
 /// scheduling (top-down; that order is a topological one of the DAG).
@@ -451,9 +456,18 @@ public:
           "agx-max-threads-per-threadgroup", 1024);
       if (Need == 0 || Need > 1024)
         Need = 1024;
+      // (or leaves the core fewer than 28 groups, fewer than before: too few
+      // to hide the latency the loads ahead saved: attention decode's 40 ->
+      // 26, whose loads ahead gained under E498 and lost once its per-key
+      // work shrank, L15-E530; the online softmaxes keep 32 to 46)
+      LLVM_DEBUG(dbgs() << "agx-occupancy loads first: halves " << H
+                        << " groups " << CoreGroups(H) << " vs "
+                        << CoreGroups(Before) << "\n");
       if (H > Before &&
           (AGXSubtarget::maxThreadsForHalves(H + 16) < Need ||
-           9 * CoreGroups(H) < 5 * CoreGroups(Before)))
+           9 * CoreGroups(H) < 5 * CoreGroups(Before) ||
+           (CoreGroups(H) < AGXSchedLoadsFirstMinGroups &&
+            CoreGroups(H) < CoreGroups(Before))))
         Reschedule(false);
     }
     LLVM_DEBUG(dbgs() << "agx-occupancy reverted: halves " << regionHalves()
