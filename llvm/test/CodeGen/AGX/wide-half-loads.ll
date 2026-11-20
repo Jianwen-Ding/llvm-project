@@ -23,7 +23,13 @@
 ; ALL: i32, xyzw
 ; ALL: i32, xyzw
 
-; A block that stores: two 8-byte halves.
+; A row of halves stored as halves (L15-E590): one 16-byte load.
+; CHECK-LABEL: hcopy:
+; CHECK: device_load 0, i32, xyzw
+; CHECK-NOT: device_load
+; CHECK: device_store
+
+; A block that stores floats: two 8-byte halves.
 ; CHECK-LABEL: widen:
 ; CHECK-NOT: device_load {{.*}}, i32, xyzw
 ; CHECK: stop
@@ -79,6 +85,27 @@ out:
   %tz = zext i32 %t to i64
   %q = getelementptr float, ptr addrspace(1) %y, i64 %tz
   store float %a1, ptr addrspace(1) %q, align 4
+  ret void
+}
+
+define agx_kernel void @hcopy(ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  br label %loop
+loop:
+  %j = phi i32 [ 0, %entry ], [ %j1, %loop ]
+  %k = add i32 %row, %j
+  %z = zext i32 %k to i64
+  %p = getelementptr half, ptr addrspace(1) %x, i64 %z
+  %v = load <8 x half>, ptr addrspace(1) %p, align 4
+  %m = fmul <8 x half> %v, %v
+  %q = getelementptr half, ptr addrspace(1) %y, i64 %z
+  store <8 x half> %m, ptr addrspace(1) %q, align 4
+  %j1 = add i32 %j, 8
+  %c = icmp ult i32 %j1, %n
+  br i1 %c, label %loop, label %out
+out:
   ret void
 }
 

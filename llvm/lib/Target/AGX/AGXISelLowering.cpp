@@ -56,6 +56,11 @@ static cl::opt<bool> AGXWideHalfLoads(
     cl::desc("Load 4-byte aligned vectors of 8 16-bit elements as one "
              "16-byte access"));
 
+static cl::opt<bool> AGXWideHalfLoadsHalfStores(
+    "agx-wide-half-loads-half-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-wide-half-loads-divergent's block may store 16-bit "
+             "elements"));
+
 static cl::opt<bool> AGXWideHalfLoadsDivergent(
     "agx-wide-half-loads-divergent", cl::init(true), cl::Hidden,
     cl::desc("-agx-wide-half-loads only for a thread's own row, in a block "
@@ -95,8 +100,12 @@ static bool wideHalfLoad(const LoadSDNode *L) {
   };
   bool Loads = false;
   for (const Instruction &I : *PI->getParent()) {
+    // (a row of halves stored as it is loaded, rowcopy_f16, once E589 kept
+    // its loads after its stores: L15-E590)
     if (auto *S = dyn_cast<StoreInst>(&I);
-        S && S->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+        S && S->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+        !(AGXWideHalfLoadsHalfStores &&
+          S->getValueOperand()->getType()->getScalarSizeInBits() == 16))
       return false;
     if (auto *LI = dyn_cast<LoadInst>(&I);
         LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
