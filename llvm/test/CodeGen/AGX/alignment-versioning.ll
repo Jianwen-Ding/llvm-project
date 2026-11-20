@@ -2,6 +2,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-alignment-versioning-elements=0 < %s | FileCheck %s --check-prefix=ONE
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-bytes-half-lanes=0 < %s | FileCheck %s --check-prefix=NOLANE
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-byte-pairs=0 < %s | FileCheck %s --check-prefix=NOPAIR
 
 ; A loop over a half row known aligned to 2 bytes only: a copy for a 4-byte
 ; aligned base (a test of the kernel argument, uniform) whose loads at
@@ -191,12 +192,19 @@ declare <4 x float> @llvm.fma.v4f32(<4 x float>, <4 x float>, <4 x float>)
 ; CHECK: and {{r[0-9]+}}, {{r[0-9]+}}, 3
 ; CHECK: %loop
 ; CHECK: device_load {{[0-9]}}, i8, x,
+; CHECK: mov_imm [[BIAS:r[0-9]+]], 8388736
 ; CHECK: %loop.aligned
 ; CHECK: device_load {{[0-9]}}, i8, xyzw,
-; CHECK: xor {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, 128
-; CHECK: isub {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, 128
+; CHECK: xor [[W:r[0-9]+]], {{r[0-9]+}}, [[BIAS]]
+; CHECK: isub [[W]]l, [[W]]l, 128
 ; CHECK: imadd {{r[0-9]+}}, {{r[0-9]+[lh]}}.sx, {{r[0-9]+[lh]}}.sx,
 ; CHECK: stop
+; Each pair of lanes (a 32-bit register's halves) is biased by one xor with
+; 0x00800080 (8388736) (L15-E488); with the option off, one xor per lane.
+; NOPAIR-LABEL: dot_i8:
+; NOPAIR: %loop.aligned
+; NOPAIR: xor {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, 128
+; NOPAIR: stop
 ; NOLANE-LABEL: dot_i8:
 ; NOLANE: %loop.aligned
 ; NOLANE: bitop 0101, {{r[0-9]+}}, {{r[0-9]+[lh]}}, 0

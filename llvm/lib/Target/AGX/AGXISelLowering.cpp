@@ -1830,6 +1830,10 @@ static cl::opt<bool> AGXSignedBytesHalfLanes(
     cl::desc("A byte in an extended 16-bit lane sign-extended in the 16-bit "
              "register, for 32-bit users' 16-bit sources"));
 
+static cl::opt<bool> AGXSignedBytePairs(
+    "agx-signed-byte-pairs", cl::init(true), cl::Hidden,
+    cl::desc("Two byte lanes of a vector load biased by one 32-bit xor"));
+
 static cl::opt<bool> AGXShiftedFieldInsert(
     "agx-shifted-field-insert", cl::init(true), cl::Hidden,
     cl::desc("(x << s) | q, s above 4 and q zero in x's field, as one bfi "
@@ -2498,8 +2502,32 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       SelectionDAG &DAG = DCI.DAG;
       SDLoc DL(N);
       auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i16); };
-      SDValue F =
-          DAG.getNode(ISD::XOR, DL, MVT::i16, X.getOperand(0), C(128));
+      SDValue Y = X.getOperand(0);
+      SDValue F;
+      // A lane of a byte vector load: its pair of halves biased by one
+      // 32-bit xor with 0x00800080 (the pair's other lane shares it,
+      // L15-E488), opaque so that the truncations do not narrow it again.
+      if (AGXSignedBytePairs &&
+          (Y.getOpcode() == AGXISD::LOAD_V2_I8 ||
+           Y.getOpcode() == AGXISD::LOAD_V4_I8) &&
+          cast<MemSDNode>(Y)->getMemoryVT().getScalarSizeInBits() == 8) {
+        unsigned K = Y.getResNo();
+        SDValue Lo(Y.getNode(), K & ~1u), Hi(Y.getNode(), K | 1u);
+        SDValue P = DAG.getNode(
+            AGXISD::PACK16, DL, MVT::i32,
+            DAG.getNode(ISD::ANY_EXTEND, DL, MVT::i32, Lo),
+            DAG.getNode(ISD::ANY_EXTEND, DL, MVT::i32, Hi));
+        P = DAG.getNode(ISD::XOR, DL, MVT::i32, P,
+                        DAG.getConstant(0x00800080, DL, MVT::i32,
+                                        /*isTarget=*/false,
+                                        /*isOpaque=*/true));
+        if (K & 1)
+          P = DAG.getNode(ISD::SRL, DL, MVT::i32, P,
+                          DAG.getConstant(16, DL, MVT::i32));
+        F = DAG.getNode(ISD::TRUNCATE, DL, MVT::i16, P);
+      } else {
+        F = DAG.getNode(ISD::XOR, DL, MVT::i16, Y, C(128));
+      }
       F = DAG.getNode(ISD::SUB, DL, MVT::i16, F, C(128));
       return DAG.getNode(ISD::SIGN_EXTEND, DL, MVT::i32, F);
     }
