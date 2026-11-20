@@ -73,6 +73,11 @@ static cl::opt<bool> CttzHalfPopcount(
     cl::desc("16-bit cttz as the popcount of (x - 1) & ~x"), cl::init(true),
     cl::Hidden);
 
+static cl::opt<bool> AGXBswapRotates(
+    "agx-bswap-rotates", cl::init(true), cl::Hidden,
+    cl::desc("A 32-bit byte swap as two rotates, two ands and an or (a 64-bit "
+             "one as two of its words)"));
+
 AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                                      const AGXSubtarget &ST)
     : TargetLowering(TM, ST), ST(ST) {
@@ -172,6 +177,8 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::FSHR, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i64, Custom);
+  if (AGXBswapRotates)
+    setOperationAction(ISD::BSWAP, {MVT::i32, MVT::i64}, Custom);
   setOperationAction(ISD::BITREVERSE, MVT::i16, Promote);
   // (ctlz_zero_poison too: expanded it takes 10 instructions of shifts, ors
   // and a popcount, promoted 4. cttz_zero_poison's expansion, a popcount of
@@ -810,6 +817,30 @@ static cl::opt<bool> SatConvertClamp(
 SDValue AGXTargetLowering::LowerOperation(SDValue Op,
                                           SelectionDAG &DAG) const {
   switch (Op.getOpcode()) {
+  case ISD::BSWAP: {
+    // The bytes [b3 b2 b1 b0] reversed: rotated right by 8, [b0 b3 b2 b1],
+    // has b0 and b2 in place, rotated left, [b2 b1 b0 b3], b1 and b3: two
+    // rotates (extr, the shared unit's) and three ALU operations, not the
+    // expansion's three of the shared unit (two rotates and a shift,
+    // L15-E556)
+    SDLoc DL(Op);
+    SDValue X = Op.getOperand(0);
+    if (Op.getValueType() == MVT::i64) {
+      auto [Lo, Hi] = DAG.SplitScalar(X, DL, MVT::i32, MVT::i32);
+      return DAG.getNode(ISD::BUILD_PAIR, DL, MVT::i64,
+                         DAG.getNode(ISD::BSWAP, DL, MVT::i32, Hi),
+                         DAG.getNode(ISD::BSWAP, DL, MVT::i32, Lo));
+    }
+    auto Rot = [&](unsigned S) {
+      return DAG.getNode(ISD::ROTL, DL, MVT::i32, X,
+                         DAG.getConstant(S, DL, MVT::i32));
+    };
+    SDValue Hi = DAG.getNode(ISD::AND, DL, MVT::i32, Rot(24),
+                             DAG.getConstant(0xFF00FF00u, DL, MVT::i32));
+    SDValue Lo = DAG.getNode(ISD::AND, DL, MVT::i32, Rot(8),
+                             DAG.getConstant(0x00FF00FFu, DL, MVT::i32));
+    return DAG.getNode(ISD::OR, DL, MVT::i32, Hi, Lo, SDNodeFlags::Disjoint);
+  }
   case ISD::STORE:
     return lowerVectorStore(Op, DAG);
   case ISD::LOAD:
