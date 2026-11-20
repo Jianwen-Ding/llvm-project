@@ -40,6 +40,7 @@
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
@@ -64,6 +65,16 @@ static cl::opt<unsigned> AGXTGLoadReaderOperandsFirst(
     cl::desc("Before a run of threadgroup loads, the other operands of their "
              "readers that do not depend on the loads (1 before, 2 after "
              "register allocation)"));
+
+static cl::opt<bool> AGXLoadsAfterStores(
+    "agx-sched-loads-after-stores", cl::Hidden, cl::init(true),
+    cl::desc("Keep device loads after the device stores before them in "
+             "program order in a thread's row loop of light work"));
+
+static cl::opt<unsigned> AGXLoadsAfterStoresWork(
+    "agx-sched-loads-after-stores-work", cl::Hidden, cl::init(3),
+    cl::desc("-agx-sched-loads-after-stores' most instructions for each "
+             "device access"));
 
 namespace {
 
@@ -104,6 +115,96 @@ int memKind(const MachineInstr &MI) {
   }
 }
 
+/// Whether V is (or is computed from) a thread position.
+static bool fromThreadPosition(const Value *V) {
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<std::pair<const Value *, unsigned>, 16> Work{{V, 0}};
+  while (!Work.empty()) {
+    auto [X, Depth] = Work.pop_back_val();
+    if (!Seen.insert(X).second)
+      continue;
+    if (auto *C = dyn_cast<CallBase>(X)) {
+      if (const Function *F = C->getCalledFunction();
+          F && F->getName().starts_with("llvm.agx.thread."))
+        return true;
+      continue;
+    }
+    auto *I = dyn_cast<Instruction>(X);
+    if (!I || Depth >= 12)
+      continue;
+    for (const Value *Op : I->operands())
+      Work.push_back({Op, Depth + 1});
+  }
+  return false;
+}
+
+/// Whether the address P is in a thread's own row: a thread position times
+/// 16 or more (a multiply or shift by a constant) in its computation.
+static bool threadRowAddress(const Value *P) {
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
+  while (!Work.empty()) {
+    auto [X, Depth] = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(X);
+    if (!I || isa<CallBase>(I) || Depth >= 12 || !Seen.insert(I).second)
+      continue;
+    if (I->getOpcode() == Instruction::Mul ||
+        I->getOpcode() == Instruction::Shl) {
+      if (auto *C = dyn_cast<ConstantInt>(I->getOperand(1))) {
+        uint64_t F = I->getOpcode() == Instruction::Mul
+                         ? C->getZExtValue()
+                         : (C->getZExtValue() < 32 ? 1ull << C->getZExtValue()
+                                                   : 0);
+        if (F >= 16 && fromThreadPosition(I->getOperand(0)))
+          return true;
+      }
+    }
+    for (const Value *Op : I->operands())
+      Work.push_back({Op, Depth + 1});
+  }
+  return false;
+}
+
+/// A region whose device loads should stay after the device stores before
+/// them (L15-E589): a loop over a thread's own rows (every store's address
+/// a thread position times 16 or more), of light work (at most
+/// -agx-sched-loads-after-stores-work instructions besides its device
+/// accesses for each), that loads at most 2.5 times the bytes it stores.
+/// With many SIMD-groups resident, its next loads ahead of its last stores
+/// stalled the core's memory pipelines (row_scale's tput -28%, gather_rows
+/// -38%, widen_f16 -27% kept after them, fewer registers besides); columns
+/// (col_softmax_norm +20%) and transcendental rows (row_exp +2.9%) gained
+/// from the loads ahead.
+static bool loadsAfterStores(ScheduleDAGInstrs *DAG) {
+  unsigned Loads = 0, Stores = 0, Work = 0;
+  uint64_t LoadBytes = 0, StoreBytes = 0;
+  for (SUnit &SU : DAG->SUnits) {
+    const MachineInstr &MI = *SU.getInstr();
+    int K = memKind(MI);
+    for (const MachineMemOperand *MMO : MI.memoperands())
+      if (MMO->getSize().hasValue())
+        (K == DeviceStore ? StoreBytes : LoadBytes) +=
+            K == DeviceStore || K == DeviceLoad
+                ? MMO->getSize().getValue().getKnownMinValue()
+                : 0;
+    if (K == DeviceStore) {
+      ++Stores;
+      for (const MachineMemOperand *MMO : MI.memoperands())
+        if (!MMO->getValue() || !threadRowAddress(MMO->getValue()))
+          return false;
+      if (MI.memoperands_empty())
+        return false;
+    }
+    Loads += K == DeviceLoad;
+    Work += K < 0 && !MI.isCopy() && !MI.isTerminator();
+  }
+  // (and loading at most 2.5 times the bytes it stores: three rows into one,
+  // row_norm_apply, and floats into bytes, to_u8 / quant_rows, lost 1-6%)
+  return Stores && Loads &&
+         Work <= AGXLoadsAfterStoresWork * (Loads + Stores) &&
+         2 * LoadBytes <= 5 * StoreBytes;
+}
+
 class AGXMemClusterMutation : public ScheduleDAGMutation {
 public:
   void apply(ScheduleDAGInstrs *DAG) override;
@@ -116,10 +217,28 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
   unsigned Kinds = AGXMemClusterKinds;
   if (AGXMemClusterKindsPostRA >= 0 && !PreRA)
     Kinds = AGXMemClusterKindsPostRA;
+  // A device load stays after the device stores before it in a thread's
+  // row of light work (loadsAfterStores, L15-E589).
+  bool LoadsFollowStores = false;
+  if (AGXLoadsAfterStores && loadsAfterStores(DAG)) {
+    SmallVector<SUnit *, 16> Stores;
+    for (SUnit &SU : DAG->SUnits) {
+      int K = memKind(*SU.getInstr());
+      if (K == DeviceStore)
+        Stores.push_back(&SU);
+      else if (K == DeviceLoad)
+        for (SUnit *St : Stores)
+          DAG->addEdge(&SU, SDep(St, SDep::Artificial));
+    }
+    // (a run of loads ends at a store the later loads now follow)
+    LoadsFollowStores = true;
+  }
   EquivalenceClasses<SUnit *> Clusters;
   SmallVector<SUnit *, 16> Run[NumKinds];
   for (SUnit &SU : DAG->SUnits) {
     int K = memKind(*SU.getInstr());
+    if (LoadsFollowStores && K == DeviceStore)
+      Run[DeviceLoad].clear();
     if (K < 0 || !(Kinds & (1u << K)))
       continue;
     SmallVector<SUnit *, 16> &R = Run[K];
