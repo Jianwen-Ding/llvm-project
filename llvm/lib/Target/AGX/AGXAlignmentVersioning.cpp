@@ -172,10 +172,20 @@ static std::pair<Value *, const SCEV *> baseAndOffset(Value *Ptr,
 
 /// The device accesses of L whose alignment a 4-byte aligned kernel argument
 /// base would raise, and those bases.
+static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
+                         SmallVectorImpl<Raise> &Raises,
+                         SetVector<Value *> &Bases);
+
 static void findRaises(Loop &L, ScalarEvolution &SE,
                        SmallVectorImpl<Raise> &Raises,
                        SetVector<Value *> &Bases) {
-  for (Instruction &I : *L.getHeader()) {
+  findRaisesIn(*L.getHeader(), SE, Raises, Bases);
+}
+
+static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
+                         SmallVectorImpl<Raise> &Raises,
+                         SetVector<Value *> &Bases) {
+  for (Instruction &I : BB) {
     Value *Ptr;
     Align Old;
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -677,12 +687,72 @@ static bool versionTapBases(Loop &L, Function &F, LoopInfo &LI,
   return true;
 }
 
+static cl::opt<unsigned> StraightLineVersioningMin(
+    "agx-straight-line-versioning-min", cl::init(16), cl::Hidden,
+    cl::desc("Fewest elements of a one-block kernel's device accesses whose "
+             "alignment a 4-byte aligned base raises for its body to be "
+             "versioned on it (0: none)"));
+
+/// A kernel of one block (no loops: opt unrolled them whole, as E511's
+/// constant trip counts let it) with many device accesses whose alignment a
+/// 4-byte aligned kernel-argument base would raise (rmsnorm_f16's
+/// vector<4xf16> at align 2, a 16-bit access each element) runs a copy of
+/// itself at the raised alignment where every such base is aligned
+/// (L15-E522; E495 for fewer accesses lost on registers).
+static bool versionBody(Function &F, ScalarEvolution &SE) {
+  if (!StraightLineVersioningMin || F.size() != 1 ||
+      !isa<ReturnInst>(F.getEntryBlock().getTerminator()))
+    return false;
+  BasicBlock *BB = &F.getEntryBlock();
+  if (any_of(*BB, [](Instruction &I) { return isa<AllocaInst>(I); }))
+    return false;
+  SmallVector<Raise, 16> Raises;
+  SetVector<Value *> Bases;
+  findRaisesIn(*BB, SE, Raises, Bases);
+  unsigned Elements = 0;
+  for (const Raise &R : Raises) {
+    auto *VT = dyn_cast<FixedVectorType>(getLoadStoreType(R.I));
+    Elements += VT ? VT->getNumElements() : 1;
+  }
+  if (Elements < StraightLineVersioningMin ||
+      any_of(Bases, [](Value *B) { return !isa<Argument>(B); }))
+    return false;
+  LLVMContext &Ctx = F.getContext();
+  ValueToValueMapTy VMap;
+  BasicBlock *Al = CloneBasicBlock(BB, VMap, ".aligned", &F);
+  for (Instruction &I : *Al)
+    RemapInstruction(&I, VMap,
+                     RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+  for (const Raise &R : Raises) {
+    auto *I = cast<Instruction>(VMap[R.I]);
+    if (auto *LdI = dyn_cast<LoadInst>(I))
+      LdI->setAlignment(R.New);
+    else
+      cast<StoreInst>(I)->setAlignment(R.New);
+  }
+  BasicBlock *Check = BasicBlock::Create(Ctx, "align.check", &F, BB);
+  IRBuilder<> B(Check);
+  Value *Cond = nullptr;
+  for (Value *Base : Bases) {
+    Value *Int = Base->getType()->isPointerTy()
+                     ? B.CreatePtrToInt(Base, B.getInt64Ty())
+                     : Base;
+    Value *Ok = B.CreateICmpEQ(B.CreateAnd(Int, 3), B.getInt64(0),
+                               Base->getName() + ".al4");
+    Cond = Cond ? B.CreateAnd(Cond, Ok) : Ok;
+  }
+  B.CreateCondBr(Cond, Al, BB);
+  return true;
+}
+
 bool AGXAlignmentVersioning::runOnFunction(Function &F) {
   if (!EnableAlignmentVersioning || skipFunction(F))
     return false;
   auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
   auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+  if (LI.empty() && versionBody(F, SE))
+    return true;
   // Innermost single-block loops in simplified form with one exit.
   SmallVector<Loop *, 4> Loops;
   bool Changed = false;
