@@ -54,6 +54,12 @@ static cl::opt<bool> ExpUnclamped(
     cl::desc("exp's +0 select by its argument's compare too, and no clamps "
              "of the argument"));
 
+static cl::opt<bool> Exp2BoundsByArg(
+    "agx-exp2-bounds-by-arg",
+    cl::desc("2^x and 10^x: +inf and +0 selected by compares of x, no "
+             "clamps of x and no NaN select"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<bool> ExpFlushedUnderflow(
     "agx-exp-flushed-underflow", cl::init(true), cl::Hidden,
     cl::desc("exp below a maximum whose users flush denormal operands: "
@@ -129,6 +135,18 @@ static cl::opt<bool> BFloatShortPolys(
     cl::init(true), cl::Hidden);
 
 namespace {
+/// The argument whose compares give the +inf / +0 results (exp's, or
+/// 2^x's / 10^x's: L15-E485): +inf from OverAt, +0 at or below ZeroAt.
+struct ArgBounds {
+  Value *Arg = nullptr;
+  double OverAt = 88.72283935546875;
+  double ZeroAt = -87.3365478515625;
+  // +0 by the compare too (no clamp below)
+  bool Zero = false;
+  // Arg is y of x = -y: the compares mirrored (a NaN fails them too).
+  bool Negated = false;
+};
+
 class MathBuilder {
   IRBuilderBase &B;
   Type *Ty; // float or a vector of float
@@ -567,7 +585,8 @@ public:
   /// overflows exactly from 0x42b17218 (88.7228394) on.
   Value *ldexp(Value *V, Value *N, bool NoOverflow = false,
               bool NoUnderflow = false, Value *MagicBits = nullptr,
-              Value *ExpArg = nullptr) {
+              ArgBounds AB = {}) {
+    Value *ExpArg = AB.Arg;
     // Frozen: a NaN n (from a NaN argument) gives some scale, and the NaN
     // reaches the result through the value it scales, without a select.
     Value *I = MagicBits ? nullptr : B.CreateFreeze(B.CreateFPToSI(N, intTy()));
@@ -588,13 +607,16 @@ public:
       // fails, and then no NaN select (L15-E473).
       bool ArgBound = ExpArg && MagicBits && NativeNaN && ExpOverflowByArg;
       if (!NoOverflow)
-        R = ArgBound ? sel(B.CreateFCmpOGE(ExpArg, k(88.72283935546875)),
+        R = ArgBound ? sel(AB.Negated ? B.CreateFCmpOLE(ExpArg, k(-AB.OverAt))
+                                      : B.CreateFCmpOGE(ExpArg, k(AB.OverAt)),
                            k(INFINITY), R)
                      : sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
       // (and +0 exactly up to -87.3365479, 0xc2aeac50: L15-E474)
       if (!NoUnderflow)
-        R = ArgBound && ExpUnclamped && !NoOverflow
-                ? sel(B.CreateFCmpOLE(ExpArg, k(-87.3365478515625)), k(0.0), R)
+        R = ArgBound && AB.Zero
+                ? sel(AB.Negated ? B.CreateFCmpOGE(ExpArg, k(-AB.ZeroAt))
+                                 : B.CreateFCmpOLE(ExpArg, k(AB.ZeroAt)),
+                      k(0.0), R)
                 : sel(B.CreateICmpSLT(S, ki(0x00800000)), k(0.0), R);
       // A NaN v comes from a NaN argument, whose sum t + 1.5 2^23 is then
       // the NaN 0x7fc00000, 0 shifted by 23: s is v's bits, which no +inf
@@ -628,8 +650,12 @@ public:
   /// \p NonNegative: hi is at least 0 (or a NaN) and lo, if any, at least 0:
   /// n >= 0 and the result at least e^r >= 0.7, so neither the clamp at -104
   /// nor ldexp's +0 select, nor (lo being one) the selects below (L15-E274).
+  /// \p AB: 2^x / 10^x with their +inf / +0 by their argument's compares;
+  /// Bounded then means only that no selects of hi are needed here (the
+  /// argument is not clamped, its garbage beyond the bounds selected away).
   Value *expHiLo(Value *Hi, Value *Lo, bool Bounded = false,
-                 bool NoOverflow = false, bool NonNegative = false) {
+                 bool NoOverflow = false, bool NonNegative = false,
+                 ArgBounds AB = {}) {
     Value *C;
     Value *Y;
     // exp's +inf and +0 selects by its argument's compares (E473, E474) give
@@ -685,7 +711,12 @@ public:
                      NoOverflow && (!Lo || Bounded),
                      NonNegative ||
                          (NoOverflow && !Bounded && !Lo && FlushedUnderflow),
-                     MagicBits, !Lo && !Bounded ? C : nullptr);
+                     MagicBits,
+                     AB.Arg ? AB
+                     : !Lo && !Bounded
+                         ? ArgBounds{C, 88.72283935546875, -87.3365478515625,
+                                     ExpUnclamped && !NoOverflow}
+                         : ArgBounds{});
     // Beyond the clamps the result is +inf (e^89 r overflows) and +0 (e^-104
     // rounds to 0) by itself: for exp, checked for every float x, flushing
     // and not; with a low part (exp2, exp10, pow) the selects stay.
@@ -719,12 +750,32 @@ public:
     return sel(gt(X, Hi), k(Hi), sel(lt(X, Lo), k(Lo), X));
   }
 
+  /// 2^x's / 10^x's +inf and +0 by compares of x (for -y, of y), where the
+  /// scaling is the magic sum's integer addition and NaNs are native: then
+  /// no clamps of x, whose n, r and integer sum beyond the bounds are
+  /// garbage the selects replace (no poison: no conversion, no nsw), and no
+  /// NaN select (a NaN x fails both compares; its magic bits shift to 0 and
+  /// leave e^r's NaN) (L15-E485).
+  ArgBounds boundsByArg(Value *X, double OverAt, double ZeroAt) {
+    if (!Exp2BoundsByArg || Exp2DirectReduction || !ExpMagicRound ||
+        !NativeNaN || !NoDenormals || !IntegerLdexp || !ExpOverflowByArg)
+      return {};
+    Value *Y;
+    if (NegatedClamp && match(X, m_FNeg(m_Value(Y))))
+      return {Y, OverAt, ZeroAt, true, true};
+    return {X, OverAt, ZeroAt, true, false};
+  }
+
   Value *exp2Precise(Value *X, bool NoOverflow = false) {
     // 2^x = e^(x ln 2), with x ln 2 as a rounded product and its error.
     // (Up to 128, where 2^x overflows: n = 128 at most, which the exponent
     // addition of ldexp needs.)
     bool BelowMax = belowMax(X, NoOverflow);
-    X = clampArg(X, -151.0, 128.0, BelowMax);
+    // (+inf exactly from 128, +0 exactly at or below -126 - 2^-17, every
+    // float checked: L15-E485)
+    ArgBounds AB = boundsByArg(X, 128.0, -126.00000762939453);
+    if (!AB.Arg)
+      X = clampArg(X, -151.0, 128.0, BelowMax);
     if (Exp2DirectReduction) {
       // n = roundeven(x), f = x - n exact in [-1/2, 1/2], e^(f ln 2) with
       // f ln 2 as a rounded product and its error (L15-E340)
@@ -738,17 +789,21 @@ public:
     Value *Hi = mul(X, k(M_LN2));
     Value *Lo = fma(X, k(M_LN2), B.CreateFNeg(Hi));
     Lo = fma(X, k(M_LN2 - (double)(float)M_LN2), Lo);
-    return expHiLo(Hi, Lo, /*Bounded=*/true, BelowMax);
+    return expHiLo(Hi, Lo, /*Bounded=*/true, BelowMax, false, AB);
   }
   Value *exp10Precise(Value *X, bool NoOverflow = false) {
     constexpr double LN10 = 2.302585092994045684;
     // (Up to 38.6, past 10^x's overflow at 38.53: n = 128 at most.)
     bool BelowMax = belowMax(X, NoOverflow);
-    X = clampArg(X, -46.0, 38.6, BelowMax);
+    // (+inf exactly from 38.5318413 (0x421a209b), +0 exactly at or below
+    // -37.9297829 (0xc217b819), every float checked: L15-E485)
+    ArgBounds AB = boundsByArg(X, 38.53184127807617, -37.92978286743164);
+    if (!AB.Arg)
+      X = clampArg(X, -46.0, 38.6, BelowMax);
     Value *Hi = mul(X, k(LN10));
     Value *Lo = fma(X, k(LN10), B.CreateFNeg(Hi));
     Lo = fma(X, k(LN10 - (double)(float)LN10), Lo);
-    return expHiLo(Hi, Lo, /*Bounded=*/true, BelowMax);
+    return expHiLo(Hi, Lo, /*Bounded=*/true, BelowMax, false, AB);
   }
 
   /// A positive finite x as 2^e * (1 + f), 1 + f in [sqrt(1/2), sqrt(2)),
