@@ -7851,7 +7851,8 @@ static cl::opt<bool> AGXMaskedHeadStarts(
 static bool raiseMaskedHead(Loop *L, PHINode *IV, BinaryOperator *IVNext,
                             ICmpInst *Exit,
                             const std::tuple<Value *, Value *, CmpPredicate> &M,
-                            ScalarEvolution &SE, DominatorTree &DT) {
+                            ScalarEvolution &SE, DominatorTree &DT,
+                            Value **Clamped = nullptr) {
   Value *UB = Exit->getOperand(1);
   auto [A, K, Pred] = M;
   auto *ARA = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
@@ -7909,6 +7910,10 @@ static bool raiseMaskedHead(Loop *L, PHINode *IV, BinaryOperator *IVNext,
           B.CreateBinaryIntrinsic(Intrinsic::uadd_sat, S0, One)),
       Step);
   Value *Kk = B.CreateBinaryIntrinsic(Intrinsic::umin, KHead, KMax);
+  // (the start then the last iteration, still masked: the first unmasked one
+  // is past it)
+  if (Clamped)
+    *Clamped = B.CreateICmpUGT(KHead, KMax, "head.clamped");
   Value *NewS0 = B.CreateAdd(S0, B.CreateMul(Kk, Step, "", /*NUW=*/true),
                              "unmasked.start", /*NUW=*/true);
   if (Ty != Wide)
@@ -7944,7 +7949,8 @@ static cl::opt<bool> AGXMaskedTailUnmaskedBody(
 /// compares in BB are false (their inverses true) (L15-E518, E519).
 static void unmaskBody(Loop *L, PHINode *IV, BasicBlock *PH, BasicBlock *BB,
                        ArrayRef<std::tuple<Value *, Value *, CmpPredicate>> Masks,
-                       DominatorTree &DT, LoopInfo &LI, ScalarEvolution &SE) {
+                       ArrayRef<Value *> Firsts, DominatorTree &DT, LoopInfo &LI,
+                       ScalarEvolution &SE) {
   using namespace PatternMatch;
   if (!PH)
     return;
@@ -8011,10 +8017,15 @@ static void unmaskBody(Loop *L, PHINode *IV, BasicBlock *PH, BasicBlock *BB,
     return;
   IRBuilder<> B(PHBr);
   Value *Masked0 = nullptr;
-  for (auto &[A, K, Pred] : Masks) {
-    auto *AR = cast<SCEVAddRecExpr>(SE.getSCEV(A));
-    Value *A0 = Exp.expandCodeFor(AR->getStart(), A->getType(), PHBr);
-    Value *M = B.CreateICmp(Pred, A0, K, "first.masked");
+  for (unsigned Idx = 0; Idx < Masks.size(); ++Idx) {
+    auto &[A, K, Pred] = Masks[Idx];
+    // (a raised head's: whether its start was clamped, computed already)
+    Value *M = Firsts[Idx];
+    if (!M) {
+      auto *AR = cast<SCEVAddRecExpr>(SE.getSCEV(A));
+      Value *A0 = Exp.expandCodeFor(AR->getStart(), A->getType(), PHBr);
+      M = B.CreateICmp(Pred, A0, K, "first.masked");
+    }
     Masked0 = Masked0 ? B.CreateOr(Masked0, M) : M;
   }
   B.CreateCondBr(Masked0, Exit, BB);
@@ -8320,14 +8331,20 @@ static bool maskedTailExits(Function &F) {
     // unmasked from the first: the tail's once its bound is in, the head's
     // once its start is raised)
     SmallVector<std::tuple<Value *, Value *, CmpPredicate>, 2> Gone;
+    SmallVector<Value *, 2> GoneFirst;
     auto Head = [&] {
-      if (HeadMask && raiseMaskedHead(L, IV, IVNext, Exit, *HeadMask, SE, DT)) {
+      Value *Clamped = nullptr;
+      if (HeadMask && raiseMaskedHead(L, IV, IVNext, Exit, *HeadMask, SE, DT,
+                                      &Clamped)) {
         Changed = true;
-        if (AGXMaskedHeadUnmaskedBody)
+        if (AGXMaskedHeadUnmaskedBody) {
           Gone.push_back(*HeadMask);
+          GoneFirst.push_back(Clamped);
+        }
       }
       if (!Gone.empty() && AGXMaskedTailUnmaskedBody)
-        unmaskBody(L, IV, L->getLoopPredecessor(), BB, Gone, DT, LI, SE);
+        unmaskBody(L, IV, L->getLoopPredecessor(), BB, Gone, GoneFirst, DT,
+                   LI, SE);
     };
     if (!Mask) {
       Head();
@@ -8395,6 +8412,7 @@ static bool maskedTailExits(Function &F) {
     // (after the head's start: the first iteration's mask is the final
     // start's)
     Gone.push_back(*Mask);
+    GoneFirst.push_back(nullptr);
     Head();
   }
   return Changed;

@@ -229,13 +229,14 @@ done:
 ; (L15-E481).
 ; CHECK-LABEL: @window(
 ; CHECK: %unmasked.bound = call i64 @llvm.umin.i64
+; CHECK: %[[HC:head.clamped[0-9]*]] = icmp ugt i{{32|64}}
 ; CHECK: %unmasked.start = add nuw{{.*}} i64
 ; CHECK: %unmasked.start.b = call i64 @llvm.umin.i64(i64 %unmasked.start, i64
 ; Both masks are then gone from the loop: it is skipped where its first
-; iteration is masked under either (L15-E519).
+; iteration is masked under either (L15-E519), the head's where its start was
+; clamped to the last iteration (L15-E521).
 ; CHECK: %first.masked = icmp ugt i64
-; CHECK: %first.masked1 = icmp ult i64
-; CHECK: or i1 %first.masked, %first.masked1
+; CHECK: or i1 %first.masked, %[[HC]]
 ; CHECK: phi i64 [{{.*}}%unmasked.start.b, %loop.preheader ]
 ; CHECK-NOT: select
 ; CHECK: %r.n = fadd float %r, %x
