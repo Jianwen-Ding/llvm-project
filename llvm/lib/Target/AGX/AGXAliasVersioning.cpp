@@ -76,6 +76,10 @@ static cl::opt<unsigned> AliasVersioningMathPerWord(
              "loaded above which a loop's latency is hidden behind its work "
              "and it is not versioned"));
 
+static cl::opt<bool> AliasVersioningWordBytes(
+    "agx-alias-versioning-word-bytes", cl::init(true), cl::Hidden,
+    cl::desc("Count the words a loop loads from its loads' bytes together"));
+
 static cl::opt<bool> AliasVersioningLoopRanges(
     "agx-alias-versioning-loop-ranges", cl::init(true), cl::Hidden,
     cl::desc("Analyze loops with the thread positions' bounds"));
@@ -210,9 +214,17 @@ static bool endsRun(const Instruction &I) {
 template <typename Range>
 static std::pair<unsigned, unsigned> work(Range &&Insts, const DataLayout &DL) {
   unsigned Words = 0, Math = 0;
+  uint64_t Bytes = 0;
   for (const Instruction &I : Insts) {
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
-      Words += divideCeil(DL.getTypeStoreSize(LI->getType()), 4);
+      // (narrow elements together: 2-byte loads, two to a word, the load /
+      // store vectorizer merges; each counted a word, i16_rows' loop of 32
+      // words seemed 64, L15-E554)
+      uint64_t B = DL.getTypeStoreSize(LI->getType());
+      if (AliasVersioningWordBytes)
+        Bytes += B;
+      else
+        Words += divideCeil(B, 4);
       continue;
     }
     if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
@@ -255,7 +267,7 @@ static std::pair<unsigned, unsigned> work(Range &&Insts, const DataLayout &DL) {
     unsigned Op = I.getOpcode();
     Math += Lanes * (Op == Instruction::FDiv || Op == Instruction::FRem ? 8 : 1);
   }
-  return {Words, Math};
+  return {Words + unsigned(divideCeil(Bytes, 4)), Math};
 }
 
 static std::pair<unsigned, unsigned> iterationWork(const Loop *L,

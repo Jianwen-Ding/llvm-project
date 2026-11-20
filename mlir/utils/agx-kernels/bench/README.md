@@ -77,6 +77,7 @@ the kernel's, as memory at VA).
 | `where_rows` | Per-element select between two f32 rows on a byte mask, a thread per row of 256: byte loads |
 | `widen_f16` | f16 rows widened to f32 with a scale and bias, a thread per row of 256: 2-byte loads |
 | `stencil_row` | A 3-point stencil over each 258-float row, a thread per row: loads at three offsets of the row, 256 stores |
+| `i16_rows` | int16 rows scaled, biased by an int16 vector and clamped back to int16, a thread per row of 256 |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
