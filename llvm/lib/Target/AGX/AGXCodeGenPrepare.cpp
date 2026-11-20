@@ -5025,6 +5025,224 @@ static bool bfloatSqrts(Function &F, const AGXSubtarget &ST) {
   return !Sqrts.empty();
 }
 
+static cl::opt<bool> AGXRelativeIndexSelects(
+    "agx-relative-index-selects", cl::init(true), cl::Hidden,
+    cl::desc("A loop's chain of selects of the counter plus constants "
+             "(argmax's index) kept relative to the counter"));
+
+/// A loop-carried value p chained through selects of the counter plus
+/// constants (an unrolled argmax: p = c0 ? i : p, c1 ? i | 1 : p, ...):
+/// every unrolled copy computes its i + k (an or or add each), the selects
+/// read them. Kept as d = p - i instead, the selects take the constants k
+/// (immediates), d steps by -s once an iteration (s the counter's step),
+/// and p = d + i is formed where it is used after the loop (L15-E490).
+/// Exact in wrapping integer arithmetic.
+static bool relativeIndexSelects(Function &F) {
+  if (!AGXRelativeIndexSelects)
+    return false;
+  DominatorTree DT(F);
+  LoopInfo LI(DT);
+  if (LI.empty())
+    return false;
+  TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+  TargetLibraryInfo TLI(TLII, &F);
+  AssumptionCache AC(F);
+  ScalarEvolution SE(F, TLI, AC, DT, LI);
+  bool Changed = false;
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *H = L->getHeader(), *Latch = L->getLoopLatch(),
+               *Pre = L->getLoopPreheader(), *Exit = L->getExitBlock();
+    if (!L->isInnermost() || !Latch || !Pre || !Exit ||
+        Exit->getSinglePredecessor() != Latch ||
+        L->getExitingBlock() != Latch)
+      continue;
+    // the counter: an integer header phi, an affine recurrence with a
+    // constant step
+    SmallVector<PHINode *, 4> Phis;
+    for (PHINode &P : H->phis())
+      Phis.push_back(&P);
+    for (PHINode *P : Phis) {
+      Type *Ty = P->getType();
+      if (!Ty->isIntegerTy())
+        continue;
+      // the chain from the latch value back to p
+      SmallVector<SelectInst *, 8> Chain;
+      Value *V = P->getIncomingValueForBlock(Latch);
+      bool Ok = true;
+      while (V != P) {
+        auto *S = dyn_cast<SelectInst>(V);
+        if (!S || !L->contains(S) || S->getParent() != H) {
+          Ok = false;
+          break;
+        }
+        Chain.push_back(S);
+        Value *T = S->getTrueValue(), *Fv = S->getFalseValue();
+        // the previous link: the operand that is p or a select of the chain
+        auto IsLink = [&](Value *X) {
+          return X == P || (isa<SelectInst>(X) &&
+                            cast<SelectInst>(X)->getParent() == H &&
+                            !isa<Constant>(X));
+        };
+        bool TL = IsLink(T), FL = IsLink(Fv);
+        if (TL == FL) {
+          Ok = false;
+          break;
+        }
+        V = TL ? T : Fv;
+      }
+      if (!Ok || Chain.size() < 2)
+        continue;
+      std::reverse(Chain.begin(), Chain.end());
+      // each link's other operand: the counter plus a constant
+      PHINode *IV = nullptr;
+      const SCEVConstant *Step = nullptr;
+      SmallVector<APInt, 8> Ks;
+      unsigned NonZero = 0;
+      for (PHINode *C : Phis) {
+        if (C == P || !C->getType()->isIntegerTy())
+          continue;
+        auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(C));
+        if (!AR || AR->getLoop() != L || !AR->isAffine())
+          continue;
+        auto *St = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+        if (!St)
+          continue;
+        const SCEV *Base = SE.getTruncateOrZeroExtend(AR, Ty);
+        SmallVector<APInt, 8> K;
+        unsigned NZ = 0;
+        for (SelectInst *S : Chain) {
+          Value *A = (S->getTrueValue() == P ||
+                      llvm::is_contained(Chain, S->getTrueValue()))
+                         ? S->getFalseValue()
+                         : S->getTrueValue();
+          auto *D = dyn_cast<SCEVConstant>(
+              SE.getMinusSCEV(SE.getSCEV(A), Base));
+          if (!D) {
+            K.clear();
+            break;
+          }
+          K.push_back(D->getAPInt());
+          NZ += !D->getAPInt().isZero();
+        }
+        if (K.size() != Chain.size())
+          continue;
+        // (a narrower type than the counter's: its step truncated)
+        if (Ty->getIntegerBitWidth() > St->getType()->getIntegerBitWidth())
+          continue;
+        IV = C;
+        Step = St;
+        Ks = std::move(K);
+        NonZero = NZ;
+        break;
+      }
+      // (one subtraction an iteration for the ors / adds it saves)
+      if (!IV || NonZero < 2)
+        continue;
+      // p only in the chain's first link; each link only in the next one,
+      // the last in p and after the loop
+      if (!P->hasOneUse() || *P->user_begin() != Chain.front())
+        continue;
+      for (unsigned I = 0; Ok && I + 1 < Chain.size(); ++I)
+        Ok = Chain[I]->hasOneUse() && *Chain[I]->user_begin() == Chain[I + 1];
+      // its uses after the loop where the exit block dominates them (for a
+      // phi, the edge it takes the value on): p = d + i is formed there
+      for (Use &U : Chain.back()->uses()) {
+        auto *UI = cast<Instruction>(U.getUser());
+        if (UI == P)
+          continue;
+        BasicBlock *At = UI->getParent();
+        if (auto *PN = dyn_cast<PHINode>(UI))
+          At = PN->getIncomingBlock(U);
+        if (L->contains(UI) || !DT.dominates(Exit, At))
+          Ok = false;
+      }
+      if (!Ok)
+        continue;
+      // d = p - i: its phi, the links of constants, -s at the latch
+      auto Cast = [&](IRBuilder<> &B, Value *X) {
+        return B.CreateZExtOrTrunc(X, Ty);
+      };
+      IRBuilder<> PB(Pre->getTerminator());
+      Value *Init = PB.CreateSub(P->getIncomingValueForBlock(Pre),
+                                 Cast(PB, IV->getIncomingValueForBlock(Pre)),
+                                 "rel.init");
+      PHINode *D = PHINode::Create(Ty, 2, "rel", H->getFirstNonPHIIt());
+      Value *Prev = D;
+      for (unsigned I = 0; I < Chain.size(); ++I) {
+        SelectInst *S = Chain[I];
+        Constant *K = ConstantInt::get(Ty, Ks[I]);
+        bool LinkTrue = S->getTrueValue() == P ||
+                        (I && S->getTrueValue() == Chain[I - 1]);
+        IRBuilder<> B(S);
+        Prev = B.CreateSelect(S->getCondition(), LinkTrue ? Prev : K,
+                              LinkTrue ? K : Prev, S->getName() + ".rel");
+      }
+      IRBuilder<> LB(Latch->getTerminator());
+      Value *Next = LB.CreateSub(
+          Prev, ConstantInt::get(Ty, Step->getAPInt().zextOrTrunc(
+                                         Ty->getIntegerBitWidth())),
+          "rel.next");
+      D->addIncoming(Init, Pre);
+      D->addIncoming(Next, Latch);
+      // after the loop: the last link's d plus the counter of that
+      // iteration, i.e. d - s plus the next counter, the values the latch
+      // computes anyway (with the counter itself, strength reduction kept
+      // another counter for it)
+      SelectInst *Last = Chain.back();
+      IRBuilder<> EB(&*Exit->getFirstInsertionPt());
+      // (in the counter's type, then truncated: a truncation of the counter
+      // made strength reduction keep a narrower counter for it)
+      Value *IVNext = IV->getIncomingValueForBlock(Latch);
+      // (its value after the loop where SCEV knows it, loop-invariant: an
+      // index of the counter there made strength reduction keep one more
+      // counter, as it addresses by byte offsets)
+      const SCEV *AtExit =
+          SE.getSCEVAtScope(SE.getSCEV(IVNext), L->getParentLoop());
+      SCEVExpander X(SE, "rel");
+      if (SE.isLoopInvariant(AtExit, L) &&
+          X.isSafeToExpandAt(AtExit, &*Exit->getFirstInsertionPt()))
+        // (inserted before the builder's point, so before what it builds)
+        IVNext = X.expandCodeFor(AtExit, IV->getType(),
+                                 Exit->getFirstInsertionPt());
+      Value *Out =
+          IV->getType() == Ty
+              ? EB.CreateAdd(Next, IVNext, "rel.out")
+              : EB.CreateTrunc(
+                    EB.CreateAdd(IVNext, EB.CreateZExt(Next, IV->getType())),
+                    Ty, "rel.out");
+      // (a phi of it in the exit block, whose one predecessor is the latch:
+      // the value itself; a phi elsewhere takes it on an edge the exit
+      // dominates)
+      SmallVector<PHINode *, 2> ExitPhis;
+      SmallVector<Use *, 4> Outs;
+      for (Use &U : Last->uses()) {
+        if (U.getUser() == P)
+          continue;
+        auto *EP = dyn_cast<PHINode>(U.getUser());
+        if (EP && EP->getParent() == Exit)
+          ExitPhis.push_back(EP);
+        else
+          Outs.push_back(&U);
+      }
+      for (Use *U : Outs)
+        U->set(Out);
+      for (PHINode *EP : ExitPhis) {
+        EP->replaceAllUsesWith(Out);
+        EP->eraseFromParent();
+      }
+      // p, its chain and the counter-plus-constant values left dead
+      P->replaceAllUsesWith(PoisonValue::get(Ty));
+      P->eraseFromParent();
+      for (SelectInst *S : llvm::reverse(Chain)) {
+        S->replaceAllUsesWith(PoisonValue::get(Ty));
+        S->eraseFromParent();
+      }
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static cl::opt<bool> AGXRebaseLoopIndices(
     "agx-rebase-loop-indices", cl::init(true), cl::Hidden,
     cl::desc("A loop's device access at B[zext(X + Y)], X invariant, as (B + "
@@ -7982,6 +8200,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= combineDeferredMinMax(F);
   Changed |= onlineSoftmaxExps(F);
   Changed |= rebaseLoopIndices(F);
+  Changed |= relativeIndexSelects(F);
   Changed |= reluZeroSelects(F);
   Changed |= exactDyadicSums(F);
   Changed |= AGX::narrowBoundedI64(F);
