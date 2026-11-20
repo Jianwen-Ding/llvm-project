@@ -1,12 +1,13 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-upper-bound-unknown-ranges=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-masked-tail-unmasked-body=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-masked-tail-unmasked-body=0 -agx-upper-bound-unknown-ranges=0 < %s | FileCheck %s --check-prefix=OFF
 ;
 ; A sliding window's loop after L15-E480 / E481 (its bound lowered, its
 ; start raised past the masked head): the start's and the bound's
 ; saturating arithmetic leaves the counter's bound to SCEV's ranges, which
 ; AGXNarrowInductions' upper bounds now take where their own structural
 ; bound has none (1024 - lane): the loop's index arithmetic and masks are
-; 32-bit (L15-E482).
+; 32-bit (L15-E482). (L15-E518 / E519 take the masks out of the loop: off
+; here.)
 
 ; CHECK-LABEL: window:
 ; CHECK: Loop Header

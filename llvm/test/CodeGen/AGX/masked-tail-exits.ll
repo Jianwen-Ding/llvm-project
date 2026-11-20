@@ -14,7 +14,14 @@ declare float @llvm.maxnum.f32(float, float)
 ; CHECK: %[[E:.*]] = zext i32 %[[L]] to i64
 ; CHECK: %[[P:.*]] = call i64 @llvm.uadd.sat.i64(i64 %[[E]], i64 1)
 ; CHECK: %unmasked.bound = call i64 @llvm.umin.i64(i64 %n, i64 %[[P]])
+; With the loop skipped where its first iteration is masked, the mask is
+; gone from it (L15-E518):
+; CHECK: %first.masked = icmp ugt i64 {{.*}}, %row
+; CHECK: br i1 %first.masked, label %done.loopexit, label %loop
+; CHECK-NOT: select
+; CHECK: %r.n = fadd float %r, %x
 ; CHECK: icmp ult i64 %j.n, %unmasked.bound
+; CHECK: phi float [ %r.n, %loop ], [ 0.000000e+00, %loop.preheader ]
 define agx_kernel void @causal(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %row32, i32 %lane32, i32 %n32) {
 entry:
   %row = zext i32 %row32 to i64
@@ -222,9 +229,16 @@ done:
 ; (L15-E481).
 ; CHECK-LABEL: @window(
 ; CHECK: %unmasked.bound = call i64 @llvm.umin.i64
-; CHECK: %unmasked.start = add nuw i64
+; CHECK: %unmasked.start = add nuw{{.*}} i64
 ; CHECK: %unmasked.start.b = call i64 @llvm.umin.i64(i64 %unmasked.start, i64
-; CHECK: phi i64 [ %unmasked.start.b, %entry ]
+; Both masks are then gone from the loop: it is skipped where its first
+; iteration is masked under either (L15-E519).
+; CHECK: %first.masked = icmp ugt i64
+; CHECK: %first.masked1 = icmp ult i64
+; CHECK: or i1 %first.masked, %first.masked1
+; CHECK: phi i64 [{{.*}}%unmasked.start.b, %loop.preheader ]
+; CHECK-NOT: select
+; CHECK: %r.n = fadd float %r, %x
 ; NOHEAD-LABEL: @window(
 ; NOHEAD-NOT: unmasked.start
 ; NOHEAD: ret void

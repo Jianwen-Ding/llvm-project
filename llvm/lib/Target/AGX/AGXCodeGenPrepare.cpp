@@ -45,6 +45,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
@@ -55,6 +56,7 @@
 #include "llvm/Analysis/CycleAnalysis.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/DomConditionCache.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -7926,6 +7928,123 @@ static bool raiseMaskedHead(Loop *L, PHINode *IV, BinaryOperator *IVNext,
   return true;
 }
 
+static cl::opt<bool> AGXMaskedTailUnmaskedBody(
+    "agx-masked-tail-unmasked-body", cl::init(true), cl::Hidden,
+    cl::desc("agx-masked-tail-exits' loop skipped where its first iteration "
+             "is masked, the mask then false in it"));
+
+/// maskedTailExits' loop L (one block BB) whose iterations are unmasked from
+/// the first on under each of Masks (Pred(A, K): the tail's once its bound is
+/// in, A increasing; the head's once its start is raised, true up to an
+/// iteration): where the first iteration is masked under one of them all
+/// iterations are masked (a tail mask stays on; a raised head start is past
+/// the head's masked iterations unless clamped to the last one), and each
+/// leaves the reductions as they were, so the preheader branches to the exit
+/// with their start values there. Then no iteration runs masked: the mask
+/// compares in BB are false (their inverses true) (L15-E518, E519).
+static void unmaskBody(Loop *L, PHINode *IV, BasicBlock *PH, BasicBlock *BB,
+                       ArrayRef<std::tuple<Value *, Value *, CmpPredicate>> Masks,
+                       DominatorTree &DT, LoopInfo &LI, ScalarEvolution &SE) {
+  using namespace PatternMatch;
+  if (!PH)
+    return;
+  // (a preheader and an exit of the loop's own, as LoopSimplify makes them)
+  if (!L->hasDedicatedExits())
+    formDedicatedExitBlocks(L, &DT, &LI, nullptr, /*PreserveLCSSA=*/false);
+  if (!L->getLoopPreheader()) {
+    BasicBlock *NewPH =
+        InsertPreheaderForLoop(L, &DT, &LI, nullptr, /*PreserveLCSSA=*/false);
+    if (!NewPH)
+      return;
+    PH = NewPH;
+  }
+  BasicBlock *Exit = L->getExitBlock();
+  auto *PHBr = dyn_cast<UncondBrInst>(PH->getTerminator());
+  if (!Exit || !PHBr || Exit->getSinglePredecessor() != BB ||
+      PH->getSingleSuccessor() != BB || L->getLoopPreheader() != PH)
+    return;
+  // each mask's value at the first iteration: its recurrence's start
+  SE.forgetLoop(L);
+  SCEVExpander Exp(SE, "unmask");
+  for (auto &[A, K, Pred] : Masks) {
+    auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
+    if (!AR || AR->getLoop() != L || !Exp.isSafeToExpand(AR->getStart()))
+      return;
+    if (auto *KI = dyn_cast<Instruction>(K);
+        KI && !DT.dominates(KI, PHBr))
+      return;
+  }
+  formLCSSA(*L, DT, &LI, &SE);
+  // each exit phi's value: a reduction's latch value, whose start it takes
+  // from the new edge
+  SmallVector<std::pair<PHINode *, Value *>, 4> Starts;
+  for (PHINode &X : Exit->phis()) {
+    Value *V = X.getIncomingValueForBlock(BB);
+    PHINode *R = nullptr;
+    for (PHINode &P : BB->phis())
+      if (&P != IV && P.getIncomingValueForBlock(BB) == V)
+        R = &P;
+    if (!R)
+      return;
+    Starts.push_back({&X, R->getIncomingValueForBlock(PH)});
+  }
+  // the mask compares: Pred(A, K) itself, or its inverse
+  MapVector<ICmpInst *, bool> Cmps;
+  for (Instruction &I : *BB) {
+    auto *C = dyn_cast<ICmpInst>(&I);
+    if (!C)
+      continue;
+    for (auto &[A, K, Pred] : Masks)
+      for (bool Swap : {false, true}) {
+        Value *X = C->getOperand(Swap), *Y = C->getOperand(!Swap);
+        CmpInst::Predicate P =
+            Swap ? C->getSwappedPredicate() : C->getPredicate();
+        if (X == A && Y == K) {
+          if (P == static_cast<CmpInst::Predicate>(Pred))
+            Cmps.insert({C, false});
+          else if (P == CmpInst::getInversePredicate(Pred))
+            Cmps.insert({C, true});
+        }
+      }
+  }
+  if (Cmps.empty())
+    return;
+  IRBuilder<> B(PHBr);
+  Value *Masked0 = nullptr;
+  for (auto &[A, K, Pred] : Masks) {
+    auto *AR = cast<SCEVAddRecExpr>(SE.getSCEV(A));
+    Value *A0 = Exp.expandCodeFor(AR->getStart(), A->getType(), PHBr);
+    Value *M = B.CreateICmp(Pred, A0, K, "first.masked");
+    Masked0 = Masked0 ? B.CreateOr(Masked0, M) : M;
+  }
+  B.CreateCondBr(Masked0, Exit, BB);
+  PHBr->eraseFromParent();
+  for (auto [X, V] : Starts)
+    X->addIncoming(V, PH);
+  for (auto [C, Inverse] : Cmps) {
+    C->replaceAllUsesWith(ConstantInt::getBool(C->getContext(), Inverse));
+    C->eraseFromParent();
+  }
+  // (the selects, ands and ors of the constants)
+  const DataLayout &DL = BB->getDataLayout();
+  for (bool Again = true; Again;) {
+    Again = false;
+    for (Instruction &I : make_early_inc_range(*BB))
+      if (Value *V = simplifyInstruction(&I, SimplifyQuery(DL))) {
+        I.replaceAllUsesWith(V);
+        I.eraseFromParent();
+        Again = true;
+      }
+  }
+  DT.recalculate(*BB->getParent());
+  SE.forgetLoop(L);
+}
+
+static cl::opt<bool> AGXMaskedHeadUnmaskedBody(
+    "agx-masked-head-unmasked-body", cl::init(true), cl::Hidden,
+    cl::desc("agx-masked-tail-unmasked-body also for the head mask of a "
+             "raised start"));
+
 static cl::opt<bool> AGXMaskedTailOr(
     "agx-masked-tail-or", cl::init(true), cl::Hidden,
     cl::desc("agx-masked-tail-exits also for a mask that is an or with the "
@@ -8197,9 +8316,18 @@ static bool maskedTailExits(Function &F) {
         UI && !DT.dominates(UI, PH->getTerminator()))
       continue;
     // the tail's bound, then the head's start
+    // (the masks the loop's iterations no longer meet once they are known
+    // unmasked from the first: the tail's once its bound is in, the head's
+    // once its start is raised)
+    SmallVector<std::tuple<Value *, Value *, CmpPredicate>, 2> Gone;
     auto Head = [&] {
-      if (HeadMask && raiseMaskedHead(L, IV, IVNext, Exit, *HeadMask, SE, DT))
+      if (HeadMask && raiseMaskedHead(L, IV, IVNext, Exit, *HeadMask, SE, DT)) {
         Changed = true;
+        if (AGXMaskedHeadUnmaskedBody)
+          Gone.push_back(*HeadMask);
+      }
+      if (!Gone.empty() && AGXMaskedTailUnmaskedBody)
+        unmaskBody(L, IV, L->getLoopPredecessor(), BB, Gone, DT, LI, SE);
     };
     if (!Mask) {
       Head();
@@ -8260,6 +8388,13 @@ static bool maskedTailExits(Function &F) {
                                            nullptr, "unmasked.bound");
     Exit->setOperand(1, NewUB);
     Changed = true;
+    // With the loop also skipped where its first iteration is masked (all
+    // are then, and each leaves every reduction as it was: the result is
+    // their start values), no iteration is masked: the tail compare is false
+    // in the loop and the selects take the unmasked values (L15-E518).
+    // (after the head's start: the first iteration's mask is the final
+    // start's)
+    Gone.push_back(*Mask);
     Head();
   }
   return Changed;

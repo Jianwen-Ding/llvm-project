@@ -1,9 +1,10 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-narrow-bounded-after-counters=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-masked-tail-unmasked-body=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-narrow-bounded-after-counters=0 -agx-masked-tail-unmasked-body=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; A causal mask j <= row in a loop over j = lane + c (MLIR's 64-bit index):
 ; once AGXNarrowInductions has narrowed the counter c, lane + zext(c) is a
-; tree of 32-bit values below 2^32, compared in 32 bits (L15-E426).
+; tree of 32-bit values below 2^32, compared in 32 bits (L15-E426). (With
+; L15-E518 the mask is gone from the loop: off here.)
 
 declare i32 @llvm.agx.thread.index.in.simdgroup()
 declare i32 @llvm.agx.threadgroup.position.in.grid.x()
