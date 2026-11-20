@@ -9029,6 +9029,11 @@ static cl::opt<bool> AGXReciprocalAboveOne(
     cl::desc("1 / (e^x + c), c >= 1, as the reciprocal step without the "
              "division's scaling and NaN select"));
 
+static cl::opt<bool> AGXReciprocalAboveOneNonNegative(
+    "agx-reciprocal-above-one-non-negative", cl::init(true), cl::Hidden,
+    cl::desc("1 / (a + c) and 1 / fma(k, a, c), a never below 0, k > 0, "
+             "c >= 1, as 1 / (e^x + c)"));
+
 static cl::opt<bool> AGXQuotientAboveOne(
     "agx-quotient-above-one", cl::init(true), cl::Hidden,
     cl::desc("(c' - e) / (e + c), e an exponential of a non-positive value, "
@@ -9087,13 +9092,33 @@ static bool reciprocalsAboveOne(Function &F) {
       Divs.push_back({&I, true});
       continue;
     }
+    // (or of any value never below 0, |x|, and fma(k, a, c) of a such a
+    // with k > 0: erfc's 1 / (|x| + 2) and 1 / (2 |x| + 1), L15-E500)
+    auto NeverNegative = [&](Value *V) {
+      return AGXReciprocalAboveOneNonNegative &&
+             computeKnownFPClass(V, fcAllFlags,
+                                 SimplifyQuery(F.getDataLayout()))
+                 .cannotBeOrderedLessThanZero();
+    };
+    const APFloat *K;
+    if (AGXReciprocalAboveOneNonNegative &&
+        (match(D, m_Intrinsic<Intrinsic::fma>(m_APFloat(K), m_Value(E),
+                                              m_APFloat(C))) ||
+         match(D, m_Intrinsic<Intrinsic::fma>(m_Value(E), m_APFloat(K),
+                                              m_APFloat(C)))) &&
+        K->isFinite() && K->isNonZero() && !K->isNegative() && C->isFinite() &&
+        C->compare(APFloat(1.0f)) != APFloat::cmpLessThan && NeverNegative(E)) {
+      Divs.push_back({&I, false});
+      continue;
+    }
     if (!match(D, m_c_FAdd(m_Value(E), m_APFloat(C))) || !C->isFinite() ||
         C->compare(APFloat(1.0f)) == APFloat::cmpLessThan)
       continue;
     auto *II = dyn_cast<IntrinsicInst>(E);
-    if (!II || (II->getIntrinsicID() != Intrinsic::exp &&
-                II->getIntrinsicID() != Intrinsic::exp2 &&
-                II->getIntrinsicID() != Intrinsic::exp10))
+    if ((!II || (II->getIntrinsicID() != Intrinsic::exp &&
+                 II->getIntrinsicID() != Intrinsic::exp2 &&
+                 II->getIntrinsicID() != Intrinsic::exp10)) &&
+        !NeverNegative(E))
       continue;
     Divs.push_back({&I, false});
   }

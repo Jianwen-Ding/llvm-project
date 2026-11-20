@@ -86,3 +86,40 @@ define agx_kernel void @inv_half(ptr addrspace(1) %p, half %h) {
 
 declare float @llvm.exp.f32(float)
 declare float @llvm.sqrt.f32(float)
+
+; 1 / (|x| + 2) and 1 / fma(|x|, 2, 1) (erfc's): the divisor is at least 1
+; or a NaN as well, |x| never below 0 (L15-E500). Not for x + 2.
+; CHECK-LABEL: abs_plus:
+; CHECK-NOT: bfi
+; CHECK: rcp
+; CHECK-NOT: bfi
+; CHECK: stop
+define agx_kernel void @abs_plus(ptr addrspace(1) %p, float %x) {
+  %a = call float @llvm.fabs.f32(float %x)
+  %d = fadd float %a, 2.0
+  %r = fdiv float 1.0, %d
+  store float %r, ptr addrspace(1) %p
+  ret void
+}
+; CHECK-LABEL: abs_fma:
+; CHECK-NOT: bfi
+; CHECK: rcp
+; CHECK-NOT: bfi
+; CHECK: stop
+define agx_kernel void @abs_fma(ptr addrspace(1) %p, float %x) {
+  %a = call float @llvm.fabs.f32(float %x)
+  %d = call float @llvm.fma.f32(float %a, float 2.0, float 1.0)
+  %r = fdiv float 1.0, %d
+  store float %r, ptr addrspace(1) %p
+  ret void
+}
+; CHECK-LABEL: plain_plus:
+; CHECK: bfi {{r[0-9]+}}, {{r[0-9]+}}, 128, 23
+define agx_kernel void @plain_plus(ptr addrspace(1) %p, float %x) {
+  %d = fadd float %x, 2.0
+  %r = fdiv float 1.0, %d
+  store float %r, ptr addrspace(1) %p
+  ret void
+}
+declare float @llvm.fabs.f32(float)
+declare float @llvm.fma.f32(float, float, float)
