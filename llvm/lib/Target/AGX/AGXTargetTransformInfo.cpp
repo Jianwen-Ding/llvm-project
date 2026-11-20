@@ -226,6 +226,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeMathStores(
     cl::desc("-agx-device-unroll-runtime-stores also for log, log2, sin, cos "
              "and sqrt"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
+    "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
+             "maximum or minimum"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -877,6 +882,24 @@ void AGXTTIImpl::getUnrollingPreferences(
                       return isa<StoreInst>(I) || I.isAtomic() ||
                              I.getOpcode() == Instruction::FDiv;
                     }));
+      // (a running maximum / minimum of a thread's own row, rowmax_dyn: as
+      // a sum, L15-E582)
+      bool LightMax =
+          AGXDeviceUnrollRuntimeMax && !Light &&
+          all_of(*L->getHeader(), [](const Instruction &I) {
+            if (isa<StoreInst>(I) || I.isAtomic() ||
+                I.getOpcode() == Instruction::FDiv)
+              return false;
+            if (auto *II = dyn_cast<IntrinsicInst>(&I))
+              return II->getIntrinsicID() == Intrinsic::fma ||
+                     II->getIntrinsicID() == Intrinsic::fmuladd ||
+                     II->getIntrinsicID() == Intrinsic::maxnum ||
+                     II->getIntrinsicID() == Intrinsic::minnum ||
+                     II->getIntrinsicID() == Intrinsic::maximum ||
+                     II->getIntrinsicID() == Intrinsic::minimum;
+            return !isa<CallBase>(I);
+          });
+      LightOrExp |= LightMax && Insts <= 24;
       if (LightOrExp && !Far && Insts <= 48 &&
           AGXDeviceUnrollRuntimeContiguous >= 2 && RowPerThread() &&
           (Light ? Insts <= 24 : true)) {
