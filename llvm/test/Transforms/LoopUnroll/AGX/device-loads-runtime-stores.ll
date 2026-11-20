@@ -1,6 +1,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-stores=0 -S < %s | FileCheck %s --check-prefix=OFF
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-stores-narrow=0 -S < %s | FileCheck %s --check-prefix=WORDS
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns=0 -S < %s | FileCheck %s --check-prefix=NOCOL
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -64,3 +65,62 @@ exit:
 declare float @llvm.roundeven.f32(float)
 declare float @llvm.maximum.f32(float, float)
 declare float @llvm.minimum.f32(float, float)
+
+; A column of a runtime length (4096 bytes a step, far) likewise, its trip
+; count independent of the thread (L15-E575); not a grid-stride loop, whose
+; trip count (n - gid) / 1024 is the thread's.
+; CHECK-LABEL: @column(
+; CHECK-COUNT-4: store float
+; CHECK: .epil
+; NOCOL-LABEL: @column(
+; NOCOL: store float
+; NOCOL-NOT: store float
+; NOCOL: ret void
+; CHECK-LABEL: @gridstride(
+; CHECK: store float
+; CHECK-NOT: store float
+; CHECK: ret void
+declare i32 @llvm.agx.thread.position.in.grid.x()
+define void @column(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y, i64 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %c0 = zext i32 %t to i64
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %row = shl nuw nsw i64 %i, 10
+  %k = add nuw nsw i64 %row, %c0
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %k
+  %v = load float, ptr addrspace(1) %px, align 4
+  %pw = getelementptr inbounds float, ptr addrspace(1) %w, i64 %i
+  %u = load float, ptr addrspace(1) %pw, align 4
+  %o = fmul float %v, %u
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %k
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+
+define void @gridstride(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %g = zext i32 %t to i64
+  %e = icmp ult i64 %g, %n
+  br i1 %e, label %loop, label %exit
+loop:
+  %i = phi i64 [ %g, %entry ], [ %i1, %loop ]
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %i
+  %v = load float, ptr addrspace(1) %px, align 4
+  %o = fmul float %v, %v
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %i
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw i64 %i, 1024
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}

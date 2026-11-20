@@ -208,6 +208,11 @@ static cl::opt<unsigned> AGXDeviceUnrollBlocks(
     cl::desc("Blocks an innermost device-load loop with a conditional device "
              "store may have for E187's factors (0: one block only)"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeColumns(
+    "agx-device-unroll-runtime-columns", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for far accesses where "
+             "the trip count does not depend on the thread (a column)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -722,11 +727,39 @@ void AGXTTIImpl::getUnrollingPreferences(
         if (I.getOpcode() == Instruction::FDiv || I.isAtomic())
           Light = false;
       }
+      // (a column of a runtime length, y[i][c] = f(x[i][c], w[i]): its trip
+      // count does not depend on the thread, as a grid-stride loop's
+      // (n - gid) / grid and a SIMD-group row's (n - lane) / 32 do, L15-E575)
+      auto ThreadFreeTrips = [&]() {
+        if (!AGXDeviceUnrollRuntimeColumns)
+          return false;
+        const SCEV *BTC = SE.getBackedgeTakenCount(L);
+        if (isa<SCEVCouldNotCompute>(BTC))
+          return false;
+        // (through the values SCEV does not see into, a lane's
+        // (n - 1 - lane) computed before the loop)
+        std::function<bool(const Value *, unsigned)> FromCall =
+            [&](const Value *V, unsigned Depth) {
+              if (isa<CallBase>(V))
+                return true;
+              auto *I = dyn_cast<Instruction>(V);
+              if (!I || Depth > 12)
+                return I != nullptr;
+              return any_of(I->operands(), [&](const Use &U) {
+                return FromCall(U.get(), Depth + 1);
+              });
+            };
+        return !SCEVExprContains(BTC, [&](const SCEV *X) {
+          auto *U = dyn_cast<SCEVUnknown>(X);
+          return U && FromCall(U->getValue(), 0);
+        });
+      };
       // A row loop that stores (y[j] = f(x[j], w[j])): its contiguous word
       // accesses, light arithmetic, unrolled with a remainder so that alias
       // versioning's copy has iterations' loads to issue together
       // (L15-E565).
-      if (!Light && !Far && Insts <= 24 && AGXDeviceUnrollRuntimeStores >= 2 &&
+      if (!Light && (!Far || (!Gather && ThreadFreeTrips())) && Insts <= 24 &&
+          AGXDeviceUnrollRuntimeStores >= 2 &&
           all_of(*L->getHeader(), [&](const Instruction &I) {
             auto Size = [&](Type *Ty) {
               unsigned B = DL.getTypeStoreSize(Ty);
