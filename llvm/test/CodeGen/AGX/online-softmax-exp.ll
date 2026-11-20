@@ -64,3 +64,35 @@ define agx_kernel void @pair_maxnum(ptr addrspace(1) %p, float %a, float %b) {
   store float %s, ptr addrspace(1) %p
   ret void
 }
+
+; maxnum of a running value from a number (-inf): never a NaN, so u is b
+; where b > a and a otherwise, and the trivial sides are u 0 + 1 again
+; (L15-E514).
+; CHECK-LABEL: @running_maxnum(
+; CHECK:       call float @llvm.fma.f32(float %u, float 0.000000e+00, float 1.000000e+00)
+; CHECK-NOT:   fadd float 1.000000e+00
+; CHECK:       ret void
+define agx_kernel void @running_maxnum(ptr addrspace(1) %p, ptr addrspace(1) %o) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %m = phi float [ 0xFFF0000000000000, %entry ], [ %u, %loop ]
+  %s = phi float [ 0.0, %entry ], [ %s1, %loop ]
+  %g = getelementptr float, ptr addrspace(1) %p, i32 %i
+  %v = load float, ptr addrspace(1) %g
+  %u = call float @llvm.maxnum.f32(float %m, float %v)
+  %dm = fsub float %m, %u
+  %dv = fsub float %v, %u
+  %em = call float @llvm.exp.f32(float %dm)
+  %ev = call float @llvm.exp.f32(float %dv)
+  %s1 = call float @llvm.fma.f32(float %s, float %em, float %ev)
+  %i1 = add i32 %i, 1
+  %c = icmp ult i32 %i1, 64
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = fadd float %s1, %u
+  store float %r, ptr addrspace(1) %o
+  ret void
+}
+declare float @llvm.fma.f32(float, float, float)

@@ -7503,6 +7503,11 @@ static cl::opt<bool> AGXOnlineSoftmaxExp(
     cl::desc("exp(a - max(a, b)) and exp(b - max(a, b)) as one exponential "
              "and 1 + (x - x) for the other"));
 
+static cl::opt<bool> AGXOnlineSoftmaxSharedNum(
+    "agx-online-softmax-shared-one-num", cl::init(true), cl::Hidden,
+    cl::desc("agx-online-softmax-shared-one also for maxnum / maximumnum of a "
+             "running value from a number"));
+
 static cl::opt<bool> AGXOnlineSoftmaxShared(
     "agx-online-softmax-shared-one", cl::init(true), cl::Hidden,
     cl::desc("agx-online-softmax-exp's trivial side as u 0 + 1, one for "
@@ -7583,8 +7588,42 @@ static bool onlineSoftmaxExps(Function &F) {
     // on every kernel: its exponentials overlap and take registers.)
     // L15-E513.
     auto *UI = cast<IntrinsicInst>(FA->getOperand(1));
+    // maxnum / maximumnum too where a is never a NaN (then u is b where b >
+    // a, else a): a running value from a number, whose maxnum keeps a
+    // number (L15-E514).
+    // (a number; a maxnum / maximumnum with a never-NaN operand; a phi of
+    // such values, itself assumed one: an unrolled loop's chain)
+    SmallPtrSet<PHINode *, 4> Assumed;
+    std::function<bool(Value *, unsigned)> NeverNaN = [&](Value *V,
+                                                          unsigned Depth) {
+      if (auto *CF = dyn_cast<ConstantFP>(V))
+        return !CF->isNaN();
+      if (Depth > 32)
+        return false;
+      if (auto *II = dyn_cast<IntrinsicInst>(V);
+          II && (II->getIntrinsicID() == Intrinsic::maxnum ||
+                 II->getIntrinsicID() == Intrinsic::maximumnum))
+        return NeverNaN(II->getArgOperand(0), Depth + 1) ||
+               NeverNaN(II->getArgOperand(1), Depth + 1);
+      if (auto *P = dyn_cast<PHINode>(V)) {
+        if (!Assumed.insert(P).second)
+          return true;
+        bool R = all_of(P->incoming_values(), [&](Value *In) {
+          return NeverNaN(In, Depth + 1);
+        });
+        Assumed.erase(P);
+        return R;
+      }
+      return false;
+    };
+    bool Shared =
+        UI->getIntrinsicID() == Intrinsic::maximum ||
+        (AGXOnlineSoftmaxSharedNum &&
+         (UI->getIntrinsicID() == Intrinsic::maxnum ||
+          UI->getIntrinsicID() == Intrinsic::maximumnum) &&
+         NeverNaN(A, 0));
     Value *Triv =
-        AGXOnlineSoftmaxShared && UI->getIntrinsicID() == Intrinsic::maximum &&
+        AGXOnlineSoftmaxShared && Shared &&
                 E1->getIntrinsicID() == Intrinsic::exp
             ? Bld.CreateIntrinsic(Intrinsic::fma, {E->getType()},
                                   {UI, ConstantFP::get(E->getType(), 0.0),
