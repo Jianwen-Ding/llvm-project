@@ -54,6 +54,13 @@ static cl::opt<bool> AGXLowMaskAndUniform(
 
 bool llvm::AGX::lowMaskAndInUniforms() { return AGXLowMaskAndUniform; }
 
+static cl::opt<bool> AGXSignBitCompares(
+    "agx-sign-bit-compares", cl::init(true), cl::Hidden,
+    cl::desc("x >> 31 (logical) as icmpsel slt x, 0, 1, 0 (the ALU's), not "
+             "a bfeil (the shared unit's)"));
+
+bool llvm::AGX::signBitCompares() { return AGXSignBitCompares; }
+
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.

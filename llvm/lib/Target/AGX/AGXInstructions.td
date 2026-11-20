@@ -2723,6 +2723,13 @@ def : Pat<(i16 (sub i16:$x, (and (add i16:$x, i16:$b), agx_neg_pow2_8_16:$c))),
 // with an icmpsel AGXFoldOperands folds into the branch.
 def : Pat<(i32 (srl (xor i32:$x, -1), (i32 31))),
           (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 0), 0, (i32 1))>;
+// and the sign bit itself, x < 0 (a double's sign in the f64 emulation:
+// L15-E558)
+def agx_sign_shift : PatLeaf<(i32 imm), [{
+  return N->getZExtValue() == 31 && llvm::AGX::signBitCompares();
+}]>;
+def : Pat<(i32 (srl i32:$x, agx_sign_shift)),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0, (i32 0))>;
 def : Pat<(AGXif (i32 (srl i32:$x, (i32 31))), bb:$t),
           (AGX_IF (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0,
                                (i32 0)), bb:$t)>;
