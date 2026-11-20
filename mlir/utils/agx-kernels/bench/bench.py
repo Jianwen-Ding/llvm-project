@@ -20,6 +20,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# As agx-build-fatbin.py (its --no-uniform-constants: AGX_BENCH_UNIFORM_CONSTANTS=0)
+UNIFORM_CONSTANTS = os.environ.get('AGX_BENCH_UNIFORM_CONSTANTS', '1') != '0'
 PIPELINE = ('builtin.module(gpu.module(canonicalize,'
             'convert-gpu-to-air{use-bare-ptr-memref-call-conv=1},canonicalize))')
 
@@ -50,16 +52,22 @@ def cost(bindir, costbin, ll, tmp, cpu, args, optimize=True):
   run([llc, '-mtriple=air', '-air-portable', ll, '-o', air])
   passes = ['-O3'] if optimize else ['-passes=agx-lower-air']
   run([opt, '-mtriple=agx', '-mcpu=' + cpu] + passes + ['-S', air, '-o', agx])
-  level = ['-O3'] if optimize else []
+  # (agx-build-fatbin.py's wide constants in uniforms, which the runtime
+  # preloads: L15-E540)
+  level = (['-O3'] if optimize else []) + (['-agx-uniform-constants'] if UNIFORM_CONSTANTS else [])
   asm = run([llc, '-mtriple=agx', '-mcpu=' + cpu] + level + [agx, '-o', '-'])
   obj, binf = os.path.join(tmp, 'k.o'), os.path.join(tmp, 'k.bin')
   run([llc, '-mtriple=agx', '-mcpu=' + cpu] + level +
       ['-filetype=obj', agx, '-o', obj])
   run([os.path.join(bindir, 'llvm-objcopy'), '-O', 'binary',
        '--only-section=.text', obj, binf])
-  # separate buffers (agx-bench's pointer_uniforms), as a launch binds them
-  args = list(args) + _agx_bench().pointer_uniforms(
-      open(agx).read(), _kernel_name(agx), args)
+  # separate buffers (agx-bench's pointer_uniforms), as a launch binds them,
+  # and the preloaded constants
+  ab = _agx_bench()
+  args = list(args) + ab.pointer_uniforms(open(agx).read(), _kernel_name(agx), args)
+  if UNIFORM_CONSTANTS:
+    args += ab.constant_uniforms(obj, _kernel_name(agx),
+                                 os.path.join(bindir, 'llvm-objcopy'))
   j = json.loads(run([costbin, binf, '--allow-unknown'] + args)
                  .strip().splitlines()[-1])
   insts = [l for l in asm.splitlines()

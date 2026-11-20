@@ -70,4 +70,6 @@ the kernel's, as memory at VA).
 | `rmsnorm_f16` | RMSNorm of f16 rows by a SIMD-group: vector<4xf16> loads, the sum of squares in f32, rsqrt, the f16 weighted write |
 | `layernorm_thread` | LayerNorm of 256-float rows, a thread per row: two passes for the mean and variance, then a loop that loads the row, gamma and beta and stores the normalized row |
 
+The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
+
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.
