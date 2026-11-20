@@ -231,6 +231,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
     cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
              "maximum or minimum"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowRows(
+    "agx-device-unroll-runtime-narrow-rows", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-contiguous's factor times 4 over "
+             "the bytes of a row's narrowest load (halves, bytes)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -904,9 +909,23 @@ void AGXTTIImpl::getUnrollingPreferences(
           AGXDeviceUnrollRuntimeContiguous >= 2 && RowPerThread() &&
           (Light ? Insts <= 24 : true)) {
         UP.Partial = UP.Runtime = true;
-        UP.DefaultUnrollRuntimeCount = UP.MaxCount =
-            RowLoads == 1 ? 2 * AGXDeviceUnrollRuntimeContiguous
-                          : unsigned(AGXDeviceUnrollRuntimeContiguous);
+        unsigned Count = RowLoads == 1
+                             ? 2 * AGXDeviceUnrollRuntimeContiguous
+                             : unsigned(AGXDeviceUnrollRuntimeContiguous);
+        // (as many bytes an iteration from rows of halves or bytes as of
+        // floats: hsum_dyn 362.8 -> 317.3, bsum_dyn 579.3 -> 472.4,
+        // L15-E583)
+        if (AGXDeviceUnrollRuntimeNarrowRows && !Exps) {
+          unsigned MinBytes = 4;
+          for (const Instruction &I : *L->getHeader())
+            if (auto *LI = dyn_cast<LoadInst>(&I);
+                LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+              MinBytes = std::min<unsigned>(
+                  MinBytes, std::max<uint64_t>(
+                                1, DL.getTypeStoreSize(LI->getType())));
+          Count *= 4 / MinBytes;
+        }
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount = Count;
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       if (Light && Far && Insts <= 24) {

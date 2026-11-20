@@ -2,6 +2,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-contiguous=0 -S < %s | FileCheck %s --check-prefix=OFF
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-exp=0 -S < %s | FileCheck %s --check-prefix=NOEXP
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-max=0 -S < %s | FileCheck %s --check-prefix=NOMAX
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-rows=0 -S < %s | FileCheck %s --check-prefix=WIDE
 
 ; A thread's own row of a runtime length (L15-E566): its loads start at the
 ; thread position times a row's bytes. A sum (one load an iteration) is
@@ -36,6 +37,20 @@
 ; NOMAX-COUNT-4: call float @llvm.maxnum.f32
 ; NOMAX-NOT: call float @llvm.maxnum.f32
 ; NOMAX: .epil
+; Rows of halves or bytes as many bytes an iteration as of floats
+; (L15-E583): a half row's sum 16 times, a byte row's 32.
+; CHECK-LABEL: @hsum(
+; CHECK-COUNT-16: fpext half
+; CHECK-NOT: fpext half
+; CHECK: .epil
+; WIDE-LABEL: @hsum(
+; WIDE-COUNT-8: fpext half
+; WIDE-NOT: fpext half
+; WIDE: .epil
+; CHECK-LABEL: @bsum(
+; CHECK-COUNT-32: sext i8
+; CHECK-NOT: sext i8
+; CHECK: .epil
 ; CHECK-LABEL: @taps(
 ; CHECK: call float @llvm.fma.f32
 ; CHECK-NOT: call float @llvm.fma.f32
@@ -143,6 +158,56 @@ loop:
 exit:
   %r = phi float [ 0.0, %entry ], [ %s1, %loop ]
   store float %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+define void @hsum(ptr addrspace(1) %x, ptr addrspace(1) %o, i64 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %s = phi float [ 0.0, %entry ], [ %s1, %loop ]
+  %it = trunc nuw nsw i64 %i to i32
+  %k = add i32 %row, %it
+  %z = zext i32 %k to i64
+  %p = getelementptr inbounds half, ptr addrspace(1) %x, i64 %z
+  %h = load half, ptr addrspace(1) %p, align 2
+  %v = fpext half %h to float
+  %s1 = fadd float %s, %v
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = phi float [ 0.0, %entry ], [ %s1, %loop ]
+  store float %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+define void @bsum(ptr addrspace(1) %x, ptr addrspace(1) %o, i64 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %s = phi i32 [ 0, %entry ], [ %s1, %loop ]
+  %it = trunc nuw nsw i64 %i to i32
+  %k = add i32 %row, %it
+  %z = zext i32 %k to i64
+  %p = getelementptr inbounds i8, ptr addrspace(1) %x, i64 %z
+  %h = load i8, ptr addrspace(1) %p, align 1
+  %v = sext i8 %h to i32
+  %s1 = add i32 %s, %v
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = phi i32 [ 0, %entry ], [ %s1, %loop ]
+  store i32 %r, ptr addrspace(1) %o, align 4
   ret void
 }
 

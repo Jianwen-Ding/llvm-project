@@ -97,6 +97,8 @@ the kernel's, as memory at VA).
 | `sincos_rows` | sin(x) cos(2x) over rows of 256, a thread per row |
 | `logpow_rows` | log(x) + pow(x, 0.75) over rows of 256 positive floats, a thread per row |
 | `rowmax_dyn` | maxnum over rows of a runtime length (512 here), a thread per row |
+| `bsum_dyn` | sums of sign-extended bytes over rows of a runtime length (512 here), a thread per row |
+| `hdot_dyn` | dots of half rows with a half vector, in floats, over a runtime length (512 here), a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
