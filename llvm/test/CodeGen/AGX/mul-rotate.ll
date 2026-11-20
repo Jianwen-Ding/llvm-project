@@ -20,7 +20,7 @@ define agx_kernel void @mix(ptr addrspace(1) %p, i32 %v) {
 ; CHECK-NEXT:    extr r1, r1, r1, 17
 ; CHECK-NEXT:    imadd r1, r1, r2, 0
 ; CHECK-NEXT:    extr r1, r1, r1, 19
-; CHECK-NEXT:    bfeil r2, 0, r1, 16
+; CHECK-NEXT:    iadd r2, r1h, 0
 ; CHECK-NEXT:    xor r1, r1, r2
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

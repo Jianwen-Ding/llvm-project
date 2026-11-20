@@ -528,6 +528,13 @@ let AddedComplexity = 10 in {
 def : Pat<(i16 (trunc (srl i32:$a, (i32 16)))), (EXTRACT_SUBREG $a, hi16)>;
 def : Pat<(i16 (trunc (sra i32:$a, (i32 16)))), (EXTRACT_SUBREG $a, hi16)>;
 }
+// ... and x >> 16 itself, sign- or zero-extended: an iadd of the high half
+// (the ALU's, a source modifier), not an asr / bfeil on the shared unit
+// (int16 rows' pairs, the high element: L15-E563).
+def : Pat<(i32 (sra i32:$a, (i32 16))),
+          (IADD_I32_FROM16 MOD_SX, (i16 (EXTRACT_SUBREG $a, hi16)), 0, (i16 0), 0)>;
+def : Pat<(i32 (srl i32:$a, (i32 16))),
+          (IADD_I32_FROM16 0, (i16 (EXTRACT_SUBREG $a, hi16)), 0, (i16 0), 0)>;
 def : Pat<(i32 (trunc i64:$a)), (EXTRACT_SUBREG $a, sub0)>;
 def : Pat<(i32 (AGXhi32 i64:$a)), (EXTRACT_SUBREG $a, sub1)>;
 def : Pat<(i16 (trunc i64:$a)),
