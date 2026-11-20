@@ -129,6 +129,11 @@ static cl::opt<bool> Exp2BelowMax(
     cl::desc("2^x and 10^x of x at most 0 (below a maximum): no upper clamp"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> AtanQuotientStep(
+    "agx-atan-quotient-step", cl::init(true), cl::Hidden,
+    cl::desc("atan's -1 / a and (a - 1) / (a + 1) by the reciprocal step and "
+             "a Markstein correction"));
+
 static cl::opt<bool> NarrowSinCosReduction(
     "agx-narrow-sincos-reduction",
     cl::desc("bfloat sin / cos: pi / 2 in two parts"),
@@ -275,6 +280,28 @@ public:
     return B.CreateFDiv(A, X);
   }
 
+  /// n / d where the result is used only for d at least 1 (+inf, a NaN)
+  /// and n zero, -1 or at least 2^-24 in magnitude: the correctly rounded
+  /// reciprocal y of d by E282's step (rcp, two fmas, +0 past 2^126) and
+  /// Markstein's q0 = n y, q = q0 + y (n - d q0) (E409), without the
+  /// division's exponent scaling and special cases (atan's -1 / a and
+  /// (a - 1) / (a + 1): every float input's atan the same, L15-E501). The
+  /// division otherwise (a half or bfloat result's reciprocal product).
+  Value *quotientAboveOne(Value *N, Value *D) {
+    if ((NarrowResult && HalfFastDivision && !PreciseDivision &&
+         !Ty->isVectorTy()) ||
+        !AtanQuotientStep || !NoDenormals)
+      return div(N, D);
+    Value *Y0 = B.CreateIntrinsic(Intrinsic::agx_rcp, {Ty}, {D});
+    Value *Y = fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
+    // (past 2^126, +inf included, the quotient flushes: q0 = n * +0, whose
+    // correction's d q0 would be inf * 0 for an infinite d)
+    Value *Huge = gt(D, 0x1p126);
+    Y = sel(Huge, k(0.0), Y);
+    Value *Q0 = mul(N, Y);
+    return sel(Huge, Q0, fma(fma(B.CreateFNeg(D), Q0, N), Y, Q0));
+  }
+
   /// atan of a value in [0, inf] or NaN: the argument reduced to
   /// [0, tan(pi / 8)] around 0, pi / 4 or pi / 2.
   Value *atanNonNegative(Value *A, bool AtMostOne = false) {
@@ -283,8 +310,9 @@ public:
                            : gt(A, 2.414213562373095);
     // One division, of the operands the range picks (-1 / a or
     // (a - 1) / (a + 1)): a select of two divisions computed both ways.
-    Value *Q = div(sel(Big, k(-1.0), sub(A, k(1.0))),
-                   sel(Big, A, add(A, k(1.0))));
+    Value *Nm = sel(Big, k(-1.0), sub(A, k(1.0)));
+    Value *Dn = sel(Big, A, add(A, k(1.0)));
+    Value *Q = quotientAboveOne(Nm, Dn);
     Value *X = sel(B.CreateOr(Big, Mid), Q, A);
     Value *Y0 = sel(Big, k(M_PI_2), sel(Mid, k(M_PI_4), k(0.0)));
     Value *Z = mul(X, X);

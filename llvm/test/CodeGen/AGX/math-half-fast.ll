@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-fast-hyperbolic=0 -agx-half-fast-division=0 -agx-narrow-fast-sqrt=0 -agx-narrow-sincos-reduction=0 -agx-bfloat-short-polys=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-fast-hyperbolic=0 -agx-half-fast-division=0 -agx-narrow-fast-sqrt=0 -agx-narrow-sincos-reduction=0 -agx-bfloat-short-polys=0 -agx-atan-quotient-step=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; Half tanh, sinh and cosh with the hardware's exponential and reciprocal
 ; (no Newton step), and half atan's and tan's division by the hardware's
