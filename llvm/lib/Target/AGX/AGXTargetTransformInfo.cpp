@@ -147,6 +147,11 @@ static cl::opt<unsigned> AGXDeviceUnrollRuntime(
     cl::desc("Unroll a light device-load loop of a runtime trip count this "
              "many times, with a remainder loop (0: not)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeStrided(
+    "agx-device-unroll-runtime-strided", cl::init(8), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime's factor where its far loads step by "
+             "a runtime stride (not a gather)"));
+
 static cl::opt<bool> AGXDeviceUnrollSomeStrided(
     "agx-device-unroll-some-strided", cl::init(true), cl::Hidden,
     cl::desc("agx-device-unroll-strided's factor also where only some of a "
@@ -493,7 +498,7 @@ void AGXTTIImpl::getUnrollingPreferences(
     // transcendental work hide their loads behind it, and lost (xent_rows).
     if (!Trips && DeviceLoads && AGXDeviceUnrollRuntime >= 2) {
       unsigned Insts = 0, Far = 0;
-      bool Light = true;
+      bool Light = true, Gather = false;
       for (const Instruction &I : *L->getHeader()) {
         ++Insts;
         if (isa<StoreInst>(I) || (isa<CallBase>(I) && !isa<IntrinsicInst>(I)))
@@ -527,6 +532,20 @@ void AGXTTIImpl::getUnrollingPreferences(
               Bytes = *St * DL.getTypeAllocSize(G->getSourceElementType());
           }
           Far += !Bytes || Bytes->abs().ugt(DL.getTypeStoreSize(LI->getType()));
+          // (a gather: an address that is no recurrence of the loop at all)
+          if (!Bytes) {
+            const SCEV *PS = SE.getSCEV(const_cast<Value *>(Ptr));
+            bool Rec = isa<SCEVAddRecExpr>(PS);
+            if (auto *G = dyn_cast<GetElementPtrInst>(Ptr);
+                !Rec && G && G->getNumIndices() == 1) {
+              const Value *Idx = G->getOperand(1);
+              if (auto *E = dyn_cast<CastInst>(Idx);
+                  E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+                Idx = E->getOperand(0);
+              Rec = isa<SCEVAddRecExpr>(SE.getSCEV(const_cast<Value *>(Idx)));
+            }
+            Gather |= !Rec;
+          }
         }
         // (light arithmetic only, and no running maximum / minimum, whose
         // deferral, L15-E444, wants the loop: the causal / window rows lost)
@@ -543,7 +562,13 @@ void AGXTTIImpl::getUnrollingPreferences(
       }
       if (Light && Far && Insts <= 24) {
         UP.Partial = UP.Runtime = true;
-        UP.DefaultUnrollRuntimeCount = UP.MaxCount = AGXDeviceUnrollRuntime;
+        // (8 where the far loads step by a runtime stride, a column: matmul
+        // 141.3 -> 138.3, colsum_dyn 408.8 -> 323.1; a gather's 8 lost,
+        // spmv_csr 41.0 -> 45.0, L15-E537)
+        unsigned Count = Gather ? AGXDeviceUnrollRuntime
+                                : std::max<unsigned>(AGXDeviceUnrollRuntime,
+                                                     AGXDeviceUnrollRuntimeStrided);
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount = Count;
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
     }

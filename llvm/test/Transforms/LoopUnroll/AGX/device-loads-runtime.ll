@@ -3,11 +3,12 @@
 
 ; A device-load loop of a runtime trip count with light work and a load that
 ; does not step by its own size (a matrix product's column of B, n floats a
-; step) is unrolled 4 times with a remainder loop (L15-E536); contiguous
-; loads alone (an FIR's taps) are not.
+; step) is unrolled with a remainder loop (L15-E536): 8 times for a runtime
+; stride (L15-E537), 4 for a gather; contiguous loads alone (an FIR's taps)
+; are not.
 
 ; CHECK-LABEL: @dot_column(
-; CHECK-COUNT-4: call float @llvm.fma.f32
+; CHECK-COUNT-8: call float @llvm.fma.f32
 ; CHECK: epil
 ; OFF-LABEL: @dot_column(
 ; OFF-COUNT-1: call float @llvm.fma.f32
@@ -64,3 +65,29 @@ exit:
   ret void
 }
 declare float @llvm.fma.f32(float, float, float)
+
+; CHECK-LABEL: @gather(
+; CHECK-COUNT-4: call float @llvm.fma.f32
+; CHECK: epil
+define void @gather(ptr addrspace(1) %x, ptr addrspace(1) %idx, ptr addrspace(1) %y, i32 %n) {
+entry:
+  %e = icmp eq i32 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %k = phi i32 [ 0, %entry ], [ %k1, %loop ]
+  %acc = phi float [ 0.0, %entry ], [ %m, %loop ]
+  %zk = zext i32 %k to i64
+  %pi = getelementptr inbounds i32, ptr addrspace(1) %idx, i64 %zk
+  %j = load i32, ptr addrspace(1) %pi, align 4
+  %zj = zext i32 %j to i64
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %zj
+  %xv = load float, ptr addrspace(1) %px, align 4
+  %m = call float @llvm.fma.f32(float %xv, float %xv, float %acc)
+  %k1 = add nuw i32 %k, 1
+  %cnd = icmp ult i32 %k1, %n
+  br i1 %cnd, label %loop, label %exit
+exit:
+  %r = phi float [ 0.0, %entry ], [ %m, %loop ]
+  store float %r, ptr addrspace(1) %y, align 4
+  ret void
+}
