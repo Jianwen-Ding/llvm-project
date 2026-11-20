@@ -256,6 +256,12 @@ static cl::opt<bool> AGXSchedKnownGrid(
     cl::desc("Keep a schedule whose registers still let every SIMD-group of "
              "a known grid reside on one core"));
 
+static cl::opt<bool> AGXOriginalOrderLoadsFirst(
+    "agx-sched-original-order-loads-first", cl::init(true), cl::Hidden,
+    cl::desc("A region kept in its original order, without barriers or "
+             "threadgroup accesses, issues a ready device load first where "
+             "its registers still let the kernel's threadgroups in"));
+
 namespace {
 /// Picks the region's instructions in their order before the first
 /// scheduling (top-down; that order is a topological one of the DAG).
@@ -267,13 +273,18 @@ public:
   AGXOriginalOrderStrategy(const DenseMap<const MachineInstr *, unsigned> &I)
       : Index(I) {}
   void initialize(ScheduleDAGMI *) override { Ready.clear(); }
+  /// A ready device load first (L15-E498).
+  bool LoadsFirst = false;
   SUnit *pickNode(bool &IsTopNode) override {
     IsTopNode = true;
     if (Ready.empty())
       return nullptr;
-    auto Best = llvm::min_element(Ready, [&](SUnit *A, SUnit *B) {
-      return Index.lookup(A->getInstr()) < Index.lookup(B->getInstr());
-    });
+    auto Key = [&](SUnit *X) {
+      bool Load = LoadsFirst && isAGXDeviceLoad(*X->getInstr());
+      return std::make_pair(!Load, Index.lookup(X->getInstr()));
+    };
+    auto Best = llvm::min_element(
+        Ready, [&](SUnit *A, SUnit *B) { return Key(A) < Key(B); });
     SUnit *SU = *Best;
     Ready.erase(Best);
     return SU;
@@ -385,17 +396,48 @@ public:
     }
     if (After <= Before || (!Threads && !Core))
       return;
-    // the original order again, through the scheduler's own moves
-    std::unique_ptr<MachineSchedStrategy> Original =
-        std::make_unique<AGXOriginalOrderStrategy>(Index);
-    // (without the mutations, whose clustering edges need not hold in the
-    // original order)
-    std::vector<std::unique_ptr<ScheduleDAGMutation>> Kept;
-    std::swap(Mutations, Kept);
-    std::swap(SchedImpl, Original);
-    ScheduleDAGMILive::schedule();
-    std::swap(SchedImpl, Original);
-    std::swap(Mutations, Kept);
+    // the original order again, through the scheduler's own moves; in a
+    // region without barriers or threadgroup accesses its ready device loads
+    // first, unless that order lowers the threads below what the kernel's
+    // threadgroups have (its known maximum, else 1024; with 16 halves of
+    // margin for register allocation) or cuts the core's SIMD-groups as
+    // above (L15-E498: attention decode's loads ahead of its per-key work,
+    // whose threadgroups of 32 the registers for them still allow)
+    bool LoadsFirst = false;
+    if (AGXOriginalOrderLoadsFirst && DeviceLoads) {
+      LoadsFirst = true;
+      for (MachineInstr &MI : make_range(RegionBegin, RegionEnd)) {
+        for (const MachineMemOperand *MMO : MI.memoperands())
+          LoadsFirst &= MMO->getAddrSpace() != AGX::THREADGROUP_ADDRESS;
+        LoadsFirst &= MI.getOpcode() != AGX::THREADGROUP_BARRIER &&
+                      MI.getOpcode() != AGX::MEMORY_BARRIER;
+      }
+    }
+    auto Reschedule = [&](bool First) {
+      auto Strategy = std::make_unique<AGXOriginalOrderStrategy>(Index);
+      Strategy->LoadsFirst = First;
+      std::unique_ptr<MachineSchedStrategy> Original = std::move(Strategy);
+      // (without the mutations, whose clustering edges need not hold in the
+      // original order)
+      std::vector<std::unique_ptr<ScheduleDAGMutation>> Kept;
+      std::swap(Mutations, Kept);
+      std::swap(SchedImpl, Original);
+      ScheduleDAGMILive::schedule();
+      std::swap(SchedImpl, Original);
+      std::swap(Mutations, Kept);
+    };
+    Reschedule(LoadsFirst);
+    if (LoadsFirst) {
+      unsigned H = regionHalves();
+      unsigned Need = MF.getFunction().getFnAttributeAsParsedInteger(
+          "agx-max-threads-per-threadgroup", 1024);
+      if (Need == 0 || Need > 1024)
+        Need = 1024;
+      if (H > Before &&
+          (AGXSubtarget::maxThreadsForHalves(H + 16) < Need ||
+           9 * CoreGroups(H) < 5 * CoreGroups(Before)))
+        Reschedule(false);
+    }
     LLVM_DEBUG(dbgs() << "agx-occupancy reverted: halves " << regionHalves()
                       << "\n");
   }
