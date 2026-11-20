@@ -57,13 +57,33 @@ def cost(bindir, costbin, ll, tmp, cpu, args, optimize=True):
       ['-filetype=obj', agx, '-o', obj])
   run([os.path.join(bindir, 'llvm-objcopy'), '-O', 'binary',
        '--only-section=.text', obj, binf])
+  # separate buffers (agx-bench's pointer_uniforms), as a launch binds them
+  args = list(args) + _agx_bench().pointer_uniforms(
+      open(agx).read(), _kernel_name(agx), args)
   j = json.loads(run([costbin, binf, '--allow-unknown'] + args)
                  .strip().splitlines()[-1])
   insts = [l for l in asm.splitlines()
            if re.match(r'^\t[a-z]', l) and not l.strip().startswith('trap')]
   gprs = re.search(r'general purpose registers: (\d+)', asm)
   return {'cycles': j['cycles'], 'instructions': len(insts),
-          'gprs': int(gprs.group(1)) if gprs else 0, 'asm': asm}
+          'gprs': int(gprs.group(1)) if gprs else 0, 'asm': asm, 'args': args}
+
+
+def _agx_bench():
+  """llvm/utils/agx-bench/agx-bench.py as a module."""
+  import importlib.util
+  spec = importlib.util.spec_from_file_location(
+      'agx_bench', os.path.join(HERE, '..', '..', '..', '..', 'llvm', 'utils',
+                                'agx-bench', 'agx-bench.py'))
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+def _kernel_name(ll):
+  m = re.search(r'^define agx_kernel [^@]*@"?([\w.$]+)', open(ll).read(), re.M)
+  return m.group(1) if m else ''
+
 
 
 def launch_args(src):

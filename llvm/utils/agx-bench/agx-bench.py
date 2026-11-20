@@ -83,6 +83,58 @@ def launch_args(src):
     return []
 
 
+def pointer_uniforms(ll, name, given=()):
+    """agx_cost uniforms that put each device buffer argument of kernel `name` (LLVM IR text `ll`) in a 4 GiB
+    region of its own, its high word k + 1: separate buffers, as a launch binds them, which a loop's runtime
+    overlap check (llc's alias versioning) sees. Uniforms `given` sets are kept. Arguments sit in uniform
+    halves in order, each aligned to its size (64-bit ones to 32 bits); the PTX front end's by-reference
+    i64 argument is a pointer where the value loaded from it becomes one."""
+    m = re.search(r"^define agx_kernel [^@]*@\"?%s\"?\((.*)\)[^)]*\{" % re.escape(name), ll, re.M)
+    if not m:
+        return []
+    params, depth, cur = [], 0, ""
+    for ch in m.group(1):
+        if ch == "," and depth == 0:
+            params.append(cur.strip())
+            cur = ""
+            continue
+        depth += ch in "(<[{"
+        depth -= ch in ")>]}"
+        cur += ch
+    if cur.strip():
+        params.append(cur.strip())
+    taken = {int(v.split("=")[0], 0) for f, v in zip(given, list(given[1:]) + [""]) if f == "--uniform"}
+    half, out = 0, []
+
+    def pointer(is_pointer):
+        nonlocal half
+        half = (half + 1) // 2 * 2
+        hi = half // 2 + 1
+        if is_pointer and hi not in taken:
+            out.extend(["--uniform", "%d=%d" % (hi, len(out) // 2 + 1)])
+        half += 4
+
+    for p in params:
+        ty = p.split()[0]
+        byref = re.search(r"byref\((\w+)\)", p)
+        if byref:
+            ty = byref.group(1)
+            if ty == "i64":
+                arg = re.escape(p.split()[-1])
+                load = re.search(r"(%\S+) = load i64, ptr addrspace\(4\) " + arg + r"(?![\w\"])", ll)
+                pointer(bool(load) and re.search(r"inttoptr i64 " + re.escape(load.group(1)) + r"(?![\w\"])", ll))
+                continue
+        if ty == "ptr":
+            pointer(p.startswith("ptr addrspace(1)"))
+        elif ty in ("i64", "double"):
+            pointer(False)
+        elif ty in ("i32", "float"):
+            half = (half + 1) // 2 * 2 + 2
+        else:
+            half += 1
+    return out
+
+
 MATTR = []   # ["-mattr=+agx-strict"] with --agx-strict
 COST_ARGS = []  # ["--agx-strict", CHIP] with --agx-strict, set per chip
 
@@ -282,9 +334,12 @@ def main():
                     if a.agx_checked:
                         hidden = checked_uniforms(obj, name, objcopy, args or [])
                         args = (args or []) + hidden
-                    m["cycles"], m["launch_inputs"] = cost(a.cost, code, tmp, args)
+                    # (separate buffers, in the cost and throughput runs only)
+                    full = (args or []) + (pointer_uniforms(open(src).read(), name, args or []) if kind == "ll" else [])
+                    m["cycles"], used = cost(a.cost, code, tmp, full)
+                    m["launch_inputs"] = used and bool(args)
                     m["groups"] = resident_groups(m["gprs"], m["tg_bytes"], args if m["launch_inputs"] else [])
-                    m["tput"] = throughput(a.cost, code, tmp, args if m["launch_inputs"] else [], m["groups"])
+                    m["tput"] = throughput(a.cost, code, tmp, full if used else [], m["groups"])
                     key = "%s:%s:%s" % (os.path.basename(src), name, chip)
                     results[key] = m
                     print(json.dumps(dict(key=key, **m)))

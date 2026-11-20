@@ -68,5 +68,6 @@ the kernel's, as memory at VA).
 | `attn_decode_f16` | one query per head attending over 512 cached f16 keys and values (128 dims, four per lane): vector<4xf16> loads, the score by gpu.subgroup_reduce add, an online maximumf softmax rescaling the weighted sum of values |
 | `rope_f32` | rotary position embedding (1024 tokens x 64 pairs): a thread per pair, the angle position * inv_freq through precise math.cos and math.sin |
 | `rmsnorm_f16` | RMSNorm of f16 rows by a SIMD-group: vector<4xf16> loads, the sum of squares in f32, rsqrt, the f16 weighted write |
+| `layernorm_thread` | LayerNorm of 256-float rows, a thread per row: two passes for the mean and variance, then a loop that loads the row, gamma and beta and stores the normalized row |
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

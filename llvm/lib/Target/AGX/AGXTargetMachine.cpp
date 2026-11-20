@@ -80,6 +80,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXRareFallbacksPass(PR);
   initializeAGXThreadgroupAddressesPass(PR);
   initializeAGXHoistGuardedLoadsPass(PR);
+  initializeAGXAliasVersioningPass(PR);
   initializeAGXAlignmentVersioningPass(PR);
   initializeAGXNarrowInductionsPass(PR);
   initializeAGXSpecialRegisterRangesPassPass(PR);
@@ -801,6 +802,10 @@ void AGXPassConfig::addIRPasses() {
     // Loads that all-pairs loops skip for one element issue together.
     addPass(createAGXHoistGuardedLoadsPass());
     addPass(createAGXThreadgroupAddressesPass());
+    // Loops that store to one buffer and load from others: a copy for
+    // access ranges that do not overlap, whose loads need not wait for the
+    // stores before them.
+    addPass(createAGXAliasVersioningPass());
     // Loops over buffers only known aligned to 1- or 2-byte elements: a
     // copy for 4-byte aligned bases, whose accesses the vectorizer merges.
     addPass(createAGXAlignmentVersioningPass());
