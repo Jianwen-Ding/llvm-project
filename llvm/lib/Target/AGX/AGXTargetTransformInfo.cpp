@@ -991,11 +991,18 @@ void AGXTTIImpl::getUnrollingPreferences(
                      LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
                      ThreadDependent(LI->getPointerOperand());
             });
+        // (twice, not E717's 4 times, with two stores an iteration:
+        // split_dyn 858.4 at twice, 869.6 at 4 times)
+        unsigned OwnRowFactor =
+            count_if(*L->getHeader(),
+                     [](const Instruction &I) { return isa<StoreInst>(I); }) > 1
+                ? 2
+                : AGXDeviceUnrollRuntimeOwnRowFactor;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             AGXDeviceUnrollRuntimeStores *
             (NarrowRow || ColumnOnly ? 4
              : Column               ? AGXDeviceUnrollRuntimeColumnFactor
-             : OwnRow               ? AGXDeviceUnrollRuntimeOwnRowFactor
+             : OwnRow               ? OwnRowFactor
                                     : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
