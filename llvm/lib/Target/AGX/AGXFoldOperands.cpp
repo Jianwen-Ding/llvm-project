@@ -31,6 +31,10 @@ using namespace llvm;
 
 #define DEBUG_TYPE "agx-fold-operands"
 
+static cl::opt<bool> FoldWholeCopies(
+    "agx-fold-uniform-copy-chains", cl::init(true), cl::Hidden,
+    cl::desc("Fold uniform registers through copies of their copies"));
+
 static cl::opt<bool> FoldSharedBranchCompares(
     "agx-fold-shared-branch-compares",
     cl::desc("Fold a comparison that only branches use into each branch"),
@@ -280,9 +284,14 @@ bool AGXFoldOperands::runOnMachineFunction(MachineFunction &MF) {
       if (!Folded)
         continue;
 
-      // Copies of parts of a uniform tuple become uniform copies themselves.
+      // Copies of parts of a uniform tuple become uniform copies themselves,
+      // and so do copies of the whole (a value across blocks: the copies
+      // instruction selection makes of a kernel argument's for a loop's
+      // fmas, which then read the uniform, L15-E687).
       if (UseMI.isCopy()) {
-        if (Use.getSubReg() && UseMI.getOperand(0).getReg().isVirtual()) {
+        if ((Use.getSubReg() || FoldWholeCopies) &&
+            UseMI.getOperand(0).getReg().isVirtual() &&
+            !UseMI.getOperand(0).getSubReg()) {
           Use.setReg(Folded);
           Use.setSubReg(0);
           Use.setIsKill(false);
