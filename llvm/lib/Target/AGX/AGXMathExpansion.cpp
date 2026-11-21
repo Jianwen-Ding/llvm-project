@@ -54,6 +54,12 @@ static cl::opt<bool> LogOffsetSplit(
     cl::desc("log's 2^e (1 + f) with 1 + f in (sqrt(1/2), sqrt(2)] from x's "
              "bits plus 1 - sqrt(1/2)'s: no compare and selects"));
 
+static cl::opt<bool> LogFastTwoSum(
+    "agx-log-fast-two-sum", cl::init(true), cl::Hidden,
+    cl::desc("log's sums with their errors as Fast2Sum (the first addend "
+             "the larger): the same exact error in three operations, not "
+             "six"));
+
 static cl::opt<bool> ExpNaNThroughScale(
     "agx-exp-nan-through-scale", cl::init(true), cl::Hidden,
     cl::desc("exp without the +inf select: no NaN select, the NaN's sum "
@@ -651,6 +657,13 @@ public:
     return {S, Err};
   }
 
+  /// a + x and its error for |a| >= |x| or a = 0 (Fast2Sum): the error is
+  /// exact, so the same as twoSum's.
+  std::pair<Value *, Value *> fastTwoSum(Value *A, Value *X) {
+    Value *S = add(A, X);
+    return {S, sub(X, sub(S, A))};
+  }
+
   /// 2^i for an i32 i in [-126, 127].
   Value *pow2i(Value *I) {
     return B.CreateBitCast(B.CreateShl(B.CreateAdd(I, ki(127)), ki(23)), Ty);
@@ -970,9 +983,14 @@ public:
   /// log(x) for a positive finite x as a sum hi + lo.
   std::pair<Value *, Value *> logHiLo(Value *X) {
     LogParts L = logParts(X);
-    auto [S, Err] = twoSum(L.F, L.Y);
+    // (|f| > |y|: y is about -f^2 / 2 with |f| <= 0.415; |e ln 2| from
+    // 0.693 above |f + y| <= 0.347 unless e = 0, its product +0: L15-E616)
+    auto Sum = [&](Value *A, Value *X) {
+      return LogFastTwoSum ? fastTwoSum(A, X) : twoSum(A, X);
+    };
+    auto [S, Err] = Sum(L.F, L.Y);
     // e ln 2 in two parts, the first exact for |e| < 2^15.
-    auto [Hi, Err2] = twoSum(mul(L.E, k(0.693359375)), S);
+    auto [Hi, Err2] = Sum(mul(L.E, k(0.693359375)), S);
     Value *Lo = add(add(Err, Err2), mul(L.E, k(-2.12194440e-4)));
     return {Hi, Lo};
   }
