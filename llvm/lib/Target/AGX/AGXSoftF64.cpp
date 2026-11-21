@@ -93,6 +93,11 @@ static cl::opt<bool> AGXSoftF64AddFrame3(
     cl::desc("Double addition's short path with the significands 3 places "
              "up and the implicit bit always set"));
 
+static cl::opt<bool> AGXSoftF64FmaFrame11(
+    "agx-soft-f64-fma-frame11", cl::init(true), cl::Hidden,
+    cl::desc("Double fma's 128-bit path with the product 11 places up from "
+             "shifted factors and the addend's significand as the high word"));
+
 static cl::opt<bool> AGXSoftF64RangeFromExponent(
     "agx-soft-f64-range-from-exponent", cl::init(true), cl::Hidden,
     cl::desc("Double short paths: a normal result told from its unrounded "
@@ -791,22 +796,42 @@ public:
   /// at most 20 places, when nothing was shifted out.
   std::pair<Value *, Value *> fmaFast(Value *X, Value *Y, Value *Z) {
     Value *Implicit = c64(F64.fracMask() + 1);
-    // a zero's significand is 0 (and its exponent below any other's)
-    auto Sig = [&](Value *V) {
-      return select(isZero(V, F64), c64(0),
-                    B.CreateOr(B.CreateAnd(V, c64(F64.fracMask())), Implicit));
-    };
     auto Exp = [&](Value *V) {
       return B.CreateTrunc(B.CreateAnd(B.CreateLShr(V, 52), c64(F64.expAll())), I32);
     };
-    Value *PZero = B.CreateOr(isZero(X, F64), isZero(Y, F64));
-    Value *ZZero = isZero(Z, F64);
-    Value *P = mulWide53x(Sig(X), Sig(Y));
-    Value *A = B.CreateShl(P, 20);
-    Value *C = B.CreateShl(B.CreateZExt(Sig(Z), I128), 72);
-    // exponents of the lowest bits of A and C
-    Value *EA = B.CreateSub(B.CreateAdd(Exp(X), Exp(Y)), c32(2 * (F64.Bias + 52) + 20));
-    Value *EC = B.CreateSub(Exp(Z), c32(F64.Bias + 52 + 72));
+    // a zero's significand is 0 (and its exponent below any other's); with
+    // -agx-soft-f64-fma-frame11 a zero told by its exponent field (a
+    // denormal, the other one of field 0, is not Valid)
+    bool ByField = AGXSoftF64FmaFrame11 && AGXSoftF64MulLimbs;
+    auto Sig = [&](Value *V) {
+      Value *F = B.CreateAnd(V, c64(F64.fracMask()));
+      if (ByField)
+        return B.CreateOr(F, select(B.CreateICmpNE(Exp(V), c32(0)), Implicit, c64(0)));
+      return select(isZero(V, F64), c64(0), B.CreateOr(F, Implicit));
+    };
+    auto IsZero = [&](Value *V) {
+      return ByField ? B.CreateICmpEQ(Exp(V), c32(0)) : isZero(V, F64);
+    };
+    Value *PZero = B.CreateOr(IsZero(X), IsZero(Y));
+    Value *ZZero = IsZero(Z);
+    Value *A, *C, *EA, *EC;
+    if (AGXSoftF64FmaFrame11 && AGXSoftF64MulLimbs) {
+      // (L15-E675) the product 11 places up from the factors 10 and 1
+      // places up (their high limbs below 2^31 and 2^22: mulWide53's sums
+      // fit), Z's significand as the high word: top bits at 115 or 116 and
+      // 116, 11 and 64 zero bits below, no 128-bit shift of either
+      A = mulWide53x(B.CreateShl(Sig(X), 10), B.CreateShl(Sig(Y), 1));
+      C = B.CreateShl(B.CreateZExt(Sig(Z), I128), 64);
+      EA = B.CreateSub(B.CreateAdd(Exp(X), Exp(Y)), c32(2 * (F64.Bias + 52) + 11));
+      EC = B.CreateSub(Exp(Z), c32(F64.Bias + 52 + 64));
+    } else {
+      Value *P = mulWide53x(Sig(X), Sig(Y));
+      A = B.CreateShl(P, 20);
+      C = B.CreateShl(B.CreateZExt(Sig(Z), I128), 72);
+      // exponents of the lowest bits of A and C
+      EA = B.CreateSub(B.CreateAdd(Exp(X), Exp(Y)), c32(2 * (F64.Bias + 52) + 20));
+      EC = B.CreateSub(Exp(Z), c32(F64.Bias + 52 + 72));
+    }
     EA = select(PZero, c32(-100000), EA);
     EC = select(ZZero, c32(-100000), EC);
     // only the one with the lower exponent is aligned
