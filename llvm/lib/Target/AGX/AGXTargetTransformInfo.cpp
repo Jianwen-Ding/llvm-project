@@ -231,6 +231,10 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowStores(
     cl::desc("-agx-device-unroll-runtime-stores 4 times for a row of halves "
              "or bytes"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeColumnStores(
+    "agx-device-unroll-runtime-column-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores twice for a column"));
+
 static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
     "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
@@ -837,8 +841,12 @@ void AGXTTIImpl::getUnrollingPreferences(
                      DL.getTypeStoreSize(
                          getLoadStoreType(&I)->getScalarType()) < 4;
             });
+        // (and twice for a column, its accesses a row's pitch apart:
+        // col_scale_dyn 533.5 -> 496.7, col_axpy_dyn 662.8 -> 602.4,
+        // col_relu_dyn 602.1 -> 547.4, L15-E602)
+        bool Column = AGXDeviceUnrollRuntimeColumnStores && Far;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
-            AGXDeviceUnrollRuntimeStores * (NarrowRow ? 4 : 1);
+            AGXDeviceUnrollRuntimeStores * (NarrowRow ? 4 : Column ? 2 : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       // A thread's own row of a runtime length (a row sum): its loads start

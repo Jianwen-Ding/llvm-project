@@ -6,6 +6,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-div-stores=0 -S < %s | FileCheck %s --check-prefix=NODIV
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-math-stores=0 -S < %s | FileCheck %s --check-prefix=NOMATH
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-stores=0 -S < %s | FileCheck %s --check-prefix=FOUR
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-column-stores=0 -S < %s | FileCheck %s --check-prefix=COL4
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -76,12 +77,17 @@ declare float @llvm.roundeven.f32(float)
 declare float @llvm.maximum.f32(float, float)
 declare float @llvm.minimum.f32(float, float)
 
-; A column of a runtime length (4096 bytes a step, far) likewise, its trip
-; count independent of the thread (L15-E575); not a grid-stride loop, whose
-; trip count (n - gid) / 1024 is the thread's.
+; A column of a runtime length (4096 bytes a step, far) likewise, 8 times
+; (L15-E602), its trip count independent of the thread (L15-E575); not a
+; grid-stride loop, whose trip count (n - gid) / 1024 is the thread's.
 ; CHECK-LABEL: @column(
-; CHECK-COUNT-4: store float
+; CHECK-COUNT-8: store float
+; CHECK-NOT: store float
 ; CHECK: .epil
+; COL4-LABEL: @column(
+; COL4-COUNT-4: store float
+; COL4-NOT: store float
+; COL4: .epil
 ; NOCOL-LABEL: @column(
 ; NOCOL: store float
 ; NOCOL-NOT: store float

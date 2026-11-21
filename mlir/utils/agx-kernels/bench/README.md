@@ -100,6 +100,8 @@ the kernel's, as memory at VA).
 | `bsum_dyn` | sums of sign-extended bytes over rows of a runtime length (512 here), a thread per row |
 | `hdot_dyn` | dots of half rows with a half vector, in floats, over a runtime length (512 here), a thread per row |
 | `hscale_dyn` | half rows scaled by a half per row, a runtime length (512 here), a thread per row |
+| `col_axpy_dyn` | y = x * w[i] + y down columns of a runtime length (256 here), a thread per column |
+| `col_relu_dyn` | max(x * w[i], 0) down columns of a runtime length (256 here), a thread per column |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
