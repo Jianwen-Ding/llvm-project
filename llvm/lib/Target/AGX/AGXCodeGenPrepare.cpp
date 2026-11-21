@@ -8583,6 +8583,94 @@ static bool byteFloatsALU(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXThreadDecidedBranches(
+    "agx-thread-decided-branches", cl::init(true), cl::Hidden,
+    cl::desc("A predecessor's edge into a block whose branch its own "
+             "condition decides (and on false, or on true) to that "
+             "branch's successor"));
+
+/// A block M ending in br (and C, Y) or br (or C, Y), where a predecessor P
+/// branches on C into M on the side that decides M's branch (C false into
+/// an and, true into an or): P's edge goes straight to M's successor for
+/// that value. An scf.while whose condition guards a load, `in = j < n;
+/// v = in ? x[j] : 0; go = in & (v <= t)` (find_first): the loop exits at
+/// its header where j reaches n, and the load's block is the latch, without
+/// the merge that the guard's if and its phi took (L15-E685). Only where
+/// M's successor's phis take, from M, M's own phis or values from outside
+/// M (which then dominate P), and P is not already its predecessor.
+static bool threadDecidedBranches(Function &F) {
+  if (!AGXThreadDecidedBranches)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  DominatorTree DT(F);
+  for (BasicBlock &M : F) {
+    auto *Br = dyn_cast<CondBrInst>(M.getTerminator());
+    if (!Br || Br->getSuccessor(0) == Br->getSuccessor(1))
+      continue;
+    Value *Cond = Br->getCondition(), *A, *Bv;
+    bool IsAnd = match(Cond, m_LogicalAnd(m_Value(A), m_Value(Bv)));
+    if (!IsAnd && !match(Cond, m_LogicalOr(m_Value(A), m_Value(Bv))))
+      continue;
+    // (not a loop's header: its preheader's edge stays)
+    if (any_of(predecessors(&M),
+               [&](BasicBlock *P) { return DT.dominates(&M, P); }))
+      continue;
+    SmallVector<BasicBlock *, 4> Preds(predecessors(&M));
+    for (BasicBlock *P : Preds) {
+      if (pred_size(&M) < 2)
+        break;
+      auto *PBr = dyn_cast<CondBrInst>(P->getTerminator());
+      if (!PBr || (PBr->getCondition() != A && PBr->getCondition() != Bv) ||
+          PBr->getSuccessor(0) == PBr->getSuccessor(1))
+        continue;
+      unsigned Idx = PBr->getSuccessor(0) == &M ? 0 : 1;
+      bool Known = Idx == 0;
+      // and(false, _) = false, or(true, _) = true
+      if (IsAnd == Known)
+        continue;
+      BasicBlock *T = Br->getSuccessor(IsAnd ? 1 : 0);
+      if (T == &M || is_contained(successors(P), T))
+        continue;
+      SmallVector<std::pair<PHINode *, Value *>, 4> In;
+      bool OK = true;
+      for (PHINode &Phi : T->phis()) {
+        Value *V = Phi.getIncomingValueForBlock(&M);
+        if (auto *VP = dyn_cast<PHINode>(V); VP && VP->getParent() == &M)
+          V = VP->getIncomingValueForBlock(P);
+        else if (auto *VI = dyn_cast<Instruction>(V);
+                 VI && VI->getParent() == &M)
+          OK = false;
+        In.push_back({&Phi, V});
+      }
+      if (!OK)
+        continue;
+      for (auto [Phi, V] : In)
+        Phi->addIncoming(V, P);
+      for (PHINode &Phi : M.phis())
+        Phi.removeIncomingValue(P, /*DeletePHIIfEmpty=*/false);
+      PBr->setSuccessor(Idx, T);
+      DT.recalculate(F);
+      Changed = true;
+      // M now entered only past P's other side (its latch, the load's
+      // block): C is !Known there, and M's condition the other operand
+      BasicBlock *Other = PBr->getSuccessor(1 - Idx);
+      auto *CI = dyn_cast<Instruction>(Cond);
+      if (CI && CI->getParent() == &M && CI->hasOneUse() &&
+          Other->getSinglePredecessor() == P &&
+          all_of(predecessors(&M),
+                 [&](BasicBlock *Q) { return DT.dominates(Other, Q); })) {
+        Value *C = PBr->getCondition();
+        Value *Y = A == C ? Bv : A;
+        Br->setCondition(Y);
+        RecursivelyDeleteTriviallyDeadInstructions(CI);
+        break;
+      }
+    }
+  }
+  return Changed;
+}
+
 static void markExpsBelowLoopMax(Function &F);
 
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
@@ -8596,6 +8684,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   bool Changed = diagnoseDoubles(F);
   // (first: the loops' maxima as the front end wrote them)
   markExpsBelowLoopMax(F);
+  Changed |= threadDecidedBranches(F);
   Changed |= mergeSameConditionIfs(F);
   Changed |= mergePhiOperations(F);
   Changed |= signedWideMuls(F);
