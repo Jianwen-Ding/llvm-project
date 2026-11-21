@@ -86,15 +86,15 @@ define agx_kernel void @k(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 ; OFF-NEXT:    bfeil r7, 0, r8, 0, mask 0xFFF
 ; OFF-NEXT:    bfi r12, 0, r8, 16
 ; OFF-NEXT:    wait 1
+; OFF-NEXT:    icmpsel ueq, r7, r7, 0, r6, r2
+; OFF-NEXT:    icmpsel ueq, r12, r12, 0, r2, r6
 ; OFF-NEXT:    icmpsel slt, r3, r8, 0, r6, r2
 ; OFF-NEXT:    icmpsel slt, r9, r8, 0, r2, r6
-; OFF-NEXT:    icmpsel ueq, r7, r7, 0, r6, r2
-; OFF-NEXT:    xor r9, r3, r9
-; OFF-NEXT:    icmpsel ueq, r12, r12, 0, r2, r6
-; OFF-NEXT:    xor r9, r9, r7
 ; OFF-NEXT:    icmpsel ueq, r2, r8, 0, r6, r2
-; OFF-NEXT:    xor r9, r9, r12
+; OFF-NEXT:    xor r9, r3, r9
 ; OFF-NEXT:    icmpsel slt, r6, r8, 0, r6, 7
+; OFF-NEXT:    xor r9, r9, r7
+; OFF-NEXT:    xor r9, r9, r12
 ; OFF-NEXT:    iadd r2, r9, r2
 ; OFF-NEXT:    iadd r8_r9, r10_r11, r4
 ; OFF-NEXT:    imadd r2, r2, r6, 0

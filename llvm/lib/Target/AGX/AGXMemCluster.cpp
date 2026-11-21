@@ -400,6 +400,29 @@ static cl::opt<unsigned> AGXPostRATGLoadLongLatency(
     cl::desc("The first reader of a threadgroup load does not wait for or go "
              "ahead of an instruction of at least this latency"));
 
+static cl::opt<bool> AGXPostRAForward(
+    "agx-postra-forward", cl::init(true), cl::Hidden,
+    cl::desc("Post-RA: of two ready instructions of three or more 32-bit "
+             "register sources, prefer one reading a result of the last "
+             "instructions scheduled (a forwarded source is not a "
+             "register-file read)"));
+
+static cl::opt<unsigned> AGXPostRAForwardWindow(
+    "agx-postra-forward-window", cl::init(2), cl::Hidden,
+    cl::desc("agx-postra-forward: the instructions scheduled last whose "
+             "results count as forwarded"));
+
+/// The distinct 32-bit general registers \p MI reads.
+static unsigned gpr32Sources(const MachineInstr &MI,
+                             SmallVectorImpl<MCRegister> &Regs) {
+  for (const MachineOperand &MO : MI.uses())
+    if (MO.isReg() && MO.getReg().isPhysical() &&
+        AGX::GPR32RegClass.contains(MO.getReg()) &&
+        !is_contained(Regs, MO.getReg().asMCReg()))
+      Regs.push_back(MO.getReg().asMCReg());
+  return Regs.size();
+}
+
 namespace {
 
 /// The generic post-RA strategy schedules a ready instruction ahead of the next
@@ -417,6 +440,33 @@ namespace {
 class AGXPostRASchedStrategy : public PostGenericScheduler {
   /// The last threadgroup load scheduled whose result is not read yet.
   SUnit *TGLoad = nullptr;
+  /// The last instructions scheduled at the top, the latest last.
+  SmallVector<SUnit *, 4> LastTop;
+
+  /// Whether \p SU reads three or more 32-bit registers (agx_cost: such an
+  /// fmadd32, fcmpsel or icmpsel issues in 2 cycles, not 1).
+  static bool threeSources(const SUnit *SU) {
+    SmallVector<MCRegister, 4> Regs;
+    return SU->getInstr() && gpr32Sources(*SU->getInstr(), Regs) >= 3;
+  }
+
+  /// Whether \p SU reads three or more 32-bit registers, one of them a
+  /// register LastTop writes: that source is forwarded, not read from the
+  /// register file, and the instruction issues at the two-source rate.
+  bool forwards(const SUnit *SU) const {
+    if (LastTop.empty() || !SU->getInstr())
+      return false;
+    SmallVector<MCRegister, 4> Regs;
+    if (gpr32Sources(*SU->getInstr(), Regs) < 3)
+      return false;
+    for (const SUnit *L : LastTop)
+      if (const MachineInstr *LI = L->getInstr())
+        for (const MachineOperand &MO : LI->defs())
+          if (MO.isReg() && MO.getReg().isPhysical() &&
+              is_contained(Regs, MO.getReg().asMCReg()))
+            return true;
+    return false;
+  }
 
   static bool isLong(const SUnit *SU) {
     return SU->Latency >= AGXPostRATGLoadLongLatency;
@@ -434,10 +484,16 @@ public:
   void initialize(ScheduleDAGMI *Dag) override {
     PostGenericScheduler::initialize(Dag);
     TGLoad = nullptr;
+    LastTop.clear();
   }
 
   void schedNode(SUnit *SU, bool IsTopNode) override {
     PostGenericScheduler::schedNode(SU, IsTopNode);
+    if (IsTopNode) {
+      LastTop.push_back(SU);
+      if (LastTop.size() > AGXPostRAForwardWindow)
+        LastTop.erase(LastTop.begin());
+    }
     if (!AGXPostRATGLoadUse || !IsTopNode)
       return;
     if (memKind(*SU->getInstr()) == LocalLoad)
@@ -500,6 +556,12 @@ protected:
       if (tryGreater(TryNext, CandNext, TryCand, Cand, Cluster))
         return TryCand.Reason != NoCand;
     }
+    if (AGXPostRAForward && Cand.isValid() && Cand.AtTop && TryCand.AtTop &&
+        !isLong(Cand.SU) && !isLong(TryCand.SU) &&
+        threeSources(Cand.SU) && threeSources(TryCand.SU) &&
+        tryGreater(forwards(TryCand.SU), forwards(Cand.SU), TryCand, Cand,
+                   RegCritical))
+      return TryCand.Reason != NoCand;
     return PostGenericScheduler::tryCandidate(Cand, TryCand);
   }
 };
