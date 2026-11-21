@@ -243,7 +243,7 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowStores(
              "or bytes"));
 
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeColumnFactor(
-    "agx-device-unroll-runtime-column-factor", cl::init(4), cl::Hidden,
+    "agx-device-unroll-runtime-column-factor", cl::init(8), cl::Hidden,
     cl::desc("agx-device-unroll-runtime-stores' factor times this for a "
              "column"));
 
@@ -1004,6 +1004,8 @@ void AGXTTIImpl::getUnrollingPreferences(
                      [](const Instruction &I) { return isa<StoreInst>(I); }) > 1
                 ? 2
                 : AGXDeviceUnrollRuntimeOwnRowFactor;
+        // (a column's 8 times since E729's word indices: col_scale_dyn
+        // 473.6 -> 458.8, col_relu_dyn and col_axpy_dyn -2.5%, L15-E747)
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             AGXDeviceUnrollRuntimeStores *
             (NarrowRow || ColumnOnly ? 4

@@ -138,12 +138,12 @@ declare float @llvm.roundeven.f32(float)
 declare float @llvm.maximum.f32(float, float)
 declare float @llvm.minimum.f32(float, float)
 
-; A column of a runtime length (4096 bytes a step, far) likewise, 16 times
-; (L15-E602, L15-E717), its trip count independent of the thread
-; (L15-E575); not a grid-stride loop, whose trip count (n - gid) / 1024 is
-; the thread's.
+; A column of a runtime length (4096 bytes a step, far) likewise, 32 times
+; (L15-E602, L15-E717; 8 times the stores' 4 since L15-E747), its trip
+; count independent of the thread (L15-E575); not a grid-stride loop, whose
+; trip count (n - gid) / 1024 is the thread's.
 ; CHECK-LABEL: @column(
-; CHECK-COUNT-16: store float
+; CHECK-COUNT-32: store float
 ; CHECK-NOT: store float
 ; CHECK: .epil
 ; COL4-LABEL: @column(
