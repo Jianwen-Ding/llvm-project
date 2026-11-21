@@ -3,13 +3,16 @@
 
 // A scan's guarded load, in = j < 256; v = in ? x[r, j] : 0: the load runs
 // unconditionally at j clamped into the row (umin(j, 255)), r below its
-// size by its upper bound, and a select takes it (L15-E736). No branch is
-// left around it.
+// size by its upper bound, and a select takes it (L15-E736); the select's
+// only use, a compare in an and with in, reads the load itself. Only the
+// loop's own branch is left.
 // CHECK-LABEL: llvm.func @find_first
 // CHECK: llvm.intr.umin
-// CHECK: llvm.load
-// CHECK: llvm.select
-// CHECK-NOT: llvm.cond_br {{.*}}^bb{{[0-9]+}}, ^bb{{[0-9]+}}(
+// CHECK: %[[L:.*]] = llvm.load
+// CHECK-NOT: llvm.select
+// CHECK: llvm.fcmp "ole" %[[L]],
+// CHECK-NEXT: llvm.and
+// CHECK-NEXT: llvm.cond_br
 // CHECK: llvm.return
 // OFF-LABEL: llvm.func @find_first
 // OFF-NOT: llvm.intr.umin

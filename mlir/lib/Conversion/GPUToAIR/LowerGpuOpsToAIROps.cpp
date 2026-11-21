@@ -2563,11 +2563,31 @@ static void speculateGuardedLoads(gpu::GPUModuleOp m) {
     SmallVector<Value> elseValues(hoist(op.getElseRegion()));
     b.setInsertionPoint(op);
     SmallVector<Value> results;
-    for (auto [t, e] : llvm::zip(thenValues, elseValues))
-      results.push_back(
-          arith::SelectOp::create(b, op.getLoc(), op.getCondition(), t, e));
+    Value cond = op.getCondition();
+    for (auto [t, e] : llvm::zip(thenValues, elseValues)) {
+      auto sel = arith::SelectOp::create(b, op.getLoc(), cond, t, e);
+      results.push_back(sel);
+    }
     op.replaceAllUsesWith(results);
     op.erase();
+    // A compare of a result used only in an and with the condition reads
+    // the then value: where the condition is false the and is (the scan's
+    // go = in && v <= t).
+    for (auto [res, t] : llvm::zip(results, thenValues)) {
+      for (OpOperand &use : llvm::make_early_inc_range(res.getUses())) {
+        Operation *cmp = use.getOwner();
+        if (!isa<arith::CmpFOp, arith::CmpIOp>(cmp) ||
+            cmp->getBlock() != res.getDefiningOp()->getBlock() ||
+            !llvm::all_of(cmp->getResult(0).getUsers(), [&](Operation *u) {
+              auto a = dyn_cast<arith::AndIOp>(u);
+              return a && (a.getLhs() == cond || a.getRhs() == cond);
+            }))
+          continue;
+        use.set(t);
+      }
+      if (res.use_empty())
+        res.getDefiningOp()->erase();
+    }
   }
 }
 
