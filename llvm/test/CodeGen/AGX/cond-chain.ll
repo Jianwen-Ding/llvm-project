@@ -10,7 +10,8 @@
 ; no if, no mask operations, no moves. The || is then `select lt, 1, (and eq,
 ; lt)`, combined into `or lt, (freeze (and eq, lt))`: the freeze is pushed into
 ; the compares (AGXISelLowering) and is no copy of the shuffle (AGXISelDAGToDAG),
-; so the or is the last compare-select, without an `and 1`.
+; so the or is the last compare-select, without an `and 1`. (Its and, the
+; branch AGXCodeGenPrepare sees, is (eq ? i' : i) < i, L15-E738.)
 ; NOFOLD: if_icmp
 
 declare i32 @llvm.agx.simd.shuffle.xor.i32(i32, i32)
@@ -24,19 +25,19 @@ define agx_kernel void @step(ptr addrspace(1) %v, ptr addrspace(1) %ix) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0: // %entry
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    device_load 0, i32, x, r2, u2_u3, r1, signed
-; CHECK-NEXT:    device_load 1, i32, x, r3, u0_u1, r1, signed
+; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
+; CHECK-NEXT:    device_load 1, i32, x, r3, u2_u3, r1, signed
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    quad_shuffle_xor r4, r2, 1
 ; CHECK-NEXT:    wait 1
 ; CHECK-NEXT:    quad_shuffle_xor r5, r3, 1
-; CHECK-NEXT:    icmpsel slt, r6, r4, r2, 1, 0
-; CHECK-NEXT:    fcmpsel eq, r6l, r3, r5, r6l, 0
-; CHECK-NEXT:    fcmpsel lt, r6l, r3, r5, 1, r6l
-; CHECK-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
+; CHECK-NEXT:    fcmpsel eq, r6, r2, r4, r5, r3
+; CHECK-NEXT:    icmpsel slt, r6, r6, r3, 1, 0
+; CHECK-NEXT:    fcmpsel lt, r6l, r2, r4, 1, r6l
 ; CHECK-NEXT:    icmpsel ueq, r2, r6l, 0, r2, r4
-; CHECK-NEXT:    device_store 0, i32, x, r3, u0_u1, r1, signed
-; CHECK-NEXT:    device_store 0, i32, x, r2, u2_u3, r1, signed
+; CHECK-NEXT:    icmpsel ueq, r3, r6l, 0, r3, r5
+; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
+; CHECK-NEXT:    device_store 0, i32, x, r3, u2_u3, r1, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap

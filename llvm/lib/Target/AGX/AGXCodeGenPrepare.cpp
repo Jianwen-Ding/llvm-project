@@ -2265,6 +2265,67 @@ static cl::opt<bool> AGXMergeLoopExitsSelect(
     "agx-merge-loop-exits-select", cl::init(true), cl::Hidden,
     cl::desc("agx-merge-loop-exits' e1 or a == b as (e1 ? b : a) == b"));
 
+static cl::opt<bool> AGXBranchConditionSelects(
+    "agx-branch-condition-selects", cl::init(true), cl::Hidden,
+    cl::desc("A branch on c or (a p b), p true at equality, as "
+             "(c ? b : a) p b, and on c and (a q b), q false there, as "
+             "(c ? a : b) q b"));
+
+/// A branch on c1 or c2 (c1 and c2), both compares used only there, c2 an
+/// integer compare a p b: c1 selects b (a) where p holds at equality (does
+/// not): (c1 ? b : a) p b is c1 or (a p b), (c1 ? a : b) p b is c1 and
+/// (a p b). One select, whose compare is c1's, and the branch's compare,
+/// not a select of each compare's i1 and their or (2D bounds checks,
+/// x >= w || y >= h). Plain or / and only: their poison operands already
+/// make the branch undefined, as the select's do (L15-E738).
+static bool branchConditionSelects(Function &F, LoopInfo &LI) {
+  if (!AGXBranchConditionSelects)
+    return false;
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    // (not in a loop: find_first's exit on in and v <= t as a select lost
+    // its threaded exits, +46%; mergeLoopExits' own form is E735's)
+    if (LI.getLoopFor(&BB))
+      continue;
+    auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
+    auto *BO = Br ? dyn_cast<BinaryOperator>(Br->getCondition()) : nullptr;
+    if (!BO || !BO->hasOneUse() || BO->getParent() != &BB ||
+        (BO->getOpcode() != Instruction::Or &&
+         BO->getOpcode() != Instruction::And))
+      continue;
+    bool Or = BO->getOpcode() == Instruction::Or;
+    auto Fits = [&](Value *V) {
+      auto *C = dyn_cast<ICmpInst>(V);
+      if (!C || !C->hasOneUse() || C->getParent() != &BB ||
+          !C->getOperand(0)->getType()->isIntegerTy())
+        return false;
+      bool Reflexive = ICmpInst::isTrueWhenEqual(C->getPredicate());
+      return Or == Reflexive;
+    };
+    Value *Op0 = BO->getOperand(0), *Op1 = BO->getOperand(1);
+    Value *C1v, *C2v;
+    if (Fits(Op1))
+      C1v = Op0, C2v = Op1;
+    else if (Fits(Op0))
+      C1v = Op1, C2v = Op0;
+    else
+      continue;
+    auto *C1 = dyn_cast<CmpInst>(C1v);
+    if (!C1 || !C1->hasOneUse() || C1->getParent() != &BB)
+      continue;
+    auto *C2 = cast<ICmpInst>(C2v);
+    Value *A = C2->getOperand(0), *Bv = C2->getOperand(1);
+    CmpInst::Predicate P = C2->getPredicate();
+    IRBuilder<> B(Br);
+    Value *S = Or ? B.CreateSelect(C1, Bv, A) : B.CreateSelect(C1, A, Bv);
+    Br->setCondition(B.CreateICmp(P, S, Bv));
+    BO->eraseFromParent();
+    C2->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
   if (!AGXMergeLoopExits)
     return false;
@@ -8895,6 +8956,11 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= simdReductions(F, ST);
   Changed |= ownValueShifts(F);
   Changed |= mergeLoopExits(F);
+  {
+    DominatorTree DT(F);
+    LoopInfo LI(DT);
+    Changed |= branchConditionSelects(F, LI);
+  }
   Changed |= forwardOwnSlots(F);
   Changed |= strideDivisions(F);
   Changed |= lowerMatrixFMA(F, ST);
