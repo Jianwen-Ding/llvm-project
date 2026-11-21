@@ -43,6 +43,7 @@ add_llvm_target(AGXCodeGen
   AGXAliasVersioning.cpp
   AGXWideIndexVersioning.cpp
   AGXWordCounterVersioning.cpp
+  AGXSplitWideAccumulators.cpp
   AGXAlignmentVersioning.cpp
   AGXNarrowInductions.cpp
   AGXWordIndices.cpp
