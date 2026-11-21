@@ -183,6 +183,11 @@ static cl::opt<bool> AGXDeviceUnrollSomeStrided(
     cl::desc("agx-device-unroll-strided's factor also where only some of a "
              "loop's device loads are strided"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeHeavyMax(
+    "agx-device-unroll-runtime-heavy-max", cl::init(true), cl::Hidden,
+    cl::desc("Twice -agx-device-unroll-runtime-contiguous's count for a row's "
+             "NaN-propagating maximum / minimum or argmax"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeContiguous(
     "agx-device-unroll-runtime-contiguous", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip loop over a thread's row (contiguous "
@@ -1080,6 +1085,25 @@ void AGXTTIImpl::getUnrollingPreferences(
                                 1, DL.getTypeStoreSize(LI->getType())));
           Count *= 4 / MinBytes;
         }
+        // (twice that for a running maximum / minimum that propagates NaNs,
+        // or a select's on a compare with the running value, an argmax:
+        // each element's few instructions more, and the chains apart:
+        // row_max_dyn, rowmin_dyn, argmax_dyn -6 to -9% at 16; not maxnum's
+        // one instruction, rowmax_dyn +15%, L15-E686)
+        if (AGXDeviceUnrollRuntimeHeavyMax &&
+            any_of(*L->getHeader(), [&](const Instruction &I) {
+              if (auto *II = dyn_cast<IntrinsicInst>(&I))
+                return II->getIntrinsicID() == Intrinsic::maximum ||
+                       II->getIntrinsicID() == Intrinsic::minimum;
+              auto *Sel = dyn_cast<SelectInst>(&I);
+              auto *Cmp = Sel ? dyn_cast<FCmpInst>(Sel->getCondition()) : nullptr;
+              return Cmp && any_of(Sel->operands(), [&](const Value *V) {
+                       auto *P = dyn_cast<PHINode>(V);
+                       return P && P->getParent() == L->getHeader() &&
+                              is_contained(Cmp->operands(), P);
+                     });
+            }))
+          Count *= 2;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount = Count;
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
