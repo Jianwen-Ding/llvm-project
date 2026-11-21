@@ -1348,7 +1348,8 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                        ArrayRef<Value *> Args, bool FlushF32,
                        bool ExpNoOverflow, bool NativeNaN,
-                       bool ExpResultFlushed, bool ExpOverflowFinite) {
+                       bool ExpResultFlushed, bool ExpOverflowFinite,
+                       bool ExpNonNegative) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
                    M.NativeNaN = NativeNaN;
@@ -1377,6 +1378,11 @@ Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                    case Intrinsic::cos:
                      return M.sinCos(A[0], true);
                    case Intrinsic::exp:
+                     if (ExpNonNegative && !ExpNoOverflow &&
+                         A[0]->getType()->isFloatTy())
+                       return M.expHiLo(A[0], nullptr, /*Bounded=*/false,
+                                        /*NoOverflow=*/false,
+                                        /*NonNegative=*/true);
                      return M.expPrecise(A[0], ExpNoOverflow);
                    case Intrinsic::exp2:
                      return M.exp2Precise(A[0], ExpNoOverflow);

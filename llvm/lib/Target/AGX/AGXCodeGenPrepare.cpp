@@ -10073,6 +10073,51 @@ static bool branchRareFallbacks(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXExpSelectedNonNegative(
+    "agx-exp-selected-non-negative", cl::init(true), cl::Hidden,
+    cl::desc("e^(a - b) whose only uses are selects that take it where a > b "
+             "(or a >= b) without the underflow clamp and +0 select"));
+
+/// e^(a - b) whose every use is a select taking it only where a > b or
+/// a >= b (ordered: then a - b is at least 0, or +0 by a flush): where the
+/// value is used its argument is not negative, and elsewhere the select
+/// drops it (the expansion makes no poison of a negative argument either:
+/// its round is the magic sum, its scale an integer add). cond_compute's
+/// v > t ? e^(v - t) : v (L15-E732).
+static bool expSelectedNonNegative(IntrinsicInst *E) {
+  using namespace PatternMatch;
+  Value *A, *Bv;
+  const APFloat *K;
+  if (!E->getType()->isFloatTy() || E->use_empty())
+    return false;
+  // (or a + k, instcombine's a - (-k): then compared with -k)
+  if (match(E->getArgOperand(0), m_FAdd(m_Value(A), m_APFloat(K))))
+    Bv = ConstantFP::get(E->getType(), -*K);
+  else if (!match(E->getArgOperand(0), m_FSub(m_Value(A), m_Value(Bv))))
+    return false;
+  for (User *U : E->users()) {
+    auto *S = dyn_cast<SelectInst>(U);
+    if (!S || S->getCondition() == E)
+      return false;
+    bool OnTrue = S->getTrueValue() == E;
+    if (OnTrue == (S->getFalseValue() == E))
+      return false;
+    CmpPredicate P;
+    Value *X, *Y;
+    if (!match(S->getCondition(), m_FCmp(P, m_Value(X), m_Value(Y))))
+      return false;
+    // (as a >= b: the predicate the value is taken under, x op y)
+    FCmpInst::Predicate Q = OnTrue ? FCmpInst::Predicate(P)
+                                   : FCmpInst::getInversePredicate(P);
+    if (X == Bv && Y == A)
+      Q = FCmpInst::getSwappedPredicate(Q), std::swap(X, Y);
+    if (X != A || Y != Bv ||
+        (Q != FCmpInst::FCMP_OGT && Q != FCmpInst::FCMP_OGE))
+      return false;
+  }
+  return true;
+}
+
 bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
   bool Changed = expandRoundToInt(F);
   Changed |= expandPowI(F);
@@ -10132,7 +10177,10 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
                                      II->getIntrinsicID() == Intrinsic::exp &&
                                      onlyFlushingUses(II),
                                  !ST.hasIEEEFP32() &&
-                                     II->getMetadata("agx.exp.overflow.finite"));
+                                     II->getMetadata("agx.exp.overflow.finite"),
+                                 AGXExpSelectedNonNegative &&
+                                     II->getIntrinsicID() == Intrinsic::exp &&
+                                     expSelectedNonNegative(II));
       R->takeName(II);
       II->replaceAllUsesWith(R);
       ExpNoOverflow.erase(II);

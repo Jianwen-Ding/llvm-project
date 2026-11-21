@@ -243,10 +243,12 @@ bool canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx);
 /// flushes a denormal operand.
 /// \p ExpOverflowFinite: an exponential's value past its overflow bound is
 /// 2^127, not +inf (its only use a reciprocal's sum, which then flushes).
+/// \p ExpNonNegative: exp's argument is at least 0 (or +0 by a flush)
+/// wherever its value is used, so no underflow clamp and no +0 select.
 Value *expandMath(IRBuilderBase &B, Intrinsic::ID ID, ArrayRef<Value *> Args,
                   bool FlushF32 = false, bool ExpNoOverflow = false,
                   bool NativeNaN = false, bool ExpResultFlushed = false,
-                  bool ExpOverflowFinite = false);
+                  bool ExpOverflowFinite = false, bool ExpNonNegative = false);
 Value *expandMath(IRBuilderBase &B, StringRef Fn, Value *X);
 
 /// Whether a device memory access must reach memory shared with the host while
