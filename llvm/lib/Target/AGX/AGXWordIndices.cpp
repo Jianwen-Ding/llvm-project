@@ -76,6 +76,11 @@ static cl::opt<bool> AGXExitOnStepCounter(
     cl::desc("-agx-loop-word-indices-exit-count against any other counter "
              "of the loop by a power of two, not only a counter of words"));
 
+static cl::opt<bool> AGXExitCountUsesAfter(
+    "agx-loop-exit-count-uses-after", cl::init(true), cl::Hidden,
+    cl::desc("-agx-loop-word-indices-exit-count where the count is also read "
+             "after the exit it equals the bound at (taking the bound)"));
+
 static cl::opt<unsigned> AGXWordIndicesOffsets(
     "agx-loop-word-indices-offsets", cl::init(1), cl::Hidden,
     cl::desc("Most further offsets (an add each) for each base"));
@@ -534,7 +539,11 @@ bool AGXWordIndices::runOnFunction(Function &F) {
               Cmp = IC;
               continue;
             }
-            if (isa<PHINode>(UI) && UI->getParent() != H) {
+            // (any use outside the loop: checked below to be after the
+            // exit taken when inc = n)
+            if (UI->getParent() != H && UI->getParent() != Latch &&
+                (!AGXExitCountUsesAfter ? isa<PHINode>(UI)
+                                        : !LI.getLoopFor(H)->contains(UI))) {
               Outside.push_back(&U);
               continue;
             }
@@ -551,11 +560,24 @@ bool AGXWordIndices::runOnFunction(Function &F) {
           continue;
         BasicBlock *Equal = Br->getSuccessor(
             Cmp->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1);
+        // (a phi of the exit edge itself, or a use that only the exit
+        // block, entered from the latch alone, reaches: an unrolled loop's
+        // remainder starting at the count, L15-E626)
         if (Equal == H ||
             any_of(Outside, [&](Use *U) {
-              auto *Phi = cast<PHINode>(U->getUser());
-              return Phi->getParent() != Equal ||
-                     Phi->getIncomingBlock(*U) != Latch;
+              auto *UI = cast<Instruction>(U->getUser());
+              if (auto *Phi = dyn_cast<PHINode>(UI);
+                  Phi && Phi->getParent() == Equal &&
+                  Phi->getIncomingBlock(*U) == Latch)
+                return false;
+              if (!AGXExitCountUsesAfter ||
+                  Equal->getSinglePredecessor() != Latch ||
+                  LI.getLoopFor(H)->getExitingBlock() != Latch)
+                return true;
+              BasicBlock *At = isa<PHINode>(UI)
+                                   ? cast<PHINode>(UI)->getIncomingBlock(*U)
+                                   : UI->getParent();
+              return !DT.dominates(Equal, At);
             }))
           continue;
         Value *Mine = Ext ? static_cast<Value *>(Ext) : Inc;

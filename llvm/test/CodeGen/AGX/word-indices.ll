@@ -3,6 +3,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit=0 -agx-loop-word-indices-exit-count=0 < %s | FileCheck %s --check-prefix=EXIT
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit-count=0 < %s | FileCheck %s --check-prefix=COUNT
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-exit-on-step-counter=0 < %s | FileCheck %s --check-prefix=STEP
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-exit-count-uses-after=0 < %s | FileCheck %s --check-prefix=AFTER
 
 ; A loop's 16-byte loads of halves at a 32-bit counter of halves (LSR's,
 ; start 512 * row, the row's 16-byte steps): a counter of words beside it
@@ -227,5 +228,48 @@ loop:
   %c = icmp eq i64 %jz, %n8
   br i1 %c, label %out, label %loop
 out:
+  ret void
+}
+
+; The count read after the loop beyond its exit block too (an unrolled
+; loop's remainder starting at it, past the exit block that only the latch
+; enters): there it is the bound (L15-E626).
+; CHECK-LABEL: define agx_kernel void @after(
+; CHECK: %c = icmp eq i32 %iv.next,
+; CHECK-NOT: %j
+; CHECK: %rest = phi i64 [ 0, %entry ], [ %n8, %exit ]
+; AFTER-LABEL: define agx_kernel void @after(
+; AFTER: %c = icmp eq i64 %jz, %n8
+define agx_kernel void @after(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %n) #0 {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %start = shl i32 %t, 9
+  %n8 = and i64 %n, 2147483640
+  %c0 = icmp ugt i64 %n8, 0
+  br i1 %c0, label %pre, label %tail
+pre:
+  br label %loop
+loop:
+  %iv = phi i32 [ %start, %pre ], [ %iv.next, %loop ]
+  %j = phi i32 [ 0, %pre ], [ %j.next, %loop ]
+  %z = zext i32 %iv to i64
+  %p = getelementptr float, ptr addrspace(1) %x, i64 %z
+  %v = load <8 x float>, ptr addrspace(1) %p, align 4
+  %m = fmul <8 x float> %v, %v
+  %q = getelementptr float, ptr addrspace(1) %y, i64 %z
+  store <8 x float> %m, ptr addrspace(1) %q, align 4
+  %iv.next = add nuw i32 %iv, 8
+  %j.next = add nuw nsw i32 %j, 8
+  %jz = zext i32 %j.next to i64
+  %c = icmp eq i64 %jz, %n8
+  br i1 %c, label %exit, label %loop
+exit:
+  br label %tail
+tail:
+  %rest = phi i64 [ 0, %entry ], [ %jz, %exit ]
+  %r = trunc i64 %rest to i32
+  %tz = zext i32 %t to i64
+  %o = getelementptr i32, ptr addrspace(1) %y, i64 %tz
+  store i32 %r, ptr addrspace(1) %o, align 4
   ret void
 }
