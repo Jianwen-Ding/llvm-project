@@ -217,6 +217,11 @@ static std::optional<Address> analyze(Instruction &I, Loop &L,
   return A;
 }
 
+static cl::opt<bool> AGXHalfIndexSplits(
+    "agx-half-index-splits", cl::init(true), cl::Hidden,
+    cl::desc("A loop's 16-byte half load at a base plus a 32-bit index of "
+             "halves as two 8-byte ones from bases 8 bytes apart"));
+
 static cl::opt<bool> AGXHalfPointerCounters(
     "agx-half-pointer-counters", cl::init(true), cl::Hidden,
     cl::desc("A pointer LSR steps by twice a 32-bit counter of halves from "
@@ -236,9 +241,10 @@ static cl::opt<bool> AGXHalfPointerCounters(
 /// at it (or its step).
 static bool halfPointerCounters(Function &F, LoopInfo &LI) {
   using namespace PatternMatch;
-  if (!AGXHalfPointerCounters)
+  if (!AGXHalfPointerCounters && !AGXHalfIndexSplits)
     return false;
   bool Changed = false;
+  const DataLayout &DL = F.getDataLayout();
   Type *I64 = Type::getInt64Ty(F.getContext());
   for (Loop *L : LI.getLoopsInPreorder()) {
     BasicBlock *Pre = L->getLoopPreheader(), *Latch = L->getLoopLatch();
@@ -246,7 +252,7 @@ static bool halfPointerCounters(Function &F, LoopInfo &LI) {
       continue;
     SmallVector<PHINode *, 4> Ptrs;
     for (PHINode &P : L->getHeader()->phis())
-      if (P.getType()->isPointerTy() &&
+      if (AGXHalfPointerCounters && P.getType()->isPointerTy() &&
           P.getType()->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
           P.getNumIncomingValues() == 2)
         Ptrs.push_back(&P);
@@ -328,6 +334,54 @@ static bool halfPointerCounters(Function &F, LoopInfo &LI) {
       P->eraseFromParent();
       Changed = true;
     }
+    // A 16-byte half load at base + 2 zext(j) itself (rms_f16_dyn's row,
+    // a counter of halves that LSR kept), split the same way: its second
+    // half's address was a 64-bit add (L15-E690).
+    if (!AGXHalfIndexSplits)
+      continue;
+    DenseMap<Value *, Value *> Base8s;
+    for (BasicBlock *BB : L->blocks())
+      for (Instruction &I : make_early_inc_range(*BB)) {
+        auto *LD = dyn_cast<LoadInst>(&I);
+        auto *VT = LD ? dyn_cast<FixedVectorType>(LD->getType()) : nullptr;
+        if (!VT || !LD->isSimple() || !VT->getElementType()->isHalfTy() ||
+            VT->getNumElements() != 8 || LD->getAlign() < Align(4) ||
+            LD->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
+            agxWideHalfLoadBlock(*BB))
+          continue;
+        auto *GP = dyn_cast<GetElementPtrInst>(LD->getPointerOperand());
+        Value *X;
+        if (!GP || GP->getNumIndices() != 1 ||
+            DL.getTypeAllocSize(GP->getSourceElementType()) != 2 ||
+            !L->isLoopInvariant(GP->getPointerOperand()) ||
+            !match(GP->getOperand(1), m_ZExt(m_Value(X))) ||
+            !X->getType()->isIntegerTy(32))
+          continue;
+        Value *B0 = GP->getPointerOperand();
+        Value *&B8 = Base8s[B0];
+        if (!B8)
+          B8 = IRBuilder<>(Pre->getTerminator())
+                   .CreateGEP(Type::getInt8Ty(F.getContext()), B0,
+                              ConstantInt::get(I64, 8),
+                              B0->getName() + ".base8");
+        IRBuilder<> LB(LD);
+        auto *V4 = FixedVectorType::get(VT->getElementType(), 4);
+        auto *L0 = LB.CreateAlignedLoad(V4, GP, LD->getAlign());
+        Value *GP8 = LB.CreateGEP(GP->getSourceElementType(), B8,
+                                  GP->getOperand(1));
+        auto *L1 = LB.CreateAlignedLoad(V4, GP8,
+                                        commonAlignment(LD->getAlign(), 8));
+        for (LoadInst *Part : {L0, L1})
+          Part->copyMetadata(*LD, {LLVMContext::MD_alias_scope,
+                                   LLVMContext::MD_noalias,
+                                   LLVMContext::MD_tbaa});
+        Value *R = LB.CreateShuffleVector(
+            L0, L1, ArrayRef<int>{0, 1, 2, 3, 4, 5, 6, 7});
+        R->takeName(LD);
+        LD->replaceAllUsesWith(R);
+        LD->eraseFromParent();
+        Changed = true;
+      }
   }
   return Changed;
 }

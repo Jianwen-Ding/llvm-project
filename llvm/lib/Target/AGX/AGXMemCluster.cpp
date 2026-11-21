@@ -216,6 +216,9 @@ static bool loadsAfterStores(ScheduleDAGInstrs *DAG) {
             !MI.isInsertSubreg() && !MI.isExtractSubreg() &&
             !MI.isImplicitDef() && !MI.isTerminator();
   }
+  LLVM_DEBUG(dbgs() << "agx-mem-cluster: loads-after-stores " << Loads << " "
+                    << Stores << " work " << Work << " bytes " << LoadBytes
+                    << " " << StoreBytes << "\n");
   // (and loading at most 2.5 times the bytes it stores: three rows into one,
   // row_norm_apply, and floats into bytes, to_u8 / quant_rows, lost 1-6%)
   return Stores && Loads &&

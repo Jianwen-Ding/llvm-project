@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-wide-half-loads=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-wide-half-loads=0 -agx-half-index-splits=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-wide-half-loads-divergent=0 < %s | FileCheck %s --check-prefix=ALL
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-wide-byte-vectors=0 < %s | FileCheck %s --check-prefix=NOBYTES
 

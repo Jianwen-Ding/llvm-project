@@ -1,10 +1,12 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-light-row-stores-apart=0 < %s | FileCheck %s --check-prefix=CLUSTER
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-index-splits=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-half-index-splits=0 -agx-sched-light-row-stores-apart=0 < %s | FileCheck %s --check-prefix=CLUSTER
 
 ; A thread's row of light work (halves widened and scaled, L15-E589's
 ; region): each 16-byte store issues once its value is ready, the first
 ; before the wait for the second half of the loads (L15-E619), not held
-; until both are (widen_dyn: 4 GPRs more).
+; until both are (widen_dyn: 4 GPRs more). (With the 16-byte half loads as
+; two at one half index, L15-E690, the stores stay apart but the scheduler
+; puts both after the second wait: the order of the loads it was tuned on.)
 ; CHECK-LABEL: widen:
 ; CHECK: wait 0
 ; CHECK-NOT: wait
