@@ -922,6 +922,9 @@ void AGXTTIImpl::getUnrollingPreferences(
                 case Intrinsic::cos:
                 case Intrinsic::tanh:
                 case Intrinsic::sqrt:
+                // (a clamp's maximum and minimum: clamp_dyn +0.4%)
+                case Intrinsic::maximum:
+                case Intrinsic::minimum:
                   return false;
                 default:
                   break;
