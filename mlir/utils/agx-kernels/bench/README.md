@@ -112,6 +112,10 @@ the kernel's, as memory at VA).
 | `axpy_c32` | y = 2x + z over rows of 32, a thread per row |
 | `copy_c64` | y = 2x over rows of 64, a thread per row |
 | `hscale_c64` | half rows of 64 halved, a thread per row |
+| `row_scale` | y = x * w[j] over rows of 512 floats, a thread per row |
+| `row_norm_apply` | y = (x - s) * w[j] + z over rows of 512 floats, a thread per row |
+| `cumsum_dyn` | row prefix sums over a runtime length n (512 in the cost run), a thread per row |
+| `entropy_dyn` | row entropies -sum p log p over a runtime length n (512 in the cost run), a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
