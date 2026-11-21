@@ -8693,6 +8693,123 @@ static bool threadDecidedBranches(Function &F) {
 
 static void markExpsBelowLoopMax(Function &F);
 
+static cl::opt<bool> AGXConditionalSums(
+    "agx-conditional-sums", cl::init(true), cl::Hidden,
+    cl::desc("A running value's select(c, p + v, p) as p + select(c, v, -0) "
+             "(and p * select(c, v, 1) for p * v)"));
+
+/// select(c, p + v, p) as p + select(c, v, -0), and select(c, p * v, p) as
+/// p * select(c, v, 1) (either side), where p is a running value: a phi of
+/// such selects, other float arithmetic and constants (numbers, not
+/// denormal floats), or another such select. p + -0 and p 1 are then p
+/// itself: arithmetic gives no denormal floats (they flush) and its NaN is
+/// the default one, which p + -0 gives back; halves keep their denormals,
+/// which p + -0 and p 1 keep too. The select of v and a constant reads v
+/// (and the compare's operands), not p and p + v: a compare-select of two
+/// registers, not three, the add after it (L15-E700).
+static bool conditionalSums(Function &F) {
+  if (!AGXConditionalSums)
+    return false;
+  struct Cand {
+    SelectInst *S;
+    BinaryOperator *Op;
+    Value *P, *V;
+    bool OpTrue;
+  };
+  SmallVector<Cand, 8> Cands;
+  for (Instruction &I : instructions(F)) {
+    auto *S = dyn_cast<SelectInst>(&I);
+    if (!S || !(S->getType()->isFloatTy() || S->getType()->isHalfTy()))
+      continue;
+    for (bool OpTrue : {true, false}) {
+      auto *Op = dyn_cast<BinaryOperator>(OpTrue ? S->getTrueValue()
+                                                 : S->getFalseValue());
+      Value *P = OpTrue ? S->getFalseValue() : S->getTrueValue();
+      if (!Op || !Op->hasOneUse() ||
+          (Op->getOpcode() != Instruction::FAdd &&
+           Op->getOpcode() != Instruction::FMul) ||
+          !(isa<PHINode>(P) || isa<SelectInst>(P)))
+        continue;
+      Value *V = Op->getOperand(0) == P   ? Op->getOperand(1)
+                 : Op->getOperand(1) == P ? Op->getOperand(0)
+                                          : nullptr;
+      if (!V || V == P)
+        continue;
+      Cands.push_back({S, Op, P, V, OpTrue});
+      break;
+    }
+  }
+  if (Cands.empty())
+    return false;
+  // The values p + -0 (p 1) gives back: the candidates still in the set
+  // (which become arithmetic), arithmetic, constants, and phis of those.
+  SmallPtrSet<Value *, 8> Set;
+  for (Cand &C : Cands)
+    Set.insert(C.S);
+  std::function<bool(Value *, SmallPtrSetImpl<PHINode *> &)> Canon =
+      [&](Value *X, SmallPtrSetImpl<PHINode *> &Seen) -> bool {
+    if (auto *CF = dyn_cast<ConstantFP>(X))
+      return !CF->isNaN() &&
+             !(CF->getType()->isFloatTy() && CF->getValueAPF().isDenormal());
+    if (Set.count(X))
+      return true;
+    if (auto *BO = dyn_cast<BinaryOperator>(X))
+      return BO->getOpcode() == Instruction::FAdd ||
+             BO->getOpcode() == Instruction::FSub ||
+             BO->getOpcode() == Instruction::FMul ||
+             BO->getOpcode() == Instruction::FDiv;
+    if (auto *II = dyn_cast<IntrinsicInst>(X))
+      return II->getIntrinsicID() == Intrinsic::fma ||
+             II->getIntrinsicID() == Intrinsic::fmuladd;
+    if (auto *Phi = dyn_cast<PHINode>(X)) {
+      if (!Seen.insert(Phi).second)
+        return true;
+      return all_of(Phi->incoming_values(),
+                    [&](Value *In) { return Canon(In, Seen); });
+    }
+    return false;
+  };
+  for (bool Removed = true; Removed;) {
+    Removed = false;
+    for (Cand &C : Cands) {
+      if (!Set.count(C.S))
+        continue;
+      SmallPtrSet<PHINode *, 8> Seen;
+      if (!Canon(C.P, Seen)) {
+        Set.erase(C.S);
+        Removed = true;
+      }
+    }
+  }
+  bool Changed = false;
+  for (Cand &C : Cands) {
+    if (!Set.count(C.S))
+      continue;
+    // (p and v again: an earlier candidate's select replaced in them)
+    C.P = C.OpTrue ? C.S->getFalseValue() : C.S->getTrueValue();
+    C.V = C.Op->getOperand(0) == C.P ? C.Op->getOperand(1)
+                                     : C.Op->getOperand(0);
+    Type *Ty = C.S->getType();
+    bool Add = C.Op->getOpcode() == Instruction::FAdd;
+    Constant *Id = Add ? (C.Op->hasNoSignedZeros()
+                              ? ConstantFP::get(Ty, 0.0)
+                              : ConstantFP::getNegativeZero(Ty))
+                       : ConstantFP::get(Ty, 1.0);
+    IRBuilder<> B(C.S);
+    Value *NS = C.OpTrue ? B.CreateSelect(C.S->getCondition(), C.V, Id)
+                         : B.CreateSelect(C.S->getCondition(), Id, C.V);
+    auto *N = cast<Instruction>(
+        B.CreateBinOp(C.Op->getOpcode(), C.P, NS));
+    N->copyIRFlags(C.Op);
+    N->takeName(C.S);
+    C.S->replaceAllUsesWith(N);
+    C.S->eraseFromParent();
+    C.Op->eraseFromParent();
+    Changed = true;
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -8719,6 +8836,7 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   Changed |= rebaseLoopIndices(F);
   Changed |= relativeIndexSelects(F);
   Changed |= reluZeroSelects(F);
+  Changed |= conditionalSums(F);
   Changed |= exactDyadicSums(F);
   // (after: exactDyadicSums takes converted bytes' sums as integer ones)
   Changed |= byteFloatsALU(F);
