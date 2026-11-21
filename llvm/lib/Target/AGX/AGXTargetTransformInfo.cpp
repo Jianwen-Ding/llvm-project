@@ -188,6 +188,12 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeHeavyMax(
     cl::desc("Twice -agx-device-unroll-runtime-contiguous's count for a row's "
              "NaN-propagating maximum / minimum or argmax"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeHeavyMaxSigned(
+    "agx-device-unroll-runtime-heavy-max-signed", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-heavy-max only for a maximum / "
+             "minimum whose zero sign matters (else one instruction, as "
+             "maxnum)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeContiguous(
     "agx-device-unroll-runtime-contiguous", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip loop over a thread's row (contiguous "
@@ -1115,8 +1121,12 @@ void AGXTTIImpl::getUnrollingPreferences(
         if (AGXDeviceUnrollRuntimeHeavyMax &&
             any_of(*L->getHeader(), [&](const Instruction &I) {
               if (auto *II = dyn_cast<IntrinsicInst>(&I))
-                return II->getIntrinsicID() == Intrinsic::maximum ||
-                       II->getIntrinsicID() == Intrinsic::minimum;
+                return (II->getIntrinsicID() == Intrinsic::maximum ||
+                        II->getIntrinsicID() == Intrinsic::minimum) &&
+                       !(AGXDeviceUnrollRuntimeHeavyMaxSigned &&
+                         (II->hasNoSignedZeros() ||
+                          AGX::zeroSignFreeValue(
+                              *const_cast<IntrinsicInst *>(II))));
               auto *Sel = dyn_cast<SelectInst>(&I);
               auto *Cmp = Sel ? dyn_cast<FCmpInst>(Sel->getCondition()) : nullptr;
               return Cmp && any_of(Sel->operands(), [&](const Value *V) {

@@ -96,6 +96,10 @@ bool signSplatCompares();
 bool addSpecialRegisterRanges(Function &F,
                               SmallVectorImpl<WeakVH> *Added = nullptr,
                               bool ForAnalysis = false);
+/// Whether no use of \p I's value depends on the sign of a zero
+/// (AGXCodeGenPrepare's ZeroSignFree, which makes a float min / max nsz,
+/// one instruction: L15-E389), without the special registers' ranges.
+bool zeroSignFreeValue(Instruction &I);
 /// The extent of the grid position an intrinsic reads that the kernel's known
 /// grid gives (agx-threads-per-grid, agx-threadgroups-per-grid), if any.
 std::optional<uint64_t> knownGridExtent(const Function &F, unsigned IntrinsicID);

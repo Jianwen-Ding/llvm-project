@@ -6530,6 +6530,14 @@ static bool zeroSignFreeMinMax(Function &F) {
   return Changed;
 }
 
+bool AGX::zeroSignFreeValue(Instruction &I) {
+  if (!AGXZeroSignFreeMinMax)
+    return false;
+  std::optional<ThreadgroupAccesses> TG;
+  ZeroSignFree Z(TG);
+  return Z.value(&I);
+}
+
 static cl::opt<bool> AGXMergePhiOperations(
     "agx-merge-phi-operations", cl::init(true), cl::Hidden,
     cl::desc("A phi of the same binary operation of the same operands from "

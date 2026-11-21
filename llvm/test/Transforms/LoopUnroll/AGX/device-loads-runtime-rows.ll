@@ -4,6 +4,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-max=0 -S < %s | FileCheck %s --check-prefix=NOMAX
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-rows=0 -S < %s | FileCheck %s --check-prefix=WIDE
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-heavy-max=0 -S < %s | FileCheck %s --check-prefix=LIGHTMAX
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-heavy-max-signed=0 -S < %s | FileCheck %s --check-prefix=SIGNED
 
 ; A thread's own row of a runtime length (L15-E566): its loads start at the
 ; thread position times a row's bytes. A sum (one load an iteration) is
@@ -47,6 +48,16 @@
 ; LIGHTMAX-COUNT-8: call float @llvm.maximum.f32
 ; LIGHTMAX-NOT: call float @llvm.maximum.f32
 ; LIGHTMAX: .epil
+; Not one whose zero sign nothing reads, a softmax's maximum that only
+; offsets its exponentials: one instruction, as maxnum's, 8 times.
+; CHECK-LABEL: @rowmaximumexp(
+; CHECK-COUNT-8: call float @llvm.maximum.f32
+; CHECK-NOT: call float @llvm.maximum.f32
+; CHECK: .epil
+; SIGNED-LABEL: @rowmaximumexp(
+; SIGNED-COUNT-16: call float @llvm.maximum.f32
+; SIGNED-NOT: call float @llvm.maximum.f32
+; SIGNED: .epil
 ; Rows of halves or bytes as many bytes an iteration as of floats
 ; (L15-E583): a half row's sum 16 times, a byte row's 32.
 ; CHECK-LABEL: @hsum(
@@ -192,6 +203,32 @@ loop:
 exit:
   %r = phi float [ 0.0, %entry ], [ %s1, %loop ]
   store float %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+
+define void @rowmaximumexp(ptr addrspace(1) %x, ptr addrspace(1) %o, i64 %n, float %w) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  %e = icmp eq i64 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %s = phi float [ 0xFFF0000000000000, %entry ], [ %s1, %loop ]
+  %it = trunc nuw nsw i64 %i to i32
+  %k = add i32 %row, %it
+  %z = zext i32 %k to i64
+  %p = getelementptr inbounds float, ptr addrspace(1) %x, i64 %z
+  %v = load float, ptr addrspace(1) %p, align 4
+  %s1 = call float @llvm.maximum.f32(float %s, float %v)
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  %r = phi float [ 0xFFF0000000000000, %entry ], [ %s1, %loop ]
+  %d = fsub float %w, %r
+  %ex = call float @llvm.exp.f32(float %d)
+  store float %ex, ptr addrspace(1) %o, align 4
   ret void
 }
 
