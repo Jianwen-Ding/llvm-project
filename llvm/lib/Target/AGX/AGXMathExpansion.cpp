@@ -134,6 +134,11 @@ static cl::opt<bool> SinCosFusedRound(
     "agx-sincos-fused-round", cl::init(true), cl::Hidden,
     cl::desc("sin / cos's magic-number round of x 2 / pi as one fma"));
 
+static cl::opt<bool> LogLowFma(
+    "agx-log-low-fma", cl::init(true), cl::Hidden,
+    cl::desc("With the constants in uniforms, logf's low part (errors) + e "
+             "ln2_lo as one fma"));
+
 static cl::opt<bool> TanQuotientSigns(
     "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
     cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
@@ -1047,7 +1052,11 @@ public:
     auto [S, Err] = Sum(L.F, L.Y);
     // e ln 2 in two parts, the first exact for |e| < 2^15.
     auto [Hi, Err2] = Sum(mul(L.E, k(0.693359375)), S);
-    Value *Lo = add(add(Err, Err2), mul(L.E, k(-2.12194440e-4)));
+    // (e ln2_lo and the errors' sum as one fma, one rounding: with the
+    // constant a uniform it reads e and the sum, L15-E708)
+    Value *Lo = LogLowFma && AGX::uniformConstantsEnabled()
+                    ? fma(L.E, k(-2.12194440e-4), add(Err, Err2))
+                    : add(add(Err, Err2), mul(L.E, k(-2.12194440e-4)));
     return {Hi, Lo};
   }
   /// The x of log's polynomial: |x|, pow's, where both are of one value
