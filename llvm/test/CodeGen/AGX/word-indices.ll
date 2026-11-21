@@ -1,6 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit=0 < %s | FileCheck %s --check-prefix=EXIT
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit-count=0 < %s | FileCheck %s --check-prefix=COUNT
 
 ; A loop's 16-byte loads of halves at a 32-bit counter of halves (LSR's,
 ; start 512 * row, the row's 16-byte steps): a counter of words beside it
@@ -126,5 +127,62 @@ loop:
   %c = icmp eq i64 %zn, 2048
   br i1 %c, label %out, label %loop
 out:
+  ret void
+}
+
+; A count of iterations from 0 that only the exit compare with a runtime
+; bound (a multiple of 16 below 2^31: an unrolled loop's) and a phi after the
+; loop read: the compare is of the counter of words with its value at that
+; bound, w.start + n / 16 * 8, and the phi takes n (L15-E624).
+; CHECK-LABEL: define agx_kernel void @count(
+; CHECK: %words.end = add i32 %words.start,
+; CHECK: %words.next = add i32 %words, 8
+; CHECK-NEXT: %c = icmp eq i32 %words.next, %words.end
+; CHECK-NOT: %j
+; CHECK: %done = phi i64 [ %nz, %loop ]
+; COUNT-LABEL: define agx_kernel void @count(
+; COUNT: %c = icmp eq i64 %jz, %nz
+define agx_kernel void @count(ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %n) #0 {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %start = shl i32 %t, 9
+  %n16 = and i32 %n, 2147483632
+  %nz = zext i32 %n16 to i64
+  %c0 = icmp ugt i32 %n16, 0
+  br i1 %c0, label %pre, label %out
+pre:
+  br label %loop
+loop:
+  %iv = phi i32 [ %start, %pre ], [ %iv.next, %loop ]
+  %j = phi i32 [ 0, %pre ], [ %j.next, %loop ]
+  %a = phi float [ 0.0, %pre ], [ %a2, %loop ]
+  %z0 = zext i32 %iv to i64
+  %p0 = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %x, i64 %z0
+  %v0 = load <8 x half>, ptr addrspace(1) %p0, align 4
+  %i8 = add i32 %iv, 8
+  %z8 = zext i32 %i8 to i64
+  %p8 = getelementptr inbounds nuw [2 x i8], ptr addrspace(1) %x, i64 %z8
+  %v8 = load <8 x half>, ptr addrspace(1) %p8, align 4
+  %e0 = fpext <8 x half> %v0 to <8 x float>
+  %e8 = fpext <8 x half> %v8 to <8 x float>
+  %s0 = call float @llvm.vector.reduce.fadd.v8f32(float %a, <8 x float> %e0)
+  %a2 = call float @llvm.vector.reduce.fadd.v8f32(float %s0, <8 x float> %e8)
+  %iv.next = add i32 %iv, 16
+  %j.next = add nuw nsw i32 %j, 16
+  %jz = zext i32 %j.next to i64
+  %c = icmp eq i64 %jz, %nz
+  br i1 %c, label %exit, label %loop
+exit:
+  %done = phi i64 [ %jz, %loop ]
+  %r0 = phi float [ %a2, %loop ]
+  %d = trunc i64 %done to i32
+  %df = uitofp i32 %d to float
+  %r1 = fadd float %r0, %df
+  br label %out
+out:
+  %r = phi float [ 0.0, %entry ], [ %r1, %exit ]
+  %tz = zext i32 %t to i64
+  %q = getelementptr float, ptr addrspace(1) %y, i64 %tz
+  store float %r, ptr addrspace(1) %q, align 4
   ret void
 }

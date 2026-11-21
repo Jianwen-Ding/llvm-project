@@ -47,6 +47,7 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/KnownBits.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
@@ -63,6 +64,12 @@ static cl::opt<bool> AGXWordIndicesExit(
     "agx-loop-word-indices-exit", cl::init(true), cl::Hidden,
     cl::desc("The loop's exit compare of a counter whose accesses all moved "
              "to the counter of words, on that counter"));
+
+static cl::opt<bool> AGXWordIndicesExitCount(
+    "agx-loop-word-indices-exit-count", cl::init(true), cl::Hidden,
+    cl::desc("A loop's count of iterations from 0 that only its exit "
+             "compare with a loop-invariant bound reads, as the counter of "
+             "words against that bound in words"));
 
 static cl::opt<unsigned> AGXWordIndicesOffsets(
     "agx-loop-word-indices-offsets", cl::init(1), cl::Hidden,
@@ -443,6 +450,128 @@ bool AGXWordIndices::runOnFunction(Function &F) {
     P->eraseFromParent();
     Inc->eraseFromParent();
   }
+  // A count from 0 by a power of two s_p that only the exit compare with a
+  // loop-invariant n reads (an unrolled loop's against its iterations of a
+  // runtime row, hsum_dyn): with n's low bits zero (a multiple of s_p) its
+  // n / s_p-th increment is the one equal to n, and the counter of words is
+  // then w.start + n / s_p * s_w, which no earlier one equals mod 2^32 where
+  // n's bound / s_p * s_w < 2^32 (L15-E624).
+  if (AGXWordIndicesExitCount)
+    for (Counter &C : Counters) {
+      if (!C.W->getParent())
+        continue;
+      BasicBlock *H = C.W->getParent();
+      BasicBlock *Latch = C.W->getIncomingBlock(1);
+      BasicBlock *Pre = C.W->getIncomingBlock(0);
+      auto *WN = dyn_cast<BinaryOperator>(C.WNext);
+      auto *SW = WN ? dyn_cast<ConstantInt>(WN->getOperand(1)) : nullptr;
+      if (!SW || !SW->getValue().isPowerOf2())
+        continue;
+      for (PHINode &P : make_early_inc_range(H->phis())) {
+        if (&P == C.W || !P.getType()->isIntegerTy(32) ||
+            P.getNumIncomingValues() != 2 ||
+            !match(P.getIncomingValueForBlock(Pre), m_Zero()))
+          continue;
+        auto *Inc =
+            dyn_cast<BinaryOperator>(P.getIncomingValueForBlock(Latch));
+        const APInt *SP;
+        if (!Inc || !P.hasOneUse() ||
+            !match(Inc, m_NUWAdd(m_Specific(&P), m_APInt(SP))) ||
+            !SP->isPowerOf2())
+          continue;
+        // Inc's users: P, the compare (directly or through a zext) and
+        // phis after the loop on the edge it takes when inc = n (there n).
+        ICmpInst *Cmp = nullptr;
+        Instruction *Ext = nullptr;
+        SmallVector<Use *, 2> Outside;
+        bool Ok = true;
+        auto Look = [&](Value *V) {
+          for (Use &U : V->uses()) {
+            auto *UI = cast<Instruction>(U.getUser());
+            if (UI == &P)
+              continue;
+            if (isa<ZExtInst>(UI) && V == Inc && !Ext) {
+              Ext = UI;
+              continue;
+            }
+            if (auto *IC = dyn_cast<ICmpInst>(UI);
+                IC && !Cmp && IC->isEquality()) {
+              Cmp = IC;
+              continue;
+            }
+            if (isa<PHINode>(UI) && UI->getParent() != H) {
+              Outside.push_back(&U);
+              continue;
+            }
+            Ok = false;
+          }
+        };
+        Look(Inc);
+        if (Ext)
+          Look(Ext);
+        auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+        if (!Ok || !Cmp || Cmp->getParent() != Latch || !Br ||
+            Br->getCondition() != Cmp ||
+            !Cmp->hasOneUse())
+          continue;
+        BasicBlock *Equal = Br->getSuccessor(
+            Cmp->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1);
+        if (Equal == H ||
+            any_of(Outside, [&](Use *U) {
+              auto *Phi = cast<PHINode>(U->getUser());
+              return Phi->getParent() != Equal ||
+                     Phi->getIncomingBlock(*U) != Latch;
+            }))
+          continue;
+        Value *Mine = Ext ? static_cast<Value *>(Ext) : Inc;
+        Value *N = Cmp->getOperand(0) == Mine ? Cmp->getOperand(1)
+                                              : Cmp->getOperand(0);
+        if (N == Mine)
+          continue;
+        // n as a 32-bit value (or the zext of one), invariant in the loop
+        Value *N32 = N;
+        if (N->getType()->isIntegerTy(64)) {
+          Value *X;
+          if (!match(N, m_ZExt(m_Value(X))) || !X->getType()->isIntegerTy(32))
+            continue;
+          N32 = X;
+        } else if (!N->getType()->isIntegerTy(32)) {
+          continue;
+        }
+        auto *NI = dyn_cast<Instruction>(N32);
+        if (NI && !DT.dominates(NI, Pre->getTerminator()))
+          continue;
+        if (!NI && !isa<Argument>(N32) && !isa<Constant>(N32))
+          continue;
+        KnownBits KB = computeKnownBits(N32, DL);
+        unsigned LogP = SP->logBase2(), LogW = SW->getValue().logBase2();
+        if (KB.countMinTrailingZeros() < LogP ||
+            KB.getMaxValue().lshr(LogP).zext(64).shl(LogW).getActiveBits() >
+                32)
+          continue;
+        IRBuilder<> PB(Pre->getTerminator());
+        Value *Bound = PB.CreateAdd(
+            C.W->getIncomingValue(0),
+            PB.CreateShl(PB.CreateLShr(N32, LogP, "", /*isExact=*/true), LogW),
+            "words.end");
+        if (Cmp->comesBefore(WN))
+          WN->moveBefore(Cmp->getIterator());
+        // (w.next may now be compared on the last iteration, where its
+        // nuw is not otherwise known: dropped)
+        WN->setHasNoUnsignedWrap(false);
+        Cmp->setOperand(0, WN);
+        Cmp->setOperand(1, Bound);
+        for (Use *U : Outside)
+          U->set(U->get() == Inc ? N32 : N);
+        if (Ext && Ext->use_empty())
+          Ext->eraseFromParent();
+        P.replaceAllUsesWith(PoisonValue::get(P.getType()));
+        P.eraseFromParent();
+        Inc->eraseFromParent();
+        Changed = true;
+        break;
+      }
+    }
   // A counter now read by nothing but its own increment (hscale_dyn's
   // halves beside its words and its count of iterations): nothing later
   // deletes the cycle, which kept an add and a register.
