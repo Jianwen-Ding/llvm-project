@@ -45,6 +45,11 @@
 
 using namespace llvm;
 
+static cl::opt<bool> AGXAddHighWords(
+    "agx-add-high-words", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit add or subtract of a value with a zero low word as a "
+             "32-bit add of the high words"));
+
 static cl::opt<bool> FieldMaskAnyLow(
     "agx-field-mask-any-low", cl::init(true), cl::Hidden,
     cl::desc("(x & m) >> s as one bfeil for every m whose bits from s are "
@@ -221,7 +226,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ATOMIC_LOAD_SUB, MVT::i32, Custom);
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
-  setTargetDAGCombine({ISD::SHL, ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
+  setTargetDAGCombine({ISD::SHL, ISD::SUB, ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
@@ -2339,7 +2344,32 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                              N->getOperand(2));
   }
   case ISD::ADD:
+  case ISD::SUB: {
+    // a 64-bit value plus (or minus) one with a zero low word: the high
+    // words only (L15-E660)
+    if (AGXAddHighWords && N->getValueType(0) == MVT::i64 &&
+        DCI.isAfterLegalizeDAG()) {
+      SelectionDAG &DAG = DCI.DAG;
+      for (unsigned K = 0; K < 2; ++K) {
+        if (K && N->getOpcode() == ISD::SUB)
+          break;
+        SDValue A = N->getOperand(K), Bv = N->getOperand(1 - K);
+        if (DAG.computeKnownBits(Bv).countMinTrailingZeros() < 32)
+          continue;
+        SDLoc DL(N);
+        SDValue Hi = DAG.getNode(
+            ISD::TRUNCATE, DL, MVT::i32,
+            DAG.getNode(ISD::SRL, DL, MVT::i64, Bv,
+                        DAG.getShiftAmountConstant(32, MVT::i64, DL)));
+        return DAG.getNode(N->getOpcode() == ISD::ADD ? AGXISD::ADD_HI
+                                                       : AGXISD::SUB_HI,
+                           DL, MVT::i64, A, Hi);
+      }
+    }
+    if (N->getOpcode() == ISD::SUB)
+      return SDValue();
     return performOffsetIndexCombine(N, DCI);
+  }
   case ISD::BITCAST: {
     // The bits of |x| that only integer ands and right shifts read (a log's
     // exponent and mantissa of |x|): x's bits under a mask, which those fold

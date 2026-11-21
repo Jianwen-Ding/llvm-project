@@ -68,6 +68,52 @@ static cl::opt<bool> AGXSoftF64Pow2Mul(
     cl::desc("Double multiplication by a constant power of two: the short "
              "path adds its exponent"));
 
+static cl::opt<bool> AGXSoftF64DivDigits(
+    "agx-soft-f64-div-digits", cl::init(true), cl::Hidden,
+    cl::desc("Double division's significand quotient in two 28-bit digits "
+             "from a 32-bit reciprocal, not a reciprocal from 64-bit "
+             "Newton steps"));
+
+static cl::opt<bool> AGXSoftF64FmaFarAny(
+    "agx-soft-f64-fma-far-any-addend", cl::init(false), cl::Hidden,
+    cl::desc("-agx-soft-f64-fma-far for any addend (to test it)"));
+
+static cl::opt<bool> AGXSoftF64MulDirect(
+    "agx-soft-f64-mul-direct", cl::init(true), cl::Hidden,
+    cl::desc("Double multiplication's short path rounds the significand "
+             "taken from the product's words, not from its top 64 bits"));
+
+static cl::opt<bool> AGXSoftF64DivDirect(
+    "agx-soft-f64-div-direct", cl::init(true), cl::Hidden,
+    cl::desc("Double division's short path rounds the significand taken "
+             "from the quotient's digits, the exponent in its field"));
+
+static cl::opt<bool> AGXSoftF64AddFrame3(
+    "agx-soft-f64-add-frame3", cl::init(true), cl::Hidden,
+    cl::desc("Double addition's short path with the significands 3 places "
+             "up and the implicit bit always set"));
+
+static cl::opt<bool> AGXSoftF64RangeFromExponent(
+    "agx-soft-f64-range-from-exponent", cl::init(true), cl::Hidden,
+    cl::desc("Double short paths: a normal result told from its unrounded "
+             "exponent (the top binade on the general path), and an "
+             "addition's operands from the exponents it extracts"));
+
+static cl::opt<bool> AGXSoftF64OneAdd(
+    "agx-soft-f64-one-add", cl::init(true), cl::Hidden,
+    cl::desc("Double significands added or subtracted on the operands' signs "
+             "with one addition and complements, not both and a select"));
+
+static cl::opt<bool> AGXSoftF64MulLimbs(
+    "agx-soft-f64-mul-limbs", cl::init(true), cl::Hidden,
+    cl::desc("Double significand products as four 32-bit multiply-adds with "
+             "the partial sums as addends"));
+static cl::opt<bool> AGXSoftF64FmaFar(
+    "agx-soft-f64-fma-far", cl::init(true), cl::Hidden,
+    cl::desc("Double fma rounded to nearest with a constant addend: a short "
+             "path for a product and the addend two or more places apart, "
+             "before the one that normalizes 128 bits"));
+
 static cl::opt<unsigned> AGXSoftF64FastPathsMax(
     "agx-soft-f64-fast-paths-max", cl::init(256), cl::Hidden,
     cl::desc("Most double precision operations per function that get a "
@@ -119,6 +165,7 @@ public:
       : B(B), I1(B.getInt1Ty()), I32(B.getInt32Ty()), I64(B.getInt64Ty()),
         I128(B.getInt128Ty()), Rounding(Rounding), CanonicalNaN(CanonicalNaN) {}
 
+  Instruction *insertPoint() { return &*B.GetInsertPoint(); }
   Value *c32(int64_t V) { return ConstantInt::getSigned(I32, V); }
   Value *c64(uint64_t V) { return B.getInt64(V); }
   Value *c128(uint64_t V) { return ConstantInt::get(I128, V); }
@@ -136,6 +183,15 @@ public:
   }
   Value *umin(Value *A, Value *X) {
     return B.CreateBinaryIntrinsic(Intrinsic::umin, A, X);
+  }
+
+  /// Same ? A + X : A - X with one addition: A - X = ~(~A + X), the
+  /// complements an xor with a mask of the sign (L15-E663).
+  Value *addOrSub(Value *Same, Value *A, Value *X) {
+    if (!AGXSoftF64OneAdd)
+      return select(Same, B.CreateAdd(A, X), B.CreateSub(A, X));
+    Value *M = B.CreateSExt(B.CreateNot(Same), A->getType());
+    return B.CreateXor(B.CreateAdd(B.CreateXor(A, M), X), M);
   }
 
   /// Bit length of M, as i32.
@@ -295,7 +351,7 @@ public:
     Value *SM = B.CreateOr(lshrTopClear(Small.M, D),
                            B.CreateZExt(lostBelow(Small.M, D), Small.M->getType()));
     Value *Same = B.CreateICmpEQ(Big.Sign, Small.Sign);
-    Value *M = select(Same, B.CreateAdd(Big.M, SM), B.CreateSub(Big.M, SM));
+    Value *M = addOrSub(Same, Big.M, SM);
     return {Big.Sign, M, Big.E};
   }
 
@@ -323,7 +379,7 @@ public:
     Value *D = B.CreateSub(TB.E, TS.E);
     SM = B.CreateOr(lshrTopClear(SM, D), B.CreateZExt(lostBelow(SM, D), I64));
     Value *Same = B.CreateICmpEQ(TB.Sign, TS.Sign);
-    Value *M = select(Same, B.CreateAdd(BM, SM), B.CreateSub(BM, SM));
+    Value *M = addOrSub(Same, BM, SM);
     return {TB.Sign, M, B.CreateSub(TB.E, c32(10))};
   }
 
@@ -364,18 +420,58 @@ public:
     Value *Sig = B.CreateLShr(N, 11);
     Value *Guard = B.CreateTrunc(B.CreateLShr(N, 10), I1);
     Value *Rest = B.CreateICmpNE(B.CreateAnd(N, c64(0x3ff)), c64(0));
+    return roundSigRNE(Sig, Guard, Rest, E);
+  }
+  /// roundNormalRNE's rounding of a 53-bit significand Sig (its top bit at
+  /// 52) with the bit below it (Guard) and whether any below that is set.
+  std::pair<Value *, Value *> roundSigRNE(Value *Sig, Value *Guard, Value *Rest,
+                                          Value *E) {
     Value *Inc = B.CreateAnd(Guard, B.CreateOr(Rest, B.CreateTrunc(Sig, I1)));
     Sig = B.CreateAdd(Sig, B.CreateZExt(Inc, I64));
     // (E - 1) << 52 plus the significand with its implicit bit (a carry to
     // 2^53 adds one more to the exponent)
     Value *E64 = B.CreateSExt(E, I64);
     Value *Bits = B.CreateAdd(B.CreateShl(B.CreateSub(E64, c64(1)), 52), Sig);
+    if (AGXSoftF64RangeFromExponent) {
+      // E of 1 to 2045: the field after a rounding carry 1 to 2046 (the top
+      // binade, E 2046, takes the general path; L15-E662), without the
+      // result's field
+      return {Bits, B.CreateICmpULT(B.CreateSub(E, c32(1)), c32(F64.expAll() - 2))};
+    }
     Value *Field = B.CreateLShr(B.CreateTrunc(B.CreateLShr(Bits, 32), I32), 20);
     Value *Valid = B.CreateAnd(
         B.CreateICmpSGE(E, c32(1)),
         B.CreateICmpULT(B.CreateSub(Field, c32(1)), c32(F64.expAll() - 1)));
     return {Bits, Valid};
   }
+  /// The 128-bit product of A and B below 2^54 each, as its high and low
+  /// words (L15-E661): four 32 x 32 -> 64-bit multiply-adds whose addends
+  /// are the partial sums (the high limbs below 2^22 keep each below 2^64,
+  /// and the two carries into the top one a 32-bit add), not the 128-bit
+  /// multiplication's 64-bit adds.
+  std::pair<Value *, Value *> mulWide53(Value *A, Value *X) {
+    auto Lo = [&](Value *V) { return B.CreateTrunc(V, I32); };
+    auto Hi = [&](Value *V) { return B.CreateTrunc(B.CreateLShr(V, 32), I32); };
+    auto MulAdd = [&](Value *P, Value *Q, Value *C) {
+      return B.CreateAdd(B.CreateMul(B.CreateZExt(P, I64), B.CreateZExt(Q, I64)),
+                         B.CreateZExt(C, I64));
+    };
+    Value *A0 = Lo(A), *A1 = Hi(A), *X0 = Lo(X), *X1 = Hi(X);
+    Value *P00 = B.CreateMul(B.CreateZExt(A0, I64), B.CreateZExt(X0, I64));
+    Value *T = MulAdd(A0, X1, Hi(P00));
+    Value *U = MulAdd(A1, X0, Lo(T));
+    Value *V = MulAdd(A1, X1, B.CreateAdd(Hi(T), Hi(U)));
+    Value *L = B.CreateOr(B.CreateShl(B.CreateZExt(Lo(U), I64), 32),
+                          B.CreateZExt(Lo(P00), I64));
+    return {V, L};
+  }
+  Value *mulWide53x(Value *A, Value *X) {
+    if (!AGXSoftF64MulLimbs)
+      return B.CreateMul(B.CreateZExt(A, I128), B.CreateZExt(X, I128));
+    auto [H, L] = mulWide53(A, X);
+    return B.CreateOr(B.CreateShl(B.CreateZExt(H, I128), 64), B.CreateZExt(L, I128));
+  }
+
   /// X * Y rounded to nearest even where both are normal and so is the
   /// result, and whether they are: the significands' product has its top bit
   /// at bit 104 or 105, so its top 64 bits (with a sticky bit for the rest)
@@ -386,7 +482,9 @@ public:
     Value *MY = B.CreateOr(B.CreateAnd(Y, c64(F64.fracMask())), Implicit);
     Value *EX = B.CreateTrunc(B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll())), I32);
     Value *EY = B.CreateTrunc(B.CreateAnd(B.CreateLShr(Y, 52), c64(F64.expAll())), I32);
-    Value *P = B.CreateMul(B.CreateZExt(MX, I128), B.CreateZExt(MY, I128));
+    if (AGXSoftF64MulDirect && AGXSoftF64MulLimbs && AGXSoftF64RangeFromExponent)
+      return mulFastDirect(X, Y, MX, MY);
+    Value *P = mulWide53x(MX, MY);
     Value *H = B.CreateTrunc(B.CreateLShr(P, 42), I64);
     Value *Low = B.CreateICmpNE(
         B.CreateAnd(B.CreateTrunc(P, I64), c64((uint64_t(1) << 42) - 1)), c64(0));
@@ -403,6 +501,57 @@ public:
     Valid = B.CreateOr(AnyZero, Valid);
     return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y)))};
   }
+  /// mulFast's product rounded from its 32-bit words (L15-E664): the
+  /// significand is the product's bits from 52 + top up (top: whether it
+  /// has 106 bits), two funnel shifts of its words 1 to 3, the guard bit
+  /// below them and the rest a sticky bit, without its top 64 bits first.
+  std::pair<Value *, Value *> mulFastDirect(Value *X, Value *Y, Value *MX,
+                                            Value *MY) {
+    auto [V, L] = mulWide53(MX, MY);
+    Value *W0 = B.CreateTrunc(L, I32), *W1 = B.CreateTrunc(B.CreateLShr(L, 32), I32);
+    Value *W2 = B.CreateTrunc(V, I32), *W3 = B.CreateTrunc(B.CreateLShr(V, 32), I32);
+    // the product's bit 105 is the top word's bit 9 (the word below 2^10)
+    Value *Top = B.CreateICmpUGE(W3, c32(0x200));
+    Value *TopI = B.CreateZExt(Top, I32);
+    Value *Sh = B.CreateAdd(TopI, c32(20));
+    Value *SigLo = B.CreateIntrinsic(Intrinsic::fshr, {I32}, {W2, W1, Sh});
+    Value *SigHi = B.CreateIntrinsic(Intrinsic::fshr, {I32}, {W3, W2, Sh});
+    Value *Sig = B.CreateOr(B.CreateShl(B.CreateZExt(SigHi, I64), 32),
+                            B.CreateZExt(SigLo, I64));
+    // bit 51 + top of the product (word 1's 19 + top), and those below
+    Value *Guard = B.CreateTrunc(B.CreateLShr(W1, B.CreateAdd(TopI, c32(19))), I1);
+    Value *Rest = B.CreateOr(
+        B.CreateICmpNE(B.CreateShl(W1, B.CreateSub(c32(13), TopI)), c32(0)),
+        B.CreateICmpNE(W0, c32(0)));
+    // The exponent as its field 20 places up in the high word: (E - 1) << 20
+    // for E = EX + EY - 1023 + top is the fields' sum (below 2^32) less
+    // 1024 << 20, plus top << 20 (modulo 2^32: an E - 1 of 0 to 2044, the
+    // normal results' as for roundSigRNE, is that value below 2045 << 20,
+    // and any other, -1023 to 3069, at or above it). No field extracted.
+    auto FieldUp = [&](Value *V) {
+      return B.CreateAnd(B.CreateTrunc(B.CreateLShr(V, 32), I32), c32(0x7ff00000));
+    };
+    Value *FX = FieldUp(X), *FY = FieldUp(Y);
+    Value *HiAdd = B.CreateAdd(B.CreateAdd(FX, FY),
+                               select(Top, c32(int32_t(0xc0100000)), c32(int32_t(0xc0000000))));
+    Value *Inc = B.CreateAnd(Guard, B.CreateOr(Rest, B.CreateTrunc(Sig, I1)));
+    Sig = B.CreateAdd(Sig, B.CreateZExt(Inc, I64));
+    Value *Bits = B.CreateAdd(Sig, B.CreateShl(B.CreateZExt(HiAdd, I64), 32));
+    Value *Valid = B.CreateICmpULT(HiAdd, c32(2045u << 20));
+    Value *SignBits = B.CreateAnd(B.CreateXor(X, Y), c64(F64.signBit()));
+    Bits = B.CreateOr(Bits, SignBits);
+    Value *AnyZero = B.CreateOr(isZero(X, F64), isZero(Y, F64));
+    Bits = select(AnyZero, SignBits, Bits);
+    Valid = B.CreateOr(AnyZero, Valid);
+    // (normal operands: fields of 1 to 2046)
+    auto NormalField = [&](Value *F) {
+      return B.CreateICmpULT(B.CreateSub(F, c32(0x100000)), c32(0x7fe00000));
+    };
+    Value *XOk = B.CreateOr(NormalField(FX), isZero(X, F64));
+    Value *YOk = B.CreateOr(NormalField(FY), isZero(Y, F64));
+    return {Bits, B.CreateAnd(Valid, B.CreateAnd(XOk, YOk))};
+  }
+
   /// X * Y where Y's significand field is zero (Y a power of two, a zero
   /// or an infinity), where X and Y are normal and so is the product, or X
   /// is zero and Y normal: Y's exponent added to X's exponent field, exactly,
@@ -440,6 +589,8 @@ public:
   std::pair<Value *, Value *> addFast(Value *X, Value *Y) {
     Value *YBigger = B.CreateICmpUGT(magnitude(Y, F64), magnitude(X, F64));
     Value *Big = select(YBigger, Y, X), *Small = select(YBigger, X, Y);
+    if (AGXSoftF64AddFrame3 && AGXSoftF64RangeFromExponent)
+      return addFast3(X, Y, Big, Small);
     Value *EB = B.CreateTrunc(B.CreateAnd(B.CreateLShr(Big, 52), c64(F64.expAll())), I32);
     Value *ES = B.CreateTrunc(B.CreateAnd(B.CreateLShr(Small, 52), c64(F64.expAll())), I32);
     // (a zero's significand 0: the implicit bit only with a nonzero
@@ -453,7 +604,7 @@ public:
     Value *D = B.CreateSub(EB, ES);
     MS = B.CreateOr(lshrTopClear(MS, D), B.CreateZExt(lostBelow(MS, D), I64));
     Value *Same = B.CreateICmpSGE(B.CreateXor(X, Y), c64(0));
-    Value *S = select(Same, B.CreateAdd(MB, MS), B.CreateSub(MB, MS));
+    Value *S = addOrSub(Same, MB, MS);
     // (a zero S gives 64, clamped so that the shift is defined: the branch
     // on Valid must not see poison)
     Value *Lz = umin64(B.CreateBinaryIntrinsic(Intrinsic::ctlz, S, B.getFalse()), 63);
@@ -466,7 +617,168 @@ public:
     Value *SZero = B.CreateICmpEQ(S, c64(0));
     Bits = select(SZero, B.CreateAnd(B.CreateAnd(Big, Small), c64(F64.signBit())), Bits);
     Valid = B.CreateOr(SZero, Valid);
-    return {Bits, B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y)))};
+    // (the two operands are Big and Small: their exponent fields at hand)
+    auto NormalOrZero = [&](Value *V, Value *E) {
+      return B.CreateOr(
+          B.CreateICmpULT(B.CreateSub(E, c32(1)), c32(F64.expAll() - 1)),
+          isZero(V, F64));
+    };
+    Value *Operands =
+        AGXSoftF64RangeFromExponent
+            ? B.CreateAnd(NormalOrZero(Big, EB), NormalOrZero(Small, ES))
+            : B.CreateAnd(isNormalOrZero(X), isNormalOrZero(Y));
+    return {Bits, B.CreateAnd(Valid, Operands)};
+  }
+
+  /// addFast with the significands 3 places up, not 10 (L15-E666): one
+  /// funnel shift for the high word, the low word's an iadd shift, and the
+  /// implicit bit set for both operands (a zero Small shifted 64 places,
+  /// then only a sticky bit, which rounds back to Big; two zeros are
+  /// selected apart). Three
+  /// zero bits are enough: Small shifted by at most one place loses
+  /// nothing, and shifted by two or more the sum's top bit is within one
+  /// place of Big's (at 54 to 56), its sticky bit then at most 9 places up,
+  /// below the guard bit. The exponent as its field in the high word, as in
+  /// mulFastDirect: E = EB + 8 - lz, (E - 1) << 20 = FB + (7 - lz) << 20.
+  std::pair<Value *, Value *> addFast3(Value *X, Value *Y, Value *Big,
+                                       Value *Small) {
+    auto FieldUp = [&](Value *V) {
+      return B.CreateAnd(B.CreateTrunc(B.CreateLShr(V, 32), I32), c32(0x7ff00000));
+    };
+    Value *FB = FieldUp(Big), *FS = FieldUp(Small);
+    // (a zero Small 64 places down: only its sticky bit is left)
+    Value *SmallZero = isZero(Small, F64);
+    Value *D = select(SmallZero, c32(64), B.CreateLShr(B.CreateSub(FB, FS), 20));
+    auto Sig3 = [&](Value *V) {
+      return B.CreateShl(B.CreateAnd(V, c64(F64.fracMask())), 3);
+    };
+    Value *MB = B.CreateOr(Sig3(Big), c64((F64.fracMask() + 1) << 3));
+    Value *MS = B.CreateOr(Sig3(Small), c64((F64.fracMask() + 1) << 3));
+    MS = B.CreateOr(lshrTopClear(MS, D), B.CreateZExt(lostBelow(MS, D), I64));
+    Value *Same = B.CreateICmpSGE(B.CreateXor(X, Y), c64(0));
+    Value *S = addOrSub(Same, MB, MS);
+    Value *Lz = umin64(B.CreateBinaryIntrinsic(Intrinsic::ctlz, S, B.getFalse()), 63);
+    Value *N = B.CreateShl(S, Lz);
+    Value *Lz32 = B.CreateTrunc(Lz, I32);
+    Value *HiAdd = B.CreateSub(B.CreateAdd(FB, c32(7 << 20)), B.CreateShl(Lz32, 20));
+    Value *Sig = B.CreateLShr(N, 11);
+    Value *Guard = B.CreateTrunc(B.CreateLShr(N, 10), I1);
+    Value *Rest = B.CreateICmpNE(B.CreateAnd(N, c64(0x3ff)), c64(0));
+    Value *Inc = B.CreateAnd(Guard, B.CreateOr(Rest, B.CreateTrunc(Sig, I1)));
+    Sig = B.CreateAdd(Sig, B.CreateZExt(Inc, I64));
+    Value *Bits = B.CreateAdd(Sig, B.CreateShl(B.CreateZExt(HiAdd, I64), 32));
+    // (E - 1 of -55 to 2053: below 2045 << 20 only for 0 to 2044)
+    Value *Valid = B.CreateICmpULT(HiAdd, c32(2045u << 20));
+    Bits = B.CreateOr(Bits, B.CreateAnd(Big, c64(F64.signBit())));
+    // an exact cancellation: +0; two zeros: -0 where both are -0
+    Value *SZero = B.CreateICmpEQ(S, c64(0));
+    Value *BigZero = isZero(Big, F64);
+    Bits = select(SZero, c64(0), Bits);
+    Bits = select(BigZero, B.CreateAnd(B.CreateAnd(Big, Small), c64(F64.signBit())), Bits);
+    Valid = B.CreateOr(B.CreateOr(SZero, BigZero), Valid);
+    auto NormalField = [&](Value *F) {
+      return B.CreateICmpULT(B.CreateSub(F, c32(0x100000)), c32(0x7fe00000));
+    };
+    // (Big zero: both are)
+    Value *Ok = B.CreateAnd(B.CreateOr(NormalField(FB), BigZero),
+                            B.CreateOr(NormalField(FS), SmallZero));
+    return {Bits, B.CreateAnd(Valid, Ok)};
+  }
+
+  /// X * Y + Z rounded to nearest even where all three are normal or zero
+  /// and so is the result, and where the product and Z are two or more
+  /// places apart (their top bits) or one of them is zero, and whether they
+  /// are (L15-E659): the sum then needs at most three places of
+  /// normalization, not a count of leading zeros of 128 bits. The product
+  /// P = MX MY 2 (top bit at 105 or 106, bit 0 zero) and Z's significand at
+  /// its place u in P's units: where P is the bigger, Z shifted into P's 128
+  /// bits, the bits it loses ORed into its lowest (a round to odd at P's
+  /// zero bit 0: exact enough for any rounding two or more places up), the
+  /// sum's bits from 44 up with a sticky bit for those below; where Z is the
+  /// bigger, P's likewise, shifted under Z's significand 10 places up, also
+  /// with a sticky bit. Either has its top bit at 60 to 63.
+  std::pair<Value *, Value *> fmaFar(Value *X, Value *Y, Value *Z) {
+    auto Field = [&](Value *V) {
+      return B.CreateTrunc(B.CreateAnd(B.CreateLShr(V, 52), c64(F64.expAll())), I32);
+    };
+    Value *EX = Field(X), *EY = Field(Y), *EZ = Field(Z);
+    // (the implicit bit only with a nonzero exponent: a zero's significand
+    // is 0; denormals take another path)
+    auto Sig = [&](Value *V, Value *E, unsigned Up) {
+      Value *M = B.CreateOr(B.CreateAnd(V, c64(F64.fracMask())),
+                            B.CreateShl(B.CreateZExt(B.CreateICmpNE(E, c32(0)), I64), 52));
+      return B.CreateShl(M, Up);
+    };
+    Value *PZero = B.CreateOr(B.CreateICmpEQ(EX, c32(0)), B.CreateICmpEQ(EY, c32(0)));
+    Value *ZZero = B.CreateICmpEQ(EZ, c32(0));
+    Value *P = mulWide53x(Sig(X, EX, 0), Sig(Y, EY, 1));
+    // (P's top 64 bits but 2, with a sticky bit for the 44 below)
+    auto Top64 = [&](Value *V) {
+      Value *H = B.CreateTrunc(B.CreateLShr(V, 44), I64);
+      return std::make_pair(H, B.CreateICmpNE(
+          B.CreateAnd(B.CreateTrunc(V, I64), c64((uint64_t(1) << 44) - 1)), c64(0)));
+    };
+    // Z's lowest bit in P's units: P's is 2^(EX + EY - 2151), Z's
+    // 2^(EZ - 1075)
+    Value *U = B.CreateAdd(B.CreateSub(EZ, B.CreateAdd(EX, EY)), c32(1076));
+    // P the bigger: Z's top bit (u + 52) at most 103 (P's at 105 or 106);
+    // Z the bigger: at least 108
+    Value *PBig = B.CreateAnd(B.CreateNot(PZero),
+                              B.CreateOr(ZZero, B.CreateICmpSLE(U, c32(51))));
+    Value *Apart = B.CreateOr(B.CreateOr(PZero, ZZero),
+                              B.CreateOr(B.CreateICmpSLE(U, c32(51)),
+                                         B.CreateICmpSGE(U, c32(56))));
+    Value *SignP = B.CreateICmpSLT(B.CreateXor(X, Y), c64(0));
+    Value *SignZ = B.CreateICmpSLT(Z, c64(0));
+    Value *Same = B.CreateICmpEQ(SignP, SignZ);
+    // P the bigger: Z's significand 11 places up, as the high word of 128
+    // bits, R = 75 - u places down (R >= 24), with the bits it loses ORed
+    // into its lowest bit (a shift of more than 127 leaves a 1 there, the
+    // odd value next to Z's)
+    Value *MZ11 = Sig(Z, EZ, 11);
+    Value *R = B.CreateSub(c32(75), U);
+    Value *RC = umin(R, c32(127)); // (negative: another path's)
+    Value *Zs = B.CreateLShr(B.CreateShl(B.CreateZExt(MZ11, I128), 64),
+                             B.CreateZExt(RC, I128));
+    Zs = B.CreateOr(Zs, B.CreateZExt(lostBelow(MZ11, B.CreateSub(R, c32(64))), I128));
+    Value *S128 = addOrSub(Same, P, Zs);
+    auto [SH, SL] = Top64(S128);
+    // Z the bigger: Z's significand 10 places up, P's top (sticky) u - 54
+    // places down (at least 2)
+    Value *MZ10 = Sig(Z, EZ, 10);
+    auto [PT, PLow] = Top64(P);
+    Value *P64 = B.CreateOr(PT, B.CreateZExt(PLow, I64));
+    Value *Ps = lshrSticky(P64, B.CreateSub(U, c32(54)));
+    Value *S64 = addOrSub(Same, MZ10, Ps);
+    Value *Top = select(PBig, SH, S64);
+    Value *Jam = B.CreateAnd(PBig, SL);
+    // (the top bit at 60 to 63: in the high word)
+    Value *Lz = B.CreateAnd(
+        B.CreateBinaryIntrinsic(Intrinsic::ctlz,
+                                B.CreateTrunc(B.CreateLShr(Top, 32), I32),
+                                B.getFalse()),
+        c32(3));
+    Value *N = B.CreateOr(B.CreateShl(Top, B.CreateZExt(Lz, I64)),
+                          B.CreateZExt(Jam, I64));
+    // P 2^(EX + EY - 2151) as N 2^(E - 1086) with N P's bits from 44 up:
+    // E = EX + EY - 1021 - lz; Z 2^(EZ - 1075) with 10 places: E = EZ + 1 -
+    // lz
+    Value *E = B.CreateSub(
+        select(PBig, B.CreateSub(B.CreateAdd(EX, EY), c32(1021)),
+               B.CreateAdd(EZ, c32(1))),
+        Lz);
+    auto [Bits, Valid] = roundNormalRNE(N, E);
+    Bits = B.CreateOr(Bits, select(select(PBig, SignP, SignZ),
+                                   c64(F64.signBit()), c64(0)));
+    // both zero: -0 only for both negative
+    Value *BothZero = B.CreateAnd(PZero, ZZero);
+    Bits = select(BothZero,
+                  select(B.CreateAnd(SignP, SignZ), c64(F64.signBit()), c64(0)),
+                  Bits);
+    Valid = B.CreateAnd(B.CreateOr(Valid, BothZero), Apart);
+    Valid = B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X),
+                                           B.CreateAnd(isNormalOrZero(Y), isNormalOrZero(Z))));
+    return {Bits, Valid};
   }
 
   /// X * Y + Z rounded to nearest even where all three are normal and so is
@@ -489,7 +801,7 @@ public:
     };
     Value *PZero = B.CreateOr(isZero(X, F64), isZero(Y, F64));
     Value *ZZero = isZero(Z, F64);
-    Value *P = B.CreateMul(B.CreateZExt(Sig(X), I128), B.CreateZExt(Sig(Y), I128));
+    Value *P = mulWide53x(Sig(X), Sig(Y));
     Value *A = B.CreateShl(P, 20);
     Value *C = B.CreateShl(B.CreateZExt(Sig(Z), I128), 72);
     // exponents of the lowest bits of A and C
@@ -506,7 +818,7 @@ public:
     Value *SignP = B.CreateICmpSLT(B.CreateXor(X, Y), c64(0));
     Value *SignZ = B.CreateICmpSLT(Z, c64(0));
     Value *Same = B.CreateICmpEQ(SignP, SignZ);
-    Value *S = select(Same, B.CreateAdd(Big, Lo), B.CreateSub(Big, Lo));
+    Value *S = addOrSub(Same, Big, Lo);
     Value *Neg = B.CreateICmpSLT(S, cw(S, 0));
     S = select(Neg, B.CreateNeg(S), S);
     Value *Sign = B.CreateXor(select(Swap, SignZ, SignP), Neg);
@@ -686,7 +998,7 @@ public:
     // enough to round, without finding its length.
     Term TX = normalize53(unpack(X, F64)), TY = normalize53(unpack(Y, F64));
     Value *Sign = B.CreateXor(TX.Sign, TY.Sign);
-    Value *P = B.CreateMul(B.CreateZExt(TX.M, I128), B.CreateZExt(TY.M, I128));
+    Value *P = mulWide53x(TX.M, TY.M);
     Value *Low = B.CreateAnd(B.CreateTrunc(P, I64), c64((uint64_t(1) << 42) - 1));
     Value *M = B.CreateOr(B.CreateTrunc(B.CreateLShr(P, 42), I64),
                           B.CreateZExt(B.CreateICmpNE(Low, c64(0)), I64));
@@ -703,7 +1015,7 @@ public:
   Value *fma(Value *X, Value *Y, Value *Z, Fmt F = F64) {
     Term TX = unpack(X, F), TY = unpack(Y, F), TZ = unpack(Z, F);
     Term P{B.CreateXor(TX.Sign, TY.Sign),
-           B.CreateMul(B.CreateZExt(TX.M, I128), B.CreateZExt(TY.M, I128)),
+           mulWide53x(TX.M, TY.M),
            B.CreateAdd(TX.E, TY.E)};
     // round() takes the 128-bit sum as it is (no compress to 64 bits first)
     Term S = addTerms(P, widen(TZ));
@@ -745,6 +1057,65 @@ public:
     return B.CreateTrunc(Signed ? B.CreateAShr(X, S) : B.CreateLShr(X, S), I64);
   }
 
+  /// The high word of the product of 32-bit A and B.
+  Value *mulHi32(Value *A, Value *X) {
+    return B.CreateTrunc(
+        B.CreateLShr(B.CreateMul(B.CreateZExt(A, I64), B.CreateZExt(X, I64)), 32),
+        I32);
+  }
+  /// quotientSticky's result in two 28-bit digits (L15-E658), each from a
+  /// 32-bit product with a 32-bit reciprocal and with an exact remainder,
+  /// instead of a reciprocal to 2^-60 from 64-bit products. One Newton step
+  /// from Y0 (2^82 / Dv, below it by less than 2^-18 of it) gives Y1 below
+  /// 2^83 / Dv by less than 1.04 (2^-29.9 of it, under 2^31): its residual
+  /// E = 2^82 - Dv * Y0 < 2^64 is -(Dv * Y0) mod 2^64, and its high word is
+  /// at least the complement of that product's (only the high word is used,
+  /// and the step's truncations all go down). With N < 2 Dv the first digit
+  /// q1 = (N >> 22) * Y1 >> 35 is floor(N 2^26 / Dv) or one less (its error
+  /// at most 2^27 2^-29.9 + 1/16 below one unit), so R1 = N 2^26 - q1 Dv is
+  /// below 2 Dv; the second, q2 = (R1 >> 22) * Y1 >> 33, floor(R1 2^28 / Dv)
+  /// or one less (2^29 2^-29.9 + 1/4), R2 = R1 2^28 - q2 Dv below 2 Dv. The
+  /// remainders are below 2^55: exact modulo 2^64. Q = q1 2^28 + q2, plus
+  /// one where R2 >= Dv.
+  Value *quotientDigits(Value *N, Value *Dv) {
+    auto [Q1, Low, Inexact] = quotientDigitParts(N, Dv);
+    // (Q << 1) | inexact = q1 2^29 + (2 low + inexact): below 2^31
+    Value *L = B.CreateAdd(B.CreateShl(Low, 1), B.CreateZExt(Inexact, I32));
+    return B.CreateAdd(B.CreateShl(B.CreateZExt(Q1, I64), 29),
+                       B.CreateZExt(L, I64));
+  }
+  /// quotientDigits' Q = q1 2^28 + low (low = q2 + ge, below 2^30) and
+  /// whether the division is inexact.
+  std::tuple<Value *, Value *, Value *> quotientDigitParts(Value *N, Value *Dv) {
+    Value *Y0 = B.CreateTrunc(
+        estimate(Intrinsic::agx_rcp, B.CreateLShr(Dv, 29), 53), I32);
+    Value *DvLo = B.CreateTrunc(Dv, I32);
+    Value *DvHi = B.CreateTrunc(B.CreateLShr(Dv, 32), I32);
+    // the high word of Dv * Y0 (mod 2^64), complemented
+    Value *PHi = B.CreateAdd(mulHi32(Y0, DvLo), B.CreateMul(Y0, DvHi));
+    Value *Eh = B.CreateNot(PHi);
+    // Y1 = 2 Y0 + floor(Y0 * Eh / 2^49)
+    Value *Y1 = B.CreateAdd(B.CreateShl(Y0, 1),
+                            B.CreateLShr(mulHi32(Y0, Eh), 17));
+    auto Digit = [&](Value *R, unsigned Shift) {
+      return B.CreateLShr(mulHi32(B.CreateTrunc(B.CreateLShr(R, 22), I32), Y1),
+                          Shift);
+    };
+    auto Rest = [&](Value *R, unsigned Up, Value *Q) {
+      return B.CreateSub(B.CreateShl(R, Up),
+                         B.CreateMul(B.CreateZExt(Q, I64), Dv));
+    };
+    Value *Q1 = Digit(N, 3);
+    Value *R1 = Rest(N, 26, Q1);
+    Value *Q2 = Digit(R1, 1);
+    Value *R2 = Rest(R1, 28, Q2);
+    Value *Ge = B.CreateICmpUGE(R2, Dv);
+    // the remainder after the correction is zero where R2 is 0 or Dv
+    Value *Inexact = B.CreateAnd(B.CreateICmpNE(R2, c64(0)),
+                                 B.CreateICmpNE(R2, Dv));
+    return {Q1, B.CreateAdd(Q2, B.CreateZExt(Ge, I32)), Inexact};
+  }
+
   /// floor(N * 2^54 / Dv) for N and Dv with their top bits at 52 (N at 53
   /// where it is the smaller), doubled with a sticky bit for the remainder
   /// (56 bits). A reciprocal from below: Y0 ~ 2^82 / Dv to 2^-18, then two
@@ -752,6 +1123,8 @@ public:
   /// the error and stays below). Q is then at most 2 above (N * Z2) >> 61,
   /// and the exact remainder corrects it.
   Value *quotientSticky(Value *N, Value *Dv) {
+    if (AGXSoftF64DivDigits)
+      return quotientDigits(N, Dv);
     Value *Y0 = estimate(Intrinsic::agx_rcp, B.CreateLShr(Dv, 29), 53);
     Value *E0 = B.CreateNeg(B.CreateMul(Dv, Y0)); // 2^82 - Dv * Y0
     Value *Z = B.CreateAdd(B.CreateShl(Y0, 33), hi(mulWide(Y0, E0), 49));
@@ -786,6 +1159,39 @@ public:
     Value *MY = B.CreateOr(B.CreateAnd(Y, c64(F64.fracMask())), Implicit);
     Value *Less = B.CreateICmpULT(MX, MY);
     Value *N = select(Less, B.CreateShl(MX, 1), MX);
+    if (AGXSoftF64DivDirect && AGXSoftF64DivDigits && AGXSoftF64RangeFromExponent) {
+      // (L15-E665) the significand Q >> 2 = (q1 << 26) + (low >> 2) (q1
+      // 2^28 a multiple of 4), the guard bit low's bit 1 and the sticky bit
+      // its bit 0 or the remainder; the exponent as its field in the high
+      // word as in mulFastDirect: (E - 1) << 20 for E = EX - EY + 1023 -
+      // less, the fields' difference plus (1022 - less) << 20 (an E - 1 of
+      // -1023 to 3067, below 2045 << 20 only for 0 to 2044)
+      auto [Q1, Low, Inexact] = quotientDigitParts(N, MY);
+      Value *Sig = B.CreateAdd(B.CreateShl(B.CreateZExt(Q1, I64), 26),
+                               B.CreateZExt(B.CreateLShr(Low, 2), I64));
+      Value *Guard = B.CreateTrunc(B.CreateLShr(Low, 1), I1);
+      Value *Rest = B.CreateOr(B.CreateTrunc(Low, I1), Inexact);
+      Value *Inc = B.CreateAnd(Guard, B.CreateOr(Rest, B.CreateTrunc(Sig, I1)));
+      Sig = B.CreateAdd(Sig, B.CreateZExt(Inc, I64));
+      auto FieldUp = [&](Value *V) {
+        return B.CreateAnd(B.CreateTrunc(B.CreateLShr(V, 32), I32), c32(0x7ff00000));
+      };
+      Value *FX = FieldUp(X), *FY = FieldUp(Y);
+      Value *HiAdd = B.CreateAdd(B.CreateSub(FX, FY),
+                                 select(Less, c32(1021 << 20), c32(1022 << 20)));
+      Value *Bits = B.CreateAdd(Sig, B.CreateShl(B.CreateZExt(HiAdd, I64), 32));
+      Value *Valid = B.CreateICmpULT(HiAdd, c32(2045u << 20));
+      Value *SignBits = B.CreateAnd(B.CreateXor(X, Y), c64(F64.signBit()));
+      Bits = B.CreateOr(Bits, SignBits);
+      Value *XZero = isZero(X, F64);
+      Bits = select(XZero, SignBits, Bits);
+      Valid = B.CreateOr(Valid, XZero);
+      auto NormalField = [&](Value *F) {
+        return B.CreateICmpULT(B.CreateSub(F, c32(0x100000)), c32(0x7fe00000));
+      };
+      Value *Ok = B.CreateAnd(B.CreateOr(NormalField(FX), XZero), NormalField(FY));
+      return {Bits, B.CreateAnd(Valid, Ok)};
+    }
     Value *M = quotientSticky(N, MY);
     Value *EX = B.CreateTrunc(B.CreateAnd(B.CreateLShr(X, 52), c64(F64.expAll())), I32);
     Value *EY = B.CreateTrunc(B.CreateAnd(B.CreateLShr(Y, 52), c64(F64.expAll())), I32);
@@ -1278,11 +1684,13 @@ static Value *withSlowPath(Instruction &I, IRBuilder<> &B, Value *Fast,
   Instruction *ThenTerm = SplitBlockAndInsertIfThen(
       B.CreateNot(Valid), I.getIterator(), false,
       MDBuilder(I.getContext()).createUnlikelyBranchWeights());
+  BasicBlock *Head = ThenTerm->getParent()->getSinglePredecessor();
   IRBuilder<> SB(ThenTerm);
   SoftDouble Slow(SB, Rounding, CanonicalNaN);
   Value *SlowBits = Build(Slow);
+  // (the block that ends the general code: another split inside it, as
+  // fma's paths, leaves the branch back in a block of its own)
   BasicBlock *Then = ThenTerm->getParent();
-  BasicBlock *Head = Then->getSinglePredecessor();
   B.SetInsertPoint(I.getParent(), I.getParent()->begin());
   PHINode *Phi = B.CreatePHI(Fast->getType(), 2);
   Phi->addIncoming(Fast, Head);
@@ -1567,10 +1975,27 @@ Value *AGX::lowerDoubleArithmetic(Instruction &I, Value *Rounding,
         R = Dbl(SD.fma(X, Y, Z));
         break;
       }
-      auto [Fast, Valid] = SD.fmaFast(X, Y, Z);
-      R = Dbl(withSlowPath(I, B, Fast, Valid, [&](SoftDouble &Slow) {
-        return Slow.fma(X, Y, Z);
-      }, Rounding, CanonicalNaN));
+      auto Near = [&](SoftDouble &Mid) {
+        auto [Fast, Valid] = Mid.fmaFast(X, Y, Z);
+        Instruction *At = Mid.insertPoint();
+        IRBuilder<> MB(At);
+        return withSlowPath(*At, MB, Fast, Valid, [&](SoftDouble &Slow) {
+          return Slow.fma(X, Y, Z);
+        }, Rounding, CanonicalNaN);
+      };
+      // Only for a constant addend (a polynomial's coefficient, which a
+      // product rarely comes close to): an accumulator, s = fma(x, y, s),
+      // is often as large as the product, and a SIMD group with a lane
+      // there would run both paths (cuda_ddot: +48%).
+      if (!AGXSoftF64FmaFar ||
+          !(AGXSoftF64FmaFarAny || isa<ConstantFP>(I.getOperand(2)))) {
+        R = Dbl(Near(SD));
+        break;
+      }
+      // (operands close together: the short path that normalizes 128 bits,
+      // in a conditional block of its own)
+      auto [Far, FarValid] = SD.fmaFar(X, Y, Z);
+      R = Dbl(withSlowPath(I, B, Far, FarValid, Near, Rounding, CanonicalNaN));
       break;
     }
     case Intrinsic::sqrt: {

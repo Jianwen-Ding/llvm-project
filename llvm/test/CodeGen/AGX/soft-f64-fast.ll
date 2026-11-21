@@ -10,7 +10,7 @@
 ; CHECK-LABEL: @mul(
 ; The product's top bit is at bit 104 or 105: a select of one shift, no
 ; count of leading zeros before the branch.
-; CHECK: mul i128
+; CHECK: mul i64
 ; CHECK-NOT: ctlz
 ; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
 ; CHECK: [[SLOW]]:
@@ -37,7 +37,7 @@ define agx_kernel void @add(ptr addrspace(1) %out, double %a, double %b) {
 ; One 128-bit alignment (of the operand with the lower exponent) and one
 ; normalization.
 ; CHECK-LABEL: @fma(
-; CHECK: mul i128
+; CHECK: mul i64
 ; CHECK: call i128 @llvm.ctlz.i128
 ; CHECK-NOT: call i128 @llvm.ctlz.i128
 ; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[JOIN:[^,]*]], !prof
@@ -45,6 +45,28 @@ define agx_kernel void @add(ptr addrspace(1) %out, double %a, double %b) {
 ; CHECK-NEXT: phi i64
 define agx_kernel void @fma(ptr addrspace(1) %out, double %a, double %b, double %c) {
   %r = call double @llvm.fma.f64(double %a, double %b, double %c)
+  store double %r, ptr addrspace(1) %out
+  ret void
+}
+
+; A constant addend (a polynomial's coefficient): the product and it two or
+; more places apart first, with at most three places of normalization
+; (L15-E659); then, in a block of its own, the path above; the general code
+; in another.
+; CHECK-LABEL: @fma_coefficient(
+; CHECK: mul i64
+; CHECK-NOT: call i128 @llvm.ctlz.i128
+; CHECK: br i1 %{{.*}}, label %[[NEAR:[^,]*]], label %[[JOIN:[^,]*]], !prof
+; CHECK: [[NEAR]]:
+; CHECK: call i128 @llvm.ctlz.i128
+; CHECK-NOT: call i128 @llvm.ctlz.i128
+; CHECK: br i1 %{{.*}}, label %[[SLOW:[^,]*]], label %[[NJOIN:[^,]*]], !prof
+; CHECK: [[NJOIN]]:
+; CHECK-NEXT: phi i64
+; CHECK: [[JOIN]]:
+; CHECK-NEXT: phi i64
+define agx_kernel void @fma_coefficient(ptr addrspace(1) %out, double %a, double %b) {
+  %r = call double @llvm.fma.f64(double %a, double %b, double 0x3FC5555555555555)
   store double %r, ptr addrspace(1) %out
   ret void
 }

@@ -58,7 +58,7 @@ define agx_kernel void @bf16_add(ptr addrspace(1) %o, bfloat %a, bfloat %b) {
 
 ; STRICT-LABEL: @bf16_fma(
 ; STRICT-NOT: @llvm.fma
-; STRICT: mul i128
+; STRICT: mul i64
 define agx_kernel void @bf16_fma(ptr addrspace(1) %o, bfloat %a, bfloat %b, bfloat %c) {
   %s = call bfloat @llvm.fma.bf16(bfloat %a, bfloat %b, bfloat %c)
   store bfloat %s, ptr addrspace(1) %o

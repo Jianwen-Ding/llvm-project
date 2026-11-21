@@ -139,6 +139,13 @@ def SDT_AGXMulWide : SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i32>,
                                           SDTCisVT<2, i32>]>;
 def AGXmul_wide_u : SDNode<"AGXISD::MUL_WIDE_U", SDT_AGXMulWide, [SDNPCommutative]>;
 def AGXmul_wide_s : SDNode<"AGXISD::MUL_WIDE_S", SDT_AGXMulWide, [SDNPCommutative]>;
+// A 64-bit value plus or minus one whose low word is zero, given as its
+// high word: the high words added (the low word is the first's, no carry),
+// one 32-bit iadd instead of the 64-bit one (L15-E660).
+def SDT_AGXAddHi : SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i64>,
+                                        SDTCisVT<2, i32>]>;
+def AGXadd_hi : SDNode<"AGXISD::ADD_HI", SDT_AGXAddHi>;
+def AGXsub_hi : SDNode<"AGXISD::SUB_HI", SDT_AGXAddHi>;
 
 // Shifts with the hardware's 7-bit amount (0 to 127; bits shifted past the
 // register are gone), for 64-bit shifts by a variable amount: bfi a, b, s
