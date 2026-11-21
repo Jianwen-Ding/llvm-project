@@ -705,6 +705,10 @@ static cl::opt<bool> AGXSignedCounterIndices(
 static cl::opt<bool> AGXIntegerAddressCounters(
     "agx-integer-address-counters", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter also for i64 addresses (inttoptr users)"));
+static cl::opt<bool> AGXDoubleWordCounters(
+    "agx-double-word-counters", cl::init(true), cl::Hidden,
+    cl::desc("pointerFromCounter also for accesses of 64-bit elements (i64, "
+             "double)"));
 static cl::opt<bool> AGXRelativeCounters(
     "agx-relative-counters", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter with the counter less its start, where the "
@@ -751,7 +755,8 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
   if (Sp->isNegative() || Sp->isZero())
     return false;
   // the accesses: P itself (through an inttoptr for an i64), of 32-bit
-  // elements
+  // elements, or 64-bit ones (two words each: the index register counts
+  // the words, L15-E680)
   auto Access = [&](User *U, Value *Ptr) {
     Type *T = nullptr;
     if (auto *Ld = dyn_cast<LoadInst>(U))
@@ -759,7 +764,9 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     else if (auto *St = dyn_cast<StoreInst>(U))
       T = St->getPointerOperand() == Ptr ? St->getValueOperand()->getType()
                                          : nullptr;
-    return T && T->getScalarSizeInBits() == 32 &&
+    return T &&
+           (T->getScalarSizeInBits() == 32 ||
+            (AGXDoubleWordCounters && T->getScalarSizeInBits() == 64)) &&
            L.contains(cast<Instruction>(U));
   };
   // For an i64: each pointer an access takes, inttoptr(P) or a constant

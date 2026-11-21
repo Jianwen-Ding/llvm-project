@@ -307,6 +307,14 @@ bool AGXWordCounterVersioning::runOnFunction(Function &F) {
       }
     }
     const SCEV *BTC = SE.getSymbolicMaxBackedgeTakenCount(L);
+    // (a count with a runtime division: 64 bits have no division to call,
+    // a grid-stride loop's count, L15-E679)
+    if (!isa<SCEVCouldNotCompute>(BTC) &&
+        SCEVExprContains(BTC, [](const SCEV *X) {
+          auto *D = dyn_cast<SCEVUDivExpr>(X);
+          return D && !isa<SCEVConstant>(D->getRHS());
+        }))
+      BTC = SE.getCouldNotCompute();
     // Without a count: a latch that continues while an i32 counter's next
     // value c + s is below an invariant n (slt or ult), s and n invariant.
     PHINode *Ctr = nullptr;
