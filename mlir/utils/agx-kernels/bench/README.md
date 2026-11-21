@@ -108,6 +108,10 @@ the kernel's, as memory at VA).
 | `q_f16_i8_dyn` | half rows quantized to int8, a runtime length (512 here), a thread per row |
 | `iadd_i32_dyn` | int32 rows plus a constant, a runtime length (512 here), a thread per row |
 | `split_dyn` | sums and differences of two rows into two outputs, a runtime length (512 here), a thread per row |
+| `axpy_c64` | y = 2x + z over rows of 64, a thread per row |
+| `axpy_c32` | y = 2x + z over rows of 32, a thread per row |
+| `copy_c64` | y = 2x over rows of 64, a thread per row |
+| `hscale_c64` | half rows of 64 halved, a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 

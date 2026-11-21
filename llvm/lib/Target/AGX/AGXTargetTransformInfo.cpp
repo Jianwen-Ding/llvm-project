@@ -245,6 +245,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeOwnRows(
     cl::desc("-agx-device-unroll-runtime-stores twice for a row of words "
              "whose device loads are all the thread's own"));
 
+static cl::opt<bool> AGXDeviceUnrollFullStoreRows(
+    "agx-device-unroll-full-store-rows", cl::init(true), cl::Hidden,
+    cl::desc("Leave a row loop that stores, of affine loads no other loop "
+             "reads, out of -agx-device-unroll-full-trips"));
+
 static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
     "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
@@ -681,16 +686,51 @@ void AGXTTIImpl::getUnrollingPreferences(
     // (and not past -agx-device-unroll-full-max-size instructions whole:
     // a thread's 64-float row softmax, 64 trips, took 2521 machine
     // instructions, L15-E551)
+    // (nor a row loop that stores, its loads affine and of objects no other
+    // loop of the function loads: whole, alias versioning's loop copy is
+    // lost and each load waits on the stores before it, axpy_c64 112.2
+    // against 80.2 at 4; a gather's loads, which no copy frees, and a
+    // softmax's passes over one row keep it, L15-E611)
+    auto LoneStoreRow = [&]() {
+      if (!AGXDeviceUnrollFullStoreRows)
+        return false;
+      bool Stores = false;
+      SmallPtrSet<const Value *, 4> Objects;
+      for (const Instruction &I : *L->getHeader()) {
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+          Stores |= SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+          continue;
+        if (!isa<SCEVAddRecExpr>(SE.getSCEV(const_cast<Value *>(LI->getPointerOperand()))))
+          return false; // a gather
+        Objects.insert(getUnderlyingObject(LI->getPointerOperand()));
+      }
+      if (!Stores)
+        return false;
+      for (const BasicBlock &BB : *L->getHeader()->getParent())
+        if (!L->contains(&BB))
+          for (const Instruction &I : BB)
+            if (auto *LI = dyn_cast<LoadInst>(&I))
+              if (Objects.contains(getUnderlyingObject(LI->getPointerOperand())))
+                return false;
+      return true;
+    };
+    bool StoreRow = DeviceLoads && Trips && F >= 2 && F < Trips &&
+                    LoneStoreRow();
     if (!MinMax && !NumMinMax && DeviceLoads && Trips &&
         Trips <= AGXDeviceUnrollFullTrips && F >= 2 && F < Trips &&
-        uint64_t(Trips) * L->getHeader()->size() <= AGXDeviceUnrollFullMaxSize)
+        uint64_t(Trips) * L->getHeader()->size() <= AGXDeviceUnrollFullMaxSize &&
+        !StoreRow)
       F = Trips;
 
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
       UP.Partial = true;
       UP.MaxCount = F;
       UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
-      if (MinMax)
+      // (nor LoopUnroll's own whole unrolling of such a row: axpy_c32's 32
+      // trips 60.6 against 56.2 at 16)
+      if (MinMax || StoreRow)
         UP.FullUnrollMaxCount = F;
     }
     // A runtime trip count: a loop of light work per load and no stores

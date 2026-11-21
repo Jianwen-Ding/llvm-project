@@ -1,6 +1,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-full-trips=0 -S < %s | FileCheck %s --check-prefix=OFF
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-full-max-size=100 -S < %s | FileCheck %s --check-prefix=OFF
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-full-store-rows=0 -S < %s | FileCheck %s --check-prefix=WHOLE
 
 ; A device-load loop of at most 64 trips (32 until L15-E551) is unrolled whole
 ; (L15-E545): a row pass of a SIMD-group's lane (32 trips, a 128-byte stride)
@@ -70,3 +71,29 @@ declare float @llvm.exp.f32(float)
 declare float @llvm.exp2.f32(float)
 declare float @llvm.maxnum.f32(float, float)
 declare float @llvm.fma.f32(float, float, float)
+
+; A row loop that stores, of affine loads no other loop reads, stays a loop
+; at its factor (L15-E611): whole, alias versioning would have no loop copy
+; to free its loads (axpy_c64 112.2 against 83.4).
+; CHECK-LABEL: @lone_row(
+; CHECK: br i1
+; WHOLE-LABEL: @lone_row(
+; WHOLE-NOT: br i1
+; WHOLE: ret void
+define void @lone_row(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %row) {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %k = add i64 %row, %i
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %k
+  %v = load float, ptr addrspace(1) %px, align 4
+  %o = fmul float %v, 2.0
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %k
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, 64
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
