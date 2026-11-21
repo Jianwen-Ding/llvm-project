@@ -85,6 +85,16 @@ static cl::opt<unsigned> AGXWordIndicesOffsets(
     "agx-loop-word-indices-offsets", cl::init(1), cl::Hidden,
     cl::desc("Most further offsets (an add each) for each base"));
 
+static cl::opt<unsigned> AGXWordIndicesLightOffsets(
+    "agx-loop-word-indices-light-offsets", cl::init(3), cl::Hidden,
+    cl::desc("agx-loop-word-indices-offsets where the loop does little "
+             "arithmetic an access"));
+
+static cl::opt<unsigned> AGXWordIndicesLightWork(
+    "agx-loop-word-indices-light-work", cl::init(16), cl::Hidden,
+    cl::desc("agx-loop-word-indices-light-offsets: the most arithmetic "
+             "instructions (vector elements) an access"));
+
 namespace {
 
 class AGXWordIndices : public FunctionPass {
@@ -524,7 +534,26 @@ bool AGXWordIndices::runOnFunction(Function &F) {
     // (an add for each further offset, against a 64-bit add for each base:
     // a run of 16 loads from one base kept its immediates, nested2d's
     // fifteen adds between them doubled its cycles)
-    Words &= Offsets.size() <= AGXWordIndicesOffsets * MinOff.size();
+    // (or up to AGXWordIndicesLightOffsets each where the loop does little
+    // arithmetic an access: copies, gathers, bit operations, whose 64-bit
+    // adds on the shared unit bound them, not an exponential's floats,
+    // whose register reads the further indices would add to: E729)
+    unsigned Light = 0;
+    if (AGXWordIndicesLightOffsets > AGXWordIndicesOffsets) {
+      unsigned Work = 0;
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (!isa<PHINode>(I) && !isa<GetElementPtrInst>(I) &&
+              !isa<CastInst>(I) && !isa<LoadInst>(I) && !isa<StoreInst>(I) &&
+              !I.isTerminator() && !isa<CmpInst>(I))
+            Work += I.getType()->isVectorTy()
+                        ? cast<FixedVectorType>(I.getType())->getNumElements()
+                        : 1;
+      if (Work <= AGXWordIndicesLightWork * G.Accesses.size())
+        Light = AGXWordIndicesLightOffsets;
+    }
+    Words &= Offsets.size() <=
+             std::max<unsigned>(AGXWordIndicesOffsets, Light) * MinOff.size();
     if (!Words)
       continue;
     IRBuilder<> B(Pre->getTerminator());

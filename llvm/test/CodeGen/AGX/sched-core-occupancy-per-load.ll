@@ -1,5 +1,5 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-core-occupancy-per-load=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-loop-word-indices-light-offsets=1 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-loop-word-indices-light-offsets=1 -agx-sched-core-occupancy-per-load=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; MLIR's bswap_rows (a byte swap of each word of a row, the loop unrolled
 ; with four 16-byte loads): the machine scheduler hoists the loads ahead of
@@ -7,7 +7,8 @@
 ; threadgroup but cuts the SIMD-groups resident on a core 82 -> 36. With 91
 ; instructions for its 4 loads (16 or more each), the region keeps its
 ; original order, the resident groups hiding the loads' latency: tput -8.8%
-; (L15-E681).
+; (L15-E681). (One further word offset a base, as then: with E729's three
+; the loop's addresses take no 64-bit adds, 16 registers, 44 without E681.)
 
 ; CHECK: general purpose registers: 30 x 32-bit
 ; OFF: general purpose registers: 43 x 32-bit
