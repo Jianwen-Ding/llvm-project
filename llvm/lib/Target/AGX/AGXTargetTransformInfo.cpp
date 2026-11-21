@@ -850,8 +850,20 @@ void AGXTTIImpl::getUnrollingPreferences(
         // col_scale_dyn 533.5 -> 496.7, col_axpy_dyn 662.8 -> 602.4,
         // col_relu_dyn 602.1 -> 547.4, L15-E602)
         bool Column = AGXDeviceUnrollRuntimeColumnStores && Far;
+        // (a column's running maximum, no store and every load a column's,
+        // as E603's column sums: col_max_dyn 262.6 -> 245.6, L15-E604)
+        unsigned Loads = count_if(*L->getHeader(), [](const Instruction &I) {
+          auto *LI = dyn_cast<LoadInst>(&I);
+          return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+        });
+        bool ColumnOnly = Column && AGXDeviceUnrollRuntimeColumnsOnly &&
+                          Far == Loads &&
+                          none_of(*L->getHeader(), [](const Instruction &I) {
+                            return isa<StoreInst>(I);
+                          });
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
-            AGXDeviceUnrollRuntimeStores * (NarrowRow ? 4 : Column ? 2 : 1);
+            AGXDeviceUnrollRuntimeStores *
+            (NarrowRow || ColumnOnly ? 4 : Column ? 2 : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       // A thread's own row of a runtime length (a row sum): its loads start

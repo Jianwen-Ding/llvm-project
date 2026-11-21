@@ -70,6 +70,37 @@ exit:
   ret void
 }
 
+; A column's running maximum likewise 16 times (L15-E604).
+; CHECK-LABEL: @colmax(
+; CHECK-COUNT-16: call float @llvm.maxnum.f32
+; CHECK-NOT: call float @llvm.maxnum.f32
+; CHECK: epil
+; EIGHT-LABEL: @colmax(
+; EIGHT-COUNT-8: call float @llvm.maxnum.f32
+; EIGHT-NOT: call float @llvm.maxnum.f32
+; EIGHT: epil
+define void @colmax(ptr addrspace(1) %b, ptr addrspace(1) %c, i32 %n, i32 %col) {
+entry:
+  %e = icmp eq i32 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %k = phi i32 [ 0, %entry ], [ %k1, %loop ]
+  %acc = phi float [ 0.0, %entry ], [ %m, %loop ]
+  %kn = mul i32 %k, %n
+  %ib = add i32 %kn, %col
+  %zb = zext i32 %ib to i64
+  %pb = getelementptr inbounds float, ptr addrspace(1) %b, i64 %zb
+  %v = load float, ptr addrspace(1) %pb, align 4
+  %m = call float @llvm.maxnum.f32(float %acc, float %v)
+  %k1 = add nuw i32 %k, 1
+  %cnd = icmp ult i32 %k1, %n
+  br i1 %cnd, label %loop, label %exit
+exit:
+  %r = phi float [ 0.0, %entry ], [ %m, %loop ]
+  store float %r, ptr addrspace(1) %c, align 4
+  ret void
+}
+
 ; CHECK-LABEL: @taps(
 ; CHECK-COUNT-1: call float @llvm.fma.f32
 ; CHECK-NOT: call float @llvm.fma.f32
@@ -123,3 +154,4 @@ exit:
   store float %r, ptr addrspace(1) %y, align 4
   ret void
 }
+declare float @llvm.maxnum.f32(float, float)
