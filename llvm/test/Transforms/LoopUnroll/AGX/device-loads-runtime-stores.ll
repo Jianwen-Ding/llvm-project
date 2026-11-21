@@ -7,6 +7,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-math-stores=0 -S < %s | FileCheck %s --check-prefix=NOMATH
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-stores=0 -S < %s | FileCheck %s --check-prefix=FOUR
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-column-stores=0 -S < %s | FileCheck %s --check-prefix=COL4
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-own-rows=0 -S < %s | FileCheck %s --check-prefix=OWN4
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -34,6 +35,66 @@ loop:
   store float %o, ptr addrspace(1) %py, align 4
   %i1 = add nuw nsw i64 %i, 1
   %c = icmp ult i64 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+
+; A row of words whose loads are all the thread's own (its row at 512 t),
+; light work, 8 times (L15-E609); @scale's loads, which no thread position
+; addresses, keep 4.
+; CHECK-LABEL: @ownrow(
+; CHECK-COUNT-8: store float
+; CHECK-NOT: store float
+; CHECK: .epil
+; OWN4-LABEL: @ownrow(
+; OWN4-COUNT-4: store float
+; OWN4-NOT: store float
+; OWN4: .epil
+define void @ownrow(ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  %e = icmp eq i32 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %k = add i32 %row, %i
+  %z = zext i32 %k to i64
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %z
+  %v = load float, ptr addrspace(1) %px, align 4
+  %o = fmul float %v, 2.0
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z
+  store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i32 %i, 1
+  %c = icmp ult i32 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+
+; Bytes into halves (or halves into bytes) keep 4 (L15-E609).
+; CHECK-LABEL: @deq(
+; CHECK-COUNT-4: store half
+; CHECK-NOT: store half
+; CHECK: .epil
+define void @deq(ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  %e = icmp eq i32 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %k = add i32 %row, %i
+  %z = zext i32 %k to i64
+  %px = getelementptr inbounds i8, ptr addrspace(1) %x, i64 %z
+  %v = load i8, ptr addrspace(1) %px, align 1
+  %f = sitofp i8 %v to half
+  %py = getelementptr inbounds half, ptr addrspace(1) %y, i64 %z
+  store half %f, ptr addrspace(1) %py, align 2
+  %i1 = add nuw nsw i32 %i, 1
+  %c = icmp ult i32 %i1, %n
   br i1 %c, label %loop, label %exit
 exit:
   ret void

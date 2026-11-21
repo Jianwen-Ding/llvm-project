@@ -105,6 +105,9 @@ the kernel's, as memory at VA).
 | `col_sum2_dyn` | column sums down a runtime length (256 here), a thread per column (no known grid) |
 | `col_max_dyn` | column maxima (maxnum) down a runtime length (256 here), a thread per column |
 | `deq_i8_f16_dyn` | int8 rows dequantized to halves (x * s), a runtime length (512 here), a thread per row |
+| `q_f16_i8_dyn` | half rows quantized to int8, a runtime length (512 here), a thread per row |
+| `iadd_i32_dyn` | int32 rows plus a constant, a runtime length (512 here), a thread per row |
+| `split_dyn` | sums and differences of two rows into two outputs, a runtime length (512 here), a thread per row |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 

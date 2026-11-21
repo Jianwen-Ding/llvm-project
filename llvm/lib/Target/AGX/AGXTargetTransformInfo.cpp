@@ -240,6 +240,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeColumnsOnly(
     cl::desc("-agx-device-unroll-runtime-strided twice where every device "
              "load steps by a runtime stride"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeOwnRows(
+    "agx-device-unroll-runtime-own-rows", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores twice for a row of words "
+             "whose device loads are all the thread's own"));
+
 static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
     "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
@@ -839,8 +844,19 @@ void AGXTTIImpl::getUnrollingPreferences(
         // 410.2 -> 280.6, twice 456.8 / 309.1 / 312.1, 8 times worse
         // (505.6 / 427.2 / 474.9); a row of floats lost at 8,
         // row_scale_dyn 453.9 -> 611.5, L15-E599, E600)
+        // (a row of bytes and halves both, int8 into halves or halves into
+        // int8, best at 4: deq_i8_f16_dyn 836.4 against 899.5 at 16 and
+        // 855.2 at 8, q_f16_i8_dyn 834.0 against 898.2 / 972.2, L15-E609)
+        auto HasSize = [&](unsigned B) {
+          return any_of(*L->getHeader(), [&](const Instruction &I) {
+            return (isa<LoadInst>(I) || isa<StoreInst>(I)) &&
+                   DL.getTypeStoreSize(getLoadStoreType(&I)->getScalarType()) ==
+                       B;
+          });
+        };
+        bool BytesAndHalves = HasSize(1) && HasSize(2);
         bool NarrowRow =
-            AGXDeviceUnrollRuntimeNarrowStores &&
+            AGXDeviceUnrollRuntimeNarrowStores && !BytesAndHalves &&
             any_of(*L->getHeader(), [&](const Instruction &I) {
               return (isa<LoadInst>(I) || isa<StoreInst>(I)) &&
                      DL.getTypeStoreSize(
@@ -861,9 +877,63 @@ void AGXTTIImpl::getUnrollingPreferences(
                           none_of(*L->getHeader(), [](const Instruction &I) {
                             return isa<StoreInst>(I);
                           });
+        // (and twice for a row of words whose loads are all the thread's
+        // own: iadd_i32_dyn 408.6 -> 361.0, row_axpy_dyn 585.8 -> 541.7; a
+        // vector every lane reads beside it lost, row_scale_dyn 453.9 ->
+        // 611.5, L15-E609)
+        auto ThreadDependent = [](const Value *P) {
+          SmallPtrSet<const Value *, 32> Seen;
+          SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
+          while (!Work.empty()) {
+            auto [V, Depth] = Work.pop_back_val();
+            if (!Seen.insert(V).second)
+              continue;
+            if (auto *C = dyn_cast<CallBase>(V)) {
+              if (const Function *F = C->getCalledFunction();
+                  F && F->getName().starts_with("llvm.agx.thread."))
+                return true;
+              continue;
+            }
+            auto *I = dyn_cast<Instruction>(V);
+            if (!I || Depth >= 12)
+              continue;
+            for (const Value *Op : I->operands())
+              Work.push_back({Op, Depth + 1});
+          }
+          return false;
+        };
+        // (a loop that stores, of light work: a row's logarithms lost,
+        // log_dyn +1.9%, and a reduction of them, entropy_dyn +2.4%)
+        bool OwnRow =
+            AGXDeviceUnrollRuntimeOwnRows && !NarrowRow && !BytesAndHalves &&
+            !Column && Loads &&
+            any_of(*L->getHeader(),
+                   [](const Instruction &I) { return isa<StoreInst>(I); }) &&
+            all_of(*L->getHeader(), [&](const Instruction &I) {
+              if (I.getOpcode() == Instruction::FDiv)
+                return false;
+              if (auto *II = dyn_cast<IntrinsicInst>(&I))
+                switch (II->getIntrinsicID()) {
+                case Intrinsic::exp:
+                case Intrinsic::exp2:
+                case Intrinsic::log:
+                case Intrinsic::log2:
+                case Intrinsic::sin:
+                case Intrinsic::cos:
+                case Intrinsic::tanh:
+                case Intrinsic::sqrt:
+                  return false;
+                default:
+                  break;
+                }
+              auto *LI = dyn_cast<LoadInst>(&I);
+              return !LI ||
+                     LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
+                     ThreadDependent(LI->getPointerOperand());
+            });
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             AGXDeviceUnrollRuntimeStores *
-            (NarrowRow || ColumnOnly ? 4 : Column ? 2 : 1);
+            (NarrowRow || ColumnOnly ? 4 : Column || OwnRow ? 2 : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       // A thread's own row of a runtime length (a row sum): its loads start
