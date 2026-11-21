@@ -2571,8 +2571,10 @@ static void speculateGuardedLoads(gpu::GPUModuleOp m) {
     op.replaceAllUsesWith(results);
     op.erase();
     // A compare of a result used only in an and with the condition reads
-    // the then value: where the condition is false the and is (the scan's
-    // go = in && v <= t).
+    // the then value, the and a select on the condition: where it is false
+    // the result is false whatever the compare, also of a poison then value
+    // (a plain and would be poison; alive2's speculated-compare test) (the
+    // scan's go = in && v <= t).
     for (auto [res, t] : llvm::zip(results, thenValues)) {
       for (OpOperand &use : llvm::make_early_inc_range(res.getUses())) {
         Operation *cmp = use.getOwner();
@@ -2584,6 +2586,16 @@ static void speculateGuardedLoads(gpu::GPUModuleOp m) {
             }))
           continue;
         use.set(t);
+        for (Operation *u : llvm::make_early_inc_range(
+                 cmp->getResult(0).getUsers())) {
+          OpBuilder ab(u);
+          Value f = arith::ConstantIntOp::create(ab, u->getLoc(),
+                                                 ab.getI1Type(), 0);
+          Value sel = arith::SelectOp::create(ab, u->getLoc(), cond,
+                                              cmp->getResult(0), f);
+          u->getResult(0).replaceAllUsesWith(sel);
+          u->erase();
+        }
       }
       if (res.use_empty())
         res.getDefiningOp()->erase();

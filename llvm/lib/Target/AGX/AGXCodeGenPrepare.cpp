@@ -2317,6 +2317,10 @@ static bool branchConditionSelects(Function &F, LoopInfo &LI) {
     Value *A = C2->getOperand(0), *Bv = C2->getOperand(1);
     CmpInst::Predicate P = C2->getPredicate();
     IRBuilder<> B(Br);
+    // (b frozen: read twice, an undef b would be two values; alive2's
+    // branch-condition-selects tests)
+    if (!isGuaranteedNotToBeUndefOrPoison(Bv))
+      Bv = B.CreateFreeze(Bv);
     Value *S = Or ? B.CreateSelect(C1, Bv, A) : B.CreateSelect(C1, A, Bv);
     Br->setCondition(B.CreateICmp(P, S, Bv));
     BO->eraseFromParent();
@@ -2393,6 +2397,9 @@ bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
         // read by the select, before its increment)
         if (!L->isLoopInvariant(Bv))
           std::swap(A, Bv);
+        // (b frozen: read twice; alive2's merged-exit-select test)
+        if (!isGuaranteedNotToBeUndefOrPoison(Bv))
+          Bv = B.CreateFreeze(Bv);
         Exit = B.CreateICmpEQ(B.CreateSelect(E1, Bv, A), Bv);
         E1Copy = C1->clone();
       }
