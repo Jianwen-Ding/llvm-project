@@ -117,6 +117,15 @@ static cl::opt<bool> SinCosSharedOdd(
     cl::desc("cos's polynomial select by sin's odd quadrant, its operands "
              "swapped, not by (q + 1) & 1"));
 
+static cl::opt<bool> ExpCoreProduct(
+    "agx-exp-core-product", cl::init(true), cl::Hidden,
+    cl::desc("expf's r + r^2 p as fma(p r, r, r), two registers, not "
+             "fma(p, r r, r), three"));
+
+static cl::opt<bool> CosHorner(
+    "agx-cos-horner", cl::init(true), cl::Hidden,
+    cl::desc("cosf's 1 - z / 2 + z^2 p as fma(z, fma(z, p, -1/2), 1)"));
+
 static cl::opt<bool> TanQuotientSigns(
     "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
     cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
@@ -756,6 +765,10 @@ public:
   Value *expCore(Value *R) {
     Value *P = poly(R, {1.9875691500e-4, 1.3981999507e-3, 8.3334519073e-3,
                         4.1665795894e-2, 1.6666665459e-1, 5.0000001201e-1});
+    // (fma(p r, r, r) reads p r and r, a 1-cycle fma where p, r r and r
+    // took 2, L15-E704)
+    if (ExpCoreProduct)
+      return add(fma(mul(P, R), R, R), k(1.0));
     return add(fma(P, mul(R, R), R), k(1.0));
   }
 
@@ -1106,10 +1119,13 @@ public:
                                 -1.6666654611e-1}),
                        Z),
                    R, R);
-    Value *C = fma(mul(Z, Z),
-                   poly(Z, {2.443315711809948e-5, -1.388731625493765e-3,
-                            4.166664568298827e-2}),
-                   fma(k(-0.5), Z, k(1.0)));
+    // (fma(z, fma(z, p, -1/2), 1): two fmas of two registers and a
+    // constant, where z^2, 1 - z / 2 and their fma of three registers took
+    // four cycles; fewer results an ulp off, L15-E705)
+    Value *CP = poly(Z, {2.443315711809948e-5, -1.388731625493765e-3,
+                         4.166664568298827e-2});
+    Value *C = CosHorner ? fma(Z, fma(Z, CP, k(-0.5)), k(1.0))
+                         : fma(mul(Z, Z), CP, fma(k(-0.5), Z, k(1.0)));
     return {S, C};
   }
 
