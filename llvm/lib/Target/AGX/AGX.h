@@ -72,6 +72,11 @@ bool uniformConstantsEnabled();
 /// Whether x & (2^k - 1) is an and with the mask in a uniform where the
 /// constants are (-agx-low-mask-and-uniform), not a bfeil.
 bool lowMaskAndInUniforms();
+/// Whether a 16-bit field under the clear bits of a constant is one bfeil
+/// with that base (-agx-field-base-16).
+bool fieldBase16();
+/// Whether x & m under the clear bits of a constant is one bfeil as well.
+bool fieldBaseAnd();
 /// Whether x >> 31 (logical) is a compare-select of x < 0, not a bfeil
 /// (-agx-sign-bit-compares).
 bool signBitCompares();

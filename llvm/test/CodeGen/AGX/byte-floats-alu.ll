@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-byte-floats-alu=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-field-base-16=0 < %s | FileCheck %s --check-prefix=NOBASE
 
 ; A signed byte's float in a loop (L15-E533): its 16-bit lane xor 0x6480 is
 ; the half 1152 + s, less 1152 exactly s, which the fma reads as its 16-bit
@@ -64,12 +65,17 @@ define agx_kernel void @alone(ptr addrspace(1) %a, ptr addrspace(1) %o) {
 
 ; A value below 1024 by its known bits plus a constant (q4 weights' nibble
 ; less 8, L15-E534): the half U | 0x6400 is 1024 + U, less 1024 - K it is
-; U + K exactly.
+; U + K exactly. The high nibble's U | 0x6400 is one bfeil with 0x6400 as
+; its base (L15-E630).
 ; CHECK-LABEL: nibbles:
 ; CHECK-NOT: convert
-; CHECK: or {{r[0-9]+}}l, {{r[0-9]+}}l, {{r[0-9]+}}l
+; CHECK-DAG: bfeil {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, 4, mask 0xF
+; CHECK-DAG: or {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}, {{r[0-9]+[lh]}}
 ; CHECK: fadd16
 ; CHECK: device_store
+; NOBASE-LABEL: nibbles:
+; NOBASE: bfeil {{r[0-9]+[lh]}}, 0, {{r[0-9]+[lh]}}, 4
+; NOBASE: or
 define agx_kernel void @nibbles(ptr addrspace(1) %a, ptr addrspace(1) %w, ptr addrspace(1) %o) {
 entry:
   %i = call i32 @llvm.agx.thread.position.in.grid.x()

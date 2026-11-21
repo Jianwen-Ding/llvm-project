@@ -54,6 +54,19 @@ static cl::opt<bool> AGXLowMaskAndUniform(
 
 bool llvm::AGX::lowMaskAndInUniforms() { return AGXLowMaskAndUniform; }
 
+static cl::opt<bool> AGXFieldBase16Opt(
+    "agx-field-base-16", cl::init(true), cl::Hidden,
+    cl::desc("(x >> s) | c and ((x >> s) & m) | c of 16 bits, c clear in the "
+             "field's bits, as one bfeil with base c"));
+
+bool llvm::AGX::fieldBase16() { return AGXFieldBase16Opt; }
+
+static cl::opt<bool> AGXFieldBaseAndOpt(
+    "agx-field-base-and", cl::init(false), cl::Hidden,
+    cl::desc("-agx-field-base-16 for x & m too (no shift)"));
+
+bool llvm::AGX::fieldBaseAnd() { return AGXFieldBaseAndOpt; }
+
 static cl::opt<bool> AGXSignBitCompares(
     "agx-sign-bit-compares", cl::init(true), cl::Hidden,
     cl::desc("x >> 31 (logical) as icmpsel slt x, 0, 1, 0 (the ALU's), not "

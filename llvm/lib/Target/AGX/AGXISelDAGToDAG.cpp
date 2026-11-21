@@ -90,6 +90,7 @@ private:
   void Select(SDNode *N) override;
   bool trySelectShift64(SDNode *N);
   bool trySelectFieldInsert(SDNode *N);
+  bool trySelectFieldBase(SDNode *N);
 
   SDValue getI32Imm(uint64_t Imm, const SDLoc &DL) {
     return CurDAG->getTargetConstant(Imm, DL, MVT::i32);
@@ -300,6 +301,8 @@ void AGXDAGToDAGISel::Select(SDNode *N) {
   case ISD::OR:
     if (trySelectFieldInsert(N))
       return;
+    if (trySelectFieldBase(N))
+      return;
     break;
   default:
     break;
@@ -336,6 +339,59 @@ bool AGXDAGToDAGISel::trySelectFieldInsert(SDNode *N) {
                        AGX::BFI_I32, DL, MVT::i32,
                        {Zero, And.getOperand(0), Zero, getI32Imm(C >> Shift, DL),
                         Zero, getI32Imm(Shift, DL), getI32Imm(Width, DL)}));
+    return true;
+  }
+  return false;
+}
+
+/// A field of x, x >> s or (x >> s) & m (or x & m), in the bits a constant
+/// c leaves clear, f | c: one bfeil with c as its base, the field as wide as
+/// its known bits allow, instead of the extract and an or (a q4_0 block's
+/// nibble under the bits of 1024 as a half: L15-E630).
+bool AGXDAGToDAGISel::trySelectFieldBase(SDNode *N) {
+  EVT VT = N->getValueType(0);
+  if (!AGX::fieldBase16() || (VT != MVT::i16 && VT != MVT::i32))
+    return false;
+  unsigned Bits = VT.getSizeInBits();
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue F = N->getOperand(I);
+    auto *CN = dyn_cast<ConstantSDNode>(N->getOperand(1 - I));
+    if (!CN || !F.hasOneUse())
+      continue;
+    SDValue X = F;
+    bool Masked = false;
+    if (X.getOpcode() == ISD::AND) {
+      auto *M = dyn_cast<ConstantSDNode>(X.getOperand(1));
+      if (!M || !isMask_64(M->getZExtValue()))
+        continue;
+      Masked = true;
+      X = X.getOperand(0);
+    }
+    uint64_t Shift = 0;
+    if (X.getOpcode() == ISD::SRL) {
+      auto *SC = dyn_cast<ConstantSDNode>(X.getOperand(1));
+      if (!SC || SC->getZExtValue() == 0 || SC->getZExtValue() >= Bits ||
+          (Masked && !X.hasOneUse()))
+        continue;
+      Shift = SC->getZExtValue();
+      X = X.getOperand(0);
+    } else if (!Masked || !AGX::fieldBaseAnd()) {
+      continue;
+    }
+    KnownBits KB = CurDAG->computeKnownBits(F);
+    unsigned Width = Bits - KB.countMinLeadingZeros();
+    uint64_t C = CN->getZExtValue();
+    if (Width == 0 || Width + Shift > Bits ||
+        (C & maskTrailingOnes<uint64_t>(Width)))
+      continue;
+    SDLoc DL(N);
+    SDValue Zero = getI32Imm(0, DL);
+    unsigned Opc = VT == MVT::i16 ? AGX::BFEIL_I16 : AGX::BFEIL_I32;
+    ReplaceNode(N, CurDAG->getMachineNode(
+                       Opc, DL, VT,
+                       {Zero, CurDAG->getConstant(C, DL, VT), Zero, X, Zero,
+                        getI32Imm(Shift, DL),
+                        getI32Imm(Width == Bits ? 0 : Width, DL)}));
     return true;
   }
   return false;
