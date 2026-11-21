@@ -54,4 +54,38 @@ exit:
   ret void
 }
 
+; A block whose branch the edge decides but that also stores (a loop's
+; results, before the next loop's test): its edge stays, the store with it
+; (agx-loop-fuzz seed 20707).
+; CHECK-LABEL: @keep_stores(
+; CHECK:       br i1 %c, label %loop, label %mid
+; CHECK:       mid:
+; CHECK:       store i32 %r
+define agx_kernel void @keep_stores(ptr addrspace(1) %o, i32 %n, i32 %m) {
+entry:
+  %c = icmp sgt i32 %n, 0
+  br i1 %c, label %loop, label %mid
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %i1 = add i32 %i, 1
+  %lc = icmp slt i32 %i1, %n
+  br i1 %lc, label %loop, label %mid
+
+mid:
+  %r = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  store i32 %r, ptr addrspace(1) %o, align 4
+  %y = icmp sgt i32 %m, 0
+  %g = and i1 %c, %y
+  br i1 %g, label %next, label %exit
+
+next:
+  %q = getelementptr inbounds i32, ptr addrspace(1) %o, i32 1
+  store i32 1, ptr addrspace(1) %q, align 4
+  br label %exit
+
+exit:
+  ret void
+}
+
 declare i32 @llvm.agx.thread.position.in.grid.x()

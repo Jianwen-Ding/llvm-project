@@ -8597,7 +8597,9 @@ static cl::opt<bool> AGXThreadDecidedBranches(
 /// its header where j reaches n, and the load's block is the latch, without
 /// the merge that the guard's if and its phi took (L15-E685). Only where
 /// M's successor's phis take, from M, M's own phis or values from outside
-/// M (which then dominate P), and P is not already its predecessor.
+/// M (which then dominate P), P is not already its predecessor, and M has
+/// nothing the edge would skip: no side effects, its values read only in M
+/// or by its successors' phis from it.
 static bool threadDecidedBranches(Function &F) {
   if (!AGXThreadDecidedBranches)
     return false;
@@ -8615,6 +8617,24 @@ static bool threadDecidedBranches(Function &F) {
     // (not a loop's header: its preheader's edge stays)
     if (any_of(predecessors(&M),
                [&](BasicBlock *P) { return DT.dominates(&M, P); }))
+      continue;
+    // (nothing of M's that an edge past it would skip: no side effects, its
+    // values read only in M or by its successors' phis from it; a loop's
+    // exit block that stores the loop's results was bypassed, the stores
+    // lost: agx-loop-fuzz seed 20707)
+    if (any_of(M, [&](Instruction &I) {
+          if (I.isTerminator())
+            return false;
+          if (I.mayHaveSideEffects() || I.mayReadFromMemory())
+            return true;
+          return any_of(I.uses(), [&](Use &U) {
+            auto *UI = cast<Instruction>(U.getUser());
+            if (UI->getParent() == &M)
+              return false;
+            auto *PN = dyn_cast<PHINode>(UI);
+            return !PN || PN->getIncomingBlock(U) != &M;
+          });
+        }))
       continue;
     SmallVector<BasicBlock *, 4> Preds(predecessors(&M));
     for (BasicBlock *P : Preds) {
