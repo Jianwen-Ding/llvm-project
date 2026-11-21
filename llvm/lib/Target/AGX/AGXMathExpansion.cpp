@@ -39,6 +39,11 @@ static cl::opt<bool> ExpMagicRound(
     cl::desc("exp's n = round(x / ln 2) by adding and subtracting 1.5 2^23, "
              "its integer the sum's low bits (no rint or convert)"));
 
+static cl::opt<bool> LogAbsCore(
+    "agx-log-abs-core", cl::init(true), cl::Hidden,
+    cl::desc("log, log2 and log10's polynomial of |x| (what pow's is of): "
+             "the same value for every x it is not replaced for"));
+
 static cl::opt<bool> ExpNaNThroughScale(
     "agx-exp-nan-through-scale", cl::init(true), cl::Hidden,
     cl::desc("exp without the +inf select: no NaN select, the NaN's sum "
@@ -925,14 +930,17 @@ public:
     Value *Lo = add(add(Err, Err2), mul(L.E, k(-2.12194440e-4)));
     return {Hi, Lo};
   }
+  /// The x of log's polynomial: |x|, pow's, where both are of one value
+  /// (logSpecial replaces every result of a negative x or a NaN).
+  Value *logCoreArg(Value *X) { return LogAbsCore ? abs(X) : X; }
   Value *logPrecise(Value *X) {
-    auto [Hi, Lo] = logHiLo(X);
+    auto [Hi, Lo] = logHiLo(logCoreArg(X));
     return logSpecial(X, add(Hi, Lo));
   }
   /// log2 and log10: e log_b(2) + (f + y) log_b(e), each constant in a
   /// part with few bits and a correction (Cephes log10f).
   Value *logBase(Value *X, double EHi, double ELo, double L2Hi, double L2Lo) {
-    LogParts L = logParts(X);
+    LogParts L = logParts(logCoreArg(X));
     Value *R = mul(L.Y, k(ELo));
     R = fma(L.F, k(ELo), R);
     R = fma(L.Y, k(EHi), R);

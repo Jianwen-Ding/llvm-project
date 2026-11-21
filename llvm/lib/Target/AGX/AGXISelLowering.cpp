@@ -45,6 +45,11 @@
 
 using namespace llvm;
 
+static cl::opt<bool> FieldMaskAnyLow(
+    "agx-field-mask-any-low", cl::init(true), cl::Hidden,
+    cl::desc("(x & m) >> s as one bfeil for every m whose bits from s are "
+             "low bits, and also where the and has other users"));
+
 static cl::opt<bool> ExperimentalLeafCalls(
     "agx-experimental-leaf-calls", cl::Hidden, cl::init(false),
     cl::desc("Emit direct calls to argument-free void AGX leaf functions"));
@@ -221,7 +226,7 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
                        ISD::MULHS, ISD::ADD, ISD::FREEZE, ISD::SINT_TO_FP,
-                       ISD::UINT_TO_FP});
+                       ISD::UINT_TO_FP, ISD::BITCAST});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -2284,6 +2289,26 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   }
   case ISD::ADD:
     return performOffsetIndexCombine(N, DCI);
+  case ISD::BITCAST: {
+    // The bits of |x| that only integer ands and right shifts read (a log's
+    // exponent and mantissa of |x|): x's bits under a mask, which those fold
+    // into (no and of the sign bit: L15-E613). DAGCombiner leaves the fabs,
+    // a source modifier here.
+    SDValue A = N->getOperand(0);
+    if (!FieldMaskAnyLow || N->getValueType(0) != MVT::i32 ||
+        A.getOpcode() != ISD::FABS || A.getValueType() != MVT::f32 ||
+        N->use_empty() || !all_of(N->users(), [&](const SDNode *U) {
+          return (U->getOpcode() == ISD::AND || U->getOpcode() == ISD::SRL) &&
+                 U->getOperand(0).getNode() == N &&
+                 isa<ConstantSDNode>(U->getOperand(1));
+        }))
+      return SDValue();
+    SDLoc DL(N);
+    return DCI.DAG.getNode(
+        ISD::AND, DL, MVT::i32,
+        DCI.DAG.getNode(ISD::BITCAST, DL, MVT::i32, A.getOperand(0)),
+        DCI.DAG.getConstant(0x7fffffff, DL, MVT::i32));
+  }
   case ISD::SHL: {
     // (x ^ c) << s -> (x << s) ^ (c << s) for c << s an 8-bit immediate: the
     // shifted x is the one other indices use (tg[t] beside tg[t ^ 1]), so
@@ -2874,11 +2899,20 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     auto *M = A.getOpcode() == ISD::AND
                   ? dyn_cast<ConstantSDNode>(A.getOperand(1))
                   : nullptr;
-    if (!DCI.isAfterLegalizeDAG() || !S || !M || !A.hasOneUse())
+    if (!DCI.isAfterLegalizeDAG() || !S || !M)
       return SDValue();
     uint64_t Mask = M->getZExtValue(), Shift = S->getZExtValue();
-    if (!isShiftedMask_64(Mask) || llvm::countr_zero(Mask) != Shift)
+    // Any mask whose bits from s on are low bits, the bits below s shifted
+    // out either way ((bits & 0x7fffffff) >> 23 of a log's |x|): one bfeil
+    // for the shift that already is one, also where the and has other users
+    // (L15-E613).
+    if (FieldMaskAnyLow && Shift < 64 && isMask_64(Mask >> Shift)) {
+      if (!A.hasOneUse() && llvm::countr_zero(Mask) == Shift)
+        return SDValue();
+    } else if (!A.hasOneUse() || !isShiftedMask_64(Mask) ||
+               llvm::countr_zero(Mask) != Shift) {
       return SDValue();
+    }
     SDLoc DL(N);
     EVT VT = N->getValueType(0);
     SDValue Shifted = DCI.DAG.getNode(ISD::SRL, DL, VT, A.getOperand(0),
