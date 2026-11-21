@@ -41,6 +41,7 @@ add_llvm_target(AGXCodeGen
   AGXFrameLowering.cpp
   AGXHoistGuardedLoads.cpp
   AGXAliasVersioning.cpp
+  AGXWideIndexVersioning.cpp
   AGXAlignmentVersioning.cpp
   AGXNarrowInductions.cpp
   AGXWordIndices.cpp

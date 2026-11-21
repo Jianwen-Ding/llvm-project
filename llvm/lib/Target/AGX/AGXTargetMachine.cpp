@@ -81,6 +81,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXThreadgroupAddressesPass(PR);
   initializeAGXHoistGuardedLoadsPass(PR);
   initializeAGXAliasVersioningPass(PR);
+  initializeAGXWideIndexVersioningPass(PR);
   initializeAGXAlignmentVersioningPass(PR);
   initializeAGXNarrowInductionsPass(PR);
   initializeAGXWordIndicesPass(PR);
@@ -843,6 +844,10 @@ void AGXPassConfig::addIRPasses() {
     // Loops over buffers only known aligned to 1- or 2-byte elements: a
     // copy for 4-byte aligned bases, whose accesses the vectorizer merges.
     addPass(createAGXAlignmentVersioningPass());
+    // Loops with 64-bit products of a loop-invariant value scaled by a
+    // constant: a copy for a value that fits 32 bits scaled, whose products
+    // are 32 x 32-bit multiply-adds (L15-E670).
+    addPass(createAGXWideIndexVersioningPass());
     addPass(createAGXVectorAccessesPass(/*BeforeVectorizer=*/true));
     addPass(createLoadStoreVectorizerPass());
     addPass(createAGXVectorAccessesPass(/*BeforeVectorizer=*/false));
