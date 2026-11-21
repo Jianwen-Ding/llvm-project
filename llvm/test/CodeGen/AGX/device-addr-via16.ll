@@ -168,8 +168,8 @@ define agx_kernel void @h4(ptr addrspace(1) %p, ptr addrspace(1) %o, i32 %k) {
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    fadd16 r2l, r2l, r2h
 ; CHECK-NEXT:    fadd16 r2h, r3l, r3h
-; CHECK-NEXT:    fmul16 r2l, r2l, r2h
-; CHECK-NEXT:    device_store 0, i16, x, r2l, u2_u3, r1, signed
+; CHECK-NEXT:    fmul16 r3l, r2l, r2h
+; CHECK-NEXT:    device_store 0, i16, x, r3l, u2_u3, r1, signed
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
 ; CHECK-NEXT:    trap

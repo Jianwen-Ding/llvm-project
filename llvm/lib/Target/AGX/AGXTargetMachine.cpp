@@ -91,6 +91,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXFoldOperandsPass(PR);
   initializeAGXLoadLanesPass(PR);
   initializeAGXInvariantHalvesPassPass(PR);
+  initializeAGXPairedHalfBitopsPassPass(PR);
   initializeAGXUniformConstantsPassPass(PR);
   initializeAGXHoistFromElseFlowPass(PR);
   initializeAGXSinkRematPass(PR);
@@ -916,6 +917,9 @@ static cl::opt<bool> AGXSinkRematEnabled(
              "move of it, for fewer registers held"));
 
 void AGXPassConfig::addMachineSSAOptimization() {
+  // (before MachineLICM and MachineCSE, which hoist and share its constant:
+  // L15-E631)
+  addPass(createAGXPairedHalfBitopsPass());
   TargetPassConfig::addMachineSSAOptimization();
   addPass(createAGXUniformConstantsPass());
   addPass(createAGXFoldOperandsPass());

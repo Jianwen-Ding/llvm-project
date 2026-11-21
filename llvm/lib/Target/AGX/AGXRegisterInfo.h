@@ -26,6 +26,13 @@ public:
   const uint32_t *getCallPreservedMask(const MachineFunction &MF,
                                        CallingConv::ID CC) const override;
   BitVector getReservedRegs(const MachineFunction &MF) const override;
+  /// Not a 16-bit destination in the other half of a register one of its
+  /// instruction's sources is read from (-agx-cross-half-hints).
+  bool getRegAllocationHints(Register VirtReg, ArrayRef<MCPhysReg> Order,
+                             SmallSetVector<MCPhysReg, 16> &Hints,
+                             const MachineFunction &MF,
+                             const VirtRegMap *VRM,
+                             const LiveRegMatrix *Matrix) const override;
   /// The registers the scheduler tries to stay under (-agx-sched-target-gprs),
   /// as AMDGPU's scheduler aims for an occupancy: below what is allocatable,
   /// since the most registers held set how many threads fit on a core.

@@ -31,8 +31,8 @@ define agx_kernel void @exp_neg(ptr addrspace(1) %p, ptr addrspace(1) %q) {
 
 ; CHECK-LABEL: clamp:
 ; CHECK: fcmpsel gt, r1h, r1l, 4.0, r1h, r1l
-; CHECK-NEXT: fcmpsel lt, r1l, r1l, -4.0, r2l, r1h
-; CHECK-NEXT: fmul32 r1, r1l, u4
+; CHECK-NEXT: fcmpsel lt, r2l, r1l, -4.0, r2l, r1h
+; CHECK-NEXT: fmul32 r1, r2l, u4
 ; a clamp of an extended half to [-4, 4] read by a multiplication
 define agx_kernel void @clamp(ptr addrspace(1) %p, ptr addrspace(1) %q, float %s) {
   %h = load half, ptr addrspace(1) %p

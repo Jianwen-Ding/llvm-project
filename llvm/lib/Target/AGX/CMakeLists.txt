@@ -33,6 +33,7 @@ add_llvm_target(AGXCodeGen
   AGXLowerRecursion.cpp
   AGXFoldOperands.cpp
   AGXInvariantHalves.cpp
+  AGXPairedHalfBitops.cpp
   AGXLoadLanesLive.cpp
   AGXHoistFromElseFlow.cpp
   AGXSinkRemat.cpp

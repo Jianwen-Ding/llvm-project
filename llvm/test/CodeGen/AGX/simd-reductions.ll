@@ -604,17 +604,17 @@ define void @hadd_ascending_quad(ptr addrspace(1) %p) {
 ; CANON-NEXT:    fcmpsel eq, r2l, r2l, r2l, r2l, r2h
 ; CANON-NEXT:    quad_shuffle_xor r3l, r2l, 2
 ; CANON-NEXT:    fadd16 r2l, r2l, r3l
-; CANON-NEXT:    fcmpsel eq, r2l, r2l, r2l, r2l, r2h
-; CANON-NEXT:    simd_shuffle_xor r3l, r2l, 4
-; CANON-NEXT:    fadd16 r2l, r2l, r3l
-; CANON-NEXT:    fcmpsel eq, r2l, r2l, r2l, r2l, r2h
-; CANON-NEXT:    simd_shuffle_xor r3l, r2l, 8
-; CANON-NEXT:    fadd16 r2l, r2l, r3l
-; CANON-NEXT:    fcmpsel eq, r2l, r2l, r2l, r2l, r2h
-; CANON-NEXT:    simd_shuffle_xor r3l, r2l, 16
-; CANON-NEXT:    fadd16 r2l, r2l, r3l
-; CANON-NEXT:    fcmpsel eq, r2l, r2l, r2l, r2l, r2h
-; CANON-NEXT:    device_store 0, i16, x, r2l, u0_u1, r1, signed
+; CANON-NEXT:    fcmpsel eq, r3l, r2l, r2l, r2l, r2h
+; CANON-NEXT:    simd_shuffle_xor r2l, r3l, 4
+; CANON-NEXT:    fadd16 r2l, r3l, r2l
+; CANON-NEXT:    fcmpsel eq, r3l, r2l, r2l, r2l, r2h
+; CANON-NEXT:    simd_shuffle_xor r2l, r3l, 8
+; CANON-NEXT:    fadd16 r2l, r3l, r2l
+; CANON-NEXT:    fcmpsel eq, r3l, r2l, r2l, r2l, r2h
+; CANON-NEXT:    simd_shuffle_xor r2l, r3l, 16
+; CANON-NEXT:    fadd16 r2l, r3l, r2l
+; CANON-NEXT:    fcmpsel eq, r3l, r2l, r2l, r2l, r2h
+; CANON-NEXT:    device_store 0, i16, x, r3l, u0_u1, r1, signed
 ; CANON-NEXT:    stop
 ; CANON-NEXT:    trap
 ; CANON-NEXT:    trap
