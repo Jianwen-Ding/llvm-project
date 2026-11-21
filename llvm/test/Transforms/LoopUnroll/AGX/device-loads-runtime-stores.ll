@@ -38,10 +38,10 @@ exit:
   ret void
 }
 
-; Byte stores (int8 quantization, roundeven) likewise (L15-E567), 8 times
-; for a row of bytes (L15-E599).
+; Byte stores (int8 quantization, roundeven) likewise (L15-E567), 16 times
+; for a row of bytes (L15-E599, E600).
 ; CHECK-LABEL: @quant(
-; CHECK-COUNT-8: store i8
+; CHECK-COUNT-16: store i8
 ; CHECK-NOT: store i8
 ; CHECK: .epil
 ; FOUR-LABEL: @quant(

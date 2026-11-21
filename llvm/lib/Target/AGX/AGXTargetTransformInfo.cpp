@@ -228,8 +228,8 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeMathStores(
 
 static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowStores(
     "agx-device-unroll-runtime-narrow-stores", cl::init(true), cl::Hidden,
-    cl::desc("-agx-device-unroll-runtime-stores twice for a row of halves or "
-             "bytes"));
+    cl::desc("-agx-device-unroll-runtime-stores 4 times for a row of halves "
+             "or bytes"));
 
 static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
     "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
@@ -825,10 +825,11 @@ void AGXTTIImpl::getUnrollingPreferences(
                     AGXDeviceUnrollRuntimeDivStores);
           })) {
         UP.Partial = UP.Runtime = true;
-        // (twice for rows of halves or bytes, as E583's reductions: quant_dyn
-        // 534.0 -> 456.8, widen_dyn 345.6 -> 309.1, hscale_dyn 410.2 ->
-        // 312.1; a row of floats lost, row_scale_dyn 453.9 -> 611.5,
-        // L15-E599)
+        // (4 times that for rows of halves or bytes, as E583's reductions:
+        // quant_dyn 534.0 -> 414.1, widen_dyn 345.6 -> 285.8, hscale_dyn
+        // 410.2 -> 280.6, twice 456.8 / 309.1 / 312.1, 8 times worse
+        // (505.6 / 427.2 / 474.9); a row of floats lost at 8,
+        // row_scale_dyn 453.9 -> 611.5, L15-E599, E600)
         bool NarrowRow =
             AGXDeviceUnrollRuntimeNarrowStores &&
             any_of(*L->getHeader(), [&](const Instruction &I) {
@@ -837,7 +838,7 @@ void AGXTTIImpl::getUnrollingPreferences(
                          getLoadStoreType(&I)->getScalarType()) < 4;
             });
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
-            AGXDeviceUnrollRuntimeStores * (NarrowRow ? 2 : 1);
+            AGXDeviceUnrollRuntimeStores * (NarrowRow ? 4 : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       // A thread's own row of a runtime length (a row sum): its loads start
