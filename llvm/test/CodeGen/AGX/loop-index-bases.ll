@@ -1,10 +1,12 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-loop-index-bases=4 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-loop-index-bases=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=OFF
 
 ; An unrolled column walk, x[i + 512 k] for k = 0..4 at i = tid + 2048 j:
 ; each load took a 32-bit addition for its index. With the grid known
 ; (tid < 512) and the trip count bounded, i + 512 k cannot wrap, so the loads
-; share x + 4 i, the 512 k as immediate indices (L15-E250).
+; share x + 4 i, the 512 k as immediate indices (L15-E250). Since L15-E720
+; only from five offsets: these four keep their additions by default.
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 

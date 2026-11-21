@@ -1056,8 +1056,10 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
   return false;
 }
 
+/// (5: quant_dyn's four offsets each an index add as before, 30 -> 27
+/// GPRs, tput 418.7 -> 412.2; nothing else changed, L15-E720)
 static cl::opt<unsigned> LoopIndexBases(
-    "agx-loop-index-bases", cl::init(4), cl::Hidden,
+    "agx-loop-index-bases", cl::init(5), cl::Hidden,
     cl::desc("Device accesses of a loop's block at B[zext(X + C)] for this "
              "many distinct constants C != 0 or more share B + zext(X), the "
              "C as immediate indices (0: never)"));
