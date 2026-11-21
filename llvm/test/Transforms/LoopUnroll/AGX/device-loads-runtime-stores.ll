@@ -41,10 +41,10 @@ exit:
 }
 
 ; A row of words whose loads are all the thread's own (its row at 512 t),
-; light work, 8 times (L15-E609); @scale's loads, which no thread position
-; addresses, keep 4.
+; light work, 16 times (L15-E609, L15-E717); @scale's loads, which no thread
+; position addresses, keep 4.
 ; CHECK-LABEL: @ownrow(
-; CHECK-COUNT-8: store float
+; CHECK-COUNT-16: store float
 ; CHECK-NOT: store float
 ; CHECK: .epil
 ; OWN4-LABEL: @ownrow(
@@ -138,11 +138,12 @@ declare float @llvm.roundeven.f32(float)
 declare float @llvm.maximum.f32(float, float)
 declare float @llvm.minimum.f32(float, float)
 
-; A column of a runtime length (4096 bytes a step, far) likewise, 8 times
-; (L15-E602), its trip count independent of the thread (L15-E575); not a
-; grid-stride loop, whose trip count (n - gid) / 1024 is the thread's.
+; A column of a runtime length (4096 bytes a step, far) likewise, 16 times
+; (L15-E602, L15-E717), its trip count independent of the thread
+; (L15-E575); not a grid-stride loop, whose trip count (n - gid) / 1024 is
+; the thread's.
 ; CHECK-LABEL: @column(
-; CHECK-COUNT-8: store float
+; CHECK-COUNT-16: store float
 ; CHECK-NOT: store float
 ; CHECK: .epil
 ; COL4-LABEL: @column(

@@ -1,6 +1,6 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime=0 -S < %s | FileCheck %s --check-prefix=OFF
-; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns-only=0 -S < %s | FileCheck %s --check-prefix=EIGHT
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns-only=0 -agx-device-unroll-runtime-column-factor=2 -S < %s | FileCheck %s --check-prefix=EIGHT
 
 ; A device-load loop of a runtime trip count with light work and a load that
 ; does not step by its own size (a matrix product's column of B, n floats a

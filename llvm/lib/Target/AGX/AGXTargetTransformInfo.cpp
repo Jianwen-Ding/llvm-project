@@ -236,6 +236,16 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowStores(
     cl::desc("-agx-device-unroll-runtime-stores 4 times for a row of halves "
              "or bytes"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeColumnFactor(
+    "agx-device-unroll-runtime-column-factor", cl::init(4), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-stores' factor times this for a "
+             "column"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeOwnRowFactor(
+    "agx-device-unroll-runtime-own-row-factor", cl::init(4), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-stores' factor times this for a row "
+             "of words whose loads are all the thread's own"));
+
 static cl::opt<bool> AGXDeviceUnrollRuntimeColumnStores(
     "agx-device-unroll-runtime-column-stores", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-stores twice for a column"));
@@ -909,7 +919,8 @@ void AGXTTIImpl::getUnrollingPreferences(
             });
         // (and twice for a column, its accesses a row's pitch apart:
         // col_scale_dyn 533.5 -> 496.7, col_axpy_dyn 662.8 -> 602.4,
-        // col_relu_dyn 602.1 -> 547.4, L15-E602)
+        // col_relu_dyn 602.1 -> 547.4, L15-E602; 4 times since: 473.6,
+        // 573.3, 519.7, L15-E717)
         bool Column = AGXDeviceUnrollRuntimeColumnStores && Far;
         // (a column's running maximum, no store and every load a column's,
         // as E603's column sums: col_max_dyn 262.6 -> 245.6, L15-E604)
@@ -925,7 +936,8 @@ void AGXTTIImpl::getUnrollingPreferences(
         // (and twice for a row of words whose loads are all the thread's
         // own: iadd_i32_dyn 408.6 -> 361.0, row_axpy_dyn 585.8 -> 541.7; a
         // vector every lane reads beside it lost, row_scale_dyn 453.9 ->
-        // 611.5, L15-E609)
+        // 611.5, L15-E609; 4 times since: iadd_i32_dyn 333.7 -> 318.1,
+        // inplace_dyn 317.3 -> 300.2, L15-E717)
         auto ThreadDependent = [](const Value *P) {
           SmallPtrSet<const Value *, 32> Seen;
           SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
@@ -981,7 +993,10 @@ void AGXTTIImpl::getUnrollingPreferences(
             });
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             AGXDeviceUnrollRuntimeStores *
-            (NarrowRow || ColumnOnly ? 4 : Column || OwnRow ? 2 : 1);
+            (NarrowRow || ColumnOnly ? 4
+             : Column               ? AGXDeviceUnrollRuntimeColumnFactor
+             : OwnRow               ? AGXDeviceUnrollRuntimeOwnRowFactor
+                                    : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }
       // A thread's own row of a runtime length (a row sum): its loads start
