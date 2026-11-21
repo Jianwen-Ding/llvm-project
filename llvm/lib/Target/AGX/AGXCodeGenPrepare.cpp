@@ -9659,6 +9659,11 @@ static cl::opt<bool> AGXQuotientNaNSelect(
     cl::desc("silu's and 1 / sqrt's NaN select on the result, not the "
              "residual"));
 
+static cl::opt<bool> AGXReciprocalFiniteExp(
+    "agx-reciprocal-finite-exp", cl::init(true), cl::Hidden,
+    cl::desc("1 / (e^x + c): e^x past its overflow bound as 2^127, not +inf, "
+             "and no select of the reciprocal past 2^126"));
+
 static cl::opt<bool> AGXReciprocalConverted(
     "agx-reciprocal-converted", cl::init(true), cl::Hidden,
     cl::desc("1 / (a converted 32-bit integer or widened half) as the "
@@ -9853,10 +9858,31 @@ static bool reciprocalsAboveOne(Function &F) {
                                  {B.CreateFNeg(D), Y0, ConstantFP::get(Ty, 1.0)});
     Value *Y = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {E, Y0, Y0});
     Value *EN = AGXQuotientNaNSelect ? Y : E;
+    // (d = e^x + c with e^x used only there: e^x past its overflow bound
+    // as 2^127, not +inf, so that d is finite and y0 = rcp(d) flushes to
+    // +0 past 2^126, y = +0 then by itself, as the select gave: no select,
+    // L15-E719)
+    IntrinsicInst *EOnly = nullptr;
+    if (AGXReciprocalFiniteExp && !Sqrt) {
+      Value *E;
+      const APFloat *C;
+      if (match(D, m_c_FAdd(m_Value(E), m_APFloat(C))) && C->isFinite())
+        if (auto *EI = dyn_cast<IntrinsicInst>(E);
+            EI && EI->hasOneUse() &&
+            (EI->getIntrinsicID() == Intrinsic::exp ||
+             EI->getIntrinsicID() == Intrinsic::exp2 ||
+             EI->getIntrinsicID() == Intrinsic::exp10) &&
+            EI->getType()->isFloatTy())
+          EOnly = EI;
+    }
+    if (EOnly)
+      EOnly->setMetadata("agx.exp.overflow.finite",
+                         MDNode::get(EOnly->getContext(), {}));
     Value *R = Sqrt ? B.CreateSelect(B.CreateFCmpUNO(EN, EN), Y0, Y)
-                    : B.CreateSelect(
-                          B.CreateFCmpOGT(D, ConstantFP::get(Ty, 0x1p126)),
-                          ConstantFP::get(Ty, 0.0), Y);
+               : EOnly ? Y
+                       : B.CreateSelect(
+                             B.CreateFCmpOGT(D, ConstantFP::get(Ty, 0x1p126)),
+                             ConstantFP::get(Ty, 0.0), Y);
     R->takeName(I);
     I->replaceAllUsesWith(R);
     I->eraseFromParent();
@@ -10083,7 +10109,9 @@ bool AGXCodeGenPrepare::expandMath(Function &F, const AGXSubtarget &ST) {
                                  !ST.hasCanonicalNaN(),
                                  !ST.hasIEEEFP32() &&
                                      II->getIntrinsicID() == Intrinsic::exp &&
-                                     onlyFlushingUses(II));
+                                     onlyFlushingUses(II),
+                                 !ST.hasIEEEFP32() &&
+                                     II->getMetadata("agx.exp.overflow.finite"));
       R->takeName(II);
       II->replaceAllUsesWith(R);
       ExpNoOverflow.erase(II);

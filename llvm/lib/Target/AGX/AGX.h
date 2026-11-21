@@ -228,9 +228,12 @@ bool canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx);
 /// \p NativeNaN: f32 arithmetic's NaN is 0x7fc00000 (no canonical-nan).
 /// \p ExpResultFlushed: exp's result only reaches f32 arithmetic, which
 /// flushes a denormal operand.
+/// \p ExpOverflowFinite: an exponential's value past its overflow bound is
+/// 2^127, not +inf (its only use a reciprocal's sum, which then flushes).
 Value *expandMath(IRBuilderBase &B, Intrinsic::ID ID, ArrayRef<Value *> Args,
                   bool FlushF32 = false, bool ExpNoOverflow = false,
-                  bool NativeNaN = false, bool ExpResultFlushed = false);
+                  bool NativeNaN = false, bool ExpResultFlushed = false,
+                  bool ExpOverflowFinite = false);
 Value *expandMath(IRBuilderBase &B, StringRef Fn, Value *X);
 
 /// Whether a device memory access must reach memory shared with the host while

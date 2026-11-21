@@ -266,6 +266,9 @@ public:
   bool NativeNaN = false;
   // exp's result only reaches arithmetic that flushes denormal operands.
   bool ExpResultFlushed = false;
+  /// The value of an exponential past its overflow bound: +inf, or 2^127
+  /// where its only use is a reciprocal's sum that then flushes (L15-E719).
+  double ExpOverflowValue = INFINITY;
 
   MathBuilder(IRBuilderBase &B, Type *Ty, bool NoDenormals = false,
               bool HalfResult = false, bool NarrowResult = false)
@@ -765,8 +768,9 @@ public:
       if (!NoOverflow)
         R = ArgBound ? sel(AB.Negated ? B.CreateFCmpOLE(ExpArg, k(-AB.OverAt))
                                       : B.CreateFCmpOGE(ExpArg, k(AB.OverAt)),
-                           k(INFINITY), R)
-                     : sel(B.CreateICmpSGE(S, ki(0x7f800000)), k(INFINITY), R);
+                           k(ExpOverflowValue), R)
+                     : sel(B.CreateICmpSGE(S, ki(0x7f800000)),
+                           k(ExpOverflowValue), R);
       // (and +0 exactly up to -87.3365479, 0xc2aeac50: L15-E474)
       if (!NoUnderflow)
         R = ArgBound && AB.Zero
@@ -921,7 +925,8 @@ public:
     // e^0.277 make ldexp's exponent sum at least the infinite one, its +inf
     // select: neither select here.
     if (Lo && !Bounded && !NonNegative && !LowSelect)
-      E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
+      E = sel(gt(Hi, 89.0), k(ExpOverflowValue),
+              sel(lt(Hi, -104.0), k(0.0), E));
     // A NaN hi is a NaN r, which makes E a NaN (ldexp freezes its
     // conversion of the NaN n, which would be poison).
     return E;
@@ -1343,11 +1348,13 @@ bool AGX::canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx) {
 Value *AGX::expandMath(IRBuilderBase &B, Intrinsic::ID ID,
                        ArrayRef<Value *> Args, bool FlushF32,
                        bool ExpNoOverflow, bool NativeNaN,
-                       bool ExpResultFlushed) {
+                       bool ExpResultFlushed, bool ExpOverflowFinite) {
   return inFloat(B, Args[0]->getType(), Args,
                  [&](MathBuilder &M, ArrayRef<Value *> A) -> Value * {
                    M.NativeNaN = NativeNaN;
                    M.ExpResultFlushed = ExpResultFlushed;
+                   if (ExpOverflowFinite)
+                     M.ExpOverflowValue = 0x1p127;
                    switch (ID) {
                    case Intrinsic::tan:
                      return M.tan(A[0]);

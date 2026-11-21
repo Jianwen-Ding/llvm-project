@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-reciprocal-above-one=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-reciprocal-finite-exp=0 < %s | FileCheck %s --check-prefix=SEL
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-reciprocal-sqrt=0 -agx-reciprocal-converted=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; 1 / (e^x + c), c >= 1: the divisor is at least 1 or a NaN, so the
@@ -8,14 +9,22 @@
 ; quotient flushes (bit-identical to the division for every divisor from 1 up
 ; and NaNs on the simulator's functional model) (L15-E282).
 
+; With e^x used only there, e^x past its overflow bound is 2^127
+; (2130706432), not +inf: d is finite, and past 2^126 its reciprocal flushes
+; to +0 by itself, no select (L15-E719).
 ; CHECK-LABEL: sigmoid:
 ; CHECK-NOT: bfi
+; CHECK-NOT: 2139095040
+; CHECK: mov_imm {{r[0-9]+}}, 2130706432
 ; CHECK: rcp {{r[0-9]+}}, [[D:r[0-9]+]]
 ; CHECK-NOT: bfi
-; CHECK: mov_imm [[K:r[0-9]+]], 2122317824
-; CHECK: fcmpsel gt, {{r[0-9]+}}, [[D]], [[K]], 0,
-; CHECK-NOT: fcmpsel
+; CHECK-NOT: 2122317824
 ; CHECK: stop
+; SEL-LABEL: sigmoid:
+; SEL: rcp {{r[0-9]+}}, [[D:r[0-9]+]]
+; SEL: mov_imm [[K:r[0-9]+]], 2122317824
+; SEL: fcmpsel gt, {{r[0-9]+}}, [[D]], [[K]], 0,
+; SEL: stop
 ; OFF-LABEL: sigmoid:
 ; OFF: bfi {{r[0-9]+}}, {{r[0-9]+}}, 128, 23
 define agx_kernel void @sigmoid(ptr addrspace(1) %p, float %x) {
