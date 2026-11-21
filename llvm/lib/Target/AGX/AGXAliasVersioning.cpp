@@ -118,6 +118,22 @@ static cl::opt<bool> AliasVersioningSegmentMath(
     cl::desc("Apply -agx-alias-versioning-math-per-word to straight-line "
              "runs too"));
 
+static cl::opt<bool> AliasVersioningDiffChecks(
+    "agx-alias-versioning-diff-checks", cl::init(true), cl::Hidden,
+    cl::desc("Check two ranges whose starts differ by the kernel's "
+             "arguments alone on that difference, one compare (the thread's "
+             "own offset common to both)"));
+
+static cl::opt<bool> AliasVersioningDiffRuntime(
+    "agx-alias-versioning-diff-runtime", cl::init(true), cl::Hidden,
+    cl::desc("-agx-alias-versioning-diff-checks also for ranges of runtime "
+             "lengths"));
+
+static cl::opt<bool> AliasVersioningDiffThread(
+    "agx-alias-versioning-diff-thread", cl::init(true), cl::Hidden,
+    cl::desc("-agx-alias-versioning-diff-checks also where the starts differ "
+             "by the thread's own offsets"));
+
 namespace {
 
 class AGXAliasVersioning : public FunctionPass {
@@ -467,6 +483,89 @@ static std::optional<Address> decompose(Value *Ptr, const DataLayout &DL,
   return std::nullopt;
 }
 
+/// A versioned loop's range checks on the differences of their starts: two
+/// ranges [a, a + m) and [b, b + n) overlap where -n < b - a < m, that is
+/// where b - a + n - 1 <u m + n - 1, one compare of what is the same for
+/// every thread where the two starts share the thread's own offset (a row's
+/// r * 4 * 32 in a and b alike: axpy_c32's checks were four 64-bit compares
+/// of four ends, L15-E636). Every pair or none, of constant or runtime
+/// lengths (m = n = 0 always a conflict: the loop as it was); with
+/// -agx-alias-versioning-diff-thread also where b - a keeps the thread's
+/// own offsets (a row against a vector all rows share, L15-E637).
+static bool diffChecks(Loop *Fallback, const RuntimePointerChecking &RPC,
+                       ScalarEvolution &SE) {
+  BasicBlock *PH = Fallback->getLoopPreheader();
+  BasicBlock *Check = PH ? PH->getSinglePredecessor() : nullptr;
+  auto *Br = Check ? dyn_cast<CondBrInst>(Check->getTerminator()) : nullptr;
+  if (!Br || Br->getSuccessor(0) != PH)
+    return false;
+  auto Invariant = [](const SCEV *S) {
+    return !SCEVExprContains(S, [](const SCEV *X) {
+      if (isa<SCEVAddRecExpr>(X))
+        return true;
+      auto *U = dyn_cast<SCEVUnknown>(X);
+      return U && !isa<Argument>(U->getValue());
+    });
+  };
+  struct Diff {
+    const SCEV *D, *Width;
+  };
+  SmallVector<Diff, 8> Diffs;
+  for (const RuntimePointerCheck &C : RPC.getChecks()) {
+    const RuntimeCheckingPtrGroup *A = C.first, *B = C.second;
+    if (!A->Low->getType()->isPointerTy() ||
+        A->Low->getType() != B->Low->getType())
+      return false;
+    const SCEV *AL = SE.getPtrToAddrExpr(A->Low);
+    const SCEV *AH = SE.getPtrToAddrExpr(A->High);
+    const SCEV *BL = SE.getPtrToAddrExpr(B->Low);
+    const SCEV *BH = SE.getPtrToAddrExpr(B->High);
+    if (isa<SCEVCouldNotCompute>(AL) || isa<SCEVCouldNotCompute>(AH) ||
+        isa<SCEVCouldNotCompute>(BL) || isa<SCEVCouldNotCompute>(BH))
+      return false;
+    const SCEV *M = SE.getMinusSCEV(AH, AL), *N = SE.getMinusSCEV(BH, BL);
+    const SCEV *D = SE.getMinusSCEV(BL, AL);
+    auto HasAddRec = [](const SCEV *X) {
+      return SCEVExprContains(X, [](const SCEV *Y) {
+        return isa<SCEVAddRecExpr>(Y);
+      });
+    };
+    auto Length = [&](const SCEV *X) {
+      if (auto *K = dyn_cast<SCEVConstant>(X))
+        return K->getAPInt().isStrictlyPositive() &&
+               K->getAPInt().getActiveBits() <= 32;
+      return AliasVersioningDiffRuntime && !HasAddRec(X);
+    };
+    if (!Length(M) || !Length(N) ||
+        (!AliasVersioningDiffThread && !Invariant(D)) || HasAddRec(D)) {
+      LLVM_DEBUG(dbgs() << "agx-alias-version: no diff check: " << *D << " "
+                        << *M << " " << *N << "\n");
+      return false;
+    }
+    const SCEV *One = SE.getOne(D->getType());
+    Diffs.push_back({SE.getAddExpr(D, SE.getMinusSCEV(N, One)),
+                     SE.getMinusSCEV(SE.getAddExpr(M, N), One)});
+  }
+  if (Diffs.empty())
+    return false;
+  SCEVExpander Exp(SE, "agx.alias");
+  IRBuilder<> B(Br);
+  Value *Conflict = nullptr;
+  for (const Diff &X : Diffs) {
+    Value *V = Exp.expandCodeFor(X.D, X.D->getType(), Br->getIterator());
+    Value *W = Exp.expandCodeFor(X.Width, X.D->getType(), Br->getIterator());
+    B.SetInsertPoint(Br);
+    Value *C = B.CreateICmpULT(V, W, "agx.alias.diff");
+    Conflict = Conflict ? B.CreateOr(Conflict, C, "agx.alias.conflict") : C;
+  }
+  LLVM_DEBUG(dbgs() << "agx-alias-version: " << Diffs.size()
+                    << " diff checks\n");
+  Value *Old = Br->getCondition();
+  Br->setCondition(Conflict);
+  RecursivelyDeleteTriviallyDeadInstructions(Old);
+  return true;
+}
+
 /// A straight-line run [First, Last] of device accesses (in a block outside
 /// loops, no call or other access in between: an unrolled loop's, as
 /// softmax_f16's normalized writes after its subgroup sum) as two copies,
@@ -589,8 +688,20 @@ static bool versionRun(Instruction *First, Instruction *Last,
   IRBuilder<> B(BB->getTerminator());
   Type *IntPtr = DL.getIntPtrType(B.getContext(), AGX::DEVICE_ADDRESS);
   SCEVExpander Exp(SE, "agx.alias");
-  SmallVector<std::pair<Value *, Value *>, 8> Bounds;
-  for (AccessGroup &G : Groups) {
+  // (two groups of one index, bases a and c: [a + Lo, a + Hi) and
+  // [c + Lo', c + Hi') of the same offset overlap where Lo - Hi' < c - a <
+  // Hi - Lo', one compare of c - a, diffChecks')
+  auto SameIndex = [&](const AccessGroup &X, const AccessGroup &Y) {
+    return AliasVersioningDiffChecks && X.A.Root == Y.A.Root &&
+           X.A.Signed == Y.A.Signed && X.A.Scale == Y.A.Scale;
+  };
+  SmallVector<std::optional<std::pair<Value *, Value *>>, 8> Bounds(
+      Groups.size());
+  auto BoundsOf = [&](unsigned GI) {
+    if (Bounds[GI])
+      return *Bounds[GI];
+    AccessGroup &G = Groups[GI];
+    B.SetInsertPoint(BB->getTerminator());
     Value *I = B.CreatePtrToInt(G.A.Base, IntPtr);
     if (G.A.Root) {
       Value *R = Exp.expandCodeFor(G.A.Root, G.A.Root->getType(),
@@ -599,15 +710,30 @@ static bool versionRun(Instruction *First, Instruction *Last,
       I = B.CreateAdd(I, B.CreateMul(B.CreateIntCast(R, IntPtr, G.A.Signed),
                                      ConstantInt::get(IntPtr, G.A.Scale)));
     }
-    Bounds.push_back({B.CreateAdd(I, ConstantInt::get(IntPtr, G.Lo)),
-                      B.CreateAdd(I, ConstantInt::get(IntPtr, G.Hi))});
-  }
+    Bounds[GI] = {B.CreateAdd(I, ConstantInt::get(IntPtr, G.Lo)),
+                  B.CreateAdd(I, ConstantInt::get(IntPtr, G.Hi))};
+    return *Bounds[GI];
+  };
   Value *Safe = B.getTrue();
-  for (auto [A, C] : Checks)
-    Safe = B.CreateAnd(
-        Safe, B.CreateOr(B.CreateICmpULE(Bounds[A].second, Bounds[C].first),
-                         B.CreateICmpULE(Bounds[C].second, Bounds[A].first)),
-        "agx.alias.safe");
+  for (auto [A, C] : Checks) {
+    Value *Apart;
+    if (SameIndex(Groups[A], Groups[C])) {
+      const AccessGroup &GA = Groups[A], &GC = Groups[C];
+      int64_t K = GA.Lo - GC.Hi + 1;
+      uint64_t W = uint64_t(GA.Hi - GC.Lo) - uint64_t(K);
+      B.SetInsertPoint(BB->getTerminator());
+      Value *D = B.CreateSub(B.CreatePtrToInt(GC.A.Base, IntPtr),
+                             B.CreatePtrToInt(GA.A.Base, IntPtr));
+      Apart = B.CreateICmpUGE(B.CreateSub(D, ConstantInt::get(IntPtr, K)),
+                              ConstantInt::get(IntPtr, W), "agx.alias.diff");
+    } else {
+      auto [ALo, AHi] = BoundsOf(A);
+      auto [CLo, CHi] = BoundsOf(C);
+      B.SetInsertPoint(BB->getTerminator());
+      Apart = B.CreateOr(B.CreateICmpULE(AHi, CLo), B.CreateICmpULE(CHi, ALo));
+    }
+    Safe = B.CreateAnd(Safe, Apart, "agx.alias.safe");
+  }
   // the copy
   ValueToValueMapTy VMap;
   BasicBlock *Fast = CloneBasicBlock(Run, VMap, ".noalias", BB->getParent());
@@ -783,6 +909,8 @@ bool AGXAliasVersioning::runOnFunction(Function &F) {
     LoopVersioning LV(LAI, RPC->getChecks(), L, &LI, &DT, &SE);
     LV.versionLoop();
     LV.annotateLoopWithNoAlias();
+    if (AliasVersioningDiffChecks)
+      diffChecks(LV.getNonVersionedLoop(), *RPC, SE);
     if (AliasVersioningBlocks)
       hoistLoads(L, DT, AA);
     // (the copy for overlapping ranges, which runs only when they do:

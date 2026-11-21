@@ -11,7 +11,7 @@
 
 ; CHECK-LABEL: define agx_kernel void @stencil(
 ; CHECK: .lver.check:
-; CHECK-NEXT: call i32 @llvm.agx.thread.position.in.grid.x(){{$}}
+; CHECK: call i32 @llvm.agx.thread.position.in.grid.x(){{$}}
 ; CHECK: load float, {{.*}} !alias.scope
 ; CHECK: store float {{.*}} !alias.scope
 ; OFF-LABEL: define agx_kernel void @stencil(

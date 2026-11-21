@@ -1,5 +1,6 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes=agx-alias-version -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes=agx-alias-version -agx-alias-versioning-straight-line=0 -S < %s | FileCheck %s --check-prefix=OFF
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes=agx-alias-version -agx-alias-versioning-diff-checks=0 -S < %s | FileCheck %s --check-prefix=BOUNDS
 
 ; A straight-line run of stores and loads (L15-E528): an unrolled pass over a
 ; row that stores y and reloads x, as softmax's last pass after its sum. A copy
@@ -11,6 +12,11 @@
 ; the earlier values in both copies.
 ; CHECK-LABEL: define agx_kernel void @normalize(
 ; CHECK-COUNT-4: call float @llvm.exp.f32
+; y's [y, y + 16) and x's [x + 4, x + 16) apart where x - y + 15 >=u 27, one
+; compare of the difference (L15-E636), instead of four ends compared.
+; CHECK: %[[D:.*]] = sub i64 %{{.*}}, %{{.*}}
+; CHECK: %[[K:.*]] = sub i64 %[[D]], -15
+; CHECK: %agx.alias.diff = icmp uge i64 %[[K]], 27
 ; CHECK: br i1 %{{.*}}, label %[[FAST:.*]], label %[[SLOW:.*]]
 ; CHECK: [[SLOW]]:
 ; CHECK-COUNT-3: call float @llvm.exp.f32
@@ -21,6 +27,10 @@
 ; CHECK-NOT: load
 ; CHECK-NOT: call float @llvm.exp.f32
 ; CHECK: br label %entry.noalias.end
+; BOUNDS-LABEL: define agx_kernel void @normalize(
+; BOUNDS-COUNT-2: icmp ule i64
+; BOUNDS-NEXT: or i1
+; BOUNDS-NEXT: br i1
 ; OFF-LABEL: define agx_kernel void @normalize(
 ; OFF-NOT: noalias
 ; OFF: ret void
