@@ -49,6 +49,11 @@ static cl::opt<bool> LogExponentByAdd(
     cl::desc("log's exponent e as the float 2^23 + e (e under 2^23's "
              "bits) less 2^23 + 127: one add, no subtract and convert"));
 
+static cl::opt<bool> LogOffsetSplit(
+    "agx-log-offset-split", cl::init(true), cl::Hidden,
+    cl::desc("log's 2^e (1 + f) with 1 + f in (sqrt(1/2), sqrt(2)] from x's "
+             "bits plus 1 - sqrt(1/2)'s: no compare and selects"));
+
 static cl::opt<bool> ExpNaNThroughScale(
     "agx-exp-nan-through-scale", cl::init(true), cl::Hidden,
     cl::desc("exp without the +inf select: no NaN select, the NaN's sum "
@@ -902,9 +907,26 @@ public:
     Value *Tiny = NoDenormals ? nullptr : lt(X, 1.17549435e-38);
     Value *XS = Tiny ? sel(Tiny, mul(X, k(8388608.0)), X) : X;
     Value *Bits = B.CreateBitCast(XS, intTy());
+    // x's bits plus those of 1 less those of the float above sqrt(1/2): the
+    // exponent field one more from a mantissa above sqrt(2)'s on, the
+    // mantissa less 1 - sqrt(1/2)'s, so that 1 + f is the low bits plus
+    // sqrt(1/2)'s, in (sqrt(1/2), sqrt(2)] and e as the compare and selects
+    // below give for every positive finite x (L15-E615).
+    // Doubled, which shifts the sign out (no and of |x|'s, one iadd with its
+    // shift): the exponent field from bit 24, the mantissa from bit 1.
+    Value *E;
+    if (LogOffsetSplit) {
+      Bits = B.CreateAdd(B.CreateShl(Bits, ki(1)),
+                         ki(2 * (0x3f800000 - 0x3f3504f4)));
+      Value *Field = B.CreateLShr(Bits, ki(24));
+      E = LogExponentByAdd
+              ? add(B.CreateBitCast(B.CreateOr(Field, ki(0x4b000000)), Ty),
+                    k(-8388735.0))
+              : B.CreateSIToFP(B.CreateSub(Field, ki(127)), Ty);
+    } else {
     // (the biased exponent field under 2^23's bits is the float 2^23 + e;
     // less 2^23 + 127 exactly: L15-E614)
-    Value *E =
+    E =
         LogExponentByAdd
             ? add(B.CreateBitCast(
                       B.CreateOr(B.CreateAnd(B.CreateLShr(Bits, ki(23)),
@@ -914,13 +936,22 @@ public:
                   k(-8388735.0))
             : B.CreateSIToFP(
                   B.CreateSub(B.CreateLShr(Bits, ki(23)), ki(127)), Ty);
+    }
     if (Tiny)
       E = sel(Tiny, sub(E, k(23.0)), E);
-    Value *M = B.CreateBitCast(
-        B.CreateOr(B.CreateAnd(Bits, ki(0x7fffff)), ki(0x3f800000)), Ty);
-    Value *Big = gt(M, 1.41421356);
-    M = sel(Big, mul(M, k(0.5)), M);
-    E = sel(Big, add(E, k(1.0)), E);
+    Value *M;
+    if (LogOffsetSplit) {
+      M = B.CreateBitCast(
+          B.CreateAdd(B.CreateAnd(B.CreateLShr(Bits, ki(1)), ki(0x7fffff)),
+                      ki(0x3f3504f4)),
+          Ty);
+    } else {
+      M = B.CreateBitCast(
+          B.CreateOr(B.CreateAnd(Bits, ki(0x7fffff)), ki(0x3f800000)), Ty);
+      Value *Big = gt(M, 1.41421356);
+      M = sel(Big, mul(M, k(0.5)), M);
+      E = sel(Big, add(E, k(1.0)), E);
+    }
     Value *F = sub(M, k(1.0));
     Value *Z = mul(F, F);
     Value *P = poly(F, {7.0376836292e-2, -1.1514610310e-1, 1.1676998740e-1,

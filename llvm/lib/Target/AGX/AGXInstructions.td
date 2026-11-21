@@ -834,6 +834,22 @@ def : Pat<(i32 (agx_or_field_base
                         agx_field_mask:$m),
                    AGXIntSrc32:$c)),
           (BFEIL_I32 0, $c, 0, $a, 0, (i32 imm:$s), (AGXFieldWidth $m))>;
+// And x >> s itself, its top s bits clear: a field of width 32 - s.
+def agx_or_shift_base : PatFrag<(ops node:$f, node:$c), (or node:$f, node:$c), [{
+  auto *C = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  SDValue F = N->getOperand(0);
+  auto *S = F.getOpcode() == ISD::SRL
+                ? dyn_cast<ConstantSDNode>(F.getOperand(1)) : nullptr;
+  return C && S && F.hasOneUse() && S->getZExtValue() > 0 &&
+         S->getZExtValue() < 32 &&
+         !(C->getZExtValue() & (0xffffffffu >> S->getZExtValue()));
+}]>;
+def AGXShiftFieldWidth : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(32 - N->getZExtValue(), SDLoc(N), MVT::i32);
+}]>;
+def : Pat<(i32 (agx_or_shift_base (srl AGXIntSrc32:$a, (i32 imm:$s)),
+                                  AGXIntSrc32:$c)),
+          (BFEIL_I32 0, $c, 0, $a, 0, (i32 imm:$s), (AGXShiftFieldWidth $s))>;
 // (x & (2^k - 1)) << n by a register amount: one bfi of the field into 0
 // (its masked register offset recorded: coverage alu/bfi_r14_r6_r7_r8_mask_*;
 // an amount from 32 is poison in the IR) (L15-E358).
