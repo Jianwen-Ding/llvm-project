@@ -9684,8 +9684,17 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
     return false;
   const SCEV *B1 = SE.getBackedgeTakenCount(L1);
   const SCEV *B2 = SE.getBackedgeTakenCount(L2);
-  if (isa<SCEVCouldNotCompute>(B1) || isa<SCEVCouldNotCompute>(B2) ||
-      !(B1 == B2 || SE.isKnownPredicate(ICmpInst::ICMP_ULE, B2, B1)))
+  if (isa<SCEVCouldNotCompute>(B1) || isa<SCEVCouldNotCompute>(B2))
+    return false;
+  // (counts of loops over counters of different widths compared at the
+  // wider, both unsigned: a row's maximum over an i32 counter and its sum
+  // over an i64 one asserted in SCEV's compare, L15-E743)
+  if (B1->getType() != B2->getType()) {
+    Type *W = SE.getWiderType(B1->getType(), B2->getType());
+    B1 = SE.getNoopOrZeroExtend(B1, W);
+    B2 = SE.getNoopOrZeroExtend(B2, W);
+  }
+  if (!(B1 == B2 || SE.isKnownPredicate(ICmpInst::ICMP_ULE, B2, B1)))
     return false;
   // nothing between L1 and the load writes memory or waits for other threads
   // but, in L2 (an in-place pass: softmax's third), a store after the load
