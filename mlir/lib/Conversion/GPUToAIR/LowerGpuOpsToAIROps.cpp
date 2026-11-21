@@ -2010,7 +2010,8 @@ static void flagNarrowTree(Value v, DenseMap<Value, Value> &done,
 /// computed in i32 (each index below its size, the sum is at most the last
 /// element's offset) into the memref reinterpreted as one dimension from its
 /// base, rather than the 64-bit linearization of the memref lowering.
-static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize) {
+static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize,
+                                bool columnNoWrap) {
   OpBuilder b(m.getContext());
   DenseMap<Value, Value> done;
   auto narrow = [&](Operation *op, MemRefType type, unsigned first) {
@@ -2063,16 +2064,37 @@ static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize) {
     b.setInsertionPoint(op);
     if (offset)
       linear = arith::ConstantIntOp::create(b, loc, i32, offset);
+    // A column's access: the innermost loop around it steps an outer
+    // dimension, the last index the same every iteration. Its sum without
+    // wrapping lets LLVM step one pointer and read the unrolled iterations
+    // at immediate offsets from it (L15-E641; a row's word indices, E594,
+    // lost where the flags reached them: rmsnorm +21%).
+    // Not in a loop that stores: its bounds would version it on its
+    // ranges, and the copy's loads, hoisted above its stores, took the
+    // registers that kept groups resident (E627: col_axpy_dyn +16.9%).
+    auto loop = op->getParentOfType<scf::ForOp>();
+    bool column = columnNoWrap && loop &&
+                  loop.isDefinedOutsideOfLoop(
+                      op->getOperand(first + strides.size() - 1)) &&
+                  !loop->walk([](memref::StoreOp) {
+                         return WalkResult::interrupt();
+                       }).wasInterrupted();
     for (auto [k, stride] : llvm::enumerate(strides)) {
       Value index = op->getOperand(first + k);
       if (matchPattern(index, m_Zero()))
         continue;
       Value term = narrowIndex(b, index, done);
       b.setInsertionPoint(op);
+      // (an in-bounds access: each index below its size, each product and
+      // partial sum at most the last element's offset, below 2^32)
+      auto nuw = column ? arith::IntegerOverflowFlags::nuw
+                        : arith::IntegerOverflowFlags::none;
       if (stride != 1)
         term = arith::MulIOp::create(
-            b, loc, term, arith::ConstantIntOp::create(b, loc, i32, stride));
-      linear = linear ? arith::AddIOp::create(b, loc, linear, term) : term;
+            b, loc, term, arith::ConstantIntOp::create(b, loc, i32, stride),
+            nuw);
+      linear =
+          linear ? arith::AddIOp::create(b, loc, linear, term, nuw) : term;
     }
     b.setInsertionPoint(op);
     if (!linear)
@@ -2873,7 +2895,7 @@ struct LowerGpuOpsToAIROpsPass final
     if (narrowLoops)
       ::narrowLoops(m);
     if (narrowIndices)
-      narrowMemRefIndices(m, linearizeIndices);
+      narrowMemRefIndices(m, linearizeIndices, columnNoWrap);
     if (simdgroupAllReduce)
       lowerAllReducesToSimdgroups(m);
     m.walk([](gpu::ShuffleOp op) {

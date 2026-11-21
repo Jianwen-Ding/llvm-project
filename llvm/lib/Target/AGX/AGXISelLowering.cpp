@@ -2046,6 +2046,57 @@ static cl::opt<bool> TruncatedCompares(
     cl::desc("a comparison's truth value truncated to 16 bits written as a "
              "half by the compare-select"));
 
+static cl::opt<bool> SelectImpliedArms(
+    "agx-select-implied-arms",
+    cl::desc("a select's arm that compares the select condition's operands "
+             "again, as the constant the condition decides it to be"),
+    cl::init(true), cl::Hidden);
+
+/// Whether integer condition Q holds for operands of which Known is true:
+/// true, false, or unknown. Each condition is the set of orderings (less,
+/// equal, greater) it accepts, signed or unsigned; an unsigned compare with
+/// a zero right operand cannot be less.
+static std::optional<bool> impliedIntCond(ISD::CondCode Known,
+                                          ISD::CondCode Q, bool RHSZero) {
+  enum { Lt = 1, Eq = 2, Gt = 4 };
+  // (domain: 0 either, 1 unsigned, 2 signed; the orderings)
+  auto Set = [&](ISD::CondCode C) -> std::pair<int, unsigned> {
+    switch (C) {
+    case ISD::SETEQ: return {0, Eq};
+    case ISD::SETNE: return {0, Lt | Gt};
+    case ISD::SETULT: return {1, Lt};
+    case ISD::SETULE: return {1, Lt | Eq};
+    case ISD::SETUGT: return {1, Gt};
+    case ISD::SETUGE: return {1, Gt | Eq};
+    case ISD::SETLT: return {2, Lt};
+    case ISD::SETLE: return {2, Lt | Eq};
+    case ISD::SETGT: return {2, Gt};
+    case ISD::SETGE: return {2, Gt | Eq};
+    default: return {-1, 0};
+    }
+  };
+  auto [DK, K] = Set(Known);
+  auto [DQ, M] = Set(Q);
+  if (DK < 0 || DQ < 0)
+    return std::nullopt;
+  // (EQ and NE in either domain; with a zero right operand unsigned, the
+  // unsigned domain's "less" is impossible)
+  int D = DK ? DK : DQ;
+  if (DK && DQ && DK != DQ)
+    return std::nullopt;
+  if (D == 1 && RHSZero) {
+    K &= ~unsigned(Lt);
+    M &= ~unsigned(Lt);
+  }
+  if (!K)
+    return std::nullopt;
+  if ((K & M) == K)
+    return true;
+  if (!(K & M))
+    return false;
+  return std::nullopt;
+}
+
 static cl::opt<bool> SelectOfSelect(
     "agx-select-of-select",
     cl::desc("a select on an or / and of truth values as two nested "
@@ -2339,6 +2390,34 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     return performRoundClampConvertCombine(N, DCI);
   case ISD::SELECT: {
     SDValue C = N->getOperand(0);
+    // select (setcc a, b, cc), x, (setcc a, b, cc2): the false arm's compare
+    // as what !cc decides it (and the true arm's under cc): an i64 a >u K
+    // (K < 2^32) after expansion is select (hi == 0, lo >u K, hi != 0),
+    // whose hi != 0 is 1 there, one compare-select fewer (L15-E639).
+    if (SelectImpliedArms && C.getOpcode() == ISD::SETCC &&
+        C.getOperand(0).getValueType().isScalarInteger() &&
+        !N->getValueType(0).isVector()) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDValue A = C.getOperand(0), B = C.getOperand(1);
+      ISD::CondCode CC = cast<CondCodeSDNode>(C.getOperand(2))->get();
+      bool RHSZero = isNullConstant(B);
+      auto Fold = [&](SDValue Arm, ISD::CondCode Known) -> SDValue {
+        if (Arm.getOpcode() != ISD::SETCC || Arm.getOperand(0) != A ||
+            Arm.getOperand(1) != B)
+          return SDValue();
+        std::optional<bool> V = impliedIntCond(
+            Known, cast<CondCodeSDNode>(Arm.getOperand(2))->get(), RHSZero);
+        if (!V)
+          return SDValue();
+        return DAG.getConstant(*V, SDLoc(Arm), Arm.getValueType());
+      };
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      SDValue NX = Fold(X, CC);
+      SDValue NY = Fold(Y, ISD::getSetCCInverse(CC, A.getValueType()));
+      if (NX || NY)
+        return DAG.getSelect(SDLoc(N), N->getValueType(0), C, NX ? NX : X,
+                             NY ? NY : Y);
+    }
     // select (select (c, 1, d)), x, y -> select c, x, (select d, x, y) and
     // select (select (c, d, 0)), x, y -> select c, (select d, x, y), y: a
     // condition that is a truth value or another (the or / and of two

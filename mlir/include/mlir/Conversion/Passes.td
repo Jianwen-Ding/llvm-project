@@ -762,6 +762,11 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            "With narrow-indices, linearize the indices of memref loads and "
            "stores of static multi-dimensional memrefs whose elements are "
            "within 2^32 of the base in 32 bits">,
+    Option<"columnNoWrap", "column-no-wrap", "bool", /*default=*/"true",
+           "With linearize-indices, compute without wrapping (nuw) the "
+           "linear index of an access in a loop that stores nothing and "
+           "steps an outer dimension: a column's, which LLVM then reads "
+           "through one pointer at immediate offsets">,
     Option<"simdgroupAllReduce", "simdgroup-all-reduce", "bool",
            /*default=*/"true",
            "Lower uniform gpu.all_reduce in kernels of a known threadgroup "
