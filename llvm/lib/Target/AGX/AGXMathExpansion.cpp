@@ -139,6 +139,11 @@ static cl::opt<bool> LogLowFma(
     cl::desc("With the constants in uniforms, logf's low part (errors) + e "
              "ln2_lo as one fma"));
 
+static cl::opt<bool> ExpLowSelect(
+    "agx-exp-low-select", cl::init(true), cl::Hidden,
+    cl::desc("e^(hi + lo) (pow): lo as 0 where |hi| >= 89, not the result's "
+             "+inf / +0 selects"));
+
 static cl::opt<bool> TanQuotientSigns(
     "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
     cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
@@ -868,6 +873,15 @@ public:
     }
     Value *R = fma(B.CreateFNeg(N), k(0.693359375), C);
     R = fma(B.CreateFNeg(N), k(-2.12194440e-4), R);
+    // e^(hi + lo) of an unbounded hi (pow): lo as 0 where |hi| >= 89 (or a
+    // NaN). There the clamped hi alone overflows (e^89 > the largest float)
+    // or flushes (below -89 the result is below 2^-126), so the result's
+    // +inf / +0 selects below are needed only for an infinite hi, whose lo
+    // is a NaN or an infinity: one select of lo for two (L15-E709).
+    bool LowSelect = ExpLowSelect && Lo && !Bounded && !NonNegative &&
+                     NoDenormals;
+    if (LowSelect)
+      Lo = sel(lt(abs(Hi), 89.0), Lo, k(0.0));
     // (Bounded with a low part and NoOverflow: 2^x / 10^x below a maximum,
     // hi <= 0 and so n <= 0, the scaled e^r below 2: L15-E484.)
     Value *E = ldexp(expCore(Lo ? add(R, Lo) : R), N,
@@ -886,7 +900,7 @@ public:
     // Non-negative: past 89, hi is clamped to 89, whose n = 128 and e^r >=
     // e^0.277 make ldexp's exponent sum at least the infinite one, its +inf
     // select: neither select here.
-    if (Lo && !Bounded && !NonNegative)
+    if (Lo && !Bounded && !NonNegative && !LowSelect)
       E = sel(gt(Hi, 89.0), k(INFINITY), sel(lt(Hi, -104.0), k(0.0), E));
     // A NaN hi is a NaN r, which makes E a NaN (ldexp freezes its
     // conversion of the NaN n, which would be poison).
