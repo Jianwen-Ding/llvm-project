@@ -9532,6 +9532,15 @@ static cl::opt<bool> AGXSiluQuotient(
     "agx-silu-quotient", cl::init(true), cl::Hidden,
     cl::desc("x / (e^-x + 1) as a scaled Markstein quotient step"));
 
+/// The final NaN select of silu's quotient and 1 / sqrt's reciprocal on the
+/// result being a NaN instead of the residual: the same values (a finite
+/// residual's step is finite there), and a compare-select of two registers,
+/// not three (L15-E699).
+static cl::opt<bool> AGXQuotientNaNSelect(
+    "agx-quotient-nan-select", cl::init(true), cl::Hidden,
+    cl::desc("silu's and 1 / sqrt's NaN select on the result, not the "
+             "residual"));
+
 static cl::opt<bool> AGXReciprocalConverted(
     "agx-reciprocal-converted", cl::init(true), cl::Hidden,
     cl::desc("1 / (a converted 32-bit integer or widened half) as the "
@@ -9695,7 +9704,8 @@ static bool reciprocalsAboveOne(Function &F) {
                                  {DS, Q0, B.CreateFNeg(XS)});
     Value *Q = B.CreateIntrinsic(Intrinsic::fma, {Ty},
                                  {B.CreateFNeg(R), Y, Q0});
-    Q = B.CreateSelect(B.CreateFCmpUNO(R, R), Q0, Q);
+    Value *RN = AGXQuotientNaNSelect ? Q : R;
+    Q = B.CreateSelect(B.CreateFCmpUNO(RN, RN), Q0, Q);
     Q->takeName(I);
     I->replaceAllUsesWith(Q);
     I->eraseFromParent();
@@ -9724,7 +9734,8 @@ static bool reciprocalsAboveOne(Function &F) {
     Value *E = B.CreateIntrinsic(Intrinsic::fma, {Ty},
                                  {B.CreateFNeg(D), Y0, ConstantFP::get(Ty, 1.0)});
     Value *Y = B.CreateIntrinsic(Intrinsic::fma, {Ty}, {E, Y0, Y0});
-    Value *R = Sqrt ? B.CreateSelect(B.CreateFCmpUNO(E, E), Y0, Y)
+    Value *EN = AGXQuotientNaNSelect ? Y : E;
+    Value *R = Sqrt ? B.CreateSelect(B.CreateFCmpUNO(EN, EN), Y0, Y)
                     : B.CreateSelect(
                           B.CreateFCmpOGT(D, ConstantFP::get(Ty, 0x1p126)),
                           ConstantFP::get(Ty, 0.0), Y);

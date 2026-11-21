@@ -3889,6 +3889,11 @@ static cl::opt<bool> HalfSqrtProduct(
     cl::desc("half sqrt as the float x rsqrt_special(x) rounded to half"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> SqrtScaleSelect(
+    "agx-sqrt-scale-select",
+    cl::desc("float sqrt's 2^-32 rescale as a product by a selected scale"),
+    cl::init(true), cl::Hidden);
+
 /// float sqrt without afn, correctly rounded (denormals flushed): from
 /// y = rsqrt_special(x) (within 1 ulp; 1 for 0 and infinity),
 ///   s0 = x y, s = s0 + (x - s0^2) y / 2
@@ -3941,6 +3946,13 @@ SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
                             DAG.getNode(ISD::FNEG, DL, VT, S0), S0, XS);
   SDValue S = DAG.getNode(ISD::FMA, DL, VT, Rem, H, S0);
   S = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, S, S, ISD::SETUO), S0, S);
+  // S times (Small ? 2^-32 : 1), with the constants in uniforms: the select
+  // reads x alone, off the chain to S, where selecting between S 2^-32 and S
+  // reads x and both (a 3-source fcmpsel). S is never denormal (x >= 2^-80
+  // or scaled), so S 1 is S (L15-E698).
+  if (SqrtScaleSelect && AGX::uniformConstantsEnabled())
+    return DAG.getNode(ISD::FMUL, DL, VT, S,
+                       DAG.getSelect(DL, VT, Small, K(0x1p-32f), K(1.0f)));
   return DAG.getSelect(DL, VT, Small,
                        DAG.getNode(ISD::FMUL, DL, VT, S, K(0x1p-32f)), S);
 }
