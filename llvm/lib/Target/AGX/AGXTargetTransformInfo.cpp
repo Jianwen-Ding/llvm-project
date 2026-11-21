@@ -252,6 +252,11 @@ static cl::opt<unsigned> AGXDeviceUnrollRuntimeOwnRowFactor(
     cl::desc("agx-device-unroll-runtime-stores' factor times this for a row "
              "of words whose loads are all the thread's own"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeInPlaceFactor(
+    "agx-device-unroll-runtime-in-place-factor", cl::init(8), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-own-row-factor for a row stored in "
+             "place (0: the own row's)"));
+
 static cl::opt<bool> AGXDeviceUnrollRuntimeColumnStores(
     "agx-device-unroll-runtime-column-stores", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-stores twice for a column"));
@@ -1004,6 +1009,20 @@ void AGXTTIImpl::getUnrollingPreferences(
                      [](const Instruction &I) { return isa<StoreInst>(I); }) > 1
                 ? 2
                 : AGXDeviceUnrollRuntimeOwnRowFactor;
+        // (8 times for an in-place row, its one store at a load's address:
+        // inplace_dyn 300.2 -> 278.7; a row stored elsewhere lost at 8,
+        // row_axpy_dyn +141%, L15-E748)
+        if (OwnRowFactor == AGXDeviceUnrollRuntimeOwnRowFactor &&
+            AGXDeviceUnrollRuntimeInPlaceFactor &&
+            any_of(*L->getHeader(), [&](const Instruction &I) {
+              auto *St = dyn_cast<StoreInst>(&I);
+              return St && any_of(*L->getHeader(), [&](const Instruction &J) {
+                       auto *Ld = dyn_cast<LoadInst>(&J);
+                       return Ld && Ld->getPointerOperand() ==
+                                        St->getPointerOperand();
+                     });
+            }))
+          OwnRowFactor = AGXDeviceUnrollRuntimeInPlaceFactor;
         // (a column's 8 times since E729's word indices: col_scale_dyn
         // 473.6 -> 458.8, col_relu_dyn and col_axpy_dyn -2.5%, L15-E747)
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =

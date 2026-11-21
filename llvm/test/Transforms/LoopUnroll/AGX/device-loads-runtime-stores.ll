@@ -8,6 +8,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-stores=0 -S < %s | FileCheck %s --check-prefix=FOUR
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-column-stores=0 -S < %s | FileCheck %s --check-prefix=COL4
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-own-rows=0 -S < %s | FileCheck %s --check-prefix=OWN4
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-in-place-factor=0 -S < %s | FileCheck %s --check-prefix=PLACE16
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -66,6 +67,37 @@ loop:
   %o = fmul float %v, 2.0
   %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z
   store float %o, ptr addrspace(1) %py, align 4
+  %i1 = add nuw nsw i32 %i, 1
+  %c = icmp ult i32 %i1, %n
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
+
+; The same row stored in place, its one store at its load's address: 32
+; times (L15-E748; another row's stores lost at that count, row_axpy_dyn).
+; CHECK-LABEL: @inplace(
+; CHECK-COUNT-32: store float
+; CHECK-NOT: store float
+; CHECK: .epil
+; PLACE16-LABEL: @inplace(
+; PLACE16-COUNT-16: store float
+; PLACE16-NOT: store float
+; PLACE16: .epil
+define void @inplace(ptr addrspace(1) %x, ptr addrspace(1) %y, i32 %n) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %row = shl i32 %t, 9
+  %e = icmp eq i32 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %k = add i32 %row, %i
+  %z = zext i32 %k to i64
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %z
+  %v = load float, ptr addrspace(1) %px, align 4
+  %o = fmul float %v, 2.0
+  store float %o, ptr addrspace(1) %px, align 4
   %i1 = add nuw nsw i32 %i, 1
   %c = icmp ult i32 %i1, %n
   br i1 %c, label %loop, label %exit
