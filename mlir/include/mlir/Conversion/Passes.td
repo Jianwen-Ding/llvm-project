@@ -752,6 +752,11 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            "Run scf.for loops over index whose iterations an in-bounds "
            "memref access or constant bounds keep below 2^31 over an "
            "unsigned i32 offset from the lower bound">,
+    Option<"speculateGuardedLoads", "speculate-guarded-loads", "bool",
+           /*default=*/"true",
+           "Run an scf.if whose regions only load from static memrefs and "
+           "compute without side effects on both sides, each load's indices "
+           "clamped into its memref, and select the results">,
     Option<"constantTripLoops", "constant-trip-loops", "bool",
            /*default=*/"true",
            "Run scf.for loops whose lower bound is a lane or thread position "

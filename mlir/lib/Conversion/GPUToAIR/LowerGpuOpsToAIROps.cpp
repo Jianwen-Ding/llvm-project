@@ -55,6 +55,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -2467,6 +2468,109 @@ static std::optional<std::pair<int64_t, int64_t>> indexRange(Value v,
   return std::nullopt;
 }
 
+/// An scf.if with results whose regions only compute without side effects
+/// (speculatable) and load from memrefs of static, non-empty shapes runs
+/// both regions before it, each load at its indices clamped into the
+/// memref (umin(i, size - 1)), and selects their results on the condition.
+/// Where the region's load runs in the original its indices are in bounds
+/// (an access out of bounds is undefined), so the clamp keeps them; where
+/// it does not, the clamped access is one of the memref's elements, whose
+/// value the select drops. An index known below its size (a constant, a
+/// position of that upper bound) is not clamped, and an if needing more
+/// than one clamp is left. A scan's guarded load,
+/// in = j < n; v = in ? x[r, j] : 0 (find_first: the if, its exec mask
+/// and the copies it took, L15-E736).
+static void speculateGuardedLoads(gpu::GPUModuleOp m) {
+  constexpr unsigned kMaxOps = 16;
+  SmallVector<scf::IfOp> ifs;
+  m.walk([&](scf::IfOp op) {
+    if (op.getNumResults() && !op.getElseRegion().empty())
+      ifs.push_back(op);
+  });
+  auto knownBelow = [](Value v, int64_t size) {
+    if (std::optional<int64_t> c = getConstantIntValue(v))
+      return *c >= 0 && *c < size;
+    std::optional<APInt> ub;
+    if (auto o = v.getDefiningOp<gpu::ThreadIdOp>())
+      ub = o.getUpperBound();
+    else if (auto o = v.getDefiningOp<gpu::BlockIdOp>())
+      ub = o.getUpperBound();
+    else if (auto o = v.getDefiningOp<gpu::GlobalIdOp>())
+      ub = o.getUpperBound();
+    else if (auto o = v.getDefiningOp<gpu::LaneIdOp>())
+      ub = o.getUpperBound();
+    return ub && ub->getActiveBits() <= 63 &&
+           int64_t(ub->getZExtValue()) <= size;
+  };
+  for (scf::IfOp op : ifs) {
+    auto loadable = [](memref::LoadOp load) {
+      MemRefType type = load.getMemRefType();
+      return type.hasStaticShape() &&
+             llvm::all_of(type.getShape(), [](int64_t d) { return d > 0; });
+    };
+    auto qualifies = [&](Region &r) {
+      if (!r.hasOneBlock())
+        return false;
+      unsigned n = 0;
+      for (Operation &o : r.front().without_terminator()) {
+        if (++n > kMaxOps || o.getNumRegions())
+          return false;
+        if (auto load = dyn_cast<memref::LoadOp>(o)) {
+          if (!loadable(load))
+            return false;
+          continue;
+        }
+        if (!isPure(&o) || !isSpeculatable(&o))
+          return false;
+      }
+      return true;
+    };
+    // (one load at least: otherwise the if is the canonicalizer's to fold;
+    // at most one index to clamp: a padded convolution's taps, two each,
+    // lost their cheap branches on in-bounds positions, conv3x3_pad +54%)
+    bool anyLoad = false;
+    unsigned clamps = 0;
+    op->walk([&](memref::LoadOp load) {
+      anyLoad = true;
+      for (auto [k, size] : llvm::enumerate(load.getMemRefType().getShape()))
+        clamps += !knownBelow(load.getIndices()[k], size);
+    });
+    if (!anyLoad || clamps > 1 || !qualifies(op.getThenRegion()) ||
+        !qualifies(op.getElseRegion()))
+      continue;
+    OpBuilder b(op);
+    auto hoist = [&](Region &r) {
+      Block &blk = r.front();
+      for (Operation &o : llvm::make_early_inc_range(blk.without_terminator())) {
+        o.moveBefore(op);
+        auto load = dyn_cast<memref::LoadOp>(o);
+        if (!load)
+          continue;
+        b.setInsertionPoint(load);
+        for (auto [k, size] : llvm::enumerate(load.getMemRefType().getShape())) {
+          OpOperand &index = load->getOpOperand(1 + k);
+          if (knownBelow(index.get(), size))
+            continue;
+          Value last = arith::ConstantIndexOp::create(b, load.getLoc(),
+                                                      size - 1);
+          index.set(arith::MinUIOp::create(b, load.getLoc(), index.get(),
+                                           last));
+        }
+      }
+      return cast<scf::YieldOp>(blk.getTerminator()).getOperands();
+    };
+    SmallVector<Value> thenValues(hoist(op.getThenRegion()));
+    SmallVector<Value> elseValues(hoist(op.getElseRegion()));
+    b.setInsertionPoint(op);
+    SmallVector<Value> results;
+    for (auto [t, e] : llvm::zip(thenValues, elseValues))
+      results.push_back(
+          arith::SelectOp::create(b, op.getLoc(), op.getCondition(), t, e));
+    op.replaceAllUsesWith(results);
+    op.erase();
+  }
+}
+
 /// An scf.for over index from a lb of values [lo, hi] (indexRange) to a
 /// constant ub by a constant step, where every lb gives the same trip count
 /// T = ceil((ub - lb) / step) > 0: a loop over k from 0 to T by 1, iv = lb +
@@ -2890,6 +2994,8 @@ struct LowerGpuOpsToAIROpsPass final
         kernelBounds[f.getName()] = bounds;
     });
     ::approximateHalfFunctions = approximateHalfFunctions;
+    if (speculateGuardedLoads)
+      ::speculateGuardedLoads(m);
     if (constantTripLoops)
       ::constantTripLoops(m);
     if (narrowLoops)
