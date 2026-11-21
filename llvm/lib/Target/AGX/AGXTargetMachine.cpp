@@ -276,6 +276,12 @@ static cl::opt<bool> AGXSchedCoreOccupancy(
              "device loads where its schedule would cut the SIMD-groups its "
              "registers let reside on a core by 1.8 times or more"));
 
+static cl::opt<unsigned> AGXSchedCoreOccupancyPerLoad(
+    "agx-sched-core-occupancy-per-load", cl::init(16), cl::Hidden,
+    cl::desc("agx-sched-core-occupancy also for a region of more device "
+             "loads with at least this many instructions for each (0: "
+             "never)"));
+
 static cl::opt<bool> AGXSchedKnownGrid(
     "agx-sched-known-grid", cl::init(true), cl::Hidden,
     cl::desc("Keep a schedule whose registers still let every SIMD-group of "
@@ -393,12 +399,24 @@ public:
       DeviceLoads += isAGXDeviceLoad(MI);
     bool Threads = AGXSubtarget::maxThreadsForHalves(After) <
                    AGXSubtarget::maxThreadsForHalves(Before);
-    bool Core = AGXSchedCoreOccupancy && DeviceLoads < 4 &&
+    // (or of more loads where each has 16 instructions or more to hide its
+    // latency behind: the resident groups' own then hide it, an online
+    // softmax's exponentials, a byte swap's shifts, not a matrix product's
+    // loads ahead of its fmas, L15-E681)
+    bool FewLoads =
+        DeviceLoads < 4 ||
+        (AGXSchedCoreOccupancyPerLoad &&
+         Index.size() >= AGXSchedCoreOccupancyPerLoad * DeviceLoads);
+    bool Core = AGXSchedCoreOccupancy && FewLoads &&
                 9 * CoreGroups(After) < 5 * CoreGroups(Before);
     // A known grid whose SIMD-groups all reside on one core with the new
     // registers (and whose threadgroups still fit) loses no occupancy
     // anywhere: the new order stays, its loads' latencies hidden behind each
     // other (L15-E319).
+    LLVM_DEBUG(dbgs() << "agx-occupancy decide: loads " << DeviceLoads
+                      << " instrs " << Index.size() << " groups "
+                      << CoreGroups(Before) << " -> " << CoreGroups(After)
+                      << " threads " << Threads << " core " << Core << "\n");
     if (AGXSchedKnownGrid && (Threads || Core)) {
       const Function &Fn = MF.getFunction();
       unsigned TG =

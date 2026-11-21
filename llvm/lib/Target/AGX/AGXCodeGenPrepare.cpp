@@ -7520,6 +7520,10 @@ static cl::opt<unsigned> AGXOnlineSoftmaxAbsArgMaxChain(
     cl::desc("agx-online-softmax-abs-arg where a block's running maximum "
              "chain has at most this many pairs"));
 
+static cl::opt<bool> AGXOnlineSoftmaxDiffCompare(
+    "agx-online-softmax-diff-compare", cl::init(true), cl::Hidden,
+    cl::desc("agx-online-softmax-abs-arg's selects on b - a > 0, not b > a"));
+
 static cl::opt<bool> AGXOnlineSoftmaxShared(
     "agx-online-softmax-shared-one", cl::init(true), cl::Hidden,
     cl::desc("agx-online-softmax-exp's trivial side as u 0 + 1, one for "
@@ -7685,6 +7689,15 @@ static bool onlineSoftmaxExps(Function &F) {
       Value *D = EB.CreateFSub(B, A);
       Value *NX = EB.CreateFNeg(EB.CreateUnaryIntrinsic(Intrinsic::fabs, D));
       cast<CallInst>(E)->setArgOperand(0, NX);
+      // The selects on b - a > 0 rather than b > a (L15-E681): one register
+      // read each fewer (b and a, long computed, take the register file's
+      // read ports; e and the trivial side are fresh). The same where they
+      // differ, b > a with b - a flushed to 0 (or a compare's flush of its
+      // denormal): e is then e^-0 = 1, and the trivial side is 1 (b finite),
+      // so both select 1 and 1; b <= a never gives b - a > 0, and NaNs and
+      // infinite ties fail both.
+      if (AGXOnlineSoftmaxDiffCompare)
+        C = Bld.CreateFCmpOGT(D, ConstantFP::get(D->getType(), 0.0));
     }
     Value *EA = Bld.CreateSelect(C, E, Triv ? Triv : Bld.CreateFAdd(One, FA));
     Value *EB = Bld.CreateSelect(C, Triv ? Triv : Bld.CreateFAdd(One, FB), E);

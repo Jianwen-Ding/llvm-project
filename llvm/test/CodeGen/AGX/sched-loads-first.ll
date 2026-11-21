@@ -10,10 +10,11 @@
 ; key's work instead of waited for one by one (L15-E498). (75 and 51 since
 ; L15-E513's shared fma, 77 and 53 before.) Since L15-E530 that order is
 ; dropped where it leaves the core fewer than 28 SIMD-groups: this loop's 26
-; (40 in the plain order) hid less latency than they saved.
+; (40 in the plain order) hid less latency than they saved. (OFF 50 since
+; L15-E681's selects on b - a.)
 
 ; CHECK: general purpose registers: 75 x 32-bit
-; OFF: general purpose registers: 51 x 32-bit
+; OFF: general purpose registers: 50 x 32-bit
 ; DEF: general purpose registers: 52 x 32-bit
 
 target datalayout = "e-m:e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-i1:8-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-v16:16-v32:32-v64:64-v96:32-v128:128-n16:32:64-S32-A5-G1"

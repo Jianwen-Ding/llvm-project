@@ -1,6 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-deferred-minmax-reductions=0 -agx-online-softmax-abs-arg=0 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-deferred-minmax-reductions=0 < %s | FileCheck %s --check-prefix=ABS
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-deferred-minmax-reductions=0 -agx-online-softmax-shared-one=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-deferred-minmax-reductions=0 -agx-online-softmax-diff-compare=0 < %s | FileCheck %s --check-prefix=VAL
 ;
 ; e^(a - u) and e^(b - u), u = maximum(a, b): one of the two arguments is
 ; x - x (+0, or a NaN for an infinite x), whose exponential is 1 + (x - x);
@@ -12,8 +13,9 @@ declare float @llvm.maximum.f32(float, float)
 
 ; The shared exponent as -|b - a| (L15-E529): its clamp compares |b - a|
 ; with the mirrored bound and selects b - a itself.
+; The selects then on b - a > 0, not b > a (L15-E681): the same choice but
+; where b - a flushes to 0, whose sides are then both 1.
 ; ABS-LABEL: @pair(
-; ABS:       [[C:%.*]] = fcmp ogt float %b, %a
 ; ABS:       [[D:%.*]] = fsub float %b, %a
 ; ABS:       [[AD:%.*]] = call float @llvm.fabs.f32(float [[D]])
 ; ABS:       [[K:%.*]] = fcmp ogt float [[AD]], f0x42AEAC50
@@ -21,8 +23,15 @@ declare float @llvm.maximum.f32(float, float)
 ; ABS:       [[AS:%.*]] = call float @llvm.fabs.f32(float [[S]])
 ; ABS:       fneg float [[AS]]
 ; ABS:       call float @llvm.fma.f32(float %u, float 0.000000e+00, float 1.000000e+00)
+; ABS:       [[C:%.*]] = fcmp ogt float [[D]], 0.000000e+00
 ; ABS:       select i1 [[C]]
 ; ABS:       ret void
+; VAL-LABEL: @pair(
+; VAL:       [[C:%.*]] = fcmp ogt float %b, %a
+; VAL:       [[D:%.*]] = fsub float %b, %a
+; VAL:       call float @llvm.fma.f32(float %u, float 0.000000e+00, float 1.000000e+00)
+; VAL:       select i1 [[C]]
+; VAL:       ret void
 
 ; CHECK-LABEL: @pair(
 ; CHECK:       [[DA:%.*]] = fsub float %a, %u
