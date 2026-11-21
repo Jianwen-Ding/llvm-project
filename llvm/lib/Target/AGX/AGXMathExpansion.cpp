@@ -92,6 +92,11 @@ static cl::opt<bool> ExpFlushedUnderflow(
     cl::desc("exp below a maximum whose users flush denormal operands: "
              "clamped at its +0 bound, no +0 select"));
 
+static cl::opt<bool> PowConstantEnds(
+    "agx-pow-constant-ends", cl::init(true), cl::Hidden,
+    cl::desc("pow(x, y) of a finite nonzero constant y: |x| = 0 and inf by "
+             "two selects of the results y's sign gives"));
+
 static cl::opt<bool> FusedExactScales(
     "agx-math-fused-exact-scales", cl::init(true), cl::Hidden,
     cl::desc("c - 2 y and the like as one fma where the scaling is exact: "
@@ -1058,10 +1063,21 @@ public:
     Value *R = expHiLo(Hi, Lo);
     // log(0) = -inf and log(inf) = inf: the product is +-inf (or NaN for a
     // zero y, handled below), the result 0 or inf.
-    Value *L = logSpecial(AX, LHi);
-    Value *Inf = mul(Y, L);
-    R = sel(B.CreateFCmpOEQ(abs(Inf), k(INFINITY)),
-            sel(gt(Inf, 0.0), k(INFINITY), k(0.0)), R);
+    // (a finite nonzero constant y of at most 2^20: y log|x| is finite but
+    // for |x| = 0 and inf, whose results y's sign gives, two selects, not
+    // logSpecial's three, the product and its test: L15-E648)
+    auto *YC = dyn_cast<ConstantFP>(Y);
+    if (PowConstantEnds && YC && YC->getValueAPF().isFinite() &&
+        !YC->isZero() && std::fabs(YC->getValueAPF().convertToDouble()) <= 0x1p20) {
+      bool Pos = !YC->isNegative();
+      R = sel(B.CreateFCmpOEQ(AX, k(0.0)), k(Pos ? 0.0 : INFINITY), R);
+      R = sel(B.CreateFCmpOEQ(AX, k(INFINITY)), k(Pos ? INFINITY : 0.0), R);
+    } else {
+      Value *L = logSpecial(AX, LHi);
+      Value *Inf = mul(Y, L);
+      R = sel(B.CreateFCmpOEQ(abs(Inf), k(INFINITY)),
+              sel(gt(Inf, 0.0), k(INFINITY), k(0.0)), R);
+    }
     // A negative x: an odd integer y gives the sign, any other finite
     // non-integer a NaN (for x = -inf, the infinity or zero above).
     Value *YInt = B.CreateFCmpOEQ(call(Intrinsic::trunc, {Y}), Y);

@@ -42,8 +42,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "agx-mem-cluster"
 
 static cl::opt<unsigned> AGXMemClusterSize(
     "agx-mem-cluster", cl::Hidden, cl::init(16),
@@ -80,6 +83,11 @@ static cl::opt<unsigned> AGXLoadsAfterStoresWork(
     "agx-sched-loads-after-stores-work", cl::Hidden, cl::init(125),
     cl::desc("-agx-sched-loads-after-stores' most instructions for every 4 "
              "bytes accessed, in hundredths"));
+
+static cl::opt<unsigned> AGXHeavyStoresApart(
+    "agx-sched-heavy-stores-apart", cl::Hidden, cl::init(64),
+    cl::desc("No clusters of device stores in a region of more than this "
+             "many instructions for every 32-bit word it stores (0: off)"));
 
 namespace {
 
@@ -216,6 +224,26 @@ static bool loadsAfterStores(ScheduleDAGInstrs *DAG) {
          2 * LoadBytes <= 5 * StoreBytes;
 }
 
+/// Whether the region's work for every stored word exceeds N instructions:
+/// clustered, its stores wait for every value of the run, all live at once
+/// (logpow_rows: 16 results of 70 instructions each, 34 -> 54 GPRs with
+/// E648's shorter pow, L15-E648).
+static bool heavyStores(ScheduleDAGInstrs *DAG, unsigned N) {
+  uint64_t Work = 0, StoreBytes = 0;
+  for (SUnit &SU : DAG->SUnits) {
+    const MachineInstr &MI = *SU.getInstr();
+    int K = memKind(MI);
+    if (K == DeviceStore)
+      for (const MachineMemOperand *MMO : MI.memoperands())
+        if (MMO->getSize().hasValue())
+          StoreBytes += MMO->getSize().getValue().getKnownMinValue();
+    Work += K < 0 && !MI.isCopyLike() && !MI.isRegSequence() &&
+            !MI.isInsertSubreg() && !MI.isExtractSubreg() &&
+            !MI.isImplicitDef() && !MI.isTerminator();
+  }
+  return StoreBytes && 4 * Work > uint64_t(N) * StoreBytes;
+}
+
 class AGXMemClusterMutation : public ScheduleDAGMutation {
 public:
   void apply(ScheduleDAGInstrs *DAG) override;
@@ -248,6 +276,12 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
     // converted halves, held together, took 4 more GPRs, L15-E619).
     if (AGXLightRowStoresApart)
       Kinds &= ~(1u << DeviceStore);
+  }
+  if (AGXHeavyStoresApart && heavyStores(DAG, AGXHeavyStoresApart)) {
+    LLVM_DEBUG(dbgs() << "agx-mem-cluster: heavy stores apart in "
+                      << printMBBReference(*DAG->begin()->getParent())
+                      << "\n");
+    Kinds &= ~(1u << DeviceStore);
   }
   EquivalenceClasses<SUnit *> Clusters;
   SmallVector<SUnit *, 16> Run[NumKinds];
