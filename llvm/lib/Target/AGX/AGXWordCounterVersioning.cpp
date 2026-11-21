@@ -67,8 +67,13 @@ static cl::opt<bool> EnableWordCounterVersioning(
 
 static cl::opt<unsigned> WordCounterMaxBases(
     "agx-loop-word-counters-max-bases", cl::init(2), cl::Hidden,
-    cl::desc("Distinct bases and constant offsets a counter's accesses may "
-             "have for -agx-loop-word-counters"));
+    cl::desc("Distinct constant offsets a counter's accesses from one base "
+             "may have for -agx-loop-word-counters"));
+
+static cl::opt<unsigned> WordCounterMaxTotalBases(
+    "agx-loop-word-counters-max-total-bases", cl::init(4), cl::Hidden,
+    cl::desc("Base registers a loop's copy may take for "
+             "-agx-loop-word-counters"));
 
 namespace {
 
@@ -282,10 +287,19 @@ bool AGXWordCounterVersioning::runOnFunction(Function &F) {
     // copy, which more than two cost in registers what the adds saved,
     // conv3x3's nine: 51 -> 68 GPRs)
     {
-      DenseMap<PHINode *, SmallSet<std::pair<Value *, int64_t>, 4>> Classes;
+      // (constant offsets only: an access at a counter plus a loop-
+      // invariant base took a 64-bit add for it before, one at a constant
+      // offset an immediate, cuda_index_add's four bases -5.7%)
+      DenseMap<std::pair<PHINode *, Value *>, SmallSet<int64_t, 4>> Classes;
       for (const Access &A : Accesses)
-        Classes[A.P].insert({A.X, A.C});
-      if (any_of(Classes, [](auto &E) {
+        Classes[{A.P, A.X}].insert(A.C);
+      // (and at most four base registers in all: conv3x3's nine runtime
+      // bases took 51 -> 68 GPRs, +0.4%)
+      unsigned Total = 0;
+      for (auto &E : Classes)
+        Total += E.second.size();
+      if (Total > WordCounterMaxTotalBases ||
+          any_of(Classes, [](auto &E) {
             return E.second.size() > WordCounterMaxBases;
           })) {
         LLVM_DEBUG(dbgs() << "wcv: too many bases\n");
