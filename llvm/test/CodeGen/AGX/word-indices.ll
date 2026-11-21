@@ -1,7 +1,8 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices=0 < %s | FileCheck %s --check-prefix=OFF
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit=0 < %s | FileCheck %s --check-prefix=EXIT
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit=0 -agx-loop-word-indices-exit-count=0 < %s | FileCheck %s --check-prefix=EXIT
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit-count=0 < %s | FileCheck %s --check-prefix=COUNT
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-exit-on-step-counter=0 < %s | FileCheck %s --check-prefix=STEP
 
 ; A loop's 16-byte loads of halves at a 32-bit counter of halves (LSR's,
 ; start 512 * row, the row's 16-byte steps): a counter of words beside it
@@ -184,5 +185,47 @@ out:
   %tz = zext i32 %t to i64
   %q = getelementptr float, ptr addrspace(1) %y, i64 %tz
   store float %r, ptr addrspace(1) %q, align 4
+  ret void
+}
+
+; Likewise against a loop's other counter by a power of two (here of floats,
+; which E594 leaves), the bound a 64-bit value below 2^32 by its known bits
+; (L15-E625): the index's flags go, as it is now compared on the last
+; iteration too.
+; CHECK-LABEL: define agx_kernel void @step(
+; CHECK: %[[N32:.*]] = trunc i64 %n8 to i32
+; CHECK: %[[Q:.*]] = lshr exact i32 %[[N32]], 3
+; CHECK: %[[S:.*]] = shl i32 %[[Q]], 3
+; CHECK: %[[END:.*]] = add i32 %start, %[[S]]
+; CHECK: %iv.next = add i32 %iv, 8
+; CHECK-NEXT: %c = icmp eq i32 %iv.next, %[[END]]
+; CHECK-NOT: %j
+; CHECK: ret void
+; STEP-LABEL: define agx_kernel void @step(
+; STEP: %c = icmp eq i64 %jz, %n8
+define agx_kernel void @step(ptr addrspace(1) %x, ptr addrspace(1) %y, i64 %n) #0 {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %start = shl i32 %t, 9
+  %n8 = and i64 %n, 2147483640
+  %c0 = icmp ugt i64 %n8, 0
+  br i1 %c0, label %pre, label %out
+pre:
+  br label %loop
+loop:
+  %iv = phi i32 [ %start, %pre ], [ %iv.next, %loop ]
+  %j = phi i32 [ 0, %pre ], [ %j.next, %loop ]
+  %z = zext i32 %iv to i64
+  %p = getelementptr float, ptr addrspace(1) %x, i64 %z
+  %v = load <8 x float>, ptr addrspace(1) %p, align 4
+  %m = fmul <8 x float> %v, %v
+  %q = getelementptr float, ptr addrspace(1) %y, i64 %z
+  store <8 x float> %m, ptr addrspace(1) %q, align 4
+  %iv.next = add nuw i32 %iv, 8
+  %j.next = add nuw nsw i32 %j, 8
+  %jz = zext i32 %j.next to i64
+  %c = icmp eq i64 %jz, %n8
+  br i1 %c, label %out, label %loop
+out:
   ret void
 }

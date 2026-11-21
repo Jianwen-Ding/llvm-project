@@ -71,6 +71,11 @@ static cl::opt<bool> AGXWordIndicesExitCount(
              "compare with a loop-invariant bound reads, as the counter of "
              "words against that bound in words"));
 
+static cl::opt<bool> AGXExitOnStepCounter(
+    "agx-loop-exit-on-step-counter", cl::init(true), cl::Hidden,
+    cl::desc("-agx-loop-word-indices-exit-count against any other counter "
+             "of the loop by a power of two, not only a counter of words"));
+
 static cl::opt<unsigned> AGXWordIndicesOffsets(
     "agx-loop-word-indices-offsets", cl::init(1), cl::Hidden,
     cl::desc("Most further offsets (an add each) for each base"));
@@ -456,19 +461,49 @@ bool AGXWordIndices::runOnFunction(Function &F) {
   // n / s_p-th increment is the one equal to n, and the counter of words is
   // then w.start + n / s_p * s_w, which no earlier one equals mod 2^32 where
   // n's bound / s_p * s_w < 2^32 (L15-E624).
-  if (AGXWordIndicesExitCount)
-    for (Counter &C : Counters) {
-      if (!C.W->getParent())
+  // (the counters to compare instead: the counters of words, then any
+  // other loop's counter by a positive power of two, its add in the latch,
+  // L15-E625)
+  struct Stepped {
+    WeakVH W, WN;
+    BasicBlock *Pre, *Latch;
+  };
+  SmallVector<Stepped, 8> Steps;
+  for (Counter &C : Counters)
+    if (auto *WN = dyn_cast<BinaryOperator>(C.WNext))
+      Steps.push_back({C.W, WN, C.W->getIncomingBlock(0),
+                       C.W->getIncomingBlock(1)});
+  if (AGXExitOnStepCounter)
+    for (Loop *L : LI.getLoopsInPreorder()) {
+      BasicBlock *Pre = L->getLoopPreheader(), *Latch = L->getLoopLatch();
+      if (!Pre || !Latch)
         continue;
-      BasicBlock *H = C.W->getParent();
-      BasicBlock *Latch = C.W->getIncomingBlock(1);
-      BasicBlock *Pre = C.W->getIncomingBlock(0);
-      auto *WN = dyn_cast<BinaryOperator>(C.WNext);
-      auto *SW = WN ? dyn_cast<ConstantInt>(WN->getOperand(1)) : nullptr;
+      for (PHINode &Q : L->getHeader()->phis()) {
+        if (!Q.getType()->isIntegerTy(32) || Q.getNumIncomingValues() != 2 ||
+            any_of(Steps, [&](const Stepped &T) { return T.W == &Q; }))
+          continue;
+        auto *QN = dyn_cast<BinaryOperator>(Q.getIncomingValueForBlock(Latch));
+        const APInt *SQ;
+        if (QN && QN->getParent() == Latch &&
+            match(QN, m_Add(m_Specific(&Q), m_APInt(SQ))) &&
+            SQ->isPowerOf2() && !SQ->isNegative())
+          Steps.push_back({&Q, QN, Pre, Latch});
+      }
+    }
+  if (AGXWordIndicesExitCount)
+    for (Stepped &S : Steps) {
+      auto *W = dyn_cast_or_null<PHINode>(S.W);
+      auto *WN = dyn_cast_or_null<BinaryOperator>(S.WN);
+      if (!W || !WN)
+        continue;
+      BasicBlock *H = W->getParent();
+      BasicBlock *Latch = S.Latch;
+      BasicBlock *Pre = S.Pre;
+      auto *SW = dyn_cast<ConstantInt>(WN->getOperand(1));
       if (!SW || !SW->getValue().isPowerOf2())
         continue;
       for (PHINode &P : make_early_inc_range(H->phis())) {
-        if (&P == C.W || !P.getType()->isIntegerTy(32) ||
+        if (&P == W || !P.getType()->isIntegerTy(32) ||
             P.getNumIncomingValues() != 2 ||
             !match(P.getIncomingValueForBlock(Pre), m_Zero()))
           continue;
@@ -529,20 +564,37 @@ bool AGXWordIndices::runOnFunction(Function &F) {
         if (N == Mine)
           continue;
         // n as a 32-bit value (or the zext of one), invariant in the loop
+        // (or a 64-bit one below 2^32 by its known bits, truncated before
+        // the loop: row_axpy_dyn's unrolled iterations, n & 0x7ffffff8)
         Value *N32 = N;
+        bool Trunc = false;
         if (N->getType()->isIntegerTy(64)) {
           Value *X;
-          if (!match(N, m_ZExt(m_Value(X))) || !X->getType()->isIntegerTy(32))
+          if (match(N, m_ZExt(m_Value(X))) && X->getType()->isIntegerTy(32))
+            N32 = X;
+          else if (computeKnownBits(N, DL).countMaxActiveBits() <= 32)
+            Trunc = true;
+          else
             continue;
-          N32 = X;
         } else if (!N->getType()->isIntegerTy(32)) {
           continue;
         }
-        auto *NI = dyn_cast<Instruction>(N32);
+        auto *NI = dyn_cast<Instruction>(Trunc ? N : N32);
         if (NI && !DT.dominates(NI, Pre->getTerminator()))
           continue;
-        if (!NI && !isa<Argument>(N32) && !isa<Constant>(N32))
+        if (!NI && !isa<Argument>(Trunc ? N : N32) &&
+            !isa<Constant>(Trunc ? N : N32))
           continue;
+        if (Trunc) {
+          // (the bits of n below: as for the 32-bit value)
+          KnownBits K64 = computeKnownBits(N, DL);
+          unsigned LP = SP->logBase2(), LW = SW->getValue().logBase2();
+          if (K64.countMinTrailingZeros() < LP ||
+              K64.getMaxValue().lshr(LP).shl(LW).getActiveBits() > 32)
+            continue;
+          N32 = IRBuilder<>(Pre->getTerminator())
+                    .CreateTrunc(N, Type::getInt32Ty(F.getContext()));
+        }
         KnownBits KB = computeKnownBits(N32, DL);
         unsigned LogP = SP->logBase2(), LogW = SW->getValue().logBase2();
         if (KB.countMinTrailingZeros() < LogP ||
@@ -551,14 +603,17 @@ bool AGXWordIndices::runOnFunction(Function &F) {
           continue;
         IRBuilder<> PB(Pre->getTerminator());
         Value *Bound = PB.CreateAdd(
-            C.W->getIncomingValue(0),
+            W->getIncomingValueForBlock(Pre),
             PB.CreateShl(PB.CreateLShr(N32, LogP, "", /*isExact=*/true), LogW),
-            "words.end");
+            any_of(Counters, [&](const Counter &K) { return K.W == W; })
+                ? "words.end"
+                : "count.end");
         if (Cmp->comesBefore(WN))
           WN->moveBefore(Cmp->getIterator());
         // (w.next may now be compared on the last iteration, where its
         // nuw is not otherwise known: dropped)
         WN->setHasNoUnsignedWrap(false);
+        WN->setHasNoSignedWrap(false);
         Cmp->setOperand(0, WN);
         Cmp->setOperand(1, Bound);
         for (Use *U : Outside)
