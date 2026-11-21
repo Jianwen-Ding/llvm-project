@@ -71,6 +71,11 @@ static cl::opt<bool> AGXLoadsAfterStores(
     cl::desc("Keep device loads after the device stores before them in "
              "program order in a thread's row loop of light work"));
 
+static cl::opt<bool> AGXLightRowStoresApart(
+    "agx-sched-light-row-stores-apart", cl::Hidden, cl::init(true),
+    cl::desc("No clusters of device stores in -agx-sched-loads-after-stores' "
+             "regions"));
+
 static cl::opt<unsigned> AGXLoadsAfterStoresWork(
     "agx-sched-loads-after-stores-work", cl::Hidden, cl::init(125),
     cl::desc("-agx-sched-loads-after-stores' most instructions for every 4 "
@@ -238,6 +243,11 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
     }
     // (a run of loads ends at a store the later loads now follow)
     LoadsFollowStores = true;
+    // Nor do its stores wait for each other's values: a row of light work
+    // stores each value as it is ready (widen_dyn: two 16-byte stores of
+    // converted halves, held together, took 4 more GPRs, L15-E619).
+    if (AGXLightRowStoresApart)
+      Kinds &= ~(1u << DeviceStore);
   }
   EquivalenceClasses<SUnit *> Clusters;
   SmallVector<SUnit *, 16> Run[NumKinds];
