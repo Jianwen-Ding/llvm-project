@@ -217,10 +217,126 @@ static std::optional<Address> analyze(Instruction &I, Loop &L,
   return A;
 }
 
+static cl::opt<bool> AGXHalfPointerCounters(
+    "agx-half-pointer-counters", cl::init(true), cl::Hidden,
+    cl::desc("A pointer LSR steps by twice a 32-bit counter of halves from "
+             "0 as the base plus the counter's halves, its 16-byte half "
+             "loads as two 8-byte ones from bases 8 bytes apart"));
+
+/// LSR steps a row of halves by pointers beside a 32-bit counter of halves
+/// (hdot_dyn: two rows' pointers by 16 bytes, j by 8): each pointer a
+/// 64-bit add an iteration. Where the counter j goes up from 0 by t without
+/// unsigned wrap (nuw) and the pointer p by 2 t bytes, p = p0 + 2 zext(j),
+/// the base and an index of halves, which instruction selection takes as a
+/// half index of the 16-bit format for 8 bytes (SelectDeviceAddr32Via16).
+/// A load of 16 bytes there (8 halves, split by type legalization where
+/// the block takes no 16-byte half loads, agxWideHalfLoadBlock, each
+/// half's address a 64-bit add) as two of 8 bytes from p0 and p0 + 8, both
+/// at j (L15-E688). Only where the pointer's every use is a load or store
+/// at it (or its step).
+static bool halfPointerCounters(Function &F, LoopInfo &LI) {
+  using namespace PatternMatch;
+  if (!AGXHalfPointerCounters)
+    return false;
+  bool Changed = false;
+  Type *I64 = Type::getInt64Ty(F.getContext());
+  for (Loop *L : LI.getLoopsInPreorder()) {
+    BasicBlock *Pre = L->getLoopPreheader(), *Latch = L->getLoopLatch();
+    if (!Pre || !Latch || !L->isInnermost())
+      continue;
+    SmallVector<PHINode *, 4> Ptrs;
+    for (PHINode &P : L->getHeader()->phis())
+      if (P.getType()->isPointerTy() &&
+          P.getType()->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+          P.getNumIncomingValues() == 2)
+        Ptrs.push_back(&P);
+    for (PHINode *P : Ptrs) {
+      auto *G = dyn_cast<GetElementPtrInst>(P->getIncomingValueForBlock(Latch));
+      const APInt *S;
+      if (!G || G->getPointerOperand() != P || G->getNumIndices() != 1 ||
+          !G->getSourceElementType()->isIntegerTy(8) ||
+          !match(G->getOperand(1), m_APInt(S)) || !G->hasOneUse() ||
+          S->isNegative() || S->isZero() || S->getZExtValue() % 2)
+        continue;
+      Value *P0 = P->getIncomingValueForBlock(Pre);
+      if (!L->isLoopInvariant(P0))
+        continue;
+      // the counter of halves: from 0 by S / 2, without unsigned wrap
+      PHINode *J = nullptr;
+      for (PHINode &Q : L->getHeader()->phis()) {
+        if (!Q.getType()->isIntegerTy(32) || Q.getNumIncomingValues() != 2 ||
+            !match(Q.getIncomingValueForBlock(Pre), m_Zero()))
+          continue;
+        auto *Inc = dyn_cast<BinaryOperator>(Q.getIncomingValueForBlock(Latch));
+        const APInt *T;
+        if (Inc && Inc->getOpcode() == Instruction::Add &&
+            Inc->hasNoUnsignedWrap() &&
+            match(Inc, m_c_Add(m_Specific(&Q), m_APInt(T))) &&
+            T->getZExtValue() * 2 == S->getZExtValue())
+          J = &Q;
+      }
+      if (!J)
+        continue;
+      bool OK = true;
+      for (User *U : P->users()) {
+        if (U == G)
+          continue;
+        auto *I = dyn_cast<Instruction>(U);
+        if (!I || !L->contains(I) || getLoadStorePointerOperand(I) != P ||
+            (isa<LoadInst>(I) && !cast<LoadInst>(I)->isSimple()) ||
+            (isa<StoreInst>(I) && !cast<StoreInst>(I)->isSimple()))
+          OK = false;
+      }
+      if (!OK)
+        continue;
+      IRBuilder<> HB(&*L->getHeader()->getFirstInsertionPt());
+      Value *Idx = HB.CreateZExt(J, I64);
+      Type *H = ArrayType::get(HB.getInt8Ty(), 2);
+      Value *NP = HB.CreateGEP(H, P0, Idx, P->getName() + ".halves");
+      Value *Base8 = nullptr;
+      for (User *U : make_early_inc_range(P->users())) {
+        auto *LD = dyn_cast<LoadInst>(U);
+        auto *VT = LD ? dyn_cast<FixedVectorType>(LD->getType()) : nullptr;
+        if (VT && VT->getElementType()->isHalfTy() &&
+            VT->getNumElements() == 8 && LD->getAlign() >= Align(4) &&
+            !agxWideHalfLoadBlock(*LD->getParent())) {
+          if (!Base8)
+            Base8 = IRBuilder<>(Pre->getTerminator())
+                        .CreateGEP(HB.getInt8Ty(), P0, HB.getInt64(8),
+                                   P->getName() + ".base8");
+          IRBuilder<> LB(LD);
+          auto *V4 = FixedVectorType::get(VT->getElementType(), 4);
+          auto *L0 = LB.CreateAlignedLoad(V4, NP, LD->getAlign());
+          Value *NP8 = LB.CreateGEP(H, Base8, Idx);
+          auto *L1 = LB.CreateAlignedLoad(
+              V4, NP8, commonAlignment(LD->getAlign(), 8));
+          for (LoadInst *Part : {L0, L1})
+            Part->copyMetadata(*LD, {LLVMContext::MD_alias_scope,
+                                     LLVMContext::MD_noalias,
+                                     LLVMContext::MD_tbaa});
+          Value *R = LB.CreateShuffleVector(L0, L1,
+                                            ArrayRef<int>{0, 1, 2, 3, 4, 5, 6, 7});
+          R->takeName(LD);
+          LD->replaceAllUsesWith(R);
+          LD->eraseFromParent();
+          continue;
+        }
+      }
+      P->replaceUsesWithIf(NP, [&](Use &U) { return U.getUser() != G; });
+      G->replaceAllUsesWith(PoisonValue::get(G->getType()));
+      G->eraseFromParent();
+      P->eraseFromParent();
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool AGXWordIndices::runOnFunction(Function &F) {
   if (!AGXWordIndicesOpt || skipFunction(F))
     return false;
   LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+  bool HalfPtrs = halfPointerCounters(F, LI);
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   AssumptionCache &AC =
       getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
@@ -656,5 +772,5 @@ bool AGXWordIndices::runOnFunction(Function &F) {
     for (WeakTrackingVH &V : Left)
       if (auto *P = dyn_cast_or_null<PHINode>(V))
         RecursivelyDeleteDeadPHINode(P);
-  return Changed;
+  return Changed || HalfPtrs;
 }
