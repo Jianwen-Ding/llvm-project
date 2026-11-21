@@ -149,6 +149,11 @@ static cl::opt<bool> ExpPoly5(
     cl::desc("expf's e^r - 1 - r as r^2 times a minimax polynomial of "
              "degree 4, not Cephes' of degree 5"));
 
+static cl::opt<bool> PowConstantTail(
+    "agx-pow-constant-tail", cl::init(true), cl::Hidden,
+    cl::desc("pow by a finite nonzero constant: no select of x = 1 and one "
+             "NaN select for a NaN or a negative finite x"));
+
 static cl::opt<bool> TanQuotientSigns(
     "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
     cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
@@ -1143,6 +1148,28 @@ public:
       Value *Inf = mul(Y, L);
       R = sel(B.CreateFCmpOEQ(abs(Inf), k(INFINITY)),
               sel(gt(Inf, 0.0), k(INFINITY), k(0.0)), R);
+    }
+    // (a finite nonzero constant y: x = 1 gives exactly 1 already, log(1)
+    // being 0 and e^(+-0) 1, and a non-integer y's NaN of a negative finite
+    // x and a NaN x's are one select of ult(x, 0) and x != -inf, L15-E718)
+    if (PowConstantTail && YC && YC->getValueAPF().isFinite() &&
+        !YC->isZero()) {
+      APFloat YV = YC->getValueAPF();
+      APFloat T = YV;
+      T.roundToIntegral(APFloat::rmTowardZero);
+      bool Integer = T.compare(YV) == APFloat::cmpEqual;
+      if (Integer) {
+        APFloat H = YV;
+        H.divide(APFloat(YV.getSemantics(), "2"), APFloat::rmNearestTiesToEven);
+        APFloat HT = H;
+        HT.roundToIntegral(APFloat::rmTowardZero);
+        if (HT.compare(H) != APFloat::cmpEqual)
+          R = sel(lt(copysign(k(1.0), X), 0.0), B.CreateFNeg(R), R);
+        return sel(B.CreateFCmpUNO(X, X), k(NAN), R);
+      }
+      return sel(B.CreateAnd(B.CreateFCmpULT(X, k(0.0)),
+                             B.CreateFCmpUNE(X, k(-INFINITY))),
+                 k(NAN), R);
     }
     // A negative x: an odd integer y gives the sign, any other finite
     // non-integer a NaN (for x = -inf, the infinity or zero above).
