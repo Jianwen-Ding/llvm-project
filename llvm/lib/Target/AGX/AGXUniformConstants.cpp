@@ -32,6 +32,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/Support/CommandLine.h"
@@ -88,6 +90,10 @@ static cl::opt<bool> AGXSignSplatCompares(
 
 bool llvm::AGX::signSplatCompares() { return AGXSignSplatCompares; }
 
+static cl::opt<bool> AGXUniformConstants16Loops(
+    "agx-uniform-constants-16-loops", cl::init(false), cl::Hidden,
+    cl::desc("-agx-uniform-constants-16 also for constants a loop reads"));
+
 static cl::opt<bool> AGXUniformConstants16(
     "agx-uniform-constants-16", cl::init(true), cl::Hidden,
     cl::desc("With -agx-uniform-constants, 16-bit constants too: the low "
@@ -109,6 +115,8 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.setPreservesCFG();
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<MachineLoopInfoWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };
@@ -117,8 +125,11 @@ public:
 
 char AGXUniformConstantsPass::ID = 0;
 
-INITIALIZE_PASS(AGXUniformConstantsPass, DEBUG_TYPE, "AGX Uniform Constants",
-                false, false)
+INITIALIZE_PASS_BEGIN(AGXUniformConstantsPass, DEBUG_TYPE,
+                      "AGX Uniform Constants", false, false)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_END(AGXUniformConstantsPass, DEBUG_TYPE,
+                    "AGX Uniform Constants", false, false)
 
 FunctionPass *llvm::createAGXUniformConstantsPass() {
   return new AGXUniformConstantsPass();
@@ -132,6 +143,8 @@ bool AGXUniformConstantsPass::runOnMachineFunction(MachineFunction &MF) {
   const AGXInstrInfo *TII = ST.getInstrInfo();
   const TargetRegisterInfo *TRI = ST.getRegisterInfo();
   auto *MFI = MF.getInfo<AGXMachineFunctionInfo>();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
   unsigned Half = alignTo(MFI->getUniformHalfCount(), 2);
   DenseMap<uint32_t, MCRegister> Slots;
@@ -146,7 +159,15 @@ bool AGXUniformConstantsPass::runOnMachineFunction(MachineFunction &MF) {
       bool Narrow = MI.getOpcode() == AGX::MOV_IMM16 && AGXUniformConstants16 &&
                     MI.getOperand(0).getReg().isVirtual() &&
                     MI.getOperand(1).isImm() &&
-                    (uint32_t(MI.getOperand(1).getImm()) & 0xffff) > 255;
+                    (uint32_t(MI.getOperand(1).getImm()) & 0xffff) > 255 &&
+                    (AGXUniformConstants16Loops ||
+                     none_of(MRI.use_nodbg_instructions(
+                                 MI.getOperand(0).getReg()),
+                             [&](const MachineInstr &U) {
+                               return MLI.getLoopFor(U.getParent());
+                             }));
+      // (a loop's: its fadd16s and xors read the uniform half every
+      // iteration, gemv_q8f +1.0% on average over prologue paddings)
       if ((MI.getOpcode() != AGX::MOV_IMM32 && !Narrow) ||
           !MI.getOperand(1).isImm())
         continue;
