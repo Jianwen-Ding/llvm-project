@@ -5,6 +5,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-bytes-half-lanes=0 < %s | FileCheck %s --check-prefix=NOLANE
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-signed-byte-pairs=0 < %s | FileCheck %s --check-prefix=NOPAIR
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-align-version-mask-bytes=0 < %s | FileCheck %s --check-prefix=NOMASK
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-align-version-converted-bytes=0 < %s | FileCheck %s --check-prefix=NOCONV
 
 ; A loop over a half row known aligned to 2 bytes only: a copy for a 4-byte
 ; aligned base (a test of the kernel argument, uniform) whose loads at
@@ -302,6 +303,137 @@ l:
   %t15 = icmp ne i8 %m15, 0
   %o15 = select i1 %t15, float %av15, float %bv15
   store float %o15, ptr addrspace(1) %gy15, align 4
+  %i1 = add i32 %i, 16
+  %c1 = icmp ult i32 %i1, 1024
+  br i1 %c1, label %l, label %x
+x:
+  ret void
+}
+
+; Bytes only converted to floating point, in a loop that stores (an int8
+; row's dequantization), are versioned too (L15-E607).
+; CHECK-LABEL: dequant:
+; CHECK: device_load {{[0-9]}}, i8, xyzw,
+; NOCONV-LABEL: dequant:
+; NOCONV-NOT: i8, xyzw
+; NOCONV: stop
+define agx_kernel void @dequant(ptr addrspace(1) noalias %c, ptr addrspace(1) noalias %y) {
+entry:
+  br label %l
+l:
+  %i = phi i32 [ 0, %entry ], [ %i1, %l ]
+  %k0 = add i32 %i, 0
+  %z0 = zext i32 %k0 to i64
+  %gc0 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z0
+  %gy0 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z0
+  %m0 = load i8, ptr addrspace(1) %gc0, align 1
+  %f0 = sitofp i8 %m0 to float
+  store float %f0, ptr addrspace(1) %gy0, align 4
+  %k1 = add i32 %i, 1
+  %z1 = zext i32 %k1 to i64
+  %gc1 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z1
+  %gy1 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z1
+  %m1 = load i8, ptr addrspace(1) %gc1, align 1
+  %f1 = sitofp i8 %m1 to float
+  store float %f1, ptr addrspace(1) %gy1, align 4
+  %k2 = add i32 %i, 2
+  %z2 = zext i32 %k2 to i64
+  %gc2 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z2
+  %gy2 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z2
+  %m2 = load i8, ptr addrspace(1) %gc2, align 1
+  %f2 = sitofp i8 %m2 to float
+  store float %f2, ptr addrspace(1) %gy2, align 4
+  %k3 = add i32 %i, 3
+  %z3 = zext i32 %k3 to i64
+  %gc3 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z3
+  %gy3 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z3
+  %m3 = load i8, ptr addrspace(1) %gc3, align 1
+  %f3 = sitofp i8 %m3 to float
+  store float %f3, ptr addrspace(1) %gy3, align 4
+  %k4 = add i32 %i, 4
+  %z4 = zext i32 %k4 to i64
+  %gc4 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z4
+  %gy4 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z4
+  %m4 = load i8, ptr addrspace(1) %gc4, align 1
+  %f4 = sitofp i8 %m4 to float
+  store float %f4, ptr addrspace(1) %gy4, align 4
+  %k5 = add i32 %i, 5
+  %z5 = zext i32 %k5 to i64
+  %gc5 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z5
+  %gy5 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z5
+  %m5 = load i8, ptr addrspace(1) %gc5, align 1
+  %f5 = sitofp i8 %m5 to float
+  store float %f5, ptr addrspace(1) %gy5, align 4
+  %k6 = add i32 %i, 6
+  %z6 = zext i32 %k6 to i64
+  %gc6 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z6
+  %gy6 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z6
+  %m6 = load i8, ptr addrspace(1) %gc6, align 1
+  %f6 = sitofp i8 %m6 to float
+  store float %f6, ptr addrspace(1) %gy6, align 4
+  %k7 = add i32 %i, 7
+  %z7 = zext i32 %k7 to i64
+  %gc7 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z7
+  %gy7 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z7
+  %m7 = load i8, ptr addrspace(1) %gc7, align 1
+  %f7 = sitofp i8 %m7 to float
+  store float %f7, ptr addrspace(1) %gy7, align 4
+  %k8 = add i32 %i, 8
+  %z8 = zext i32 %k8 to i64
+  %gc8 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z8
+  %gy8 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z8
+  %m8 = load i8, ptr addrspace(1) %gc8, align 1
+  %f8 = sitofp i8 %m8 to float
+  store float %f8, ptr addrspace(1) %gy8, align 4
+  %k9 = add i32 %i, 9
+  %z9 = zext i32 %k9 to i64
+  %gc9 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z9
+  %gy9 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z9
+  %m9 = load i8, ptr addrspace(1) %gc9, align 1
+  %f9 = sitofp i8 %m9 to float
+  store float %f9, ptr addrspace(1) %gy9, align 4
+  %k10 = add i32 %i, 10
+  %z10 = zext i32 %k10 to i64
+  %gc10 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z10
+  %gy10 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z10
+  %m10 = load i8, ptr addrspace(1) %gc10, align 1
+  %f10 = sitofp i8 %m10 to float
+  store float %f10, ptr addrspace(1) %gy10, align 4
+  %k11 = add i32 %i, 11
+  %z11 = zext i32 %k11 to i64
+  %gc11 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z11
+  %gy11 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z11
+  %m11 = load i8, ptr addrspace(1) %gc11, align 1
+  %f11 = sitofp i8 %m11 to float
+  store float %f11, ptr addrspace(1) %gy11, align 4
+  %k12 = add i32 %i, 12
+  %z12 = zext i32 %k12 to i64
+  %gc12 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z12
+  %gy12 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z12
+  %m12 = load i8, ptr addrspace(1) %gc12, align 1
+  %f12 = sitofp i8 %m12 to float
+  store float %f12, ptr addrspace(1) %gy12, align 4
+  %k13 = add i32 %i, 13
+  %z13 = zext i32 %k13 to i64
+  %gc13 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z13
+  %gy13 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z13
+  %m13 = load i8, ptr addrspace(1) %gc13, align 1
+  %f13 = sitofp i8 %m13 to float
+  store float %f13, ptr addrspace(1) %gy13, align 4
+  %k14 = add i32 %i, 14
+  %z14 = zext i32 %k14 to i64
+  %gc14 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z14
+  %gy14 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z14
+  %m14 = load i8, ptr addrspace(1) %gc14, align 1
+  %f14 = sitofp i8 %m14 to float
+  store float %f14, ptr addrspace(1) %gy14, align 4
+  %k15 = add i32 %i, 15
+  %z15 = zext i32 %k15 to i64
+  %gc15 = getelementptr inbounds i8, ptr addrspace(1) %c, i64 %z15
+  %gy15 = getelementptr inbounds float, ptr addrspace(1) %y, i64 %z15
+  %m15 = load i8, ptr addrspace(1) %gc15, align 1
+  %f15 = sitofp i8 %m15 to float
+  store float %f15, ptr addrspace(1) %gy15, align 4
   %i1 = add i32 %i, 16
   %c1 = icmp ult i32 %i1, 1024
   br i1 %c1, label %l, label %x

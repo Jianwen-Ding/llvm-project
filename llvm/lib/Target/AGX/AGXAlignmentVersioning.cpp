@@ -74,6 +74,18 @@ static cl::opt<bool> VersionByteLoads(
     "agx-align-version-byte-loads", cl::init(true), cl::Hidden,
     cl::desc("Raise scalar byte loads' alignment too"));
 
+static cl::opt<bool> VersionConvertedBytes(
+    "agx-align-version-converted-bytes", cl::init(true), cl::Hidden,
+    cl::desc("Raise scalar byte loads' alignment where their values are only "
+             "converted to floating point (an int8 row's dequantization)"));
+
+/// Whether a byte load's value is only converted to floating point (L15-E607).
+static bool convertedBytes(const Instruction &I) {
+  return !I.use_empty() && all_of(I.users(), [](const User *U) {
+    return isa<SIToFPInst>(U) || isa<UIToFPInst>(U);
+  });
+}
+
 static cl::opt<bool> VersionMaskBytes(
     "agx-align-version-mask-bytes", cl::init(true), cl::Hidden,
     cl::desc("Raise scalar byte loads' alignment where their values are only "
@@ -231,6 +243,12 @@ static void findRaises(Loop &L, ScalarEvolution &SE,
 static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
                          SmallVectorImpl<Raise> &Raises,
                          SetVector<Value *> &Bases) {
+  // (converted bytes only where the block stores: a dequantization's row,
+  // not a dot product's, q8_matvec's tput +2.5%, L15-E607)
+  bool Stores = any_of(BB, [](const Instruction &I) {
+    auto *S = dyn_cast<StoreInst>(&I);
+    return S && S->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+  });
   for (Instruction &I : BB) {
     Value *Ptr;
     Align Old;
@@ -263,7 +281,9 @@ static void findRaisesIn(BasicBlock &BB, ScalarEvolution &SE,
         !(VersionByteVectors && getLoadStoreType(&I)->isVectorTy()) &&
         !(VersionByteStores && isa<StoreInst>(I)) &&
         !(VersionByteLoads && isa<LoadInst>(I) && integerBytes(I)) &&
-        !(VersionMaskBytes && isa<LoadInst>(I) && maskBytes(I)))
+        !(VersionMaskBytes && isa<LoadInst>(I) && maskBytes(I)) &&
+        !(VersionConvertedBytes && Stores && isa<LoadInst>(I) &&
+          convertedBytes(I)))
       continue;
     auto [Base, Off] = baseAndOffset(Ptr, SE);
     if (!Base)
