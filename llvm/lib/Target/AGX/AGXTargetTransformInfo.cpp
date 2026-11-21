@@ -235,6 +235,11 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeColumnStores(
     "agx-device-unroll-runtime-column-stores", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-stores twice for a column"));
 
+static cl::opt<bool> AGXDeviceUnrollRuntimeColumnsOnly(
+    "agx-device-unroll-runtime-columns-only", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-strided twice where every device "
+             "load steps by a runtime stride"));
+
 static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
     "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
     cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
@@ -961,6 +966,11 @@ void AGXTTIImpl::getUnrollingPreferences(
         unsigned Count = Gather ? AGXDeviceUnrollRuntime
                                 : std::max<unsigned>(AGXDeviceUnrollRuntime,
                                                      AGXDeviceUnrollRuntimeStrided);
+        // (twice that where every load is a column's: colsum_dyn 322.8 ->
+        // 295.6; with a row's beside it, a matrix product's, 16 lost: matmul
+        // 138.0 -> 146.5, L15-E603)
+        if (!Gather && AGXDeviceUnrollRuntimeColumnsOnly && Far == RowLoads)
+          Count *= 2;
         UP.DefaultUnrollRuntimeCount = UP.MaxCount = Count;
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }

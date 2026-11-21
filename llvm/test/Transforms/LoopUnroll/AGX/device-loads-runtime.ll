@@ -1,5 +1,6 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime=0 -S < %s | FileCheck %s --check-prefix=OFF
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-columns-only=0 -S < %s | FileCheck %s --check-prefix=EIGHT
 
 ; A device-load loop of a runtime trip count with light work and a load that
 ; does not step by its own size (a matrix product's column of B, n floats a
@@ -29,6 +30,37 @@ loop:
   %pb = getelementptr inbounds float, ptr addrspace(1) %b, i64 %zb
   %v = load float, ptr addrspace(1) %pb, align 4
   %m = call float @llvm.fma.f32(float %u, float %v, float %acc)
+  %k1 = add nuw i32 %k, 1
+  %cnd = icmp ult i32 %k1, %n
+  br i1 %cnd, label %loop, label %exit
+exit:
+  %r = phi float [ 0.0, %entry ], [ %m, %loop ]
+  store float %r, ptr addrspace(1) %c, align 4
+  ret void
+}
+
+; A column alone (every load a runtime stride apart) 16 times (L15-E603).
+; CHECK-LABEL: @colsum(
+; CHECK-COUNT-16: fadd float
+; CHECK-NOT: fadd float
+; CHECK: epil
+; EIGHT-LABEL: @colsum(
+; EIGHT-COUNT-8: fadd float
+; EIGHT-NOT: fadd float
+; EIGHT: epil
+define void @colsum(ptr addrspace(1) %b, ptr addrspace(1) %c, i32 %n, i32 %col) {
+entry:
+  %e = icmp eq i32 %n, 0
+  br i1 %e, label %exit, label %loop
+loop:
+  %k = phi i32 [ 0, %entry ], [ %k1, %loop ]
+  %acc = phi float [ 0.0, %entry ], [ %m, %loop ]
+  %kn = mul i32 %k, %n
+  %ib = add i32 %kn, %col
+  %zb = zext i32 %ib to i64
+  %pb = getelementptr inbounds float, ptr addrspace(1) %b, i64 %zb
+  %v = load float, ptr addrspace(1) %pb, align 4
+  %m = fadd float %acc, %v
   %k1 = add nuw i32 %k, 1
   %cnd = icmp ult i32 %k1, %n
   br i1 %cnd, label %loop, label %exit
