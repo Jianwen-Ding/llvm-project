@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-exp-core-product=0 -agx-cos-horner=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-exp-core-product=0 -agx-cos-horner=0 -agx-exp-poly5=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-uniform-constants < %s | FileCheck %s --check-prefix=UNI
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-uniform-constants -agx-exp-fused-round=0 -agx-sincos-fused-round=0 -agx-log-low-fma=0 < %s | FileCheck %s --check-prefix=SEP
 ;
@@ -23,7 +23,7 @@
 ; SEP-NEXT: fadd float [[T]], f0x4B400000
 
 ; CHECK-LABEL: @e(
-; CHECK:      [[P:%[0-9]+]] = call float @llvm.fma.f32(float %{{[0-9]+}}, float [[R:%[0-9]+]], float 5.000000e-01)
+; CHECK:      [[P:%[0-9]+]] = call float @llvm.fma.f32(float %{{[0-9]+}}, float [[R:%[0-9]+]], float f0x3EFFFFFE)
 ; CHECK-NEXT: [[PR:%[0-9]+]] = fmul float [[P]], [[R]]
 ; CHECK-NEXT: [[E:%[0-9]+]] = call float @llvm.fma.f32(float [[PR]], float [[R]], float [[R]])
 ; CHECK-NEXT: fadd float [[E]], 1.000000e+00

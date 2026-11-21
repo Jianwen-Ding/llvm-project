@@ -144,6 +144,11 @@ static cl::opt<bool> ExpLowSelect(
     cl::desc("e^(hi + lo) (pow): lo as 0 where |hi| >= 89, not the result's "
              "+inf / +0 selects"));
 
+static cl::opt<bool> ExpPoly5(
+    "agx-exp-poly5", cl::init(true), cl::Hidden,
+    cl::desc("expf's e^r - 1 - r as r^2 times a minimax polynomial of "
+             "degree 4, not Cephes' of degree 5"));
+
 static cl::opt<bool> TanQuotientSigns(
     "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
     cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
@@ -781,8 +786,18 @@ public:
 
   /// e^r for |r| <= ln(2) / 2 (Cephes expf).
   Value *expCore(Value *R) {
-    Value *P = poly(R, {1.9875691500e-4, 1.3981999507e-3, 8.3334519073e-3,
-                        4.1665795894e-2, 1.6666665459e-1, 5.0000001201e-1});
+    // (degree 4, weighted minimax over |r| <= ln(2) / 2, the coefficients
+    // then searched in float: 0.05 ulp of e^r where Cephes' degree 5 is
+    // 0.02, one fma fewer; the maximum error stays 1 ulp, L15-E712)
+    // (for float results: half and bfloat ones keep Cephes' terms, which
+    // a bfloat result drops two of, L15-E351)
+    Value *P =
+        ExpPoly5 && !NarrowResult
+            ? poly(R, {0.0013814327539876103, 0.008368846029043198,
+                       0.04166828468441963, 0.1666651964187622,
+                       0.4999999403953552})
+            : poly(R, {1.9875691500e-4, 1.3981999507e-3, 8.3334519073e-3,
+                       4.1665795894e-2, 1.6666665459e-1, 5.0000001201e-1});
     // (fma(p r, r, r) reads p r and r, a 1-cycle fma where p, r r and r
     // took 2, L15-E704)
     if (ExpCoreProduct)

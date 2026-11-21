@@ -144,7 +144,7 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    icmpsel ueq, r2, r2l, 0, r4, r18
 ; CHECK-NEXT:    fmul32 r4, r6, r11
 ; CHECK-NEXT:    mov_imm r6, 1249902592
-; CHECK-NEXT:    mov_imm r11, 1007192328
+; CHECK-NEXT:    mov_imm r11, 1026206813
 ; CHECK-NEXT:    fcmpsel lt, r2, u2.abs, r6, r2, r4
 ; CHECK-NEXT:    fmul32 r1, r2, r1
 ; CHECK-NEXT:    fadd32 r1, r1, r3
@@ -158,12 +158,12 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    fmadd32 r7, r5, r10, r9
 ; CHECK-NEXT:    floor r10, r8
 ; CHECK-NEXT:    fmadd32 r7, r7, r5, r12
-; CHECK-NEXT:    mov_imm r12, 1026206145
+; CHECK-NEXT:    mov_imm r12, 1042983496
 ; CHECK-NEXT:    fmul32 r7, r7, r5
 ; CHECK-NEXT:    fadd32 r8, r8, r10.neg
 ; CHECK-NEXT:    mov_imm r17, 1060439284
 ; CHECK-NEXT:    fmadd32 r9, r5, r14, r13
-; CHECK-NEXT:    mov_imm r13, 1042983594
+; CHECK-NEXT:    mov_imm r13, 1056964606
 ; CHECK-NEXT:    mov_imm r14, 1124073472
 ; CHECK-NEXT:    fmadd32 r9, r9, r5, r16
 ; CHECK-NEXT:    fmadd32 r4, r7, r4, r4
@@ -193,14 +193,13 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    fadd32 r7, r6, r3.neg
 ; CHECK-NEXT:    fmadd32 r4, r7.neg, r8, r4
 ; CHECK-NEXT:    fmadd32 r4, r7.neg, r9, r4
-; CHECK-NEXT:    mov_imm r7, 961571175
+; CHECK-NEXT:    mov_imm r7, 984944945
 ; CHECK-NEXT:    fadd32 r2, r4, r2
-; CHECK-NEXT:    mov_imm r4, 985088974
+; CHECK-NEXT:    mov_imm r4, 1007230332
 ; CHECK-NEXT:    fmadd32 r10, r2, r7, r4
 ; CHECK-NEXT:    fmadd32 r10, r10, r2, r11
 ; CHECK-NEXT:    fmadd32 r10, r10, r2, r12
 ; CHECK-NEXT:    fmadd32 r10, r10, r2, r13
-; CHECK-NEXT:    fmadd32 r10, r10, r2, 0.5
 ; CHECK-NEXT:    fmul32 r10, r10, r2
 ; CHECK-NEXT:    fmadd32 r2, r10, r2, r2
 ; CHECK-NEXT:    mov_imm r10, 8388608
@@ -295,7 +294,6 @@ define agx_kernel void @transcendental(ptr addrspace(1) %out, float %a, float %b
 ; CHECK-NEXT:    fcmpsel gte, r4, r1.abs, 0.0, r4, r18
 ; CHECK-NEXT:    fmadd32 r3, r3, r2, r13
 ; CHECK-NEXT:    fmul32 r4, u3, r4
-; CHECK-NEXT:    fmadd32 r3, r3, r2, 0.5
 ; CHECK-NEXT:    fmul32 r3, r3, r2
 ; CHECK-NEXT:    fmadd32 r2, r3, r2, r2
 ; CHECK-NEXT:    fadd32 r2, r2, 1.0
