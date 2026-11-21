@@ -84,6 +84,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXWideIndexVersioningPass(PR);
   initializeAGXAlignmentVersioningPass(PR);
   initializeAGXNarrowInductionsPass(PR);
+  initializeAGXWordCounterVersioningPass(PR);
   initializeAGXWordIndicesPass(PR);
   initializeAGXSpecialRegisterRangesPassPass(PR);
   initializeAGXVectorAccessesPass(PR);
@@ -881,6 +882,10 @@ bool AGXPassConfig::addPreISel() {
   // 64-bit address arithmetic.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createAGXNarrowInductionsPass());
+  // 64-bit byte offsets that remain, of word accesses: a copy with a 32-bit
+  // counter of words, the accesses' index register (L15-E674).
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAGXWordCounterVersioningPass());
   // Word accesses at a counter of bytes or halves indexed by a counter of
   // words, once the counters are 32 bits (L15-E594).
   if (getOptLevel() != CodeGenOptLevel::None)

@@ -64,6 +64,7 @@ FunctionPass *createAGXAliasVersioningPass();
 FunctionPass *createAGXWideIndexVersioningPass();
 FunctionPass *createAGXAlignmentVersioningPass();
 FunctionPass *createAGXNarrowInductionsPass();
+FunctionPass *createAGXWordCounterVersioningPass();
 FunctionPass *createAGXWordIndicesPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
@@ -165,6 +166,7 @@ void initializeAGXAliasVersioningPass(PassRegistry &);
 void initializeAGXWideIndexVersioningPass(PassRegistry &);
 void initializeAGXAlignmentVersioningPass(PassRegistry &);
 void initializeAGXNarrowInductionsPass(PassRegistry &);
+void initializeAGXWordCounterVersioningPass(PassRegistry &);
 void initializeAGXWordIndicesPass(PassRegistry &);
 void initializeAGXSpecialRegisterRangesPassPass(PassRegistry &);
 void initializeAGXVectorAccessesPass(PassRegistry &);
