@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -start-before=agx-word-indices -stop-after=agx-word-indices -agx-loop-word-indices-exit=0 < %s | FileCheck %s --check-prefix=EXIT
 
 ; A loop's 16-byte loads of halves at a 32-bit counter of halves (LSR's,
 ; start 512 * row, the row's 16-byte steps): a counter of words beside it
@@ -7,10 +8,15 @@
 ; where the half index took a 64-bit add for each address.
 ; CHECK-LABEL: define agx_kernel void @hsum(
 ; CHECK: %words.start = lshr exact i32 %start, 1
+; The counter of halves, then read by its increment only, goes as well
+; (L15-E623).
 ; CHECK: %words = phi i32 [ %words.start, %pre ], [ %words.next, %loop ]
+; CHECK-NOT: %iv
 ; CHECK: getelementptr nuw i32, ptr addrspace(1) %x, i64
 ; CHECK: add nuw i32 %words, 4
 ; CHECK: %words.next = add nuw i32 %words, 8
+; EXIT-LABEL: define agx_kernel void @hsum(
+; EXIT: %iv = phi i32
 ; OFF-LABEL: define agx_kernel void @hsum(
 ; OFF-NOT: words
 ; OFF: getelementptr inbounds nuw [2 x i8]
@@ -86,3 +92,39 @@ out:
 declare float @llvm.vector.reduce.fadd.v8f32(float, <8 x float>)
 
 attributes #0 = { "agx-upper-bounds:air.thread_position_in_grid"="1024,0,0" }
+
+; The counter of bytes left with its increment and the exit compare only (a
+; row of 512 floats in 16-byte steps): the compare is of the counter of words,
+; 2048 / 4, and the counter of bytes goes (L15-E623).
+; CHECK-LABEL: define agx_kernel void @exit(
+; CHECK: %words.next = add nuw i32 %words, 4
+; CHECK-NEXT: %c = icmp eq i32 %words.next, 512
+; CHECK-NOT: %iv
+; CHECK: ret void
+; EXIT-LABEL: define agx_kernel void @exit(
+; EXIT: %iv = phi i32
+; EXIT: %c = icmp eq i64 %zn, 2048
+; EXIT: %words.next = add nuw i32 %words, 4
+define agx_kernel void @exit(ptr addrspace(1) %x, ptr addrspace(1) %y) {
+entry:
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %tz = zext i32 %t to i64
+  %off = shl nuw nsw i64 %tz, 11
+  %xr = getelementptr i8, ptr addrspace(1) %x, i64 %off
+  %yr = getelementptr i8, ptr addrspace(1) %y, i64 %off
+  br label %loop
+loop:
+  %iv = phi i32 [ 0, %entry ], [ %iv.next, %loop ]
+  %z = zext i32 %iv to i64
+  %p = getelementptr i8, ptr addrspace(1) %xr, i64 %z
+  %v = load <4 x float>, ptr addrspace(1) %p, align 4
+  %m = fmul <4 x float> %v, %v
+  %q = getelementptr i8, ptr addrspace(1) %yr, i64 %z
+  store <4 x float> %m, ptr addrspace(1) %q, align 4
+  %iv.next = add nuw nsw i32 %iv, 16
+  %zn = zext i32 %iv.next to i64
+  %c = icmp eq i64 %zn, 2048
+  br i1 %c, label %out, label %loop
+out:
+  ret void
+}

@@ -59,6 +59,11 @@ static cl::opt<bool> AGXWordIndicesOpt(
     cl::desc("Index a loop's word accesses by a counter of words beside its "
              "counter of bytes or halves"));
 
+static cl::opt<bool> AGXWordIndicesExit(
+    "agx-loop-word-indices-exit", cl::init(true), cl::Hidden,
+    cl::desc("The loop's exit compare of a counter whose accesses all moved "
+             "to the counter of words, on that counter"));
+
 static cl::opt<unsigned> AGXWordIndicesOffsets(
     "agx-loop-word-indices-offsets", cl::init(1), cl::Hidden,
     cl::desc("Most further offsets (an add each) for each base"));
@@ -295,6 +300,14 @@ bool AGXWordIndices::runOnFunction(Function &F) {
 
   bool Changed = false;
   SmallVector<WeakTrackingVH, 16> Dead;
+  // (the old counter, the counter of words and its next value, the shift)
+  struct Counter {
+    PHINode *Phi;
+    PHINode *W;
+    Value *WNext;
+    unsigned Shift;
+  };
+  SmallVector<Counter, 4> Counters;
   for (Group &G : Groups) {
     Loop *L = G.L;
     BasicBlock *Pre = L->getLoopPreheader(), *Latch = L->getLoopLatch();
@@ -337,6 +350,7 @@ bool AGXWordIndices::runOnFunction(Function &F) {
                                 "words.next", /*HasNUW=*/true);
     W->addIncoming(WStart, Pre);
     W->addIncoming(WNext, Latch);
+    Counters.push_back({G.Phi, W, WNext, Shift});
     DenseMap<Value *, Value *> Bases;
     for (auto &[Base, Min] : MinOff)
       Bases[Base] = Min ? B.CreateGEP(B.getInt8Ty(), Base, B.getInt64(Min),
@@ -368,5 +382,73 @@ bool AGXWordIndices::runOnFunction(Function &F) {
   for (WeakTrackingVH &V : Dead)
     if (auto *I = dyn_cast_or_null<Instruction>(V))
       RecursivelyDeleteTriviallyDeadInstructions(I);
+  // A counter left with only its increment and the loop's exit compare
+  // (row_norm_apply's bytes beside its words: a register): phi = w << shift
+  // exactly, so phi == c is w == c >> shift for a c of the shift's low zero
+  // bits (L15-E623).
+  SmallPtrSet<PHINode *, 4> Done;
+  SmallVector<WeakTrackingVH, 4> Left;
+  for (Counter &C : Counters)
+    Left.push_back(C.Phi);
+  for (Counter &C : AGXWordIndicesExit ? Counters : SmallVector<Counter, 4>()) {
+    if (!Done.insert(C.Phi).second)
+      continue;
+    PHINode *P = C.Phi;
+    if (P->getNumIncomingValues() != 2)
+      continue;
+    // (its increment no-wrap, so that inc = w.next << shift exactly)
+    auto *Inc = dyn_cast<BinaryOperator>(
+        P->getIncomingValueForBlock(C.W->getIncomingBlock(1)));
+    if (!Inc || Inc->getOpcode() != Instruction::Add ||
+        !Inc->hasNoUnsignedWrap() || !is_contained(Inc->operands(), P) ||
+        !P->hasOneUse())
+      continue;
+    // Inc's users: P and one compare, directly or through a zext.
+    ICmpInst *Cmp = nullptr;
+    Instruction *Ext = nullptr;
+    bool Ok = true;
+    for (User *U : Inc->users()) {
+      if (U == P)
+        continue;
+      Instruction *UI = cast<Instruction>(U);
+      if (isa<ZExtInst>(UI) && UI->hasOneUse() && !Ext) {
+        Ext = UI;
+        UI = cast<Instruction>(*UI->user_begin());
+      }
+      auto *IC = dyn_cast<ICmpInst>(UI);
+      if (!IC || Cmp || !IC->isEquality() ||
+          !isa<ConstantInt>(IC->getOperand(1))) {
+        Ok = false;
+        break;
+      }
+      Cmp = IC;
+    }
+    if (!Ok || !Cmp)
+      continue;
+    const APInt &CV = cast<ConstantInt>(Cmp->getOperand(1))->getValue();
+    if (CV.getActiveBits() > 32 || CV.countr_zero() < C.Shift)
+      continue;
+    // (w.next, at the latch's end, before the compare: it reads only w)
+    auto *WN = dyn_cast<Instruction>(C.WNext);
+    if (!WN || WN->getParent() != Cmp->getParent())
+      continue;
+    if (Cmp->comesBefore(WN))
+      WN->moveBefore(Cmp->getIterator());
+    IRBuilder<> CB(Cmp);
+    Cmp->setOperand(0, C.WNext);
+    Cmp->setOperand(1, CB.getInt32(CV.getZExtValue() >> C.Shift));
+    if (Ext)
+      Ext->eraseFromParent();
+    P->replaceAllUsesWith(PoisonValue::get(P->getType()));
+    P->eraseFromParent();
+    Inc->eraseFromParent();
+  }
+  // A counter now read by nothing but its own increment (hscale_dyn's
+  // halves beside its words and its count of iterations): nothing later
+  // deletes the cycle, which kept an add and a register.
+  if (AGXWordIndicesExit)
+    for (WeakTrackingVH &V : Left)
+      if (auto *P = dyn_cast_or_null<PHINode>(V))
+        RecursivelyDeleteDeadPHINode(P);
   return Changed;
 }
