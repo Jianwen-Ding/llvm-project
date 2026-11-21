@@ -234,6 +234,21 @@ void AGXTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
           MPM.addPass(
               createModuleToFunctionPassAdaptor(AGXAliasVersioningPass()));
       });
+  // The exps below another loop's maximum marked before the unroller
+  // (L15-E731).
+  PB.registerVectorizerStartEPCallback(
+      [](FunctionPassManager &FPM, OptimizationLevel Level) {
+        if (Level != OptimizationLevel::O0)
+          FPM.addPass(AGXMarkExpsBelowMaxPass());
+      });
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, FunctionPassManager &FPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name != "agx-mark-exps-below-max")
+          return false;
+        FPM.addPass(AGXMarkExpsBelowMaxPass());
+        return true;
+      });
   PB.registerPipelineParsingCallback(
       [](StringRef Name, FunctionPassManager &FPM,
          ArrayRef<PassBuilder::PipelineElement>) {

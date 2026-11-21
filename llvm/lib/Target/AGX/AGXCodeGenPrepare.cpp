@@ -9619,7 +9619,7 @@ static bool expBelowLoopMax(IntrinsicInst *E, LoopInfo &LI,
 /// of the pass: the deferred maximum reductions rewrite the loop's maximum
 /// that it matches (L15-E450).
 static void markExpsBelowLoopMax(Function &F) {
-  if (!AGXExpBelowLoopMax)
+  if (!AGXExpBelowLoopMax || F.isDeclaration())
     return;
   SmallVector<IntrinsicInst *, 4> Exps;
   for (Instruction &I : instructions(F))
@@ -9637,6 +9637,19 @@ static void markExpsBelowLoopMax(Function &F) {
   for (IntrinsicInst *II : Exps)
     if (expBelowLoopMax(II, LI, SE))
       II->setMetadata("agx.exp.below.max", MDNode::get(F.getContext(), {}));
+}
+
+static cl::opt<bool> AGXMarkExpsBelowMaxEarly(
+    "agx-mark-exps-below-max-early", cl::init(true), cl::Hidden,
+    cl::desc("Mark the exps below another loop's maximum in opt, before the "
+             "loop unroller (whose copies of the loops it does not match)"));
+
+PreservedAnalyses AGXMarkExpsBelowMaxPass::run(Function &F,
+                                               FunctionAnalysisManager &) {
+  if (AGXMarkExpsBelowMaxEarly)
+    markExpsBelowLoopMax(F);
+  // (metadata only)
+  return PreservedAnalyses::all();
 }
 
 static cl::opt<bool> AGXReciprocalAboveOne(

@@ -202,6 +202,15 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
+/// The exps below a maximum another loop takes of the same loads
+/// (AGXCodeGenPrepare's expBelowLoopMax) marked !agx.exp.below.max, in opt
+/// before the loop unroller, whose copies keep the mark (L15-E731).
+class AGXMarkExpsBelowMaxPass
+    : public OptionalPassInfoMixin<AGXMarkExpsBelowMaxPass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 class AGXLowerAIRPass : public RequiredPassInfoMixin<AGXLowerAIRPass> {
   const TargetMachine &TM;
 
