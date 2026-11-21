@@ -1,9 +1,25 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-exp-core-product=0 -agx-cos-horner=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-uniform-constants < %s | FileCheck %s --check-prefix=UNI
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-codegenprepare -agx-uniform-constants -agx-exp-fused-round=0 -agx-sincos-fused-round=0 < %s | FileCheck %s --check-prefix=SEP
 ;
 ; expf's r + r^2 p as fma(p r, r, r) (L15-E704) and cosf's 1 - z / 2 + z^2 p
 ; as fma(z, fma(z, p, -1/2), 1) (L15-E705): fmas of two registers and a
 ; constant, where fma(p, r r, r) and fma(z z, p, 1 - z / 2) read three.
+; With the constants in uniforms, the magic-number rounds of x log2(e) and
+; x 2 / pi as one fma each (L15-E706, L15-E707): it reads x and two uniforms
+; (with mov_imm registers three, no faster than the product and the sum).
+
+; UNI-LABEL: @e(
+; UNI:      call float @llvm.fma.f32(float %x, float f0x3FB8AA3B, float f0x4B400000)
+; UNI-LABEL: @c(
+; UNI:      call float @llvm.fma.f32(float %x, float f0x3F22F983, float f0x4B400000)
+; SEP-LABEL: @e(
+; SEP:      [[T:%[0-9]+]] = fmul float %x, f0x3FB8AA3B
+; SEP-NEXT: fadd float [[T]], f0x4B400000
+; SEP-LABEL: @c(
+; SEP:      [[T:%[0-9]+]] = fmul float %x, f0x3F22F983
+; SEP-NEXT: fadd float [[T]], f0x4B400000
 
 ; CHECK-LABEL: @e(
 ; CHECK:      [[P:%[0-9]+]] = call float @llvm.fma.f32(float %{{[0-9]+}}, float [[R:%[0-9]+]], float 5.000000e-01)

@@ -126,6 +126,14 @@ static cl::opt<bool> CosHorner(
     "agx-cos-horner", cl::init(true), cl::Hidden,
     cl::desc("cosf's 1 - z / 2 + z^2 p as fma(z, fma(z, p, -1/2), 1)"));
 
+static cl::opt<bool> ExpFusedRound(
+    "agx-exp-fused-round", cl::init(true), cl::Hidden,
+    cl::desc("expf's magic-number round of x log2(e) as one fma"));
+
+static cl::opt<bool> SinCosFusedRound(
+    "agx-sincos-fused-round", cl::init(true), cl::Hidden,
+    cl::desc("sin / cos's magic-number round of x 2 / pi as one fma"));
+
 static cl::opt<bool> TanQuotientSigns(
     "agx-tan-quotient-signs", cl::init(true), cl::Hidden,
     cl::desc("tan as sin / cos's polynomials by quadrant, the quotient's sign "
@@ -834,13 +842,20 @@ public:
                         : sel(gt(Hi, 89.0), k(89.0),
                               sel(lt(Hi, -104.0), k(-104.0), Hi));
     }
-    Value *T = mul(C, k(M_LOG2E));
+    // (the fma reads x and two uniforms; with the constants in registers it
+    // would read three, no faster than the product and sum)
+    bool Fused = ExpMagicRound && ExpFusedRound && AGX::uniformConstantsEnabled();
+    Value *T = Fused ? nullptr : mul(C, k(M_LOG2E));
     Value *N, *MagicBits = nullptr;
     if (ExpMagicRound) {
       // |t| <= 151: t + 1.5 2^23 rounds to the integer nearest t, ties to
       // even (1.5 2^23 is even), on the FP pipe instead of the shared
       // units' rint and convert (L15-E469); n = that - 1.5 2^23 exactly.
-      Value *M = add(T, k(12582912.0));
+      // (As one fma, the integer nearest x log2(e) unrounded: any n near
+      // it reduces x as well, r staying within a few ulps of ln(2) / 2,
+      // L15-E706.)
+      Value *M = Fused ? fma(C, k(M_LOG2E), k(12582912.0))
+                               : add(T, k(12582912.0));
       N = sub(M, k(12582912.0));
       MagicBits = B.CreateBitCast(M, intTy());
     } else {
@@ -1138,14 +1153,19 @@ public:
   /// -(c / s) there and s / c elsewhere, and (-c) / s is -(c / s) exactly
   /// (L15-E503).
   std::pair<Value *, Value *> sinAndCos(Value *X, bool ForQuotient = false) {
-    Value *T = mul(X, k(M_2_PI));
+    bool Fused = SinCosMagicRound && SinCosFusedRound &&
+                 AGX::uniformConstantsEnabled();
+    Value *T = Fused ? nullptr : mul(X, k(M_2_PI));
     Value *J, *QBits = nullptr;
     if (SinCosMagicRound) {
       // Where |x| < 2^22 (the expansion's range; beyond, the hardware's is
       // taken) |t| < 2^22: j = t + 1.5 2^23 - 1.5 2^23 rounds to even as
       // rint does, and the sum's bits are 0x4b400000 + j, whose low two
       // bits are the quadrant's (L15-E470).
-      Value *M = add(T, k(12582912.0));
+      // (as one fma, as expf's: j the integer nearest x 2 / pi unrounded,
+      // L15-E707)
+      Value *M = Fused ? fma(X, k(M_2_PI), k(12582912.0))
+                                  : add(T, k(12582912.0));
       J = sub(M, k(12582912.0));
       QBits = B.CreateBitCast(M, intTy());
     } else {
