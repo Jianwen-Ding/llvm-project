@@ -44,6 +44,11 @@ static cl::opt<bool> LogAbsCore(
     cl::desc("log, log2 and log10's polynomial of |x| (what pow's is of): "
              "the same value for every x it is not replaced for"));
 
+static cl::opt<bool> LogExponentByAdd(
+    "agx-log-exponent-by-add", cl::init(true), cl::Hidden,
+    cl::desc("log's exponent e as the float 2^23 + e (e under 2^23's "
+             "bits) less 2^23 + 127: one add, no subtract and convert"));
+
 static cl::opt<bool> ExpNaNThroughScale(
     "agx-exp-nan-through-scale", cl::init(true), cl::Hidden,
     cl::desc("exp without the +inf select: no NaN select, the NaN's sum "
@@ -897,8 +902,18 @@ public:
     Value *Tiny = NoDenormals ? nullptr : lt(X, 1.17549435e-38);
     Value *XS = Tiny ? sel(Tiny, mul(X, k(8388608.0)), X) : X;
     Value *Bits = B.CreateBitCast(XS, intTy());
-    Value *E = B.CreateSIToFP(
-        B.CreateSub(B.CreateLShr(Bits, ki(23)), ki(127)), Ty);
+    // (the biased exponent field under 2^23's bits is the float 2^23 + e;
+    // less 2^23 + 127 exactly: L15-E614)
+    Value *E =
+        LogExponentByAdd
+            ? add(B.CreateBitCast(
+                      B.CreateOr(B.CreateAnd(B.CreateLShr(Bits, ki(23)),
+                                             ki(0xff)),
+                                 ki(0x4b000000)),
+                      Ty),
+                  k(-8388735.0))
+            : B.CreateSIToFP(
+                  B.CreateSub(B.CreateLShr(Bits, ki(23)), ki(127)), Ty);
     if (Tiny)
       E = sel(Tiny, sub(E, k(23.0)), E);
     Value *M = B.CreateBitCast(

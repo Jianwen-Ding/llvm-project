@@ -820,6 +820,20 @@ def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
 def : Pat<(i16 (and (agx_srl_oneuse AGXIntSrc16:$a, (i16 imm:$s)),
                     agx_field_mask:$m)),
           (BFEIL_I16 0, (i16 0), 0, $a, 0, (i16 imm:$s), (AGXFieldWidth $m))>;
+// The field into the bits of a constant it leaves clear, (x >> s) & m | c
+// with c & m = 0: bfeil's base (a log's exponent as 2^23 + e, L15-E614).
+def agx_or_field_base : PatFrag<(ops node:$f, node:$c), (or node:$f, node:$c), [{
+  auto *C = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  SDValue F = N->getOperand(0);
+  auto *M = F.getOpcode() == ISD::AND
+                ? dyn_cast<ConstantSDNode>(F.getOperand(1)) : nullptr;
+  return C && M && F.hasOneUse() && !(C->getZExtValue() & M->getZExtValue());
+}]>;
+def : Pat<(i32 (agx_or_field_base
+                   (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
+                        agx_field_mask:$m),
+                   AGXIntSrc32:$c)),
+          (BFEIL_I32 0, $c, 0, $a, 0, (i32 imm:$s), (AGXFieldWidth $m))>;
 // (x & (2^k - 1)) << n by a register amount: one bfi of the field into 0
 // (its masked register offset recorded: coverage alu/bfi_r14_r6_r7_r8_mask_*;
 // an amount from 32 is poison in the IR) (L15-E358).
