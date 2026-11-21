@@ -2261,6 +2261,10 @@ bool AGXCodeGenPrepare::mergeSameConditionIfs(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXMergeLoopExitsSelect(
+    "agx-merge-loop-exits-select", cl::init(true), cl::Hidden,
+    cl::desc("agx-merge-loop-exits' e1 or a == b as (e1 ? b : a) == b"));
+
 bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
   if (!AGXMergeLoopExits)
     return false;
@@ -2309,8 +2313,36 @@ bool AGXCodeGenPrepare::mergeLoopExits(Function &F) {
       E2 = B.CreateNot(E2);
     BasicBlock *X = BasicBlock::Create(F.getContext(), H->getName() + ".exit",
                                        &F, XH);
-    B.CreateCondBr(B.CreateOr(E1, E2), X, H);
-    IRBuilder<>(X).CreateCondBr(E1, XH, XT);
+    // e1 or a == b as (e1 ? b : a) == b, b loop-invariant: one select and
+    // the branch's compare, not a select for each condition (mandelbrot's
+    // escape test and iteration limit, L15-E735). X then branches on a copy
+    // of e1's compare, so that the loop's select reads e1's compare itself.
+    Value *Exit = nullptr;
+    Instruction *E1Copy = nullptr;
+    {
+      using namespace PatternMatch;
+      Value *A, *Bv;
+      auto *C1 = dyn_cast<CmpInst>(E1);
+      if (AGXMergeLoopExitsSelect && C1 && C1->hasOneUse() &&
+          match(E2, m_SpecificICmp(ICmpInst::ICMP_EQ, m_Value(A),
+                                   m_Value(Bv))) &&
+          A->getType()->isIntegerTy(32) &&
+          (L->isLoopInvariant(A) || L->isLoopInvariant(Bv))) {
+        // (compared with the loop-invariant one: the counter then only
+        // read by the select, before its increment)
+        if (!L->isLoopInvariant(Bv))
+          std::swap(A, Bv);
+        Exit = B.CreateICmpEQ(B.CreateSelect(E1, Bv, A), Bv);
+        E1Copy = C1->clone();
+      }
+    }
+    if (!Exit)
+      Exit = B.CreateOr(E1, E2);
+    B.CreateCondBr(Exit, X, H);
+    IRBuilder<> XB(X);
+    if (E1Copy)
+      E1 = XB.Insert(E1Copy);
+    XB.CreateCondBr(E1, XH, XT);
     BH->eraseFromParent();
     for (PHINode &P : H->phis())
       P.replaceIncomingBlockWith(T, H);

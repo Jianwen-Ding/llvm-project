@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-merge-loop-exits=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-merge-loop-exits-select=0 < %s | FileCheck %s --check-prefix=OR
 
 ; Mandelbrot's escape loop exits from its header (|z|^2 >= 4) and from its
 ; latch (the iteration count): structurized, an if inside the loop every
@@ -8,11 +9,22 @@
 
 declare float @llvm.fma.f32(float, float, float)
 
+; The two tests as one select: e1 ? maxit : it == maxit, the counter read
+; before its increment and compared with the invariant (L15-E735: mandelbrot
+; 11 -> 10 loop instructions, -8.5% tput); without it, a select for each.
 ; CHECK-LABEL: escape:
 ; CHECK: Loop Header
 ; CHECK-NOT: if_
-; CHECK: while_icmp
+; CHECK-NOT: icmpsel
+; CHECK: fcmpsel lt, [[F:r[0-9]+]], {{r[0-9]+}}, 4.0, {{r[0-9]+}}, [[M:u[0-9]+]]
+; CHECK-NEXT: iadd
+; CHECK-NEXT: while_icmp r0l, nueq, [[F]], [[M]], 1
 ; CHECK-NEXT: jmp_exec_any
+; OR-LABEL: escape:
+; OR: Loop Header
+; OR: icmpsel
+; OR: fcmpsel
+; OR: while_icmp
 ; OFF-LABEL: escape:
 ; OFF: Loop Header
 ; OFF: if_fcmp
