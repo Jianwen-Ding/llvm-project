@@ -88,6 +88,11 @@ static cl::opt<bool> AGXSignSplatCompares(
 
 bool llvm::AGX::signSplatCompares() { return AGXSignSplatCompares; }
 
+static cl::opt<bool> AGXUniformConstants16(
+    "agx-uniform-constants-16", cl::init(true), cl::Hidden,
+    cl::desc("With -agx-uniform-constants, 16-bit constants too: the low "
+             "half of a preloaded 32-bit uniform"));
+
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.
@@ -133,9 +138,20 @@ bool AGXUniformConstantsPass::runOnMachineFunction(MachineFunction &MF) {
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
-      if (MI.getOpcode() != AGX::MOV_IMM32 || !MI.getOperand(1).isImm())
+      // (a 16-bit constant: the low half of a 32-bit slot holding it
+      // zero-extended, L15-E644; swiglu_f16's exponential bounds in half
+      // were two mov_imm a thread)
+      // (not 0, 1 and the like: a flag's or an index's start, a register's
+      // value whose copy from a uniform costs the move it replaces)
+      bool Narrow = MI.getOpcode() == AGX::MOV_IMM16 && AGXUniformConstants16 &&
+                    MI.getOperand(0).getReg().isVirtual() &&
+                    MI.getOperand(1).isImm() &&
+                    (uint32_t(MI.getOperand(1).getImm()) & 0xffff) > 255;
+      if ((MI.getOpcode() != AGX::MOV_IMM32 && !Narrow) ||
+          !MI.getOperand(1).isImm())
         continue;
-      uint32_t Value = uint32_t(MI.getOperand(1).getImm());
+      uint32_t Value = Narrow ? uint32_t(MI.getOperand(1).getImm()) & 0xffff
+                              : uint32_t(MI.getOperand(1).getImm());
       MCRegister Reg = Slots.lookup(Value);
       if (!Reg) {
         if (Slots.size() >= MaxConstants || Half + 2 > UniformHalves)
@@ -146,6 +162,12 @@ bool AGXUniformConstantsPass::runOnMachineFunction(MachineFunction &MF) {
         Slots[Value] = Reg;
         MFI->UniformConstants.push_back({Half, Value});
         Half += 2;
+      }
+      if (Narrow) {
+        Register Lo = TRI->getSubReg(Reg, AGX::lo16);
+        if (!Lo)
+          continue;
+        Reg = Lo;
       }
       BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(TargetOpcode::COPY),
               MI.getOperand(0).getReg())

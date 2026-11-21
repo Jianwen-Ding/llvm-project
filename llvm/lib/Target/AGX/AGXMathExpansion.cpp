@@ -92,6 +92,12 @@ static cl::opt<bool> ExpFlushedUnderflow(
     cl::desc("exp below a maximum whose users flush denormal operands: "
              "clamped at its +0 bound, no +0 select"));
 
+static cl::opt<bool> FusedExactScales(
+    "agx-math-fused-exact-scales", cl::init(true), cl::Hidden,
+    cl::desc("c - 2 y and the like as one fma where the scaling is exact: "
+             "tanh's 1 - 2 y, asin's pi / 2 - 2 p, asin's and acos's "
+             "(1 - a) / 2, x - 2 round(x / 2)"));
+
 static cl::opt<bool> TanhDoubledClamp(
     "agx-tanh-doubled-clamp", cl::init(true), cl::Hidden,
     cl::desc("tanh's 2 min(|x|, 9) as min(|x| + |x|, 18)"));
@@ -365,16 +371,29 @@ public:
     return fma(mul(P, Z), A, A);
   }
 
+  /// (1 - a) / 2 for asin's and acos's square root, where it is read for a
+  /// in [0.5, 1]: 1 - a is exact there (Sterbenz), and so its half, the
+  /// fma's 0.5 - 0.5 a the same; any a > 1 is negative either way, the
+  /// square root's NaN (L15-E638).
+  Value *halfOneMinus(Value *A) {
+    return FusedExactScales ? fma(k(-0.5), A, k(0.5))
+                            : mul(k(0.5), sub(k(1.0), A));
+  }
+
   Value *asin(Value *X) {
     if (bfloatResult())
       PolyDrop = 1;
     Value *A = abs(X);
     // Above 0.5: asin(a) = pi / 2 - 2 asin(sqrt((1 - a) / 2)).
     Value *Big = gt(A, 0.5);
-    Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)), /*Approx=*/true);
+    Value *S = sqrt(halfOneMinus(A), /*Approx=*/true);
     // One polynomial, of the argument the range picks.
     Value *P = asinSmall(sel(Big, S, A));
-    Value *R = sel(Big, sub(k(M_PI_2), mul(k(2.0), P)), P);
+    // (2 p is exact: one fma, L15-E638)
+    Value *R = sel(Big,
+                   FusedExactScales ? fma(k(-2.0), P, k(M_PI_2))
+                                    : sub(k(M_PI_2), mul(k(2.0), P)),
+                   P);
     // |x| > 1: the square root is NaN.
     R = sel(gt(A, 1.0), S, R);
     return copysign(R, X);
@@ -388,7 +407,7 @@ public:
     // acos(-|x|) = pi - acos(|x|); else pi / 2 - asin(x).
     // (bfloat: the hardware's square root; half: one result was further
     // off with it)
-    Value *S = sqrt(mul(k(0.5), sub(k(1.0), A)), /*Approx=*/!HalfResult);
+    Value *S = sqrt(halfOneMinus(A), /*Approx=*/!HalfResult);
     Value *Big = gt(A, 0.5);
     // One polynomial, of the argument the range picks.
     Value *P = asinSmall(sel(Big, S, A));
@@ -520,7 +539,10 @@ public:
     Value *Y = NarrowResult && HalfFastHyperbolic
                    ? Y0
                    : fma(fma(B.CreateFNeg(D), Y0, k(1.0)), Y0, Y0);
-    Value *Big = copysign(sub(k(1.0), mul(k(2.0), Y)), X);
+    // (2 y is exact: one fma, L15-E638)
+    Value *Big = copysign(FusedExactScales ? fma(k(-2.0), Y, k(1.0))
+                                           : sub(k(1.0), mul(k(2.0), Y)),
+                          X);
     return sel(lt(A, 0.625), Small, Big);
   }
 
@@ -594,7 +616,8 @@ public:
 
   /// x - 2 round(x / 2), exactly: in [-1, 1].
   Value *halfTurns(Value *X) {
-    return sub(X, mul(k(2.0), call(Intrinsic::roundeven, {mul(X, k(0.5))})));
+    Value *R = call(Intrinsic::roundeven, {mul(X, k(0.5))});
+    return FusedExactScales ? fma(k(-2.0), R, X) : sub(X, mul(k(2.0), R));
   }
 
   /// sin(pi r) and cos(pi r) for |r| <= 1/4, with pi r as a rounded
