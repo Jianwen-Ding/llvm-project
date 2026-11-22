@@ -1993,3 +1993,21 @@ gpu.module @subgroup_mma {
     gpu.return
   }
 }
+
+// -----
+
+// With bare pointers, a memref argument of a dynamic leading size that
+// nothing reads the size of is one of a static size (L15-E853): its pointer
+// is all the indexing reads.
+gpu.module @dynamic_leading {
+  // CHECK-LABEL: gpu.module @dynamic_leading
+  // CHECK: llvm.func @k(%{{.*}}: !llvm.ptr<1>, %{{.*}}: !llvm.ptr<1>, %{{.*}}: i64)
+  // CHECK: llvm.load
+  // CHECK: llvm.store
+  gpu.func @k(%a: memref<?xf32, 1>, %o: memref<?x4xf32, 1>, %i: index) kernel {
+    %c2 = arith.constant 2 : index
+    %v = memref.load %a[%i] : memref<?xf32, 1>
+    memref.store %v, %o[%i, %c2] : memref<?x4xf32, 1>
+    gpu.return
+  }
+}

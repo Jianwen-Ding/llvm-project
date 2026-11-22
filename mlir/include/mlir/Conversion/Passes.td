@@ -800,6 +800,10 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            /*default=*/"true",
            "f64 sin and cos with one polynomial chain of selected "
            "coefficients, not both kernels">,
+    Option<"staticLeadingDimArgs", "static-leading-dim-args", "bool",
+           /*default=*/"true",
+           "With bare pointers, a kernel's memref argument of a dynamic leading "
+           "size that nothing reads the size of as one of a static size">,
     Option<"subByteRewrites", "sub-byte-rewrites", "bool",
            /*default=*/"true",
            "Rewrite extensions of sub-byte integer vectors (bitcasts of bytes "

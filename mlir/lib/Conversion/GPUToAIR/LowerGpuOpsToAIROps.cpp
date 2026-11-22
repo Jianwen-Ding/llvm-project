@@ -3681,6 +3681,78 @@ static LogicalResult lowerSubgroupMma(Operation *m) {
   return applyPartialConversion(m, target, std::move(patterns));
 }
 
+
+/// (L15-E853) a kernel argument of a memref whose only dynamic size is the
+/// leading one (identity layout) that nothing reads the size of (indexing
+/// only: loads, stores, atomics, in-bounds vector accesses, views): with the
+/// bare-pointer convention, whose memrefs must have static shapes, the
+/// argument becomes one of a static leading size (2^40 elements over the
+/// others: no index narrowing assumed) cast to the original type; its
+/// pointer is all the indexing reads.
+static bool readsOnlyAddresses(Value v) {
+  for (Operation *u : v.getUsers()) {
+    if (auto c = dyn_cast<memref::CastOp>(u)) {
+      if (!readsOnlyAddresses(c.getResult()))
+        return false;
+      continue;
+    }
+    if (auto t = dyn_cast<vector::TransferReadOp>(u)) {
+      if (!llvm::all_of(t.getInBoundsValues(), [](bool b) { return b; }) ||
+          t.getMask())
+        return false;
+      continue;
+    }
+    if (auto t = dyn_cast<vector::TransferWriteOp>(u)) {
+      if (!llvm::all_of(t.getInBoundsValues(), [](bool b) { return b; }) ||
+          t.getMask())
+        return false;
+      continue;
+    }
+    if (isa<memref::LoadOp, memref::StoreOp, memref::AtomicRMWOp,
+            memref::GenericAtomicRMWOp, vector::LoadOp, vector::StoreOp,
+            vector::MaskedLoadOp, vector::MaskedStoreOp, vector::GatherOp,
+            vector::ScatterOp, vector::ExpandLoadOp, vector::CompressStoreOp,
+            memref::SubViewOp, gpu::SubgroupMmaLoadMatrixOp,
+            gpu::SubgroupMmaStoreMatrixOp>(u))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+static void staticLeadingDims(gpu::GPUModuleOp m) {
+  m.walk([&](gpu::GPUFuncOp f) {
+    if (!f.isKernel())
+      return;
+    SmallVector<Type> types(f.getArgumentTypes());
+    bool changed = false;
+    for (BlockArgument a : f.getArguments()) {
+      auto mt = dyn_cast<MemRefType>(a.getType());
+      if (!mt || !mt.getLayout().isIdentity() || mt.getRank() == 0 ||
+          !ShapedType::isDynamic(mt.getDimSize(0)) ||
+          llvm::any_of(mt.getShape().drop_front(), ShapedType::isDynamic) ||
+          !readsOnlyAddresses(a))
+        continue;
+      int64_t inner = 1;
+      for (int64_t d : mt.getShape().drop_front())
+        inner *= std::max<int64_t>(d, 1);
+      SmallVector<int64_t> shape(mt.getShape());
+      shape[0] = std::max<int64_t>((int64_t(1) << 40) / inner, 1);
+      auto st = MemRefType::get(shape, mt.getElementType(), mt.getLayout(),
+                                mt.getMemorySpace());
+      OpBuilder b(&f.getBody().front(), f.getBody().front().begin());
+      a.setType(st);
+      auto cast = memref::CastOp::create(b, a.getLoc(), mt, a);
+      a.replaceAllUsesExcept(cast.getResult(), cast);
+      types[a.getArgNumber()] = st;
+      changed = true;
+    }
+    if (changed)
+      f.setFunctionTypeAttr(TypeAttr::get(
+          FunctionType::get(f.getContext(), types, f.getResultTypes())));
+  });
+}
+
 /// math.isinf (no MathToLLVM pattern): |x| == +inf, ordered (false for NaN).
 static LogicalResult rewriteIsInf(math::IsInfOp op, PatternRewriter &rewriter) {
   Type type = op.getOperand().getType();
@@ -5156,6 +5228,8 @@ struct LowerGpuOpsToAIROpsPass final
     options.useBarePtrCallConv = useBarePtrCallConv;
 
     assignDefaultMemorySpaces(m);
+    if (useBarePtrCallConv && staticLeadingDimArgs)
+      staticLeadingDims(m);
 
     // gpu.global_id is AIR's thread_position_in_grid, one 32-bit read
     // (which an address takes as a 32-bit index), where the dimension has
