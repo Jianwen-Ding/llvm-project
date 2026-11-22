@@ -9,7 +9,7 @@ Each seed generates a gpu.func whose threads each update their row of a 1024x256
 
 c a second memref at the thread's row (column) or at j + o'' alone (every thread's same elements), or b itself
 passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
-vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16 or f32 (small integers,
+vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16, f32 or f16 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
 and a guarded statement's c load inside its scf.if (speculate-guarded-loads). An eighth of the seeds instead compute float math over a row (exp, e^(x - k), x > k ? e^(x - k) : x, tanh, the
 sigmoid, log(abs(x) + 1), e^x k + 1, and e^(x - m) of the row's maximum m from a loop before: E731 / E732 / E743's
