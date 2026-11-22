@@ -315,7 +315,7 @@ static cl::opt<unsigned> AGXSchedCoreOccupancyCut(
              "L15-E799)"));
 
 static cl::opt<unsigned> AGXSchedCoreShortInstrs(
-    "agx-sched-core-occupancy-short", cl::init(32), cl::Hidden,
+    "agx-sched-core-occupancy-short", cl::init(40), cl::Hidden,
     cl::desc("Regions of fewer instructions take "
              "-agx-sched-core-occupancy-short-cut, not "
              "-agx-sched-core-occupancy-cut"));
@@ -565,7 +565,7 @@ public:
                     10 * CoreGroups(Before) ||
                 AGXSubtarget::maxThreadsForHalves(After + 16) < Need;
     }
-    // (a short region at E761's 1.2 times: swiglu's and permute4d's 28
+    // (a short region at E761's 1.2 times: swiglu's and permute4d's 28 and 33
     // instructions, 96 -> 82 groups, hide more of their loads' latency in
     // the free order than the 14 groups do, +4.3% / +2.0% at 1.0; the
     // longer softmax, log and sincos rows' gain at 1.0, L15-E806)
