@@ -1475,7 +1475,12 @@ static cl::opt<bool> AGXMergeLaggingCounters(
 /// a register fewer. p's increment keeps only the wrap flags both have (it
 /// computes what q's did: p_n = p_{n-1} + k, q'_n = p_{n-1} + k), so p is
 /// poison no more often than q' was (L15-E794).
-static bool mergeLaggingCounters(Loop &L) {
+static cl::opt<bool> AGXExitValueFromIncrement(
+    "agx-exit-value-from-increment", cl::init(true), cl::Hidden,
+    cl::desc("A counter's value after its loop as its increment less the "
+             "step there"));
+
+static bool mergeLaggingCounters(Loop &L, DominatorTree &DT) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
   if (!Pre || !Latch)
@@ -1511,7 +1516,31 @@ static bool mergeLaggingCounters(Loop &L) {
       RecursivelyDeleteDeadPHINode(Q.P);
       return true;
     }
-  return false;
+  // A counter read after the loop is live past its increment, so the two
+  // take two registers and the phi a copy every iteration (find_first's
+  // exit value). Outside the loop it is the increment less the step, in
+  // each block of such uses that the increment dominates: one add after
+  // the loop (L15-E795).
+  bool Changed = false;
+  if (AGXExitValueFromIncrement)
+    for (Counter &P : Counters) {
+      DenseMap<BasicBlock *, Value *> Before;
+      for (Use &U : make_early_inc_range(P.P->uses())) {
+        auto *I = dyn_cast<Instruction>(U.getUser());
+        if (!I || isa<PHINode>(I) || L.contains(I) ||
+            !DT.dominates(P.Inc, I->getParent()))
+          continue;
+        Value *&V = Before[I->getParent()];
+        if (!V)
+          V = BinaryOperator::CreateAdd(
+              P.Inc, ConstantInt::get(P.Inc->getType(), -P.Step),
+              P.P->getName() + ".exit",
+              I->getParent()->getFirstInsertionPt());
+        U.set(V);
+        Changed = true;
+      }
+    }
+  return Changed;
 }
 
 static cl::opt<bool> AGXNarrowAfterCounters(
@@ -1937,7 +1966,7 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
         }
     }
     if (AGXMergeLaggingCounters)
-      while (mergeLaggingCounters(*L)) {
+      while (mergeLaggingCounters(*L, DT)) {
         SE.forgetLoop(L);
         Changed = true;
       }

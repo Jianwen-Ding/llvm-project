@@ -1,16 +1,24 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-narrow-inductions < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-narrow-inductions -agx-merge-lagging-counters=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -stop-after=agx-narrow-inductions -agx-exit-value-from-increment=0 < %s | FileCheck %s --check-prefix=PHI
 
 ; find_first (an MLIR search loop with an early exit): loop strength
 ; reduction counts the exit value from -1 beside the index from 0, which
 ; narrowing makes 32-bit. The count is one step behind the index, so its
 ; increment is the index itself: one phi, the exit value the index
-; (L15-E794).
+; (L15-E794). After the loop the index is its increment less 1, so it is not
+; live past the increment (L15-E795).
 
 ; CHECK-LABEL: @find_first(
-; CHECK: [[J:%[.a-z0-9]+]] = phi i32
+; CHECK: [[J:%[.a-z0-9]+]] = phi i32 [ 0, %entry ], [ [[N:%[.a-z0-9]+]], %
 ; CHECK-NOT: phi i32
-; CHECK: store i32 [[J]],
+; CHECK: [[N]] = add {{.*}}i32 [[J]], 1
+; CHECK: [[E:%[.a-z0-9]+]] = add i32 [[N]], -1
+; CHECK: store i32 [[E]],
+; PHI-LABEL: @find_first(
+; PHI: [[J:%[.a-z0-9]+]] = phi i32
+; PHI-NOT: phi i32
+; PHI: store i32 [[J]],
 ; OFF-LABEL: @find_first(
 ; OFF-COUNT-2: phi i32
 target triple = "agx"

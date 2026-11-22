@@ -137,7 +137,7 @@ exit:
 define agx_kernel void @nested_loops(ptr addrspace(1) %out, i32 %n, i32 %m) {
 ; CHECK-LABEL: nested_loops:
 ; CHECK:         // uniform registers: 14 x 16-bit (threadgroups_per_grid at u4)
-; CHECK-NEXT:    // general purpose registers: 7 x 32-bit (up to 1024 threads per threadgroup)
+; CHECK-NEXT:    // general purpose registers: 6 x 32-bit (up to 1024 threads per threadgroup)
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0: // %entry
@@ -153,18 +153,18 @@ define agx_kernel void @nested_loops(ptr addrspace(1) %out, i32 %n, i32 %m) {
 ; CHECK-NEXT:  .LBB3_2: // %inner
 ; CHECK-NEXT:    // Parent Loop BB3_1 Depth=1
 ; CHECK-NEXT:    // => This Inner Loop Header: Depth=2
-; CHECK-NEXT:    bitop 0101, r6, r3, 0
-; CHECK-NEXT:    icmpsel ult, r3, r3, u3, 0, 1
-; CHECK-NEXT:    icmpsel ueq, r4, r1, r6, 1, r3
-; CHECK-NEXT:    iadd r3, r6, 1
+; CHECK-NEXT:    icmpsel ult, r4, r3, u3, 0, 1
+; CHECK-NEXT:    icmpsel ueq, r4, r1, r3, 1, r4
+; CHECK-NEXT:    iadd r3, r3, 1
 ; CHECK-NEXT:    while_icmp r0l, ueq, r4, 0, 1
 ; CHECK-NEXT:    jmp_exec_any .LBB3_2
 ; CHECK-NEXT:  // %bb.3: // %inner.exit
 ; CHECK-NEXT:    // in Loop: Header=BB3_1 Depth=1
 ; CHECK-NEXT:    pop_exec r0l, 1
+; CHECK-NEXT:    isub r3, r3, 1
 ; CHECK-NEXT:    mov_imm r5, 1
 ; CHECK-NEXT:    mov_imm r4l, 1
-; CHECK-NEXT:    if_icmp r0l, nueq, r1, r6, 1
+; CHECK-NEXT:    if_icmp r0l, nueq, r1, r3, 1
 ; CHECK-NEXT:  // %bb.4: // %outer.latch
 ; CHECK-NEXT:    // in Loop: Header=BB3_1 Depth=1
 ; CHECK-NEXT:    iadd r2, r2, 1
@@ -179,7 +179,7 @@ define agx_kernel void @nested_loops(ptr addrspace(1) %out, i32 %n, i32 %m) {
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    if_icmp r0l, nueq, r4l, 0, 1
 ; CHECK-NEXT:  // %bb.7: // %inner.exit.exit_crit_edge
-; CHECK-NEXT:    isub r2, r3, 1
+; CHECK-NEXT:    bitop 0101, r2, r3, 0
 ; CHECK-NEXT:  // %bb.8: // %exit
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    device_store 0, i32, x, r2, u0_u1, r1, signed
