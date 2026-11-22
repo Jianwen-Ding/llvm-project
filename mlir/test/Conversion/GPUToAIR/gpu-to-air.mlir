@@ -1567,6 +1567,25 @@ gpu.module @nd_vectors {
 
 // -----
 
+// complex functions with no ComplexToLLVM pattern (L15-E829): ComplexToStandard's
+// forms on the parts (complex.exp: e^re cos(im), e^re sin(im)); the ops
+// ComplexToLLVM lowers stay its own.
+gpu.module @complex_functions {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: complex.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xcomplex<f32>, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xcomplex<f32>, 1>
+    %e = complex.exp %v : complex<f32>
+    %f = complex.mul %e, %v : complex<f32>
+    memref.store %f, %a[%c0] : memref<8xcomplex<f32>, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

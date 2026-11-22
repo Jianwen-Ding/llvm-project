@@ -29,6 +29,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/GPUToAIR/GPUToAIRPass.h"
+#include "mlir/Conversion/ComplexToStandard/ComplexToStandard.h"
+#include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
@@ -4481,6 +4483,36 @@ struct LowerGpuOpsToAIROpsPass final
         Value res = math::FmaOp::create(b, loc, r, y, q0);
         op.replaceAllUsesWith(res);
         op.erase();
+      }
+    }
+    // complex functions ComplexToLLVM has no pattern for (exp, log, sqrt,
+    // sin, pow, tanh and the others) by ComplexToStandard's, on the parts'
+    // arith and math ops (which the rewrites below then take), first; the
+    // ops ComplexToLLVM lowers (add, sub, mul, div, abs, create, re, im,
+    // constants) stay its own (L15-E829).
+    {
+      ConversionTarget target(*ctx);
+      target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+      target.addIllegalOp<complex::Atan2Op, complex::CosOp, complex::EqualOp,
+                          complex::ExpOp, complex::Expm1Op, complex::LogOp,
+                          complex::Log1pOp, complex::NegOp,
+                          complex::NotEqualOp, complex::PowOp,
+                          complex::PowiOp, complex::RsqrtOp, complex::SignOp,
+                          complex::SinOp, complex::SqrtOp, complex::TanhOp,
+                          complex::TanOp, complex::ConjOp, complex::AngleOp>();
+      bool any = false;
+      m.walk([&](Operation *op) {
+        if (op->getDialect() &&
+            isa<complex::ComplexDialect>(op->getDialect()) &&
+            target.isIllegal(op))
+          any = true;
+        return any ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (any) {
+        RewritePatternSet patterns(ctx);
+        populateComplexToStandardConversionPatterns(patterns);
+        if (failed(applyPartialConversion(m, target, std::move(patterns))))
+          return signalPassFailure();
       }
     }
     // n-D vectors (linalg vectorization's: shape casts, transposes,

@@ -7,6 +7,7 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
   LINK_LIBS PUBLIC
   MLIRAIRDialect
   MLIRArithToLLVM
+  MLIRComplexToStandard
   MLIRFuncToLLVM
   MLIRGPUDialect
   MLIRGPUToGPURuntimeTransforms
