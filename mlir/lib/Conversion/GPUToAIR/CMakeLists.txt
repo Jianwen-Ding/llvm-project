@@ -24,6 +24,7 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
   MLIRPass
   MLIRSCFDialect
   MLIRSCFToControlFlow
+  MLIRSCFTransforms
   MLIRVectorDialect
   MLIRVectorTransforms
   )

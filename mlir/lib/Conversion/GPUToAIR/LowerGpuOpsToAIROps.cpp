@@ -57,6 +57,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
@@ -3498,6 +3499,188 @@ static LogicalResult rewriteNibbleExt(OpTy op, PatternRewriter &rewriter) {
   return success();
 }
 
+
+namespace {
+/// (L15-E852) gpu.subgroup_mma_* on AIR's 8x8 SIMD-group matrices: an
+/// M x N mma_matrix of f16 or f32 (M and N multiples of 8) is its 8x8
+/// blocks in row-major order, each an AIR matrix (vector<64 x T>).
+static std::optional<std::pair<int64_t, int64_t>>
+mmaBlocks(gpu::MMAMatrixType t) {
+  ArrayRef<int64_t> sh = t.getShape();
+  Type et = t.getElementType();
+  if (sh.size() != 2 || sh[0] % 8 || sh[1] % 8 || !(et.isF16() || et.isF32()))
+    return std::nullopt;
+  return std::make_pair(sh[0] / 8, sh[1] / 8);
+}
+
+/// A 2-D memref whose row stride is \p ld (statically) and whose columns are
+/// contiguous, as an AIR matrix load or store reads it.
+static bool mmaMemrefMatches(Value memref, int64_t ld) {
+  auto mt = dyn_cast<MemRefType>(memref.getType());
+  if (!mt || mt.getRank() != 2)
+    return false;
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (failed(mt.getStridesAndOffset(strides, offset)))
+    return false;
+  return strides[1] == 1 && strides[0] == ld;
+}
+
+struct MmaLoadToAIR : OpConversionPattern<gpu::SubgroupMmaLoadMatrixOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaLoadMatrixOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto t = cast<gpu::MMAMatrixType>(op.getType());
+    auto blocks = mmaBlocks(t);
+    if (!blocks || op.getIndices().size() != 2 ||
+        !mmaMemrefMatches(op.getSrcMemref(),
+                          op.getLeadDimension().getSExtValue()))
+      return failure();
+    Location loc = op.getLoc();
+    bool tr = op.getTranspose().value_or(false);
+    Value src = adaptor.getSrcMemref().front();
+    Value i = adaptor.getIndices()[0].front(), j = adaptor.getIndices()[1].front();
+    auto vt = VectorType::get({64}, t.getElementType());
+    SmallVector<Value> parts;
+    for (int64_t bi = 0; bi < blocks->first; ++bi)
+      for (int64_t bj = 0; bj < blocks->second; ++bj) {
+        // (transposed: the block of the source at (8 bj, 8 bi), transposed)
+        int64_t di = 8 * (tr ? bj : bi), dj = 8 * (tr ? bi : bj);
+        Value ii = arith::AddIOp::create(
+            rewriter, loc, i, arith::ConstantIndexOp::create(rewriter, loc, di));
+        Value jj = arith::AddIOp::create(
+            rewriter, loc, j, arith::ConstantIndexOp::create(rewriter, loc, dj));
+        auto l = air::MatrixLoadOp::create(rewriter, loc, vt, src,
+                                           ValueRange{ii, jj});
+        if (tr)
+          l.setTranspose(true);
+        parts.push_back(l);
+      }
+    rewriter.replaceOpWithMultiple(op, {parts});
+    return success();
+  }
+};
+
+struct MmaStoreToAIR : OpConversionPattern<gpu::SubgroupMmaStoreMatrixOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaStoreMatrixOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto t = cast<gpu::MMAMatrixType>(op.getSrc().getType());
+    auto blocks = mmaBlocks(t);
+    if (!blocks || op.getIndices().size() != 2 ||
+        !mmaMemrefMatches(op.getDstMemref(),
+                          op.getLeadDimension().getSExtValue()))
+      return failure();
+    Location loc = op.getLoc();
+    bool tr = op.getTranspose().value_or(false);
+    ValueRange parts = adaptor.getSrc();
+    Value dst = adaptor.getDstMemref().front();
+    Value i = adaptor.getIndices()[0].front(), j = adaptor.getIndices()[1].front();
+    for (int64_t bi = 0; bi < blocks->first; ++bi)
+      for (int64_t bj = 0; bj < blocks->second; ++bj) {
+        int64_t di = 8 * (tr ? bj : bi), dj = 8 * (tr ? bi : bj);
+        Value ii = arith::AddIOp::create(
+            rewriter, loc, i, arith::ConstantIndexOp::create(rewriter, loc, di));
+        Value jj = arith::AddIOp::create(
+            rewriter, loc, j, arith::ConstantIndexOp::create(rewriter, loc, dj));
+        auto st = air::MatrixStoreOp::create(
+            rewriter, loc, parts[bi * blocks->second + bj], dst,
+            ValueRange{ii, jj});
+        if (tr)
+          st.setTranspose(true);
+      }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct MmaComputeToAIR : OpConversionPattern<gpu::SubgroupMmaComputeOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaComputeOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getATranspose().value_or(false) || op.getBTranspose().value_or(false))
+      return failure();
+    auto ta = cast<gpu::MMAMatrixType>(op.getOpA().getType());
+    auto tc = cast<gpu::MMAMatrixType>(op.getOpC().getType());
+    auto ba = mmaBlocks(ta), bc = mmaBlocks(tc);
+    if (!ba || !bc)
+      return failure();
+    // (A and B f16 with C f32, or all one type: AIR's forms)
+    if (ta.getElementType() != tc.getElementType() &&
+        !(ta.getElementType().isF16() && tc.getElementType().isF32()))
+      return failure();
+    int64_t mb = bc->first, nb = bc->second, kb = ba->second;
+    ValueRange a = adaptor.getOpA(), b = adaptor.getOpB(), c = adaptor.getOpC();
+    SmallVector<Value> d;
+    for (int64_t bi = 0; bi < mb; ++bi)
+      for (int64_t bj = 0; bj < nb; ++bj) {
+        Value acc = c[bi * nb + bj];
+        for (int64_t bk = 0; bk < kb; ++bk)
+          acc = air::MatrixMultiplyAccumulateOp::create(
+              rewriter, op.getLoc(), a[bi * kb + bk], b[bk * nb + bj], acc);
+        d.push_back(acc);
+      }
+    rewriter.replaceOpWithMultiple(op, {d});
+    return success();
+  }
+};
+
+struct MmaConstantToAIR : OpConversionPattern<gpu::SubgroupMmaConstantMatrixOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaConstantMatrixOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto t = cast<gpu::MMAMatrixType>(op.getType());
+    auto blocks = mmaBlocks(t);
+    if (!blocks)
+      return failure();
+    auto vt = VectorType::get({64}, t.getElementType());
+    Value fill = air::MatrixFillOp::create(rewriter, op.getLoc(), vt,
+                                           adaptor.getValue().front());
+    SmallVector<Value> parts(blocks->first * blocks->second, fill);
+    rewriter.replaceOpWithMultiple(op, {parts});
+    return success();
+  }
+};
+} // namespace
+
+/// Lowers the module's gpu.subgroup_mma ops to AIR matrices (L15-E852).
+static LogicalResult lowerSubgroupMma(Operation *m) {
+  bool any = false;
+  m->walk([&](Operation *op) {
+    any = isa<gpu::SubgroupMmaLoadMatrixOp, gpu::SubgroupMmaStoreMatrixOp,
+              gpu::SubgroupMmaComputeOp, gpu::SubgroupMmaConstantMatrixOp>(op);
+    return any ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  if (!any)
+    return success();
+  MLIRContext *ctx = m->getContext();
+  TypeConverter tc;
+  tc.addConversion([](Type t) { return t; });
+  tc.addConversion([](gpu::MMAMatrixType t, SmallVectorImpl<Type> &out)
+                       -> std::optional<LogicalResult> {
+    auto blocks = mmaBlocks(t);
+    if (!blocks)
+      return std::nullopt;
+    out.append(blocks->first * blocks->second,
+               VectorType::get({64}, t.getElementType()));
+    return success();
+  });
+  ConversionTarget target(*ctx);
+  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+  target.addIllegalOp<gpu::SubgroupMmaLoadMatrixOp,
+                      gpu::SubgroupMmaStoreMatrixOp, gpu::SubgroupMmaComputeOp,
+                      gpu::SubgroupMmaConstantMatrixOp>();
+  RewritePatternSet patterns(ctx);
+  patterns.add<MmaLoadToAIR, MmaStoreToAIR, MmaComputeToAIR, MmaConstantToAIR>(
+      tc, ctx);
+  scf::populateSCFStructuralTypeConversionsAndLegality(tc, patterns, target);
+  return applyPartialConversion(m, target, std::move(patterns));
+}
+
 /// math.isinf (no MathToLLVM pattern): |x| == +inf, ordered (false for NaN).
 static LogicalResult rewriteIsInf(math::IsInfOp op, PatternRewriter &rewriter) {
   Type type = op.getOperand().getType();
@@ -5254,6 +5437,9 @@ struct LowerGpuOpsToAIROpsPass final
         });
       }
     }
+    // (L15-E852) gpu.subgroup_mma_* as AIR's 8x8 SIMD-group matrices
+    if (failed(lowerSubgroupMma(m)))
+      return signalPassFailure();
     // (L15-E850) sub-byte integer vectors (an int4 weight's vector.bitcast
     // of bytes to i4 and its extension): upstream's narrow-type rewrites,
     // shifts of the bytes, no i4 vector (which the backend scalarized into a

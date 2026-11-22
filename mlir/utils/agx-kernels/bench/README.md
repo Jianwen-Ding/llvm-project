@@ -119,6 +119,7 @@ the kernel's, as memory at VA).
 | `fp8_dot_e4m3` | a row of f8E4M3FN weights times an f32 vector (vector<4xf8E4M3FN> loads extended through the half their fields make), a thread per row of 256 |
 | `fp8_dot_e5m2` | the same with f8E5M2 weights (a half's top byte) |
 | `fp8_quant_e4m3` | f32 rows times a scale rounded to f8E4M3FN (through a round-to-odd half), a thread per row of 256 |
+| `gemm_mma16` | C = A B, 32x32x32 with f16 inputs and f32 accumulators, as gpu.subgroup_mma 16x16 tiles on one SIMD-group (each four 8x8 AIR matrices) |
 | `int4_dot` | a row of int4 weights (a vector.bitcast of bytes to i4) times an f32 vector, each nibble through a half's 0x6400, a thread per row of 128 bytes |
 
 The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
