@@ -45,6 +45,7 @@
 #include "mlir/Dialect/AIR/IR/AIRDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
@@ -4580,7 +4581,8 @@ struct LowerGpuOpsToAIROpsPass final
       m.walk([&](Operation *op) {
         if (isa<vector::ContractionOp, vector::TransposeOp,
                 vector::MultiDimReductionOp, vector::OuterProductOp,
-                vector::ShapeCastOp, vector::ConstantMaskOp>(op))
+                vector::ShapeCastOp, vector::ConstantMaskOp,
+                vector::TransferReadOp, vector::TransferWriteOp>(op))
           nd = true;
         for (Type t : op->getResultTypes())
           if (auto vt = dyn_cast<VectorType>(t); vt && vt.getRank() > 1)
@@ -4607,6 +4609,10 @@ struct LowerGpuOpsToAIROpsPass final
             patterns, vector::VectorMultiReductionLowering::InnerReduction);
         vector::populateVectorTransferLoweringPatterns(patterns,
                                                        /*maxTransferRank=*/1);
+        // (L15-E843) a transfer that may run out of bounds as a masked load
+        // or store, its mask from the memref's size
+        vector::populateVectorMaskMaterializationPatterns(
+            patterns, /*force32BitVectorIndices=*/true);
         vector::populateVectorInsertExtractStridedSliceTransforms(patterns);
         vector::populateVectorRankReducingFMAPattern(patterns);
         vector::populateVectorFromElementsUnrollPatterns(patterns);
@@ -5083,8 +5089,34 @@ void mlir::configureGpuToAIRConversionLegality(ConversionTarget &target) {
   target.addLegalOp<gpu::YieldOp, gpu::GPUModuleOp>();
 }
 
+namespace {
+/// (L15-E843) cf.assert as a trap where its condition fails: AIR has no
+/// puts / abort (ControlFlowToLLVM's lowering, whose message global AIR's
+/// module cannot reference either), the AGX backend a trap instruction.
+struct AssertOpToTrapLowering : public ConvertOpToLLVMPattern<cf::AssertOp> {
+  AssertOpToTrapLowering(const LLVMTypeConverter &converter)
+      : ConvertOpToLLVMPattern<cf::AssertOp>(converter, /*benefit=*/2) {}
+  LogicalResult
+  matchAndRewrite(cf::AssertOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Block *opBlock = rewriter.getInsertionBlock();
+    Block *continuation =
+        rewriter.splitBlock(opBlock, rewriter.getInsertionPoint());
+    Block *failure = rewriter.createBlock(opBlock->getParent());
+    LLVM::Trap::create(rewriter, loc);
+    LLVM::UnreachableOp::create(rewriter, loc);
+    rewriter.setInsertionPointToEnd(opBlock);
+    rewriter.replaceOpWithNewOp<LLVM::CondBrOp>(op, adaptor.getArg(),
+                                                continuation, failure);
+    return success();
+  }
+};
+} // namespace
+
 void mlir::populateGpuToAIRConversionPatterns(
     const LLVMTypeConverter &converter, RewritePatternSet &patterns) {
+  patterns.add<AssertOpToTrapLowering>(converter);
   patterns.add<GPUSystemValueLowering<gpu::ThreadIdOp>>(
       converter, "air.thread_position_in_threadgroup", IndexKind::Block,
       IntrType::Id);

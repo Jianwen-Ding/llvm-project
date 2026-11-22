@@ -1823,3 +1823,31 @@ gpu.module @affine_ops {
     gpu.return
   }
 }
+
+// -----
+
+// A 1-D transfer that may run out of bounds as a masked load (its mask from
+// the memref's size), an in-bounds one as a plain store, and cf.assert as a
+// trap where its condition fails, not a call of puts and abort (L15-E843).
+gpu.module @assert_transfer {
+  // CHECK-LABEL: gpu.module @assert_transfer
+  // CHECK-NOT: llvm.func @abort
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.icmp "sgt" {{.*}} : vector<4xi32>
+  // CHECK: llvm.intr.masked.load
+  // CHECK: llvm.cond_br %{{.*}}, ^[[OK:.*]], ^[[FAIL:.*]]
+  // CHECK: ^[[OK]]:
+  // CHECK: llvm.store {{.*}} : vector<4xf32>, !llvm.ptr<1>
+  // CHECK: ^[[FAIL]]:
+  // CHECK-NEXT: llvm.intr.trap
+  // CHECK-NEXT: llvm.unreachable
+  gpu.func @k(%a: memref<256xf32, 1>, %i: index) kernel {
+    %p = arith.constant 0.0 : f32
+    %v = vector.transfer_read %a[%i], %p : memref<256xf32, 1>, vector<4xf32>
+    %e = vector.extract %v[0] : f32 from vector<4xf32>
+    %c = arith.cmpf oge, %e, %p : f32
+    cf.assert %c, "negative"
+    vector.transfer_write %v, %a[%i] {in_bounds = [true]} : vector<4xf32>, memref<256xf32, 1>
+    gpu.return
+  }
+}
