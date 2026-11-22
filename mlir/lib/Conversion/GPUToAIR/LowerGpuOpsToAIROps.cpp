@@ -1881,6 +1881,164 @@ static LogicalResult rewritePowF64(math::PowFOp op, PatternRewriter &rewriter) {
   return success();
 }
 
+/// e^(hi + lo) of f64 parts with hi + lo at most about 0 (fdlibm's e_exp.c,
+/// its argument in two parts, L15-E824): k = roundeven((hi + lo) / ln 2), r =
+/// ((hi - k ln2hi) + lo) - k ln2lo, hi - k ln2hi exact for an hi with no
+/// bit below 2^-36 (erf's -z^2 - 9/16), so that the sum's rounding is r's,
+/// not that of an argument up to 800 (which e^ magnifies to many ulps); 2^k
+/// in two exact steps, a denormal result rounded once.
+static Value expTwoPartF64(ImplicitLocOpBuilder &b, Value hi, Value lo) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v).getResult(); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v).getResult(); };
+  Value s = add(hi, lo);
+  s = arith::SelectOp::create(
+      b, arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, s, c(-1000.0)),
+      c(-1000.0), s);
+  Value k = math::RoundEvenOp::create(b, mul(s, c(1.44269504088896338700e+00)));
+  Value h = add(sub(hi, mul(k, c(6.93147180369123816490e-01))), lo);
+  Value l = mul(k, c(1.90821492927058770002e-10));
+  Value r = sub(h, l);
+  Value t = mul(r, r);
+  Value p = c(4.13813679705723846039e-08);
+  for (double coef : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
+                      -2.77777777770155933842e-03, 1.66666666666666019037e-01})
+    p = f64Fma(b, t, p, c(coef));
+  Value cc = sub(r, mul(t, p));
+  Value y = sub(c(1.0), sub(sub(l, arith::DivFOp::create(b, mul(r, cc),
+                                                          sub(c(2.0), cc))),
+                            h));
+  Value ki = arith::FPToSIOp::create(b, i64, k);
+  Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
+  Value k2 = arith::SubIOp::create(b, ki, k1);
+  Value scaled = dbl(arith::AddIOp::create(
+      b, arith::BitcastOp::create(b, i64, y), arith::ShLIOp::create(b, k1, ci(52))));
+  return mul(scaled, dbl(arith::ShLIOp::create(
+                         b, arith::AddIOp::create(b, k2, ci(1023)), ci(52))));
+}
+
+/// erf and erfc of f64 (L15-E824; before, math.erf and math.erfc of f64
+/// were left unlowered and the kernel did not compile): fdlibm's s_erf.c
+/// branch-free. Its four ranges' rationals (x^2's below 0.84375, |x| - 1's
+/// below 1.25, 1/x^2's below 1/0.35 and from it) as one numerator and one
+/// denominator of selected coefficients and argument, one division; the
+/// tail's e^(-z^2 - 0.5625) e^((z - |x|)(z + |x|) + R/S) (z = |x|'s high
+/// word) as one exponential of its argument in two parts. erf: x + x y,
+/// erx + P/Q, 1 - r / |x|, 1 from 6, with x's sign; erfc as s_erf.c's
+/// (1 - (x + x y) below 1/4, 1/2 - (x y + (x - 1/2)) from it, 1 - erx - P/Q
+/// or 1 + erx + P/Q, r / |x| or 2 - r / |x|, 2 below -6, 0 from 28). Tiny x:
+/// x + efx x (erf), 1 - x (erfc); NaNs themselves.
+template <typename OpTy>
+static LogicalResult rewriteErfF64(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  constexpr bool isErfc = std::is_same_v<OpTy, math::ErfcOp>;
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v).getResult(); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto lt = [&](Value u, double v) {
+    return arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, u, c(v)).getResult();
+  };
+  Value x = op.getOperand();
+  Value a = math::AbsFOp::create(b, x);
+  Value r0 = lt(a, 0.84375), r1 = lt(a, 1.25), r2 = lt(a, 1.0 / 0.35);
+  Value neg = lt(x, 0.0);
+  // the rational's argument: x^2, |x| - 1, 1/x^2
+  Value t = sel(r0, mul(x, x), sel(r1, sub(a, c(1.0)), div(c(1.0), mul(x, x))));
+  static const double num[4][8] = {
+      {1.28379167095512558561e-01, -3.25042107247001499370e-01,
+       -2.84817495755985104766e-02, -5.77027029648944159157e-03,
+       -2.37630166566501626084e-05, 0, 0, 0},
+      {-2.36211856075265944077e-03, 4.14856118683748331666e-01,
+       -3.72207876035701323847e-01, 3.18346619901161753674e-01,
+       -1.10894694282396677476e-01, 3.54783043256182359371e-02,
+       -2.16637559486879084300e-03, 0},
+      {-9.86494403484714822705e-03, -6.93858572707181764372e-01,
+       -1.05586262253232909814e+01, -6.23753324503260060396e+01,
+       -1.62396669462573470355e+02, -1.84605092906711035994e+02,
+       -8.12874355063065934246e+01, -9.81432934416914548592e+00},
+      {-9.86494292470009928597e-03, -7.99283237680523006574e-01,
+       -1.77579549177547519889e+01, -1.60636384855821916062e+02,
+       -6.37566443368389627722e+02, -1.02509513161107724954e+03,
+       -4.83519191608651397019e+02, 0}};
+  static const double den[4][9] = {
+      {1, 3.97917223959155352819e-01, 6.50222499887672944485e-02,
+       5.08130628187576562776e-03, 1.32494738004321644526e-04,
+       -3.96022827877536812320e-06, 0, 0, 0},
+      {1, 1.06420880400844228286e-01, 5.40397917702171048937e-01,
+       7.18286544141962662868e-02, 1.26171219808761642112e-01,
+       1.36370839120290507362e-02, 1.19844998467991074170e-02, 0, 0},
+      {1, 1.96512716674392571292e+01, 1.37657754143519042600e+02,
+       4.34565877475229228821e+02, 6.45387271733267880336e+02,
+       4.29008140027567833386e+02, 1.08635005541779435134e+02,
+       6.57024977031928170135e+00, -6.04244152148580987438e-02},
+      {1, 3.03380607434824582924e+01, 3.25792512996573918826e+02,
+       1.53672958608443695994e+03, 3.19985821950859553908e+03,
+       2.55305040643316442583e+03, 4.74528541206955367215e+02,
+       -2.24409524465858183362e+01, 0}};
+  auto coef = [&](double v0, double v1, double v2, double v3) {
+    return sel(r0, c(v0), sel(r1, c(v1), sel(r2, c(v2), c(v3))));
+  };
+  Value pn = coef(num[0][7], num[1][7], num[2][7], num[3][7]);
+  for (int i = 6; i >= 0; --i)
+    pn = f64Fma(b, pn, t, coef(num[0][i], num[1][i], num[2][i], num[3][i]));
+  Value pd = coef(den[0][8], den[1][8], den[2][8], den[3][8]);
+  for (int i = 7; i >= 0; --i)
+    pd = f64Fma(b, pd, t, coef(den[0][i], den[1][i], den[2][i], den[3][i]));
+  Value q = div(pn, pd);
+  // the tail's r = e^(-z^2 - 0.5625 + (z - |x|)(z + |x|) + R/S)
+  Value z = arith::BitcastOp::create(
+      b, f64,
+      arith::AndIOp::create(b, arith::BitcastOp::create(b, i64, a),
+                            arith::ConstantIntOp::create(
+                                b, i64, int64_t(0xffffffff00000000ULL))));
+  Value hi = sub(arith::NegFOp::create(b, mul(z, z)).getResult(), c(0.5625));
+  Value lo = add(mul(sub(z, a), add(z, a)), q);
+  Value rt = div(expTwoPartF64(b, hi, lo), a);
+  const double erx = 8.45062911510467529297e-01;
+  Value res;
+  if constexpr (!isErfc) {
+    Value small = add(x, mul(x, q));
+    Value mid = add(c(erx), q);
+    Value tail = sub(c(1.0), rt);
+    Value m = sel(r1, mid, sel(lt(a, 6.0), tail, c(1.0)));
+    res = sel(r0, small, math::CopySignOp::create(b, m, x).getResult());
+    res = sel(lt(a, 0x1p-28), add(x, mul(c(1.28379167095512586316e-01), x)),
+              res);
+  } else {
+    Value xq = mul(x, q);
+    Value small = sel(lt(x, 0.25), sub(c(1.0), add(x, xq)),
+                      sub(c(0.5), add(xq, sub(x, c(0.5)))));
+    Value mid = sel(neg, add(c(1.0), add(c(erx), q)), sub(c(1.0 - erx), q));
+    Value tail = sel(neg, sub(c(2.0), rt), rt);
+    tail = sel(arith::AndIOp::create(b, neg, arith::CmpFOp::create(
+                                                 b, arith::CmpFPredicate::OGT,
+                                                 a, c(6.0))),
+               c(2.0), tail);
+    Value far = sel(neg, c(2.0), c(0.0));
+    res = sel(r0, small, sel(r1, mid, sel(lt(a, 28.0), tail, far)));
+    res = sel(lt(a, 0x1p-56), sub(c(1.0), x), res);
+  }
+  res = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::UNO, x, x), x, res);
+  rewriter.replaceOp(op, res);
+  return success();
+}
+
 /// atan of an f64 a >= 0 (or NaN): fdlibm's s_atan.c, branch-free. Below
 /// 0.4375 a itself is the polynomial's argument; above, (2a - 1) / (2 + a),
 /// (a - 1) / (a + 1), (a - 1.5) / (1 + 1.5a) or -1 / a by the range (one
@@ -4271,6 +4429,8 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteInverseTrigF64<math::AtanOp>);
       patterns.add(rewriteTrigF64<math::SinOp>);
       patterns.add(rewritePowF64);
+      patterns.add(rewriteErfF64<math::ErfOp>);
+      patterns.add(rewriteErfF64<math::ErfcOp>);
       patterns.add(rewriteTrigF64<math::CosOp>);
       patterns.add(rewriteTrigF64<math::TanOp>);
       patterns.add(rewriteInverseTrigF64<math::Atan2Op>);

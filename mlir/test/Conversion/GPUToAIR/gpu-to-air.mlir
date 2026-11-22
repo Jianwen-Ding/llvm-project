@@ -1456,6 +1456,29 @@ gpu.module @f64_pow {
 
 // -----
 
+// f64 erf and erfc (L15-E824; before, left unlowered): fdlibm's s_erf.c with
+// its four rationals as one of selected coefficients (1/x^2, the quotient),
+// the tail's two exponentials as one (its division) and r / |x|: 4 divisions
+// each, no math op left.
+gpu.module @f64_erf {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: math.
+  // CHECK-COUNT-8: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: math.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.erf %v : f64
+    %f = math.erfc %e : f64
+    memref.store %f, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.
