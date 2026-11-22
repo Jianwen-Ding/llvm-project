@@ -5404,13 +5404,16 @@ static bool rebaseLoopIndices(Function &F) {
     BasicBlock *Pre = L->getLoopPreheader();
     if (!L->isInnermost() || !Pre)
       continue;
-    // the accesses' 64-bit index SCEVs
+    // the accesses' 64-bit index SCEVs (each address once: two accesses at
+    // one gep, rewritten for the first, leave none for the second)
     SmallVector<std::pair<GetElementPtrInst *, const SCEV *>, 8> Accesses;
+    SmallPtrSet<GetElementPtrInst *, 8> Seen;
     for (BasicBlock *BB : L->blocks())
       for (Instruction &I : *BB) {
         Value *Ptr = getLoadStorePointerOperand(&I);
         auto *G = dyn_cast_or_null<GetElementPtrInst>(Ptr);
-        if (!G || G->getAddressSpace() != AGX::DEVICE_ADDRESS ||
+        if (!G || !Seen.insert(G).second ||
+            G->getAddressSpace() != AGX::DEVICE_ADDRESS ||
             G->getNumIndices() != 1 || !L->isLoopInvariant(G->getPointerOperand()) ||
             !G->getOperand(1)->getType()->isIntegerTy(64))
           continue;
