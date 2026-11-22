@@ -157,7 +157,8 @@ def cost(costbin, code, tmp, args=()):
 def resident_groups(gprs, tg_bytes, args):
     """SIMD groups resident on a core (AGX Performance Simulator dispatch.rs, measured): registers allow
     min(96, 2 * floor(3328 / (2 * halves))) groups, 32- and 64-lane workgroups at most 55 and 84, and only whole
-    workgroups fit, as many as 64 KiB of threadgroup memory holds."""
+    workgroups fit, as many as 64 KiB of threadgroup memory holds. The halves are the launch's: the code's,
+    rounded up to a multiple of 8 (agx_cost's register_halves, SR19)."""
     wg = [1, 1, 1]
     if "--wg" in args:
         for i, v in enumerate(args[args.index("--wg") + 1].split(",")):
@@ -165,7 +166,8 @@ def resident_groups(gprs, tg_bytes, args):
     else:
         wg[0] = 32
     threads = wg[0] * wg[1] * wg[2]
-    cap = min(96, 2 * (3328 // (2 * max(8, 2 * gprs))))
+    halves = max(8, -(-2 * gprs // 8) * 8)
+    cap = min(96, 2 * (3328 // (2 * halves)))
     if threads <= 32:
         cap = min(cap, 55)
     elif threads <= 64:
