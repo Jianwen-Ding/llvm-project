@@ -2,13 +2,13 @@
 """Differential fuzz of the AGX backend's row loops that load and store device memory, against a Python model, on
 the AGX Performance Simulator.
 
-Each seed generates a kernel whose threads each update a row of 256 words of an output buffer b: a loop of one to
-three statements b[x + i + o] = f(b[x + i + o'], c[...]) in program order, x the thread's row, i the counter, the
-offsets small constants (so a statement may read what an earlier one, or an earlier iteration, stored). c is an
-input buffer at i + o'' (every thread's same words) or x + i + o'', or b itself at x + i + o'' (one buffer passed
-twice: alias versioning's overlapping copy). The trip is a constant or an input word's low bits, the loop guarded
-or not; f is an exact 32-bit integer op (add, sub, xor, or, and, a multiply or shift by a constant, a select of an
-unsigned compare). Compiled with llc (and every other seed with opt -O2 first), run with agx_run on 1024 threads
+Each seed generates a kernel whose threads each update a row of 256 elements of an output buffer b (32-, 16- or
+8-bit; or a column, element (i + o) * 1024 + tid): a loop of one to three statements b[x + i + o] = f(b[x + i + o'],
+c[...]) in program order, x the thread's row, i the counter, the offsets small constants (so a statement may read
+what an earlier one, or an earlier iteration, stored). c is an input buffer at i + o'' (every thread's same
+elements) or x + i + o'', or b itself at x + i + o'' (one buffer passed twice: alias versioning's overlapping copy).
+The trip is a constant or an input word's low bits, the loop guarded or not; f is an exact integer op of the
+element's width (add, sub, xor, or, and, a multiply or shift by a constant, umax). Compiled with llc (and every other seed with opt -O2 first), run with agx_run on 1024 threads
 over random rows and compared word for word with the model: alias and alignment versioning, the unroller's
 runtime remainders, LSR, word indices and rebased indices (L15-E769: a gep a load and a store shared, a crash)
 with stores in the loop.
@@ -39,6 +39,8 @@ def gen(seed):
     R = random.Random(seed)
     alias = R.random() < 0.3
     k = dict(alias=alias,
+             w=R.choice([32, 32, 32, 16, 8]),
+             col=R.random() < 0.25,
              # (with b passed as c, b's first word may change under the
              # other threads' loads: a constant trip)
              trip=R.choice(['const'] if alias else ['const', 'const', 'input']),
@@ -65,9 +67,11 @@ def gen(seed):
 
 
 def emit(k):
+    w = k['w']
+    T, al = 'i%d' % w, w // 8
     L = ['target triple = "agx"',
          'declare i32 @llvm.agx.thread.position.in.grid.x()',
-         'declare i32 @llvm.umax.i32(i32, i32)',
+         'declare %s @llvm.umax.%s(%s, %s)' % (T, T, T, T),
          'define agx_kernel void @k(ptr addrspace(1) %c, ptr addrspace(1) %b) '
          '"agx-upper-bounds:air.thread_position_in_grid"="1024,0,0" {',
          'entry:',
@@ -85,38 +89,44 @@ def emit(k):
         L += ['  br label %loop']
     L += ['loop:', '  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]']
     for n, s in enumerate(k['stmts']):
-        def addr(base, off, row, nm):
+        def addr(base, off, own, nm):
             idx = '%%%s.i' % nm
-            if row:
+            if own and k['col']:
+                # a column: (i + o) * 1024 + tid
+                L.append('  %%%s.r = add nuw nsw i32 %%i, %d' % (nm, off))
+                L.append('  %%%s.m = mul nuw nsw i32 %%%s.r, %d' % (nm, nm, N))
+                L.append('  %s = add nuw nsw i32 %%%s.m, %%tid' % (idx, nm))
+            elif own:
                 L.append('  %%%s.r = add nuw nsw i32 %%x, %%i' % nm)
                 L.append('  %s = add nuw nsw i32 %%%s.r, %d' % (idx, nm, off))
             else:
                 L.append('  %s = add nuw nsw i32 %%i, %d' % (idx, off))
             L.append('  %%%s.z = zext i32 %s to i64' % (nm, idx))
-            L.append('  %%%s.p = getelementptr inbounds i32, ptr addrspace(1) %s, i64 %%%s.z' % (nm, base, nm))
+            L.append('  %%%s.p = getelementptr inbounds %s, ptr addrspace(1) %s, i64 %%%s.z' % (nm, T, base, nm))
             return '%%%s.p' % nm
         pc = addr('%b' if k['alias'] else '%c', s['lc'], s['cw'] == 'row', 'c%d' % n)
-        L.append('  %%vc%d = load i32, ptr addrspace(1) %s, align 4' % (n, pc))
+        L.append('  %%vc%d = load %s, ptr addrspace(1) %s, align %d' % (n, T, pc, al))
         a = '%%vc%d' % n
         pst = addr('%b', s['st'], True, 's%d' % n)
+        kk = s['k'] & ((1 << w) - 1)
         if s['lb'] is not None:
             pb = pst if s['same'] else addr('%b', s['lb'], True, 'b%d' % n)
-            L.append('  %%vb%d = load i32, ptr addrspace(1) %s, align 4' % (n, pb))
+            L.append('  %%vb%d = load %s, ptr addrspace(1) %s, align %d' % (n, T, pb, al))
             bv = '%%vb%d' % n
         else:
-            bv = str(s['k'])
+            bv = str(kk)
         op, r = s['op'], '%%r%d' % n
         if op in ('add', 'sub', 'xor', 'or', 'and'):
-            L.append('  %s = %s i32 %s, %s' % (r, op, bv, a))
+            L.append('  %s = %s %s %s, %s' % (r, op, T, bv, a))
         elif op == 'mul':
-            L.append('  %%m%d = mul i32 %s, %d' % (n, a, s['k']))
-            L.append('  %s = add i32 %s, %%m%d' % (r, bv, n))
+            L.append('  %%m%d = mul %s %s, %d' % (n, T, a, kk))
+            L.append('  %s = add %s %s, %%m%d' % (r, T, bv, n))
         elif op in ('shl', 'lshr'):
-            L.append('  %%m%d = %s i32 %s, %d' % (n, op, a, s['k'] & 31))
-            L.append('  %s = xor i32 %s, %%m%d' % (r, bv, n))
+            L.append('  %%m%d = %s %s %s, %d' % (n, op, T, a, s['k'] & (w - 1)))
+            L.append('  %s = xor %s %s, %%m%d' % (r, T, bv, n))
         else:
-            L.append('  %s = call i32 @llvm.umax.i32(i32 %s, i32 %s)' % (r, bv, a))
-        L.append('  store i32 %s, ptr addrspace(1) %s, align 4' % (r, pst))
+            L.append('  %s = call %s @llvm.umax.%s(%s %s, %s %s)' % (r, T, T, T, bv, T, a))
+        L.append('  store %s %s, ptr addrspace(1) %s, align %d' % (T, r, pst, al))
     L += ['  %%i1 = add nuw nsw i32 %%i, %d' % k['step'],
           '  %e = icmp ult i32 %i1, %t',
           '  br i1 %e, label %loop, label %exit',
@@ -124,20 +134,30 @@ def emit(k):
     return '\n'.join(L) + '\n'
 
 
-def model(k, cin, bout):
-    """Every thread's row of bout (uint32, updated in place), cin the input words (b itself where aliased)."""
+def dtype(w):
+    return {32: np.uint32, 16: np.uint16, 8: np.uint8}[w]
+
+
+def model(k, t, cin, bout):
+    """b's elements (bout, updated in place) after every thread's loop of trip t, cin c's elements (b itself where
+    aliased)."""
+    w = k['w']
+    Mw = (1 << w) - 1
     b = bout.astype(np.uint64)
     c = b if k['alias'] else cin.astype(np.uint64)
-    t = k['tconst'] if k['trip'] == 'const' else (int(cin[0]) & k['tmask']) + k['tadd']
     if t == 0 and k['guarded']:
         return bout
-    x = np.arange(N, dtype=np.int64) * ROW
+    tid = np.arange(N, dtype=np.int64)
+    x = tid * ROW
+    def own(i, o):
+        return (i + o) * N + tid if k['col'] else x + i + o
     i = 0
     while True:
         for s in k['stmts']:
-            ci = (x + i + s['lc']) if s['cw'] == 'row' else np.full(N, i + s['lc'])
+            ci = own(i, s['lc']) if s['cw'] == 'row' else np.full(N, i + s['lc'])
             a = c[ci].copy()
-            bv = b[x + i + s['lb']].copy() if s['lb'] is not None else np.full(N, s['k'], np.uint64)
+            kk = s['k'] & Mw
+            bv = b[own(i, s['lb'])].copy() if s['lb'] is not None else np.full(N, kk, np.uint64)
             op = s['op']
             if op == 'add':
                 r = bv + a
@@ -150,18 +170,18 @@ def model(k, cin, bout):
             elif op == 'and':
                 r = bv & a
             elif op == 'mul':
-                r = bv + ((a * s['k']) & M)
+                r = bv + ((a * kk) & Mw)
             elif op == 'shl':
-                r = bv ^ ((a << (s['k'] & 31)) & M)
+                r = bv ^ ((a << (s['k'] & (w - 1))) & Mw)
             elif op == 'lshr':
-                r = bv ^ (a >> (s['k'] & 31))
+                r = bv ^ (a >> (s['k'] & (w - 1)))
             else:
                 r = np.maximum(bv, a)
-            b[x + i + s['st']] = r & M
+            b[own(i, s['st'])] = r & Mw
         i += k['step']
         if not i < t:   # (unsigned: i and t are small)
             break
-    return b.astype(np.uint32)
+    return b.astype(dtype(w))
 
 
 def run_seed(seed, a, tmp):
@@ -182,14 +202,16 @@ def run_seed(seed, a, tmp):
         return src, "compile failure: " + (r.stderr.strip().splitlines() or [""])[0][:200]
     subprocess.run([a.objcopy, "-O", "binary", "--only-section=.text", obj, code], check=True)
     rng = np.random.default_rng(seed)
+    w = k['w']
     cin = rng.integers(0, 2**32, WORDS, dtype=np.uint64).astype(np.uint32)
-    bout = rng.integers(0, 2**32, N * ROW, dtype=np.uint64).astype(np.uint32)
-    m = rng.random(N * ROW) < 0.2
-    bout[m] = rng.choice(np.array([0, 1, M, 0x80000000, 0x7fffffff], np.uint32), m.sum())
+    bw = rng.integers(0, 2**32, N * ROW * w // 32, dtype=np.uint64).astype(np.uint32)
+    m = rng.random(bw.size) < 0.2
+    bw[m] = rng.choice(np.array([0, 1, M, 0x80000000, 0x7fffffff], np.uint32), m.sum())
+    bout = bw.view(dtype(w))
     fin, fb, fout = (os.path.join(tmp, n) for n in ("in.bin", "b.bin", "out.bin"))
     cin.tofile(fin)
     bout.tofile(fb)
-    nbytes = 4 * N * ROW
+    nbytes = bout.nbytes
     cva = OUT if k['alias'] else IN
     try:
         r = subprocess.run([a.run, code, "--grid", "%d,1,1" % N, "--wg", "256,1,1", "--map", "%#x=%s" % (IN, fin),
@@ -200,14 +222,14 @@ def run_seed(seed, a, tmp):
         return src, "agx_run timed out"
     if r.returncode:
         return src, "agx_run failed: " + ((r.stderr + r.stdout).strip().splitlines() or [""])[-1][:200]
-    got = np.fromfile(fout, np.uint32)
-    # (with b passed as c, the trip word is b's first)
-    ref = model(k, bout if k['alias'] else cin, bout.copy())
+    got = np.fromfile(fout, dtype(w))
+    t = k['tconst'] if k['trip'] == 'const' else (int(cin[0]) & k['tmask']) + k['tadd']
+    ref = model(k, t, bout if k['alias'] else cin.view(dtype(w)), bout.copy())
     bad = np.nonzero(got != ref)[0]
     if bad.size:
-        w = int(bad[0])
-        return src, "word %d (thread %d, +%d): %#x, the model %#x (%d words differ)" % (
-            w, w // ROW, w % ROW, int(got[w]), int(ref[w]), bad.size)
+        e = int(bad[0])
+        return src, "element %d of %d bits: %#x, the model %#x (%d elements differ)" % (
+            e, w, int(got[e]), int(ref[e]), bad.size)
     return src, None
 
 
