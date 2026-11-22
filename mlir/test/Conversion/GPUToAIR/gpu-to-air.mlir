@@ -3,6 +3,7 @@
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 approximate-half-functions=0" --split-input-file | FileCheck %s --check-prefix=HALFOFF
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 expm1-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=E1OFF
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 f64-polynomial-fma=1" --split-input-file | FileCheck %s --check-prefix=PFMA
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 log1p-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=L1OFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -1323,6 +1324,30 @@ gpu.module @f64_polynomial_mul_add {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<8xf64, 1>
     %e = math.exp %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 log1p as fdlibm's (L15-E818): one division of doubles (log's s), the
+// correction c / u in f32 by the hardware's reciprocal; log1p-f64-direct=0:
+// log(1 + x) and Kahan's division, two.
+gpu.module @f64_log1p {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK: llvm.fdiv {{.*}} fastmath<afn> : f32
+  // CHECK: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK: llvm.return
+  // L1OFF-LABEL: gpu.module @f64_log1p
+  // L1OFF-COUNT-2: llvm.fdiv {{.*}} : f64
+  // L1OFF-NOT: llvm.fdiv
+  // L1OFF: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.log1p %v : f64
     memref.store %e, %a[%c0] : memref<8xf64, 1>
     gpu.return
   }

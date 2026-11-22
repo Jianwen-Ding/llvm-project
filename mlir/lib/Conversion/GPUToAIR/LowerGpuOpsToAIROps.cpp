@@ -978,6 +978,97 @@ static Value expm1F64(ImplicitLocOpBuilder &b, Value x) {
   return sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, res);
 }
 
+/// log1p of an f64 x: fdlibm's s_log1p.c in f64, i64 and f32 operations
+/// (L15-E818). Outside fdlibm's k = 0 range (x from -0.2929 to 0.4142, where
+/// f = x itself) u = 1 + x is reduced as log's argument, 2^k (1 + f), and
+/// its rounding error c ((1 + x) - u, exactly: 1 - (u - x) from u = 2, else
+/// x - (u - 1); none from 2^53) corrects the result by c / u, at most 2^-53
+/// of it: that quotient in f32 with the hardware's reciprocal, to 2^-21, is
+/// enough (fdlibm divides in double). Then log's s = f / (2 + f), R its
+/// polynomial, k ln2hi - ((f^2/2 - (s (f^2/2 + R) + (k ln2lo + c/u))) - f).
+/// -1 gives -inf, below -1 and NaN the default NaN (as log of 1 + x did),
+/// +inf itself, |x| below 2^-54 x (and -0 -0). Not log(1 + x) with Kahan's
+/// log(u) x / (u - 1) below 1/2: one division of doubles fewer.
+static Value log1pF64(ImplicitLocOpBuilder &b, Value x) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type(), f32 = b.getF32Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto fma = [&](Value u, Value v, Value w) -> Value {
+    return f64Fma(b, u, v, w);
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v);
+  };
+  Value u = add(c(1.0), x);
+  Value bu = arith::BitcastOp::create(b, i64, u);
+  Value hu = arith::ShRUIOp::create(b, bu, ci(32));
+  Value k = arith::SubIOp::create(b, arith::ShRUIOp::create(b, hu, ci(20)),
+                                  ci(1023));
+  Value cr = sel(icmp(arith::CmpIPredicate::sgt, k, ci(0)),
+                 sub(c(1.0), sub(u, x)), sub(x, sub(u, c(1.0))));
+  cr = sel(icmp(arith::CmpIPredicate::sge, k, ci(53)), c(0.0), cr);
+  auto q = arith::DivFOp::create(b, arith::TruncFOp::create(b, f32, cr),
+                                 arith::TruncFOp::create(b, f32, u));
+  q.setFastmath(arith::FastMathFlags::afn);
+  Value cu = arith::ExtFOp::create(b, f64, q.getResult());
+  hu = arith::AndIOp::create(b, hu, ci(0xfffff));
+  Value up = icmp(arith::CmpIPredicate::uge, hu, ci(0x6a09e));
+  Value newHi = arith::OrIOp::create(
+      b, hu, sel(up, ci(0x3fe00000), ci(0x3ff00000)));
+  k = arith::AddIOp::create(b, k, sel(up, ci(1), ci(0)));
+  Value f = sub(arith::BitcastOp::create(
+                    b, f64,
+                    arith::OrIOp::create(
+                        b, arith::ShLIOp::create(b, newHi, ci(32)),
+                        arith::AndIOp::create(b, bu, ci(0xffffffff)))),
+                c(1.0));
+  // fdlibm's k = 0 range: f = x (high words below 0x3fda827a and, negative,
+  // at most 0x3fd2bec3)
+  Value near = arith::AndIOp::create(
+      b, fcmp(arith::CmpFPredicate::OLT, x, c(0x1.a827ap-2)),
+      fcmp(arith::CmpFPredicate::OGT, x, c(-0x1.2bec4p-2)));
+  f = sel(near, x, f);
+  k = sel(near, ci(0), k);
+  cu = sel(near, c(0.0), cu);
+  Value sv = arith::DivFOp::create(b, f, add(c(2.0), f));
+  Value z = mul(sv, sv), w = mul(z, z);
+  Value t1 = mul(w, fma(w, fma(w, c(1.531383769920937332e-01),
+                               c(2.222219843214978396e-01)),
+                        c(3.999999999940941908e-01)));
+  Value t2 = mul(z, fma(w, fma(w, fma(w, c(1.479819860511658591e-01),
+                                      c(1.818357216161805012e-01)),
+                               c(2.857142874366239149e-01)),
+                        c(6.666666666666735130e-01)));
+  Value r = add(t2, t1);
+  Value dk = arith::SIToFPOp::create(b, f64, k);
+  Value hfsq = mul(mul(c(0.5), f), f);
+  Value res = sub(mul(dk, c(6.93147180369123816490e-01)),
+                  sub(sub(hfsq, add(mul(sv, add(hfsq, r)),
+                                    add(mul(dk, c(1.90821492927058770002e-10)),
+                                        cu))),
+                      f));
+  Value inf = c(std::numeric_limits<double>::infinity());
+  res = sel(fcmp(arith::CmpFPredicate::OLT, math::AbsFOp::create(b, x),
+                 c(0x1p-54)),
+            x, res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, x, inf), inf, res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(-1.0)),
+            c(-std::numeric_limits<double>::infinity()), res);
+  return sel(fcmp(arith::CmpFPredicate::ULT, x, c(-1.0)),
+             c(std::numeric_limits<double>::quiet_NaN()), res);
+}
+
 /// The f32 operations of a half function's expansion that may take the
 /// hardware's approximations (fastmath afn: exp, log, square root, division
 /// by the reciprocal).
@@ -993,6 +1084,8 @@ enum HalfApprox : unsigned {
 static thread_local bool approximateHalfFunctions = true;
 /// Whether convert-gpu-to-air's expm1-f64-direct is on (set as above).
 static thread_local bool expm1F64Direct = true;
+/// Whether convert-gpu-to-air's log1p-f64-direct is on (set as above).
+static thread_local bool log1pF64Direct = true;
 
 /// For a half result computed in f32 from \p x: fastmath afn on the f32
 /// operations of the kinds in \p kinds computing \p r, the kinds for which
@@ -1061,6 +1154,10 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
       r = accurateExpM1(rewriter, loc, x,
                         math::ExpOp::create(rewriter, loc, x));
     }
+  } else if (type.isF64() && log1pF64Direct) {
+    (void)small;
+    ImplicitLocOpBuilder ib(loc, rewriter);
+    r = log1pF64(ib, x);
   } else {
     Value u = arith::AddFOp::create(rewriter, loc, one, x);
     Value lu = math::LogOp::create(rewriter, loc, u);
@@ -3150,6 +3247,7 @@ struct LowerGpuOpsToAIROpsPass final
     });
     ::approximateHalfFunctions = approximateHalfFunctions;
     ::expm1F64Direct = expm1F64Direct;
+    ::log1pF64Direct = log1pF64Direct;
     ::f64PolynomialFma = f64PolynomialFma;
     if (speculateGuardedLoads)
       ::speculateGuardedLoads(m);
