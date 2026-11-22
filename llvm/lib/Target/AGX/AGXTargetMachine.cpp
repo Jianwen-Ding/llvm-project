@@ -311,6 +311,16 @@ static cl::opt<unsigned> AGXSchedCoreOccupancyCut(
     cl::desc("agx-sched-core-occupancy's cut of the core's SIMD-groups, in "
              "tenths (1.8 times until L15-E761)"));
 
+static cl::opt<unsigned> AGXSchedLoadsFirstCut(
+    "agx-sched-loads-first-cut", cl::init(18), cl::Hidden,
+    cl::desc("agx-sched-original-order-loads-first's order dropped where it "
+             "cuts the core's SIMD-groups this much, in tenths"));
+
+static cl::opt<unsigned> AGXSchedNeedCut(
+    "agx-sched-keep-occupancy-need-cut", cl::init(30), cl::Hidden,
+    cl::desc("agx-sched-keep-occupancy-need's cut of the core's SIMD-groups "
+             "past which the original order stays, in tenths"));
+
 static cl::opt<bool> AGXSchedKnownGrid(
     "agx-sched-known-grid", cl::init(true), cl::Hidden,
     cl::desc("Keep a schedule whose registers still let every SIMD-group of "
@@ -476,7 +486,8 @@ public:
       for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
         Stores |= MI.mayStore();
       Threads = Stores || FewLoads ||
-                3 * CoreGroups(After) < CoreGroups(Before) ||
+                AGXSchedNeedCut * CoreGroups(After) <
+                    10 * CoreGroups(Before) ||
                 AGXSubtarget::maxThreadsForHalves(After + 16) < Need;
     }
     bool Core = AGXSchedCoreOccupancy && FewLoads &&
@@ -565,7 +576,8 @@ public:
       auto Bad = [&](unsigned H) {
         return H > Before &&
                (AGXSubtarget::maxThreadsForHalves(H + 16) < Need ||
-                9 * CoreGroups(H) < 5 * CoreGroups(Before) ||
+                AGXSchedLoadsFirstCut * CoreGroups(H) <
+                    10 * CoreGroups(Before) ||
                 (CoreGroups(H) < AGXSchedLoadsFirstMinGroups &&
                  CoreGroups(H) < CoreGroups(Before)));
       };
