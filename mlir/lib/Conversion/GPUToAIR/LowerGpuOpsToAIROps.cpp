@@ -875,6 +875,94 @@ static Value accurateExpM1(OpBuilder &b, Location loc, Value x, Value u) {
       b, loc, small, arith::SelectOp::create(b, loc, isOne, x, q), um1);
 }
 
+/// expm1 of an f64 x: fdlibm's s_expm1.c in f64 and i64 operations, its
+/// branches selects (within 1 ulp; L15-E814). x = k ln 2 + r (k =
+/// roundeven(x / ln 2), r = hi - lo with its rounding error c, as exp's
+/// reduction), expm1(r) from fdlibm's rational form with one division, then
+/// its reconstruction, whose six cases are one form here (below); 2^k
+/// applied on the exponent field (each such value normal). x is clamped to
+/// -40 (below which the result rounds to -1) and a NaN or an x above 709.78
+/// (overflow) reduced as 0, the result selected; |x| below 2^-54 gives x
+/// (and -0 -0). Not exp's u - 1 and Kahan's (u - 1) x / log(u) near 0: no
+/// log and two divisions fewer.
+static Value expm1F64(ImplicitLocOpBuilder &b, Value x) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto neg = [&](Value u) { return arith::NegFOp::create(b, u); };
+  auto fma = [&](Value u, Value v, Value w) {
+    return math::FmaOp::create(b, u, v, w);
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v);
+  };
+  auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v); };
+  auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v); };
+  Value over = fcmp(arith::CmpFPredicate::UGT, x, c(7.09782712893383973096e+02));
+  Value xr = sel(fcmp(arith::CmpFPredicate::OLT, x, c(-40.0)), c(-40.0), x);
+  xr = sel(over, c(0.0), xr);
+  Value kf = math::RoundEvenOp::create(b, mul(xr, c(1.44269504088896338700e+00)));
+  Value hi = sub(xr, mul(kf, c(6.93147180369123816490e-01)));
+  Value lo = mul(kf, c(1.90821492927058770002e-10));
+  Value r = sub(hi, lo);
+  Value cr = sub(sub(hi, r), lo);
+  Value hfx = mul(c(0.5), r);
+  Value hxs = mul(r, hfx);
+  Value p = c(-2.01099218183624371326e-07);
+  for (double q : {4.00821782732936239552e-06, -7.93650757867487942473e-05,
+                   1.58730158725481460165e-03, -3.33333333333331316428e-02})
+    p = fma(hxs, p, c(q));
+  Value r1 = fma(hxs, p, c(1.0));
+  Value t = fma(neg(r1), hfx, c(3.0));
+  Value e = mul(hxs, arith::DivFOp::create(b, sub(r1, t),
+                                           fma(neg(r), t, c(6.0))));
+  Value ki = arith::FPToSIOp::create(b, i64, kf);
+  // r 2^k: k added to the exponent field
+  auto scale = [&](Value y) {
+    return dbl(arith::AddIOp::create(b, bits(y),
+                                     arith::ShLIOp::create(b, ki, ci(52))));
+  };
+  // fdlibm's reconstructions are 2^k ((1 - 2^-k) - (e2 - r)), e2 = (r (e -
+  // c) - c) - hxs (for k 0, -1, 1 and below 20: with 64-bit fields 1 - 2^-k
+  // is exact up to k = 52, and the same for k = 0 and from -58, whose
+  // rounding there is the result's), 2^k (1 - ((e2 + 2^-k) - r)) (k from
+  // 53; fdlibm's (r - (e2 + 2^-k)) + 1, the same) and 2 ((r + 1/2) - e2)
+  // (k = 1 and r below -1/4): one form, (r + f) + g, its operands selected
+  // (2^-k of k up to 1000: a 2^-k of a k above 56 does not change the sum)
+  Value e2 = sub(fma(r, sub(e, cr), neg(cr)), hxs);
+  Value big = icmp(arith::CmpIPredicate::sge, ki, ci(53));
+  Value pkBits = arith::ShLIOp::create(
+      b,
+      arith::SubIOp::create(b, ci(1023),
+                            arith::MinSIOp::create(b, ki, ci(1000))),
+      ci(52));
+  Value zeroBits = ci(0);
+  Value e2s = add(e2, dbl(sel(big, pkBits, zeroBits)));
+  Value tk = sub(c(1.0), dbl(sel(big, zeroBits, pkBits)));
+  Value oneLow = arith::AndIOp::create(
+      b, icmp(arith::CmpIPredicate::eq, ki, ci(1)),
+      fcmp(arith::CmpFPredicate::OLT, r, c(-0.25)));
+  Value f = sel(oneLow, c(0.5), neg(e2s));
+  Value g = sel(oneLow, neg(e2), tk);
+  Value res = scale(add(add(r, f), g));
+  res = sel(fcmp(arith::CmpFPredicate::OLT, math::AbsFOp::create(b, x),
+                 c(0x1p-54)),
+            x, res);
+  res = sel(over, c(std::numeric_limits<double>::infinity()), res);
+  return sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, res);
+}
+
 /// The f32 operations of a half function's expansion that may take the
 /// hardware's approximations (fastmath afn: exp, log, square root, division
 /// by the reciprocal).
@@ -888,6 +976,8 @@ enum HalfApprox : unsigned {
 /// Whether convert-gpu-to-air's approximate-half-functions is on (set by the
 /// pass for its patterns).
 static thread_local bool approximateHalfFunctions = true;
+/// Whether convert-gpu-to-air's expm1-f64-direct is on (set as above).
+static thread_local bool expm1F64Direct = true;
 
 /// For a half result computed in f32 from \p x: fastmath afn on the f32
 /// operations of the kinds in \p kinds computing \p r, the kinds for which
@@ -949,7 +1039,13 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   Value r;
   if constexpr (std::is_same_v<OpTy, math::ExpM1Op>) {
     (void)small;
-    r = accurateExpM1(rewriter, loc, x, math::ExpOp::create(rewriter, loc, x));
+    if (type.isF64() && expm1F64Direct) {
+      ImplicitLocOpBuilder ib(loc, rewriter);
+      r = expm1F64(ib, x);
+    } else {
+      r = accurateExpM1(rewriter, loc, x,
+                        math::ExpOp::create(rewriter, loc, x));
+    }
   } else {
     Value u = arith::AddFOp::create(rewriter, loc, one, x);
     Value lu = math::LogOp::create(rewriter, loc, u);
@@ -1443,8 +1539,18 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     // below 22) from it as math.expm1's rewrite would from exp(|x|), the
     // large range's e^|x| and the huge range's e^(|x| / 2) (L15-E309).
     Value below = fcmp(arith::CmpFPredicate::OLT, a, c(709.0));
-    Value w = math::ExpOp::create(b, sel(below, a, mul(c(0.5), a)));
-    Value t = accurateExpM1(b, b.getLoc(), a, w);
+    Value arg = sel(below, a, mul(c(0.5), a));
+    Value w, t;
+    if (expm1F64Direct) {
+      // fdlibm's expm1 of the argument (L15-E814), and e^arg = t + 1 where
+      // it is read (|x| from 22: t from 2^31, an integer multiple of its
+      // ulp, so t + 1 is exact)
+      t = expm1F64(b, arg);
+      w = add(t, c(1.0));
+    } else {
+      w = math::ExpOp::create(b, arg);
+      t = accurateExpM1(b, b.getLoc(), a, w);
+    }
     Value tp1 = add(t, c(1.0));
     // (one division by t + 1, of t^2 below 1 and of t from it, each lane's
     // the same: L15-E323)
@@ -3026,6 +3132,7 @@ struct LowerGpuOpsToAIROpsPass final
         kernelBounds[f.getName()] = bounds;
     });
     ::approximateHalfFunctions = approximateHalfFunctions;
+    ::expm1F64Direct = expm1F64Direct;
     if (speculateGuardedLoads)
       ::speculateGuardedLoads(m);
     if (constantTripLoops)

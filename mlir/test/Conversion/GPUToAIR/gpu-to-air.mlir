@@ -1,6 +1,7 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0 simdgroup-all-reduce=0" --split-input-file | FileCheck %s --check-prefix=OFF
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 approximate-half-functions=0" --split-input-file | FileCheck %s --check-prefix=HALFOFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 expm1-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=E1OFF
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -1283,15 +1284,21 @@ gpu.module @loop_carried_offset {
 
 // f64 sinh and tanh: one division each of their own beside those of the exp
 // and expm1 they use (sinh's t^2 or t by t + 1, tanh's t or 2 by t + 2, the
-// dividend selected: L15-E323): 8 divisions in all, 10 before.
+// dividend selected: L15-E323), and the expm1 fdlibm's, with one division
+// (L15-E814): 4 divisions in all; 8 with exp, log and Kahan's division
+// (expm1-f64-direct=0), 10 before L15-E323.
 gpu.module @f64_sinh_tanh_one_division {
   // CHECK-LABEL: llvm.func @k(
+  // E1OFF-LABEL: gpu.module @f64_sinh_tanh_one_division
   gpu.func @k(%a: memref<8xf64, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<8xf64, 1>
-    // CHECK-COUNT-8: llvm.fdiv
+    // CHECK-COUNT-4: llvm.fdiv
     // CHECK-NOT: llvm.fdiv
     // CHECK: llvm.return
+    // E1OFF-COUNT-8: llvm.fdiv
+    // E1OFF-NOT: llvm.fdiv
+    // E1OFF: llvm.return
     %s = math.sinh %v : f64
     %t = math.tanh %s : f64
     memref.store %t, %a[%c0] : memref<8xf64, 1>
