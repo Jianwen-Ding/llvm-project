@@ -1540,6 +1540,33 @@ gpu.module @f64_vector_reduction {
 
 // -----
 
+// n-D vectors (L15-E828): shape casts, transposes and contractions lowered to
+// 1-D vectors first, as ConvertVectorToLLVMPass does (before, they were left
+// in the output); the contraction's outer products as fmas.
+#nd_map0 = affine_map<(i, j, k) -> (i, k)>
+#nd_map1 = affine_map<(i, j, k) -> (k, j)>
+#nd_map2 = affine_map<(i, j, k) -> (i, j)>
+gpu.module @nd_vectors {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: vector.
+  // CHECK: llvm.intr.fma
+  // CHECK-NOT: vector.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<64xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<64xf32, 1>, vector<4xf32>
+    %m = vector.shape_cast %v : vector<4xf32> to vector<2x2xf32>
+    %t = vector.transpose %m, [1, 0] : vector<2x2xf32> to vector<2x2xf32>
+    %z = arith.constant dense<0.0> : vector<2x2xf32>
+    %r = vector.contract {indexing_maps = [#nd_map0, #nd_map1, #nd_map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %m, %t, %z : vector<2x2xf32>, vector<2x2xf32> into vector<2x2xf32>
+    %f = vector.shape_cast %r : vector<2x2xf32> to vector<4xf32>
+    vector.store %f, %a[%c0] : memref<64xf32, 1>, vector<4xf32>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

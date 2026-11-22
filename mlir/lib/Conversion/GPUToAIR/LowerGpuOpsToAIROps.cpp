@@ -51,6 +51,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/CallInterfaces.h"
@@ -4479,6 +4481,50 @@ struct LowerGpuOpsToAIROpsPass final
         Value res = math::FmaOp::create(b, loc, r, y, q0);
         op.replaceAllUsesWith(res);
         op.erase();
+      }
+    }
+    // n-D vectors (linalg vectorization's: shape casts, transposes,
+    // contractions, multi-reductions, n-D broadcasts) to 1-D ones by
+    // ConvertVectorToLLVMPass's progressive lowerings, which VectorToLLVM's
+    // patterns below do not do (L15-E828); only where the module has such a
+    // vector or op, so that 1-D kernels are as they were.
+    {
+      bool nd = false;
+      m.walk([&](Operation *op) {
+        if (isa<vector::ContractionOp, vector::TransposeOp,
+                vector::MultiDimReductionOp, vector::OuterProductOp,
+                vector::ShapeCastOp>(op))
+          nd = true;
+        for (Type t : op->getResultTypes())
+          if (auto vt = dyn_cast<VectorType>(t); vt && vt.getRank() > 1)
+            nd = true;
+        return nd ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (nd) {
+        RewritePatternSet patterns(ctx);
+        vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+        vector::populateVectorBroadcastLoweringPatterns(patterns);
+        vector::populateVectorContractLoweringPatterns(
+            patterns, vector::VectorContractLowering::OuterProduct);
+        vector::populateVectorOuterProductLoweringPatterns(patterns);
+        vector::populateVectorMaskOpLoweringPatterns(patterns);
+        vector::populateVectorShapeCastLoweringPatterns(patterns);
+        vector::populateVectorInterleaveLoweringPatterns(patterns);
+        vector::populateVectorTransposeLoweringPatterns(
+            patterns, vector::VectorTransposeLowering::EltWise);
+        vector::populateVectorMultiReductionReorderPatterns(
+            patterns, vector::VectorMultiReductionLowering::InnerReduction);
+        vector::populateVectorMultiReductionFlatteningPatterns(
+            patterns, vector::VectorMultiReductionLowering::InnerReduction);
+        vector::populateVectorMultiReductionUnrollingPatterns(
+            patterns, vector::VectorMultiReductionLowering::InnerReduction);
+        vector::populateVectorTransferLoweringPatterns(patterns,
+                                                       /*maxTransferRank=*/1);
+        vector::populateVectorInsertExtractStridedSliceTransforms(patterns);
+        vector::populateVectorRankReducingFMAPattern(patterns);
+        vector::populateVectorFromElementsUnrollPatterns(patterns);
+        vector::populateVectorToElementsUnrollPatterns(patterns);
+        (void)applyPatternsGreedily(m, std::move(patterns));
       }
     }
     // In-dialect lowering of gpu.all_reduce and friends first.
