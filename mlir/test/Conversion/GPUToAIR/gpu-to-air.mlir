@@ -1542,14 +1542,14 @@ gpu.module @f64_vector_reduction {
 
 // n-D vectors (L15-E828): shape casts, transposes and contractions lowered to
 // 1-D vectors first, as ConvertVectorToLLVMPass does (before, they were left
-// in the output); the contraction's outer products as fmas.
+// in the output); the contraction's outer products as fmuladds.
 #nd_map0 = affine_map<(i, j, k) -> (i, k)>
 #nd_map1 = affine_map<(i, j, k) -> (k, j)>
 #nd_map2 = affine_map<(i, j, k) -> (i, j)>
 gpu.module @nd_vectors {
   // CHECK-LABEL: llvm.func @k(
   // CHECK-NOT: vector.
-  // CHECK: llvm.intr.fma
+  // CHECK: llvm.intr.fmuladd
   // CHECK-NOT: vector.
   // CHECK: llvm.return
   gpu.func @k(%a: memref<64xf32, 1>) kernel {
