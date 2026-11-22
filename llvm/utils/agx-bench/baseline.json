@@ -372,16 +372,16 @@
   "waits": 30
  },
  "cuda_index_add.ll:index_add:agx-g14c": {
-  "bytes": 3740,
-  "cycles": 16912.0,
+  "bytes": 4468,
+  "cycles": 12070.0,
   "gprs": 36,
   "groups": 40,
-  "instructions": 584,
+  "instructions": 704,
   "launch_inputs": true,
   "tg_bytes": 0,
-  "tput": 1345.0,
+  "tput": 698.7,
   "uniform_halves": 22,
-  "waits": 20
+  "waits": 40
  },
  "cuda_jacobi2d.ll:jacobi2d:agx-g13g": {
   "bytes": 538,
@@ -576,26 +576,26 @@
   "waits": 4
  },
  "cuda_radix_hist.ll:radix_hist:agx-g13g": {
-  "bytes": 522,
-  "cycles": 2006.8,
+  "bytes": 596,
+  "cycles": 1960.6,
   "gprs": 11,
   "groups": 96,
-  "instructions": 87,
+  "instructions": 98,
   "launch_inputs": true,
   "tg_bytes": 64,
-  "tput": 82.8,
+  "tput": 73.6,
   "uniform_halves": 18,
   "waits": 1
  },
  "cuda_radix_hist.ll:radix_hist:agx-g14c": {
-  "bytes": 522,
-  "cycles": 2006.8,
+  "bytes": 596,
+  "cycles": 1960.6,
   "gprs": 11,
   "groups": 96,
-  "instructions": 87,
+  "instructions": 98,
   "launch_inputs": true,
   "tg_bytes": 64,
-  "tput": 82.8,
+  "tput": 73.6,
   "uniform_halves": 18,
   "waits": 1
  },
@@ -888,26 +888,26 @@
   "waits": 1
  },
  "histogram.ll:histogram:agx-g13g": {
-  "bytes": 400,
-  "cycles": 354.3,
+  "bytes": 468,
+  "cycles": 309.0,
   "gprs": 11,
   "groups": 96,
-  "instructions": 67,
+  "instructions": 77,
   "launch_inputs": true,
   "tg_bytes": 1024,
-  "tput": 30.3,
+  "tput": 19.9,
   "uniform_halves": 16,
   "waits": 1
  },
  "histogram.ll:histogram:agx-g14c": {
-  "bytes": 400,
-  "cycles": 354.3,
+  "bytes": 468,
+  "cycles": 309.0,
   "gprs": 11,
   "groups": 96,
-  "instructions": 67,
+  "instructions": 77,
   "launch_inputs": true,
   "tg_bytes": 1024,
-  "tput": 30.3,
+  "tput": 19.9,
   "uniform_halves": 16,
   "waits": 1
  },
