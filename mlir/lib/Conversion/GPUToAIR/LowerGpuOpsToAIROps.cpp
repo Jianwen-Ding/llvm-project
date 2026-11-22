@@ -2039,6 +2039,47 @@ static LogicalResult rewriteErfF64(OpTy op, PatternRewriter &rewriter) {
   return success();
 }
 
+/// A math dialect op on a 1-D vector of f64 as one op per element (L15-E825):
+/// the f64 rewrites above take scalars, and a vector op left for MathToLLVM
+/// became a vector intrinsic whose scalarized calls (llvm.exp.f64 and the
+/// others) the AIR target's f64 emulation does not take.
+struct UnrollVectorF64Math : public RewritePattern {
+  UnrollVectorF64Math(MLIRContext *ctx)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/3, ctx) {}
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa_and_nonnull<math::MathDialect>(op->getDialect()) ||
+        op->getNumResults() != 1 || op->getNumRegions() != 0 ||
+        !op->hasTrait<OpTrait::Elementwise>())
+      return failure();
+    auto vt = dyn_cast<VectorType>(op->getResult(0).getType());
+    if (!vt || vt.getRank() != 1 || vt.isScalable() ||
+        !vt.getElementType().isF64() || vt.getNumElements() > 16)
+      return failure();
+    for (Value o : op->getOperands()) {
+      auto ot = dyn_cast<VectorType>(o.getType());
+      if (!ot || ot.getShape() != vt.getShape())
+        return failure();
+    }
+    Location loc = op->getLoc();
+    Value acc = arith::ConstantOp::create(
+        rewriter, loc, vt, rewriter.getZeroAttr(vt));
+    for (int64_t i = 0, e = vt.getNumElements(); i < e; ++i) {
+      SmallVector<Value> ops;
+      SmallVector<Type> types{vt.getElementType()};
+      for (Value o : op->getOperands())
+        ops.push_back(vector::ExtractOp::create(rewriter, loc, o, i));
+      OperationState st(loc, op->getName().getStringRef(), ops, types,
+                        op->getAttrs());
+      Operation *scalar = rewriter.create(st);
+      acc = vector::InsertOp::create(rewriter, loc, scalar->getResult(0), acc,
+                                     i);
+    }
+    rewriter.replaceOp(op, acc);
+    return success();
+  }
+};
+
 /// atan of an f64 a >= 0 (or NaN): fdlibm's s_atan.c, branch-free. Below
 /// 0.4375 a itself is the polynomial's argument; above, (2a - 1) / (2 + a),
 /// (a - 1) / (a + 1), (a - 1.5) / (1 + 1.5a) or -1 / a by the range (one
@@ -4398,6 +4439,7 @@ struct LowerGpuOpsToAIROpsPass final
       populateGpuShufflePatterns(patterns);
       patterns.add(rewriteAccurateM1<math::ExpM1Op>);
       patterns.add(rewriteAccurateM1<math::Log1pOp>);
+      patterns.add<UnrollVectorF64Math>(ctx);
       patterns.add(rewriteInverseHyperbolic<math::AsinhOp>);
       patterns.add(rewriteInverseHyperbolicF64<math::AsinhOp>);
       patterns.add(rewriteInverseHyperbolicF64<math::AcoshOp>);

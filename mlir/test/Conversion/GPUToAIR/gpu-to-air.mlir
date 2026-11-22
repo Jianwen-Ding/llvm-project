@@ -1479,6 +1479,26 @@ gpu.module @f64_erf {
 
 // -----
 
+// f64 math on vectors (L15-E825): one scalar op an element, which the f64
+// rewrites expand (before, MathToLLVM's vector intrinsic was scalarized into
+// llvm.exp.f64 calls that the AIR target's f64 emulation does not take).
+gpu.module @f64_vector_math {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.exp
+  // CHECK-COUNT-2: llvm.intr.roundeven({{.*}}) : (f64) -> f64
+  // CHECK-NOT: llvm.intr.exp
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<8xf64, 1>, vector<2xf64>
+    %e = math.exp %v : vector<2xf64>
+    vector.store %e, %a[%c0] : memref<8xf64, 1>, vector<2xf64>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.
