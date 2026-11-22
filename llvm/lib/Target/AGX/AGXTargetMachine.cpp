@@ -565,10 +565,11 @@ public:
                     10 * CoreGroups(Before) ||
                 AGXSubtarget::maxThreadsForHalves(After + 16) < Need;
     }
-    // (a short region at E761's 1.2 times: swiglu's and permute4d's 28 and 33
-    // instructions, 96 -> 82 groups, hide more of their loads' latency in
-    // the free order than the 14 groups do, +4.3% / +2.0% at 1.0; the
-    // longer softmax, log and sincos rows' gain at 1.0, L15-E806)
+    // (a short region at E761's 1.2 times: swiglu's and permute4d's of 28
+    // instructions, 96 -> 82 groups, and permute4d's of 33, 68 -> 58, hide
+    // more of their loads' latency in the free order than the groups it
+    // costs, +4.3% / +2.0% at 1.0; the longer softmax, log and sincos rows'
+    // gain at 1.0, L15-E806, E807)
     unsigned CoreCut = Index.size() < AGXSchedCoreShortInstrs
                            ? AGXSchedCoreShortCut
                            : AGXSchedCoreOccupancyCut;
