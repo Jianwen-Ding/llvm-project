@@ -41,12 +41,13 @@ sys.path.insert(0, os.path.join(HERE, 'bench'))
 import bench  # noqa: E402
 
 N, ROW = 1024, 256
+FLOATS = ('f32', 'f16')
 BASE = 0x100000000
 
 
 def gen(seed):
     R = random.Random(seed)
-    k = dict(ty=R.choice(['i32', 'i32', 'i16', 'f32']),
+    k = dict(ty=R.choice(['i32', 'i32', 'i16', 'f32', 'f16']),
              col=R.random() < 0.3,
              alias=R.random() < 0.25,
              trip=R.choice(['const', 'const', 'arg']),
@@ -64,12 +65,12 @@ def gen(seed):
     # iteration, stored after the loop at the row's last element
     k['red'] = R.random() < 0.35
     k['rop'] = R.choice(['add', 'sub', 'mul', 'max', 'min'] +
-                        (['xor'] if k['ty'] != 'f32' else ['maxnum', 'minnum']))
+                        (['xor'] if k['ty'] not in FLOATS else ['maxnum', 'minnum']))
     k['rlc'] = R.randrange(0, 64) & (~3 if k['vec'] else ~0)
     k['rinit'] = R.choice([0, 1, 5])
     # c at the thread's row (column) or at j + o alone, for every statement
     cw = 'own' if k['alias'] or R.random() < 0.7 else 'shared'
-    ops = ['add', 'sub', 'mul', 'max', 'min'] + (['xor'] if k['ty'] != 'f32' else ['maxnum', 'minnum'])
+    ops = ['add', 'sub', 'mul', 'max', 'min'] + (['xor'] if k['ty'] not in FLOATS else ['maxnum', 'minnum'])
     for _ in range(R.randint(1, 3)):
         k['stmts'].append(dict(
             st=R.randrange(0, 64), lb=R.choice([None, R.randrange(0, 64)]),
@@ -90,7 +91,7 @@ def emit(k):
     T = k['ty']
     E = T                                # the scalar
     V = 'vector<4x%s>' % T if k['vec'] else T
-    flt = T == 'f32'
+    flt = T in FLOATS
     bshape = '256x1024' if k['col'] else '1024x256'
     cshape = bshape if k['alias'] or any(s['cw'] == 'own' for s in k['stmts']) else None
     cty = 'memref<%sx%s, 1>' % (cshape or '256', T)
@@ -205,13 +206,14 @@ def emit(k):
     return '\n'.join(L) + '\n'
 
 
-DT = {'i32': np.uint32, 'i16': np.uint16, 'f32': np.float32}
+DT = {'i32': np.uint32, 'i16': np.uint16, 'f32': np.float32, 'f16': np.float16}
 
 
 def model(k, t, c, b):
     """b (updated in place) after every thread's loop; c is b where aliased."""
     T = k['ty']
-    flt = T == 'f32'
+    flt = T in FLOATS
+    FT = DT[T]
     W = 32 if T == 'i32' else 16
     MW = (1 << W) - 1
     tid = np.arange(N)
@@ -230,13 +232,13 @@ def model(k, t, c, b):
         if flt:
             with np.errstate(all='ignore'):
                 if o == 'add':
-                    return (a + x).astype(np.float32)
+                    return (a + x).astype(FT)
                 if o == 'sub':
-                    return (a - x).astype(np.float32)
+                    return (a - x).astype(FT)
                 if o == 'mul':
-                    return (a + (x * np.float32(kc)).astype(np.float32)).astype(np.float32)
+                    return (a + (x * FT(kc)).astype(FT)).astype(FT)
                 # (no NaN arises: the values are small integers)
-                return (np.maximum if o in ('max', 'maxnum') else np.minimum)(a, x).astype(np.float32)
+                return (np.maximum if o in ('max', 'maxnum') else np.minimum)(a, x).astype(FT)
         a64, x64 = a.astype(np.int64), x.astype(np.int64)
         if o == 'add':
             r = a64 + x64
@@ -264,7 +266,7 @@ def model(k, t, c, b):
             if flt:
                 r = acc[:, 0]
                 for l in range(1, 4):
-                    r = (r + acc[:, l]).astype(np.float32)
+                    r = (r + acc[:, l]).astype(FT)
                 return r
             return (acc.astype(np.int64).sum(axis=1) & MW).astype(DT[T])
         if rop == 'xor':
@@ -286,7 +288,7 @@ def model(k, t, c, b):
             cv = cv.copy() if own else np.broadcast_to(cv, shape).astype(DT[T])
             r = f(s['op'], bv, cv, s['kc'])
             if s['guard']:
-                g = (bv < np.float32(16)) if flt else (bv.astype(np.int64) < 16)
+                g = (bv < FT(16)) if flt else (bv.astype(np.int64) < 16)
                 r = np.where(g, r, bv).astype(DT[T])
             b[at(b, s['st'], True, j)] = r
         if k.get('red'):
@@ -626,9 +628,9 @@ def run_seed(seed, a, tmp):
         return src, 'compile failure: ' + ((e.stderr or '').strip().splitlines() or [''])[-1][:200]
     rng = np.random.default_rng(seed)
     T = k['ty']
-    if T == 'f32':
-        b = rng.integers(-40, 40, N * ROW).astype(np.float32)
-        c = rng.integers(-40, 40, N * ROW).astype(np.float32)
+    if T in FLOATS:
+        b = rng.integers(-40, 40, N * ROW).astype(DT[T])
+        c = rng.integers(-40, 40, N * ROW).astype(DT[T])
     else:
         top = 1 << (32 if T == 'i32' else 16)
         b = rng.integers(0, top, N * ROW, dtype=np.uint64).astype(DT[T])
@@ -658,7 +660,7 @@ def run_seed(seed, a, tmp):
         return src, 'agx_run failed: ' + ((r.stderr + r.stdout).strip().splitlines() or [''])[-1][:200]
     got = np.fromfile(fo, DT[T]).reshape(shape)
     ref = model(k, t, c, b.copy())
-    if T == 'f32':
+    if T in FLOATS:
         diff = ~((got == ref) | (np.isnan(got) & np.isnan(ref)))
     else:
         diff = got != ref
