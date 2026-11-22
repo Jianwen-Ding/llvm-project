@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-tan-quotient-signs=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-tan-quotient-signs=0 -agx-sincos-minus-by-shift=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; tan (L15-E503): sin / cos by quadrant, the quotient's sign that of an odd
 ; quadrant (bit 1 of q and of q + 1 differ exactly there): -(c / s) as

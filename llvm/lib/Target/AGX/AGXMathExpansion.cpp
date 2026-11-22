@@ -112,6 +112,12 @@ static cl::opt<bool> SinCosMagicRound(
     cl::desc("sin / cos's j = round(2 x / pi) likewise, the quadrant the "
              "sum's low bits"));
 
+static cl::opt<bool> SinCosMinusByShift(
+    "agx-sincos-minus-by-shift", cl::init(true), cl::Hidden,
+    cl::desc("sin and cos's minus quadrants as (q << 30) < 0, an ALU shift "
+             "and compare, not (q & 2) != 0, which selects to a bit-field "
+             "extract on the shared unit"));
+
 static cl::opt<bool> SinCosSharedOdd(
     "agx-sincos-shared-odd", cl::init(true), cl::Hidden,
     cl::desc("cos's polynomial select by sin's odd quadrant, its operands "
@@ -1260,7 +1266,10 @@ public:
       // see through the add)
       bool Swap = Ahead && SinCosSharedOdd;
       Value *Odd = B.CreateICmpNE(B.CreateAnd(Swap ? Q : Q1, ki(1)), ki(0));
-      Value *Minus = B.CreateICmpNE(B.CreateAnd(Q1, ki(2)), ki(0));
+      Value *Minus =
+          SinCosMinusByShift
+              ? B.CreateICmpSLT(B.CreateShl(Q1, ki(30)), ki(0))
+              : B.CreateICmpNE(B.CreateAnd(Q1, ki(2)), ki(0));
       Value *V = Swap ? sel(Odd, S, C) : sel(Odd, C, S);
       return sel(Minus, B.CreateFNeg(V), V);
     };
