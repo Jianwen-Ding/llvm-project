@@ -228,6 +228,11 @@ def fminmax(mx, a, b):
 
 def model(k, t, c, b):
     """b (updated in place) after every thread's loop; c is b where aliased."""
+    with np.errstate(all='ignore'):
+        return model_(k, t, c, b)
+
+
+def model_(k, t, c, b):
     T = k['ty']
     flt = T in FLOATS
     FT = DT[T]
@@ -1053,6 +1058,11 @@ def run_seed(seed, a, tmp):
     if T in FLOATS:
         b = rng.integers(-40, 40, N * ROW).astype(DT[T])
         c = rng.integers(-40, 40, N * ROW).astype(DT[T])
+        # (a few NaNs, infinities and -0s: E444's deferred NaN and zero sign)
+        sp = np.array([np.nan, np.inf, -np.inf, -0.0, 0.0], DT[T])
+        for arr in (b, c):
+            m = rng.random(arr.size) < 0.02
+            arr[m] = rng.choice(sp, m.sum())
     else:
         top = 1 << (32 if T == 'i32' else 16)
         b = rng.integers(0, top, N * ROW, dtype=np.uint64).astype(DT[T])
