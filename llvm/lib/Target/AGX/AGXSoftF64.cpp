@@ -893,7 +893,12 @@ public:
     Bits = B.CreateOr(Bits, select(Sign, c64(F64.signBit()), c64(0)));
     // an exact zero: -0 only for a zero product and a zero Z both negative,
     // +0 for a cancellation
-    Value *SZero = B.CreateICmpEQ(S, cw(S, 0));
+    // (L15-E839) a nonzero S normalizes to its top bit set, a zero one to 0:
+    // zero just where the top word's sign bit is clear
+    Value *SZero = ByField && AGXSoftF64FmaOperandChecks
+                       ? B.CreateICmpSGT(B.CreateTrunc(B.CreateLShr(Hi, 32), I32),
+                                         c32(-1))
+                       : B.CreateICmpEQ(S, cw(S, 0));
     Value *ZeroSign = B.CreateAnd(B.CreateAnd(PZero, ZZero), B.CreateAnd(SignP, SignZ));
     Bits = select(SZero, select(ZeroSign, c64(F64.signBit()), c64(0)), Bits);
     Valid = B.CreateOr(Valid, SZero);
