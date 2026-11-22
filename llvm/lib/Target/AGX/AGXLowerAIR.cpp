@@ -1170,10 +1170,16 @@ static bool isMatrix(Type *T) {
           VT->getElementType()->isBFloatTy());
 }
 
+// A comparison of matrices' elements (<64 x i1>), a select's condition.
+static bool isMatrixMask(Type *T) {
+  auto *VT = dyn_cast<FixedVectorType>(T);
+  return VT && VT->getNumElements() == 64 && VT->getElementType()->isIntegerTy(1);
+}
+
 static bool usesMatrix(const Instruction &I) {
-  return isMatrix(I.getType()) || any_of(I.operands(), [](const Use &U) {
-           return isMatrix(U->getType());
-         });
+  auto M = [](Type *T) { return isMatrix(T) || isMatrixMask(T); };
+  return M(I.getType()) ||
+         any_of(I.operands(), [&](const Use &U) { return M(U->getType()); });
 }
 
 // The SIMD-group matrices of AIR (air.simdgroup_matrix_8x8_*) as AGX's: each
@@ -1265,6 +1271,22 @@ void LowerAIR::lowerMatrices(Function &F) {
       if (auto *S = dyn_cast<SelectInst>(&I);
           S && !S->getCondition()->getType()->isVectorTy()) {
         Frag[&I] = IB.CreateSelect(S->getCondition(), Get(S->getTrueValue()),
+                                   Get(S->getFalseValue()), I.getName());
+        continue;
+      }
+      // (L15-E855) a comparison of matrices' elements, and a select of
+      // matrices by one: on the two elements a thread holds
+      if (auto *C = dyn_cast<CmpInst>(&I);
+          C && isMatrixMask(C->getType()) && isMatrix(C->getOperand(0)->getType())) {
+        Frag[&I] = IB.CreateCmp(C->getPredicate(), Get(C->getOperand(0)),
+                                Get(C->getOperand(1)), I.getName());
+        continue;
+      }
+      if (auto *S = dyn_cast<SelectInst>(&I);
+          S && isMatrixMask(S->getCondition()->getType()) &&
+          isMatrix(S->getType())) {
+        Frag[&I] = IB.CreateSelect(Get(S->getCondition()),
+                                   Get(S->getTrueValue()),
                                    Get(S->getFalseValue()), I.getName());
         continue;
       }

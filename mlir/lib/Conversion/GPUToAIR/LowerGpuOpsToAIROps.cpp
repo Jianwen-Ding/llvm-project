@@ -3645,6 +3645,88 @@ struct MmaConstantToAIR : OpConversionPattern<gpu::SubgroupMmaConstantMatrixOp> 
     return success();
   }
 };
+/// (L15-E855) subgroup_mma_elementwise of float matrices as the operation on
+/// each block's vector<64 x T>: the AGX backend applies element-wise
+/// operations to the two elements each thread holds. maxf / minf as
+/// upstream's NVVM lowering: an ordered compare and select, the NaN where
+/// either is one.
+struct MmaElementwiseToAIR
+    : OpConversionPattern<gpu::SubgroupMmaElementwiseOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaElementwiseOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto rt = cast<gpu::MMAMatrixType>(op.getType());
+    auto blocks = mmaBlocks(rt);
+    if (!blocks)
+      return failure();
+    for (Value a : op.getArgs())
+      if (!mmaBlocks(cast<gpu::MMAMatrixType>(a.getType())))
+        return failure();
+    Location loc = op.getLoc();
+    auto vt = VectorType::get({64}, rt.getElementType());
+    using E = gpu::MMAElementwiseOp;
+    E kind = op.getOpType();
+    int64_t n = blocks->first * blocks->second;
+    SmallVector<Value> out;
+    for (int64_t k = 0; k < n; ++k) {
+      SmallVector<Value> x;
+      for (ValueRange r : adaptor.getArgs())
+        x.push_back(r[k]);
+      Value v;
+      auto minmax = [&](bool isMin) {
+        Value c = arith::CmpFOp::create(
+            rewriter, loc,
+            isMin ? arith::CmpFPredicate::OLT : arith::CmpFPredicate::OGT,
+            x[0], x[1]);
+        Value sel = arith::SelectOp::create(rewriter, loc, c, x[0], x[1]);
+        Value nan = arith::CmpFOp::create(rewriter, loc,
+                                          arith::CmpFPredicate::UNO, x[0], x[1]);
+        auto ft = cast<FloatType>(rt.getElementType());
+        Value q = arith::ConstantOp::create(
+            rewriter, loc, vt,
+            DenseElementsAttr::get(
+                vt, rewriter.getFloatAttr(
+                        ft, APFloat::getQNaN(ft.getFloatSemantics()))));
+        return arith::SelectOp::create(rewriter, loc, nan, q, sel).getResult();
+      };
+      switch (kind) {
+      case E::ADDF:
+        v = arith::AddFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::SUBF:
+        v = arith::SubFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::MULF:
+        v = arith::MulFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::DIVF:
+        v = arith::DivFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::MAXF:
+        v = minmax(false);
+        break;
+      case E::MINF:
+        v = minmax(true);
+        break;
+      case E::NEGATEF:
+        v = arith::NegFOp::create(rewriter, loc, x[0]);
+        break;
+      case E::EXTF:
+        v = arith::ExtFOp::create(rewriter, loc, vt, x[0]);
+        break;
+      case E::TRUNCF:
+        v = arith::TruncFOp::create(rewriter, loc, vt, x[0]);
+        break;
+      default:
+        return failure();
+      }
+      out.push_back(v);
+    }
+    rewriter.replaceOpWithMultiple(op, {out});
+    return success();
+  }
+};
 } // namespace
 
 /// Lowers the module's gpu.subgroup_mma ops to AIR matrices (L15-E852).
@@ -3652,7 +3734,8 @@ static LogicalResult lowerSubgroupMma(Operation *m) {
   bool any = false;
   m->walk([&](Operation *op) {
     any = isa<gpu::SubgroupMmaLoadMatrixOp, gpu::SubgroupMmaStoreMatrixOp,
-              gpu::SubgroupMmaComputeOp, gpu::SubgroupMmaConstantMatrixOp>(op);
+              gpu::SubgroupMmaComputeOp, gpu::SubgroupMmaConstantMatrixOp,
+              gpu::SubgroupMmaElementwiseOp>(op);
     return any ? WalkResult::interrupt() : WalkResult::advance();
   });
   if (!any)
@@ -3673,10 +3756,11 @@ static LogicalResult lowerSubgroupMma(Operation *m) {
   target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
   target.addIllegalOp<gpu::SubgroupMmaLoadMatrixOp,
                       gpu::SubgroupMmaStoreMatrixOp, gpu::SubgroupMmaComputeOp,
-                      gpu::SubgroupMmaConstantMatrixOp>();
+                      gpu::SubgroupMmaConstantMatrixOp,
+                      gpu::SubgroupMmaElementwiseOp>();
   RewritePatternSet patterns(ctx);
-  patterns.add<MmaLoadToAIR, MmaStoreToAIR, MmaComputeToAIR, MmaConstantToAIR>(
-      tc, ctx);
+  patterns.add<MmaLoadToAIR, MmaStoreToAIR, MmaComputeToAIR, MmaConstantToAIR,
+               MmaElementwiseToAIR>(tc, ctx);
   scf::populateSCFStructuralTypeConversionsAndLegality(tc, patterns, target);
   return applyPartialConversion(m, target, std::move(patterns));
 }

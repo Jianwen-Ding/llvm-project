@@ -2011,3 +2011,30 @@ gpu.module @dynamic_leading {
     gpu.return
   }
 }
+
+// -----
+
+// subgroup_mma_elementwise as the operation on each block's vector<64 x T>
+// (L15-E855): addf an fadd, maxf an ordered compare and select with the NaN
+// where either is one, truncf an fptrunc; the AGX backend applies them to
+// the elements each thread holds.
+gpu.module @subgroup_mma_elementwise {
+  // CHECK-LABEL: gpu.module @subgroup_mma_elementwise
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.fadd {{.*}} : vector<64xf32>
+  // CHECK: llvm.fcmp "ogt" {{.*}} : vector<64xf32>
+  // CHECK: llvm.fcmp "uno" {{.*}} : vector<64xf32>
+  // CHECK: llvm.fptrunc {{.*}} : vector<64xf32> to vector<64xf16>
+  // CHECK: llvm.call @air.simdgroup_matrix_8x8_store
+  gpu.func @k(%a: memref<8x8xf32, 1>, %c: memref<8x8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %z = arith.constant 0.0 : f32
+    %A = gpu.subgroup_mma_load_matrix %a[%c0, %c0] leadDimension 8 : memref<8x8xf32, 1> -> !gpu.mma_matrix<8x8xf32, "COp">
+    %Z = gpu.subgroup_mma_constant_matrix %z : !gpu.mma_matrix<8x8xf32, "COp">
+    %S = gpu.subgroup_mma_elementwise addf %A, %A : (!gpu.mma_matrix<8x8xf32, "COp">, !gpu.mma_matrix<8x8xf32, "COp">) -> !gpu.mma_matrix<8x8xf32, "COp">
+    %M = gpu.subgroup_mma_elementwise maxf %S, %Z : (!gpu.mma_matrix<8x8xf32, "COp">, !gpu.mma_matrix<8x8xf32, "COp">) -> !gpu.mma_matrix<8x8xf32, "COp">
+    %H = gpu.subgroup_mma_elementwise truncf %M : (!gpu.mma_matrix<8x8xf32, "COp">) -> !gpu.mma_matrix<8x8xf16, "COp">
+    gpu.subgroup_mma_store_matrix %H, %c[%c0, %c0] leadDimension 8 : !gpu.mma_matrix<8x8xf16, "COp">, memref<8x8xf16, 1>
+    gpu.return
+  }
+}
