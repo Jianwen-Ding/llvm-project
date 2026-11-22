@@ -3073,12 +3073,21 @@ static LogicalResult rewriteSmallFloatExtF(arith::ExtFOp op,
       Type i16 = smallFloatShaped(srcTy, b.getI16Type());
       Type f16 = smallFloatShaped(srcTy, b.getF16Type());
       Value code = arith::BitcastOp::create(b, iw, op.getIn());
-      Value hb = s->w < 16 ? arith::ExtSIOp::create(b, i16, code).getResult()
-                           : code;
-      hb = arith::AndIOp::create(
-          b,
-          arith::ShLIOp::create(b, hb, smallFloatConst(b, i16, up)),
-          smallFloatConst(b, i16, 0x8000u | (magMask << up)));
+      // (the sign moved 5 - e places up, to 15 - up, by adding the sign bit
+      // times 2^(5 - e) - 1: one multiply-add, no sign extension)
+      Value z = arith::ExtUIOp::create(b, i16, code);
+      unsigned e = s->w - 1 - s->m;
+      Value hb = z;
+      if (e < 5)
+        hb = arith::AddIOp::create(
+            b,
+            arith::MulIOp::create(
+                b,
+                arith::AndIOp::create(b, z,
+                                      smallFloatConst(b, i16, 1u << (s->w - 1))),
+                smallFloatConst(b, i16, (1u << (5 - e)) - 1)),
+            z);
+      hb = arith::ShLIOp::create(b, hb, smallFloatConst(b, i16, up));
       Value h = arith::BitcastOp::create(b, f16, hb);
       Value r;
       Type rt = dw == 16 && getElementTypeOrSelf(dstTy).isF16() ? f16 : f32;
