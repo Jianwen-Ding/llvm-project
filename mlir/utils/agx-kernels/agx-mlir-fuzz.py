@@ -8,7 +8,8 @@ Each seed generates a gpu.func whose threads each update their row of a 1024x256
   b[t, j + o] = f(b[t, j + o'] or a constant, c[...])     (some under scf.if g(...) { ... } else { b's old value })
 
 c a second memref at the thread's row (column) or at j + o'' alone (every thread's same elements), or b itself
-passed twice; the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16 or f32 (small integers,
+passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
+vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16 or f32 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
 and a guarded statement's c load inside its scf.if (speculate-guarded-loads). Lowered as bench.py does
 (convert-gpu-to-air, mlir-translate, the AIR target's portable passes, opt -O3, llc -O3, the constants in
@@ -48,12 +49,18 @@ def gen(seed):
              targ=R.choice([0, 1, 5, 31, 64, 129, 192]),
              step=R.choice([1, 1, 1, 2]),
              stmts=[])
+    # a vector<4> of the row's elements an access (rows only: a column's
+    # vector would span the other threads' elements), in steps of 4 or 8 at
+    # offsets of 4
+    k['vec'] = not k['col'] and R.random() < 0.3
+    if k['vec']:
+        k['step'] = R.choice([4, 4, 8])
     # a running value carried by the loop (iter_args), f(acc, c[...]) each
     # iteration, stored after the loop at the row's last element
     k['red'] = R.random() < 0.35
     k['rop'] = R.choice(['add', 'sub', 'mul', 'max', 'min'] +
                         (['xor'] if k['ty'] != 'f32' else ['maxnum', 'minnum']))
-    k['rlc'] = R.randrange(0, 64)
+    k['rlc'] = R.randrange(0, 64) & (~3 if k['vec'] else ~0)
     k['rinit'] = R.choice([0, 1, 5])
     # c at the thread's row (column) or at j + o alone, for every statement
     cw = 'own' if k['alias'] or R.random() < 0.7 else 'shared'
@@ -63,8 +70,12 @@ def gen(seed):
             st=R.randrange(0, 64), lb=R.choice([None, R.randrange(0, 64)]),
             same=R.random() < 0.5, cw=cw,
             lc=R.randrange(0, 64), op=R.choice(ops), kc=R.choice([1, 3, 7, -2]),
-            guard=R.random() < 0.35))
+            guard=R.random() < 0.35 and not k['vec']))
         s = k['stmts'][-1]
+        if k['vec']:
+            for f in ('st', 'lb', 'lc'):
+                if s[f] is not None:
+                    s[f] &= ~3
         if s['same']:
             s['lb'] = s['st']
     return k
@@ -72,6 +83,8 @@ def gen(seed):
 
 def emit(k):
     T = k['ty']
+    E = T                                # the scalar
+    V = 'vector<4x%s>' % T if k['vec'] else T
     flt = T == 'f32'
     bshape = '256x1024' if k['col'] else '1024x256'
     cshape = bshape if k['alias'] or any(s['cw'] == 'own' for s in k['stmts']) else None
@@ -86,9 +99,12 @@ def emit(k):
         L.append('    %%T = arith.constant %d : index' % k['tconst'])
     else:
         L.append('    %T = arith.index_cast %n : i32 to index')
+    def lit(v):
+        x = ('%d.0' % v) if flt else str(v)
+        return 'dense<%s> : %s' % (x, V) if k['vec'] else '%s : %s' % (x, V)
     if k['red']:
-        L.append('    %%init = arith.constant %s : %s' % (('%d.0' % k['rinit']) if flt else str(k['rinit']), T))
-        L.append('    %%res = scf.for %%j = %%c0 to %%T step %%st iter_args(%%acc = %%init) -> (%s) {' % T)
+        L.append('    %%init = arith.constant %s' % lit(k['rinit']))
+        L.append('    %%res = scf.for %%j = %%c0 to %%T step %%st iter_args(%%acc = %%init) -> (%s) {' % V)
     else:
         L.append('    scf.for %j = %c0 to %T step %st {')
     n = [0]
@@ -105,29 +121,33 @@ def emit(k):
 
     def access(mem, off, own, shape):
         j = idx(off)
+        vt = ', %s' % V if k['vec'] else ''
         if not own:
-            return '%s[%s] : memref<256x%s, 1>' % (mem, j, T)
+            return '%s[%s] : memref<256x%s, 1>%s' % (mem, j, E, vt)
         sub = '%s, %%t' % j if k['col'] else '%%t, %s' % j
-        return '%s[%s] : memref<%sx%s, 1>' % (mem, sub, shape, T)
+        return '%s[%s] : memref<%sx%s, 1>%s' % (mem, sub, shape, E, vt)
+
+    LOAD = 'vector.load' if k['vec'] else 'memref.load'
+    STORE = 'vector.store' if k['vec'] else 'memref.store'
 
     def const(v):
         c = nv()
-        L.append('      %s = arith.constant %s : %s' % (c, ('%d.0' % v) if flt else str(v), T))
+        L.append('      %s = arith.constant %s' % (c, lit(v)))
         return c
 
     def op(o, a, b, kc):
         r = nv()
         if o == 'mul':
             m = nv()
-            L.append('      %s = arith.%s %s, %s : %s' % (m, 'mulf' if flt else 'muli', b, const(kc), T))
-            L.append('      %s = arith.%s %s, %s : %s' % (r, 'addf' if flt else 'addi', a, m, T))
+            L.append('      %s = arith.%s %s, %s : %s' % (m, 'mulf' if flt else 'muli', b, const(kc), V))
+            L.append('      %s = arith.%s %s, %s : %s' % (r, 'addf' if flt else 'addi', a, m, V))
         elif o in ('max', 'min', 'maxnum', 'minnum'):
             name = {'max': 'maximumf', 'min': 'minimumf', 'maxnum': 'maxnumf', 'minnum': 'minnumf'}[o] if flt \
                 else {'max': 'maxui', 'min': 'minui'}[o]
-            L.append('      %s = arith.%s %s, %s : %s' % (r, name, a, b, T))
+            L.append('      %s = arith.%s %s, %s : %s' % (r, name, a, b, V))
         else:
             name = {'add': 'addf', 'sub': 'subf'}[o] if flt else {'add': 'addi', 'sub': 'subi', 'xor': 'xori'}[o]
-            L.append('      %s = arith.%s %s, %s : %s' % (r, name, a, b, T))
+            L.append('      %s = arith.%s %s, %s : %s' % (r, name, a, b, V))
         return r
 
     cmem = '%b' if k['alias'] else '%c'
@@ -135,7 +155,7 @@ def emit(k):
         own = s['cw'] == 'own'
         if s['lb'] is not None:
             bv = nv()
-            L.append('      %s = memref.load %s' % (bv, access('%b', s['lb'], True, bshape)))
+            L.append('      %s = %s %s' % (bv, LOAD, access('%b', s['lb'], True, bshape)))
         else:
             bv = const(s['kc'])
         if s['guard']:
@@ -146,7 +166,7 @@ def emit(k):
             r = nv()
             L.append('      %s = scf.if %s -> (%s) {' % (r, g, T))
             cv = nv()
-            L.append('      %s = memref.load %s' % (cv, access(cmem, s['lc'], own, bshape)))
+            L.append('      %s = %s %s' % (cv, LOAD, access(cmem, s['lc'], own, bshape)))
             y = op(s['op'], bv, cv, s['kc'])
             L.append('      scf.yield %s : %s' % (y, T))
             L.append('      } else {')
@@ -154,19 +174,26 @@ def emit(k):
             L.append('      }')
         else:
             cv = nv()
-            L.append('      %s = memref.load %s' % (cv, access(cmem, s['lc'], own, bshape)))
+            L.append('      %s = %s %s' % (cv, LOAD, access(cmem, s['lc'], own, bshape)))
             r = op(s['op'], bv, cv, s['kc'])
-        L.append('      memref.store %s, %s' % (r, access('%b', s['st'], True, bshape)))
+        L.append('      %s %s, %s' % (STORE, r, access('%b', s['st'], True, bshape)))
     if k['red']:
         cv = nv()
-        L.append('      %s = memref.load %s' % (cv, access(cmem, k['rlc'], k['stmts'][0]['cw'] == 'own', bshape)))
+        L.append('      %s = %s %s' % (cv, LOAD, access(cmem, k['rlc'], k['stmts'][0]['cw'] == 'own', bshape)))
         acc = op(k['rop'], '%acc', cv, 3)
-        L.append('      scf.yield %s : %s' % (acc, T))
+        L.append('      scf.yield %s : %s' % (acc, V))
         L.append('    }')
+        res = '%res'
+        if k['vec']:
+            kind = {'add': 'add', 'sub': 'add', 'mul': 'add', 'xor': 'xor',
+                    'max': 'maximumf' if flt else 'maxui', 'min': 'minimumf' if flt else 'minui',
+                    'maxnum': 'maxnumf', 'minnum': 'minnumf'}[k['rop']]
+            res = nv()
+            L.append('    %s = vector.reduction <%s>, %%res : %s into %s' % (res, kind, V, E))
         last = nv()
         L.append('    %s = arith.constant 255 : index' % last)
         sub = '%s, %%t' % last if k['col'] else '%%t, %s' % last
-        L.append('    memref.store %%res, %%b[%s] : memref<%sx%s, 1>' % (sub, bshape, T))
+        L.append('    memref.store %s, %%b[%s] : memref<%sx%s, 1>' % (res, sub, bshape, E))
     else:
         L.append('    }')
     L += ['    gpu.return', '  }', '}']
@@ -184,10 +211,15 @@ def model(k, t, c, b):
     MW = (1 << W) - 1
     tid = np.arange(N)
 
+    lanes = np.arange(4) if k.get('vec') else 0
+    shape = (N, 4) if k.get('vec') else (N,)
+
     def at(arr, off, own, j):
         if not own:
-            return (j + off,)
-        return (j + off, tid) if k['col'] else (tid, j + off)
+            return (j + off + lanes,)
+        if k['col']:
+            return (j + off, tid)
+        return (tid[:, None], j + off + lanes) if k.get('vec') else (tid, j + off)
 
     def f(o, a, x, kc):
         if flt:
@@ -216,11 +248,26 @@ def model(k, t, c, b):
         return (r & MW).astype(DT[T])
 
     j = 0
-    acc = np.full(N, k['rinit'], DT[T]) if k.get('red') else None
+    acc = np.full(shape, k['rinit'], DT[T]) if k.get('red') else None
     last = (255, tid) if k['col'] else (tid, 255)
+
+    def reduced(acc):
+        if not k.get('vec'):
+            return acc
+        rop = k['rop']
+        if rop in ('add', 'sub', 'mul'):
+            if flt:
+                r = acc[:, 0]
+                for l in range(1, 4):
+                    r = (r + acc[:, l]).astype(np.float32)
+                return r
+            return (acc.astype(np.int64).sum(axis=1) & MW).astype(DT[T])
+        if rop == 'xor':
+            return np.bitwise_xor.reduce(acc, axis=1)
+        return (acc.max(axis=1) if rop in ('max', 'maxnum') else acc.min(axis=1)).astype(DT[T])
     if not 0 < t:
         if k.get('red'):
-            b[last] = acc
+            b[last] = reduced(acc)
         return b
     while j < t:
         for s in k['stmts']:
@@ -228,10 +275,10 @@ def model(k, t, c, b):
             if s['lb'] is not None:
                 bv = b[at(b, s['lb'], True, j)].copy()
             else:
-                bv = np.full(N, s['kc'] if flt else s['kc'] & MW, DT[T])
+                bv = np.full(shape, s['kc'] if flt else s['kc'] & MW, DT[T])
             cm = b if k['alias'] else c
             cv = cm[at(cm, s['lc'], own, j)]
-            cv = cv.copy() if own else np.full(N, cv, DT[T])
+            cv = cv.copy() if own else np.broadcast_to(cv, shape).astype(DT[T])
             r = f(s['op'], bv, cv, s['kc'])
             if s['guard']:
                 g = (bv < np.float32(16)) if flt else (bv.astype(np.int64) < 16)
@@ -241,11 +288,11 @@ def model(k, t, c, b):
             own = k['stmts'][0]['cw'] == 'own'
             cm = b if k['alias'] else c
             cv = cm[at(cm, k['rlc'], own, j)]
-            cv = cv.copy() if own else np.full(N, cv, DT[T])
+            cv = cv.copy() if own else np.broadcast_to(cv, shape).astype(DT[T])
             acc = f(k['rop'], acc, cv, 3)
         j += k['step']
     if k.get('red'):
-        b[last] = acc
+        b[last] = reduced(acc)
     return b
 
 
