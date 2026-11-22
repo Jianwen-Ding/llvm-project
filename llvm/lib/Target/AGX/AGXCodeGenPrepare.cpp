@@ -6022,6 +6022,10 @@ static cl::opt<bool> AGXNarrowBoundedI64(
 /// shifts, masks and adds (L15-E405). AGXNarrowInductions runs it again
 /// once the counters are narrowed (L15-E426). (Not as range attributes on the
 /// positions, which the DAG's address folds then use: E391.)
+static cl::opt<bool> AGXNarrowBoundedScaledIndices(
+    "agx-narrow-bounded-scaled-indices", cl::init(true), cl::Hidden,
+    cl::desc("narrowBoundedI64 also for an address's zext(x) << s or * c"));
+
 bool AGX::narrowBoundedI64(Function &F) {
   if (!AGXNarrowBoundedI64)
     return false;
@@ -6162,8 +6166,35 @@ bool AGX::narrowBoundedI64(Function &F) {
                    A->getOpcode() == Instruction::Or ||
                    A->getOpcode() == Instruction::Sub);
     };
+    // (but a scaled index, zext(x) << s or * c, s past the access's own
+    // scale, is zext(x << s) << scale only narrowed: one 32-bit shift for
+    // the 64-bit shift's two halves and add, L15-E866)
+    auto ScaledPast = [&]() {
+      auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AGXNarrowBoundedScaledIndices || !CI ||
+          !isa<ZExtInst>(BO->getOperand(0)))
+        return false;
+      uint64_t Sh;
+      if (BO->getOpcode() == Instruction::Shl)
+        Sh = CI->getZExtValue();
+      else if (BO->getOpcode() == Instruction::Mul &&
+               CI->getValue().isPowerOf2())
+        Sh = CI->getValue().logBase2();
+      else
+        return false;
+      // every user a gep whose scale takes the shift past iadd's lsl 4
+      return all_of(BO->users(), [&](User *U) {
+        auto *G = dyn_cast<GetElementPtrInst>(U);
+        if (!G || G->getNumIndices() != 1 || G->getOperand(1) != BO)
+          return false;
+        uint64_t Size =
+            F.getDataLayout().getTypeAllocSize(G->getSourceElementType());
+        return isPowerOf2_64(Size) && Sh + Log2_64(Size) > 4;
+      });
+    };
+    bool ScaledIndex = ScaledPast();
     if (any_of(BO->users(), [&](User *U) { return !Narrowable(U, 0); }) &&
-        none_of(BO->users(), AddressUse))
+        (ScaledIndex || none_of(BO->users(), AddressUse)))
       Roots.push_back(BO);
   }
   bool Changed = false;
