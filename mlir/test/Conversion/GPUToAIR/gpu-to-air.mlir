@@ -4,6 +4,7 @@
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 expm1-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=E1OFF
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 f64-polynomial-fma=1" --split-input-file | FileCheck %s --check-prefix=PFMA
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 log1p-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=L1OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 small-float-ext-via-half=0" --split-input-file | FileCheck %s --check-prefix=SFINT
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -1854,17 +1855,27 @@ gpu.module @assert_transfer {
 
 // -----
 
-// Conversions of small floats in integer operations (L15-E844): an f8E4M3FN
-// code extended to f32 (its denormals by uitofp and a scale), f32 rounded to
-// f8E5M2 and f64 to f4E2M1FN on their own bits (no double rounding), the
-// codes stored as integers.
+// Conversions of small floats (L15-E844): an f8E4M3FN code extended to f32
+// as the half its fields make, scaled by 2^8, its NaN codes selected
+// (L15-E846; with small-float-ext-via-half=0 in integer operations, its
+// denormals by uitofp and a scale), f32 rounded to f8E5M2 and f64 to
+// f4E2M1FN on their own bits (no double rounding), the codes stored as
+// integers.
 gpu.module @small_floats {
   // CHECK-LABEL: gpu.module @small_floats
   // CHECK: llvm.func @k(
   // CHECK: llvm.load {{.*}} -> i8
-  // CHECK: llvm.uitofp {{.*}} : i32 to f32
+  // CHECK: llvm.sext {{.*}} : i8 to i16
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
   // CHECK: llvm.fmul
+  // CHECK: llvm.select
+  // CHECK: llvm.select
   // CHECK: llvm.store {{.*}} : f32, !llvm.ptr<1>
+  // SFINT-LABEL: gpu.module @small_floats
+  // SFINT: llvm.load {{.*}} -> i8
+  // SFINT-NOT: llvm.fpext {{.*}} : f16 to f32
+  // SFINT: llvm.uitofp {{.*}} : i32 to f32
+  // SFINT: llvm.store {{.*}} : f32, !llvm.ptr<1>
   // CHECK: llvm.trunc {{.*}} : i32 to i8
   // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
   // CHECK: llvm.load {{.*}} -> f64

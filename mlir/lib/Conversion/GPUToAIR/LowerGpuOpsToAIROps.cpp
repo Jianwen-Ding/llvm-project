@@ -2928,6 +2928,8 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
   return success();
 }
 
+static thread_local bool smallFloatExtViaHalf = true;
+
 namespace {
 /// A float type of at most 8 bits with a sign, a zero and a significand (f4,
 /// f6 and f8 but f8E8M0FNU), and what its conversions need: every code's f32
@@ -3036,6 +3038,88 @@ static LogicalResult rewriteSmallFloatExtF(arith::ExtFOp op,
   Type i32 = smallFloatShaped(srcTy, b.getI32Type());
   Type f32 = smallFloatShaped(srcTy, b.getF32Type());
   auto c32 = [&](uint64_t v) { return smallFloatConst(b, i32, v); };
+  Type dstTy = op.getType();
+  unsigned dw = getElementTypeOrSelf(dstTy).getIntOrFloatBitWidth();
+  // (L15-E846) with at most 5 exponent bits, the code's fields are a half's
+  // top bits (the sign at 15, the magnitude 10 - m places up: sign-extended,
+  // shifted, masked), whose value is the code's times 2^(bias - 15) for
+  // every code, denormals included (a half's own), so the half extended
+  // and multiplied by 2^(15 - bias) (one f32 multiply with a half source;
+  // nothing for f8E5M2, a half's top byte, to a half) is exact; the codes it
+  // does not give (an infinity or NaN not at a half's, FN's NaN, FNUZ's
+  // 0x80), at most four, selected from the table.
+  if (smallFloatExtViaHalf && s->w - 1 - s->m <= 5) {
+    unsigned up = 10 - s->m;
+    int bias = 1 - s->emin;
+    float scale = std::ldexp(1.0f, 15 - bias);
+    uint32_t magMask = (1u << (s->w - 1)) - 1;
+    SmallVector<std::pair<uint32_t, uint32_t>> specials;
+    bool ok = true;
+    for (uint32_t c = 0; c < (1u << s->w) && ok; ++c) {
+      uint32_t mag = c & magMask;
+      uint16_t hb = uint16_t(((c >> (s->w - 1)) << 15) | (mag << up));
+      APFloat h(APFloat::IEEEhalf(), APInt(16, hb));
+      bool lost;
+      h.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &lost);
+      float hv = llvm::bit_cast<float>(uint32_t(h.bitcastToAPInt().getZExtValue()));
+      uint32_t bits = llvm::bit_cast<uint32_t>(hv * scale);
+      bool bothNaN = std::isnan(hv) &&
+                     (s->table[c] & 0x7fffffffu) > 0x7f800000u;
+      if (bits != s->table[c] && !bothNaN)
+        specials.push_back({c, s->table[c]});
+      ok = specials.size() <= 4;
+    }
+    if (ok) {
+      Type i16 = smallFloatShaped(srcTy, b.getI16Type());
+      Type f16 = smallFloatShaped(srcTy, b.getF16Type());
+      Value code = arith::BitcastOp::create(b, iw, op.getIn());
+      Value hb = s->w < 16 ? arith::ExtSIOp::create(b, i16, code).getResult()
+                           : code;
+      hb = arith::AndIOp::create(
+          b,
+          arith::ShLIOp::create(b, hb, smallFloatConst(b, i16, up)),
+          smallFloatConst(b, i16, 0x8000u | (magMask << up)));
+      Value h = arith::BitcastOp::create(b, f16, hb);
+      Value r;
+      Type rt = dw == 16 && getElementTypeOrSelf(dstTy).isF16() ? f16 : f32;
+      if (rt == f16 && bias == 15) {
+        r = h;
+      } else {
+        TypedAttr sa = rt == f16 ? TypedAttr(b.getF16FloatAttr(scale))
+                                 : TypedAttr(b.getF32FloatAttr(scale));
+        if (auto vt = dyn_cast<VectorType>(rt))
+          sa = DenseElementsAttr::get(vt, sa);
+        Value hx = rt == f16 ? h : arith::ExtFOp::create(b, f32, h).getResult();
+        r = bias == 15 ? hx
+                       : arith::MulFOp::create(
+                             b, hx, arith::ConstantOp::create(b, rt, sa))
+                             .getResult();
+      }
+      for (auto [c, f] : specials) {
+        APFloat v(APFloat::IEEEsingle(), APInt(32, f));
+        bool lost;
+        if (rt == f16)
+          v.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven, &lost);
+        TypedAttr fa = b.getFloatAttr(getElementTypeOrSelf(rt), v);
+        if (auto vt = dyn_cast<VectorType>(rt))
+          fa = DenseElementsAttr::get(vt, fa);
+        r = arith::SelectOp::create(
+            b,
+            arith::CmpIOp::create(b, arith::CmpIPredicate::eq, code,
+                                  smallFloatConst(b, iw, c)),
+            arith::ConstantOp::create(b, rt, fa), r);
+      }
+      unsigned rw = getElementTypeOrSelf(rt).getIntOrFloatBitWidth();
+      if (rt != dstTy) {
+        if (dw > rw)
+          r = arith::ExtFOp::create(b, dstTy, r);
+        else
+          r = arith::TruncFOp::create(b, dstTy, r);
+      }
+      rewriter.replaceOp(op, r);
+      return success();
+    }
+  }
   Value c = arith::ExtUIOp::create(
       b, i32, arith::BitcastOp::create(b, iw, op.getIn()));
   Value mag = arith::AndIOp::create(b, c, c32((1u << (s->w - 1)) - 1));
@@ -3076,8 +3160,6 @@ static LogicalResult rewriteSmallFloatExtF(arith::ExtFOp op,
         b, arith::CmpIOp::create(b, arith::CmpIPredicate::eq, c, c32(code)),
         c32(f), bits);
   Value r = arith::BitcastOp::create(b, f32, bits);
-  Type dstTy = op.getType();
-  unsigned dw = getElementTypeOrSelf(dstTy).getIntOrFloatBitWidth();
   if (dw > 32)
     r = arith::ExtFOp::create(b, dstTy, r);
   else if (dw < 32)
@@ -4733,6 +4815,7 @@ struct LowerGpuOpsToAIROpsPass final
     ::expm1F64Direct = expm1F64Direct;
     ::log1pF64Direct = log1pF64Direct;
     ::trigSharedPolynomial = trigF64SharedPolynomial;
+    ::smallFloatExtViaHalf = smallFloatExtViaHalf;
     ::f64PolynomialFma = f64PolynomialFma;
     if (speculateGuardedLoads)
       ::speculateGuardedLoads(m);

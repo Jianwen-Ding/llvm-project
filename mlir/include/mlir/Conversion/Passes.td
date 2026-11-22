@@ -791,6 +791,10 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            /*default=*/"true",
            "f64 sin and cos with one polynomial chain of selected "
            "coefficients, not both kernels">,
+    Option<"smallFloatExtViaHalf", "small-float-ext-via-half", "bool",
+           /*default=*/"true",
+           "Extend a small float of at most 5 exponent bits as the half its "
+           "fields make, scaled, not by integer operations">,
     Option<"log1pF64Direct", "log1p-f64-direct", "bool",
            /*default=*/"true",
            "math.log1p of f64 as fdlibm's log1p, not log with Kahan's "
