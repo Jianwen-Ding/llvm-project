@@ -9073,6 +9073,93 @@ static bool conditionalSums(Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXBoundedPositionFlags(
+    "agx-bounded-position-flags", cl::init(true), cl::Hidden,
+    cl::desc("nuw / nsw on a thread or threadgroup position's shl or mul by a "
+             "constant that its upper_bound keeps from wrapping"));
+
+static cl::opt<bool> AGXBoundedPositionFlagsLoops(
+    "agx-bounded-position-flags-loops", cl::init(true), cl::Hidden,
+    cl::desc("-agx-bounded-position-flags only for shifts a loop reads"));
+
+/// A position p below b by the kernel's upper_bound (AGX::knownUpperBound):
+/// p << c and p * c cannot wrap where (b - 1) << c stays below 2^31. The
+/// flags (which the IR optimizer would have set from a range the AIR call
+/// could not carry, E865) let the loop passes keep an index such as
+/// (row << 10) + lane + 32 j in 32 bits: softmax_f16 73 -> 46 GPRs
+/// (L15-E867). Run by AGXLowerAIR in llc, before any pass caches a scalar
+/// evolution of the shifts.
+bool AGX::boundedPositionFlags(Function &F) {
+  if (!AGXBoundedPositionFlags)
+    return false;
+  bool Changed = false;
+  std::unique_ptr<DominatorTree> DT;
+  std::unique_ptr<LoopInfo> LI;
+  // (only for a shift a loop reads, perhaps through adds and ors: in
+  // straight-line code the flags let the DAG fold the offsets of a row's
+  // loads into a 64-bit pointer's immediates, rmsnorm +7%, as E391)
+  auto InLoop = [&](Instruction *X) {
+    if (!LI) {
+      DT = std::make_unique<DominatorTree>(F);
+      LI = std::make_unique<LoopInfo>(*DT);
+    }
+    SmallVector<std::pair<Instruction *, unsigned>, 8> Work{{X, 0}};
+    while (!Work.empty()) {
+      auto [V, D] = Work.pop_back_val();
+      for (User *U : V->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI)
+          continue;
+        if (LI->getLoopFor(UI->getParent()))
+          return true;
+        if (D < 3 && (UI->getOpcode() == Instruction::Add ||
+                      UI->getOpcode() == Instruction::Or))
+          Work.push_back({UI, D + 1});
+      }
+    }
+    return false;
+  };
+  for (Instruction &I : instructions(F)) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (!II || !II->getType()->isIntegerTy(32))
+      continue;
+    std::optional<uint64_t> B = AGX::knownUpperBound(F, II->getIntrinsicID());
+    if (!B || !*B)
+      continue;
+    for (User *U : II->users()) {
+      auto *BO = dyn_cast<BinaryOperator>(U);
+      if (!BO || BO->getOperand(0) != II)
+        continue;
+      auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!C)
+        continue;
+      APInt Max(64, *B - 1);
+      bool Ok;
+      if (BO->getOpcode() == Instruction::Shl)
+        Ok = C->getZExtValue() < 31 &&
+             Max.shl(C->getZExtValue()).ult(APInt(64, 1).shl(31)) &&
+             Max.countl_zero() >= C->getZExtValue();
+      else if (BO->getOpcode() == Instruction::Mul)
+        Ok = C->getValue().isIntN(31) &&
+             (Max * C->getValue().zextOrTrunc(64)).ult(APInt(64, 1).shl(31)) &&
+             (Max.getActiveBits() + C->getValue().getActiveBits() <= 62);
+      else
+        continue;
+      // (not one a zext reads: zext(p << c) with nuw becomes zext(p) << c,
+      // a 64-bit shift where the address's scale is added to c: count_above
+      // +5.5%)
+      if (!Ok || (BO->hasNoUnsignedWrap() && BO->hasNoSignedWrap()) ||
+          any_of(BO->users(), [](User *V) { return isa<ZExtInst>(V); }) ||
+          (AGXBoundedPositionFlagsLoops && !InLoop(BO)))
+        continue;
+      BO->setHasNoUnsignedWrap(true);
+      BO->setHasNoSignedWrap(true);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool AGXCodeGenPrepare::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;

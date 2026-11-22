@@ -114,6 +114,8 @@ std::optional<uint64_t> knownUpperBound(const Function &F, unsigned IntrinsicID)
 /// (L15-E405), which AGXNarrowInductions runs again once the counters are
 /// narrowed (L15-E426).
 bool narrowBoundedI64(Function &F);
+/// nuw / nsw on shifts and multiplies of bounded positions (-agx-bounded-position-flags).
+bool boundedPositionFlags(Function &F);
 std::optional<APInt> scevUpperBound(const SCEV *S, ScalarEvolution &SE,
                                     const Function &F);
 } // namespace AGX

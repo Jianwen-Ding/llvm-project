@@ -2505,7 +2505,13 @@ public:
 
   StringRef getPassName() const override { return "AGX Lower AIR"; }
   bool runOnModule(Module &M) override {
-    return TM && LowerAIR(M, *TM).run();
+    bool Changed = TM && LowerAIR(M, *TM).run();
+    // (llc: the positions' wrap flags before the versioning passes' scalar
+    // evolution, L15-E867)
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        Changed |= AGX::boundedPositionFlags(F);
+    return Changed;
   }
 };
 } // namespace
