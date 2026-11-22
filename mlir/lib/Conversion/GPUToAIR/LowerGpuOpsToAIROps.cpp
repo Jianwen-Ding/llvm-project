@@ -3259,7 +3259,11 @@ static LogicalResult rewriteSmallFloatTruncF(arith::TruncFOp op,
     // a NaN: the format's (an IEEE-like format's payload is not kept); the
     // sign the input's, its high half's top bit (the half's conversion
     // gives a NaN its own sign)
-    mag = sel(arith::CmpFOp::create(b, FP::UNO, x, x), c16(nanV), mag);
+    // (where an overflow gives the NaN, or with no NaN the largest, a NaN
+    // input needs nothing more: the half's NaN rounds past the largest
+    // magnitude)
+    if (s->hasInf)
+      mag = sel(arith::CmpFOp::create(b, FP::UNO, x, x), c16(nanV), mag);
     Type i32t = smallFloatShaped(f32t, b.getI32Type());
     Value xhi = arith::TruncIOp::create(
         b, i16,
