@@ -875,6 +875,21 @@ static Value accurateExpM1(OpBuilder &b, Location loc, Value x, Value u) {
       b, loc, small, arith::SelectOp::create(b, loc, isOne, x, q), um1);
 }
 
+/// Whether convert-gpu-to-air's f64-polynomial-fma is on (set by the pass for
+/// its patterns).
+static thread_local bool f64PolynomialFma = false;
+
+/// u v + w in the f64 expansions' polynomials and fdlibm's steps (exp, log,
+/// expm1): fdlibm's own multiply and add, or an fma with f64-polynomial-fma.
+/// The emulated fma (its exact product, a 106-bit sum) costs more than a
+/// multiply and an add (newk tput 83.0 against 27.2 + 35.6), and the results
+/// differ in a few in 10^4 lanes, within the same maximum error (L15-E815).
+static Value f64Fma(ImplicitLocOpBuilder &b, Value u, Value v, Value w) {
+  if (f64PolynomialFma)
+    return math::FmaOp::create(b, u, v, w);
+  return arith::AddFOp::create(b, arith::MulFOp::create(b, u, v), w);
+}
+
 /// expm1 of an f64 x: fdlibm's s_expm1.c in f64 and i64 operations, its
 /// branches selects (within 1 ulp; L15-E814). x = k ln 2 + r (k =
 /// roundeven(x / ln 2), r = hi - lo with its rounding error c, as exp's
@@ -895,8 +910,8 @@ static Value expm1F64(ImplicitLocOpBuilder &b, Value x) {
   auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
   auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
   auto neg = [&](Value u) { return arith::NegFOp::create(b, u); };
-  auto fma = [&](Value u, Value v, Value w) {
-    return math::FmaOp::create(b, u, v, w);
+  auto fma = [&](Value u, Value v, Value w) -> Value {
+    return f64Fma(b, u, v, w);
   };
   auto sel = [&](Value cnd, Value u, Value v) {
     return arith::SelectOp::create(b, cnd, u, v);
@@ -1296,8 +1311,8 @@ static LogicalResult rewriteExpF64(math::ExpOp op, PatternRewriter &rewriter) {
   auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
   auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
   auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
-  auto fma = [&](Value x, Value y, Value z) {
-    return math::FmaOp::create(b, x, y, z);
+  auto fma = [&](Value x, Value y, Value z) -> Value {
+    return f64Fma(b, x, y, z);
   };
   auto sel = [&](Value cnd, Value x, Value y) {
     return arith::SelectOp::create(b, cnd, x, y);
@@ -1361,8 +1376,8 @@ static LogicalResult rewriteLogF64(math::LogOp op, PatternRewriter &rewriter) {
   auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
   auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
   auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
-  auto fma = [&](Value x, Value y, Value z) {
-    return math::FmaOp::create(b, x, y, z);
+  auto fma = [&](Value x, Value y, Value z) -> Value {
+    return f64Fma(b, x, y, z);
   };
   auto sel = [&](Value cnd, Value x, Value y) {
     return arith::SelectOp::create(b, cnd, x, y);
@@ -3133,6 +3148,7 @@ struct LowerGpuOpsToAIROpsPass final
     });
     ::approximateHalfFunctions = approximateHalfFunctions;
     ::expm1F64Direct = expm1F64Direct;
+    ::f64PolynomialFma = f64PolynomialFma;
     if (speculateGuardedLoads)
       ::speculateGuardedLoads(m);
     if (constantTripLoops)

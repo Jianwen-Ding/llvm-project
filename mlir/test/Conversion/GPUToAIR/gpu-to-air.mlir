@@ -2,6 +2,7 @@
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0 simdgroup-all-reduce=0" --split-input-file | FileCheck %s --check-prefix=OFF
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 approximate-half-functions=0" --split-input-file | FileCheck %s --check-prefix=HALFOFF
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 expm1-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=E1OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 f64-polynomial-fma=1" --split-input-file | FileCheck %s --check-prefix=PFMA
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -1302,6 +1303,27 @@ gpu.module @f64_sinh_tanh_one_division {
     %s = math.sinh %v : f64
     %t = math.tanh %s : f64
     memref.store %t, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 exp's polynomial in fdlibm's multiplies and adds, not fmas (the
+// emulated fma costs more than both: L15-E815); f64-polynomial-fma=1: fmas.
+gpu.module @f64_polynomial_mul_add {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.fma
+  // CHECK: llvm.return
+  // PFMA-LABEL: gpu.module @f64_polynomial_mul_add
+  // PFMA-COUNT-4: llvm.intr.fma
+  // PFMA-NOT: llvm.intr.fma
+  // PFMA: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.exp %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
     gpu.return
   }
 }

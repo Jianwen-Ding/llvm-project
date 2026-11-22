@@ -782,6 +782,10 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            "Divide f32 erf's rational approximation by the hardware's "
            "reciprocal, one Newton step and a residual correction, where "
            "every input's result is the same">,
+    Option<"f64PolynomialFma", "f64-polynomial-fma", "bool",
+           /*default=*/"false",
+           "Evaluate the f64 exp, log and expm1 expansions' polynomials with "
+           "fma, not fdlibm's multiplies and adds">,
     Option<"expm1F64Direct", "expm1-f64-direct", "bool",
            /*default=*/"true",
            "math.expm1 of f64 (and sinh's and tanh's) as fdlibm's expm1, not "
