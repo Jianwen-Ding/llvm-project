@@ -113,6 +113,11 @@ static cl::opt<bool> AGXSoftF64MulLimbs(
     "agx-soft-f64-mul-limbs", cl::init(true), cl::Hidden,
     cl::desc("Double significand products as four 32-bit multiply-adds with "
              "the partial sums as addends"));
+static cl::opt<bool> AGXSoftF64FmaOperandChecks(
+    "agx-soft-f64-fma-operand-checks", cl::init(true), cl::Hidden,
+    cl::desc("The fma fast path's operand checks from its fields and "
+             "product (L15-E836), not each operand's bits"));
+
 static cl::opt<bool> AGXSoftF64FmaFar(
     "agx-soft-f64-fma-far", cl::init(true), cl::Hidden,
     cl::desc("Double fma rounded to nearest with a constant addend: a short "
@@ -832,6 +837,23 @@ public:
       EA = B.CreateSub(B.CreateAdd(Exp(X), Exp(Y)), c32(2 * (F64.Bias + 52) + 20));
       EC = B.CreateSub(Exp(Z), c32(F64.Bias + 52 + 72));
     }
+    // (L15-E836) the operands' checks from what is at hand, as soon as it
+    // is (one bit live, not the product): an infinity or NaN by the largest
+    // field; a denormal factor (its field 0, its significand kept) as a
+    // nonzero product where a field is 0 (a denormal times a zero is that
+    // zero, which the product of 0 gives exactly); a denormal Z as a nonzero
+    // significand where its field is 0
+    Value *OperandsBad = nullptr;
+    if (ByField && AGXSoftF64FmaOperandChecks) {
+      Value *MaxE = B.CreateBinaryIntrinsic(
+          Intrinsic::umax, B.CreateBinaryIntrinsic(Intrinsic::umax, Exp(X), Exp(Y)),
+          Exp(Z));
+      OperandsBad = B.CreateICmpEQ(MaxE, c32(F64.expAll()));
+      OperandsBad = B.CreateOr(OperandsBad,
+                               B.CreateAnd(PZero, B.CreateICmpNE(A, cw(A, 0))));
+      OperandsBad = B.CreateOr(
+          OperandsBad, B.CreateAnd(ZZero, B.CreateICmpNE(Sig(Z), c64(0))));
+    }
     EA = select(PZero, c32(-100000), EA);
     EC = select(ZZero, c32(-100000), EC);
     // only the one with the lower exponent is aligned
@@ -861,6 +883,8 @@ public:
     Value *ZeroSign = B.CreateAnd(B.CreateAnd(PZero, ZZero), B.CreateAnd(SignP, SignZ));
     Bits = select(SZero, select(ZeroSign, c64(F64.signBit()), c64(0)), Bits);
     Valid = B.CreateOr(Valid, SZero);
+    if (OperandsBad)
+      return {Bits, B.CreateAnd(Valid, B.CreateNot(OperandsBad))};
     Valid = B.CreateAnd(Valid, B.CreateAnd(isNormalOrZero(X),
                                            B.CreateAnd(isNormalOrZero(Y), isNormalOrZero(Z))));
     return {Bits, Valid};
