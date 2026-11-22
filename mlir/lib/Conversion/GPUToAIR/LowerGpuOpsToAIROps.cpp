@@ -4617,12 +4617,16 @@ struct LowerGpuOpsToAIROpsPass final
     // (L15-E840) views of memrefs (subview, expand_shape, collapse_shape),
     // which MemRefToLLVM no longer lowers, as reinterpret_casts of their
     // sources' metadata, their offsets and strides by affine.apply, lowered
-    // to arith; only where the module has such a view
+    // to arith; only where the module has such a view. (L15-E842) Likewise
+    // the affine dialect's ops (an outlined kernel's affine.apply / min /
+    // max, loads, stores, loops) to arith, memref and scf, as lower-affine
+    // would.
     {
       bool views = false;
       m.walk([&](Operation *op) {
         views = isa<memref::SubViewOp, memref::ExpandShapeOp,
-                    memref::CollapseShapeOp>(op);
+                    memref::CollapseShapeOp>(op) ||
+                isa_and_nonnull<affine::AffineDialect>(op->getDialect());
         return views ? WalkResult::interrupt() : WalkResult::advance();
       });
       if (views) {

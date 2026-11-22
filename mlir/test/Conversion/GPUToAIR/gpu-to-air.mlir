@@ -1798,3 +1798,28 @@ gpu.module @subgroup_reduce_vector {
     gpu.return
   }
 }
+
+// -----
+
+// The affine dialect's ops (an outlined kernel's index maps, loads and
+// stores) to arith and memref before the conversion (L15-E842): d0 * 2 + 1,
+// min(d0 floordiv 3, 50) by a compare and select.
+gpu.module @affine_ops {
+  // CHECK-LABEL: gpu.module @affine_ops
+  // CHECK: llvm.func @k(
+  // CHECK-NOT: affine.
+  // CHECK: llvm.icmp "slt"
+  // CHECK: llvm.select
+  // CHECK: llvm.load
+  // CHECK: llvm.store
+  // CHECK-NOT: affine.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<256xf32, 1>, %i: index) kernel {
+    %c1 = arith.constant 1 : index
+    %j = affine.apply affine_map<(d0)[s0] -> (d0 * 2 + s0)>(%i)[%c1]
+    %k = affine.min affine_map<(d0) -> (d0 floordiv 3, 50)>(%i)
+    %v = affine.load %a[%j] : memref<256xf32, 1>
+    affine.store %v, %a[%k] : memref<256xf32, 1>
+    gpu.return
+  }
+}
