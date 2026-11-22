@@ -11,7 +11,9 @@ c a second memref at the thread's row (column) or at j + o'' alone (every thread
 passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
 vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16 or f32 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
-and a guarded statement's c load inside its scf.if (speculate-guarded-loads). Lowered as bench.py does
+and a guarded statement's c load inside its scf.if (speculate-guarded-loads). A quarter of the seeds instead run a SIMD-group a row: each lane's running value
+over j = lane, lane + 32, ... (scf.for from the lane id), gpu.subgroup_reduce of them, and the row rewritten with
+the result (the online softmax's shape, exact ops). Lowered as bench.py does
 (convert-gpu-to-air, mlir-translate, the AIR target's portable passes, opt -O3, llc -O3, the constants in
 uniforms on every other seed), run with agx_run on 1024 threads and compared element for element with the model
 (NaNs alike): narrow-indices, narrow-loops, linearize-indices, column-no-wrap, constant-trip-loops and
@@ -311,7 +313,137 @@ def compile_kernel(a, src, tmp, uniform_constants):
     return code, consts
 
 
+def gen_lanes(seed):
+    R = random.Random(seed)
+    k = dict(ty=R.choice(['i32', 'i32', 'f32']),
+             trip=R.choice(['const', 'arg']),
+             tconst=R.choice([32, 64, 100, 192, 256]),
+             targ=R.choice([0, 7, 32, 33, 200, 256]),
+             init=R.choice([0, 1, 5]),
+             second=R.random() < 0.7,
+             op2=R.choice(['add', 'sub', 'max', 'min']))
+    k['op'] = R.choice(['add', 'max', 'min'] + (['xor'] if k['ty'] != 'f32' else ['maxnum', 'minnum']))
+    return k
+
+
+def emit_lanes(k):
+    """One SIMD-group a row: each lane's running value over j = lane, lane + 32, ..., the SIMD-group's reduction
+    of them, stored at the row's element 256, and (second) the row rewritten with it."""
+    T = k['ty']
+    flt = T == 'f32'
+    lit = (lambda v: '%d.0' % v) if flt else str
+    M = 'memref<1024x257x%s, 1>' % T
+    fop = {'add': 'addf' if flt else 'addi', 'sub': 'subf' if flt else 'subi', 'xor': 'xori',
+           'max': 'maximumf' if flt else 'maxui', 'min': 'minimumf' if flt else 'minui',
+           'maxnum': 'maxnumf', 'minnum': 'minnumf'}
+    kind = {'add': 'add', 'xor': 'xor', 'max': 'maximumf' if flt else 'maxui',
+            'min': 'minimumf' if flt else 'minui', 'maxnum': 'maxnumf', 'minnum': 'minnumf'}[k['op']]
+    L = ['gpu.module @k {',
+         '  gpu.func @k(%%c: %s, %%b: %s, %%n: i32) kernel' % (M, M),
+         '      attributes {known_block_size = array<i32: 32, 1, 1>} {',
+         '    %c32 = arith.constant 32 : index',
+         '    %c256 = arith.constant 256 : index',
+         '    %row = gpu.block_id x upper_bound 1024',
+         '    %lane = gpu.lane_id upper_bound 32']
+    if k['trip'] == 'const':
+        L.append('    %%T = arith.constant %d : index' % k['tconst'])
+    else:
+        L.append('    %T = arith.index_cast %n : i32 to index')
+    L += ['    %%init = arith.constant %s : %s' % (lit(k['init']), T),
+          '    %%p = scf.for %%j = %%lane to %%T step %%c32 iter_args(%%a = %%init) -> (%s) {' % T,
+          '      %%v = memref.load %%c[%%row, %%j] : %s' % M,
+          '      %%a2 = arith.%s %%a, %%v : %s' % (fop[k['op']], T),
+          '      scf.yield %%a2 : %s' % T,
+          '    }',
+          '    %%r = gpu.subgroup_reduce %s %%p : (%s) -> %s' % (kind, T, T)]
+    if k['second']:
+        L += ['    scf.for %j = %lane to %T step %c32 {',
+              '      %%v = memref.load %%c[%%row, %%j] : %s' % M,
+              '      %%w = arith.%s %%v, %%r : %s' % (fop[k['op2']], T),
+              '      memref.store %%w, %%b[%%row, %%j] : %s' % M,
+              '    }']
+    L += ['    memref.store %%r, %%b[%%row, %%c256] : %s' % M,
+          '    gpu.return', '  }', '}']
+    return '\n'.join(L) + '\n'
+
+
+def model_lanes(k, t, c, b):
+    T = k['ty']
+    flt = T == 'f32'
+    MW = 0xffffffff
+
+    def f(o, x, y):
+        if flt:
+            if o == 'add':
+                return (x + y).astype(np.float32)
+            if o == 'sub':
+                return (x - y).astype(np.float32)
+            return (np.maximum if o in ('max', 'maxnum') else np.minimum)(x, y).astype(np.float32)
+        x64, y64 = x.astype(np.int64), y.astype(np.int64)
+        r = {'add': lambda: x64 + y64, 'sub': lambda: x64 - y64, 'xor': lambda: x64 ^ y64,
+             'max': lambda: np.maximum(x64, y64), 'min': lambda: np.minimum(x64, y64)}[o]()
+        return (r & MW).astype(np.uint32)
+    acc = np.full((1024, 32), k['init'], DT[T])
+    for j0 in range(0, max(t, 0), 32):
+        js = j0 + np.arange(32)
+        v = c[:, np.minimum(js, 255)]
+        acc = np.where(js[None, :] < t, f(k['op'], acc, v), acc).astype(DT[T])
+    r = acc[:, 0]
+    for l in range(1, 32):
+        r = f('add' if k['op'] in ('add',) else k['op'], r, acc[:, l])
+    if k['second']:
+        for j in range(min(max(t, 0), 256)):
+            b[:, j] = f(k['op2'], c[:, j], r)
+    b[:, 256] = r
+    return b
+
+
+def run_lanes(seed, a, tmp):
+    k = gen_lanes(seed)
+    src = emit_lanes(k)
+    sp = os.path.join(tmp, 'k.mlir.src')
+    open(sp, 'w').write(src)
+    try:
+        code, consts = compile_kernel(a, sp, tmp, seed % 2 == 1)
+    except subprocess.CalledProcessError as e:
+        return src, 'compile failure: ' + ((e.stderr or '').strip().splitlines() or [''])[-1][:200]
+    rng = np.random.default_rng(seed)
+    T = k['ty']
+    if T == 'f32':
+        c = rng.integers(-40, 40, (1024, 257)).astype(np.float32)
+        b = rng.integers(-40, 40, (1024, 257)).astype(np.float32)
+    else:
+        c = rng.integers(0, 1 << 32, (1024, 257), dtype=np.uint64).astype(np.uint32)
+        b = rng.integers(0, 1 << 32, (1024, 257), dtype=np.uint64).astype(np.uint32)
+    t = k['tconst'] if k['trip'] == 'const' else k['targ']
+    fb, fc, fo = (os.path.join(tmp, x) for x in ('b.bin', 'c.bin', 'o.bin'))
+    b.tofile(fb)
+    c.tofile(fc)
+    vb, vc = BASE, BASE + 0x1000000
+    cmd = [a.run, code, '--grid', '%d,1,1' % (1024 * 32), '--wg', '32,1,1',
+           '--map', '%#x=%s' % (vb, fb), '--map', '%#x=%s' % (vc, fc), '--dump', '%#x=%d:%s' % (vb, b.nbytes, fo),
+           '--uniform', '0=%d' % (vc & 0xffffffff), '--uniform', '1=%d' % (vc >> 32),
+           '--uniform', '2=%d' % (vb & 0xffffffff), '--uniform', '3=%d' % (vb >> 32),
+           '--uniform', '4=%d' % t] + consts
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return src, 'agx_run timed out'
+    if r.returncode:
+        return src, 'agx_run failed: ' + ((r.stderr + r.stdout).strip().splitlines() or [''])[-1][:200]
+    got = np.fromfile(fo, DT[T]).reshape(b.shape)
+    ref = model_lanes(k, t, c, b.copy())
+    bad = np.argwhere(got != ref)
+    if bad.size:
+        e = tuple(bad[0])
+        return src, 'lanes: element %s: %r, the model %r (%d elements differ)' % (e, got[e], ref[e], len(bad))
+    return src, None
+
+
 def run_seed(seed, a, tmp):
+    # (a quarter of the seeds: a SIMD-group a row)
+    if seed % 4 == 3:
+        return run_lanes(seed, a, tmp)
     k = gen(seed)
     src = emit(k)
     sp = os.path.join(tmp, 'k.mlir.src')
