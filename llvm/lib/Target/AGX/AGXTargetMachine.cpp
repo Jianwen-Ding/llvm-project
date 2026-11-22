@@ -321,6 +321,12 @@ static cl::opt<unsigned> AGXSchedLoadsFirstMinGroups(
     cl::desc("agx-sched-original-order-loads-first's order dropped where it "
              "leaves the core fewer SIMD-groups than this (and than before)"));
 
+static cl::opt<unsigned> AGXSchedLoadsFirstLimit(
+    "agx-sched-loads-first-limit", cl::init(12), cl::Hidden,
+    cl::desc("Where agx-sched-original-order-loads-first's order is dropped, "
+             "that order again with at most this many device loads ahead of "
+             "their first reader (0: off)"));
+
 namespace {
 /// Picks the region's instructions in their order before the first
 /// scheduling (top-down; that order is a topological one of the DAG).
@@ -331,15 +337,23 @@ class AGXOriginalOrderStrategy : public MachineSchedStrategy {
 public:
   AGXOriginalOrderStrategy(const DenseMap<const MachineInstr *, unsigned> &I)
       : Index(I) {}
-  void initialize(ScheduleDAGMI *) override { Ready.clear(); }
+  void initialize(ScheduleDAGMI *) override {
+    Ready.clear();
+    Ahead.clear();
+  }
   /// A ready device load first (L15-E498).
   bool LoadsFirst = false;
+  /// With LoadsFirst, at most this many device loads ahead of their first
+  /// reader (0: any).
+  unsigned Limit = 0;
+  SmallPtrSet<const SUnit *, 16> Ahead;
   SUnit *pickNode(bool &IsTopNode) override {
     IsTopNode = true;
     if (Ready.empty())
       return nullptr;
+    bool Room = !Limit || Ahead.size() < Limit;
     auto Key = [&](SUnit *X) {
-      bool Load = LoadsFirst && isAGXDeviceLoad(*X->getInstr());
+      bool Load = LoadsFirst && Room && isAGXDeviceLoad(*X->getInstr());
       return std::make_pair(!Load, Index.lookup(X->getInstr()));
     };
     auto Best = llvm::min_element(
@@ -348,7 +362,15 @@ public:
     Ready.erase(Best);
     return SU;
   }
-  void schedNode(SUnit *, bool) override {}
+  void schedNode(SUnit *SU, bool) override {
+    if (!Limit)
+      return;
+    for (const SDep &D : SU->Preds)
+      if (D.getKind() == SDep::Data)
+        Ahead.erase(D.getSUnit());
+    if (isAGXDeviceLoad(*SU->getInstr()))
+      Ahead.insert(SU);
+  }
   void releaseTopNode(SUnit *SU) override { Ready.push_back(SU); }
   void releaseBottomNode(SUnit *) override {}
 };
@@ -539,9 +561,10 @@ public:
                       MI.getOpcode() != AGX::MEMORY_BARRIER;
       }
     }
-    auto Reschedule = [&](bool First) {
+    auto Reschedule = [&](bool First, unsigned Limit = 0) {
       auto Strategy = std::make_unique<AGXOriginalOrderStrategy>(Index);
       Strategy->LoadsFirst = First;
+      Strategy->Limit = Limit;
       std::unique_ptr<MachineSchedStrategy> Original = std::move(Strategy);
       // (without the mutations, whose clustering edges need not hold in the
       // original order)
@@ -566,12 +589,29 @@ public:
       LLVM_DEBUG(dbgs() << "agx-occupancy loads first: halves " << H
                         << " groups " << CoreGroups(H) << " vs "
                         << CoreGroups(Before) << "\n");
-      if (H > Before &&
-          (AGXSubtarget::maxThreadsForHalves(H + 16) < Need ||
-           9 * CoreGroups(H) < 5 * CoreGroups(Before) ||
-           (CoreGroups(H) < AGXSchedLoadsFirstMinGroups &&
-            CoreGroups(H) < CoreGroups(Before))))
-        Reschedule(false);
+      auto Bad = [&](unsigned H) {
+        return H > Before &&
+               (AGXSubtarget::maxThreadsForHalves(H + 16) < Need ||
+                9 * CoreGroups(H) < 5 * CoreGroups(Before) ||
+                (CoreGroups(H) < AGXSchedLoadsFirstMinGroups &&
+                 CoreGroups(H) < CoreGroups(Before)));
+      };
+      // (and dropped, the same order with at most 12 loads ahead of their
+      // readers, where that one keeps the groups: attention decode's keys
+      // and values partly ahead, attn_decode_f16 -2.1%, softmax_thread
+      // -0.5%; 4 ahead, bf16_dot_rows +13%, L15-E754)
+      if (Bad(H)) {
+        bool Done = false;
+        if (AGXSchedLoadsFirstLimit) {
+          Reschedule(true, AGXSchedLoadsFirstLimit);
+          unsigned H2 = regionHalves();
+          LLVM_DEBUG(dbgs() << "agx-occupancy loads first, limited: halves "
+                            << H2 << " groups " << CoreGroups(H2) << "\n");
+          Done = !Bad(H2);
+        }
+        if (!Done)
+          Reschedule(false);
+      }
     }
     LLVM_DEBUG(dbgs() << "agx-occupancy reverted: halves " << regionHalves()
                       << "\n");
