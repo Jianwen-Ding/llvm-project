@@ -1586,6 +1586,25 @@ gpu.module @complex_functions {
 
 // -----
 
+// gpu.dynamic_shared_memory (L15-E830; before, illegal): an external-size
+// threadgroup global the backend places after the static ones.
+gpu.module @dynamic_shared_memory {
+  // CHECK: llvm.mlir.global internal @__dynamic_shmem__0() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK: llvm.mlir.addressof @__dynamic_shmem__0 : !llvm.ptr<3>
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %sh = gpu.dynamic_shared_memory : memref<?xi8, #gpu.address_space<workgroup>>
+    %v = memref.view %sh[%c0][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<8xf32, #gpu.address_space<workgroup>>
+    %x = memref.load %a[%c0] : memref<8xf32, 1>
+    memref.store %x, %v[%c0] : memref<8xf32, #gpu.address_space<workgroup>>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

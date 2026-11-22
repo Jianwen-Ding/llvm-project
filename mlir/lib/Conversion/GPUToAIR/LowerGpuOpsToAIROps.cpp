@@ -4970,6 +4970,12 @@ void mlir::populateGpuToAIRConversionPatterns(
                MatrixStoreOpLowering, MatrixMultiplyAccumulateOpLowering,
                MatrixFillOpLowering>(converter);
   patterns.add<GPUReturnOpLowering>(converter);
+  // gpu.dynamic_shared_memory: an external threadgroup global of no size,
+  // which the backend places after the kernel's static threadgroup memory
+  // (the launch's threadgroup memory length covers it), 16-byte aligned
+  // (L15-E830; before, the op was illegal)
+  patterns.add<GPUDynamicSharedMemoryOpLowering>(converter,
+                                                 /*alignmentBit=*/128);
   patterns.add<GPUFuncOpLowering>(
       converter,
       GPUFuncOpLoweringOptions{
