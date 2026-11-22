@@ -869,8 +869,10 @@ public:
     Value *Neg = B.CreateICmpSLT(S, cw(S, 0));
     S = select(Neg, B.CreateNeg(S), S);
     Value *Sign = B.CreateXor(select(Swap, SignZ, SignP), Neg);
-    Value *Lz = B.CreateBinaryIntrinsic(Intrinsic::ctlz, S, B.getFalse());
-    Lz = B.CreateBinaryIntrinsic(Intrinsic::umin, Lz, cw(S, 127));
+    // (ctlz(S | 1) is S's own for any nonzero S and 127 for a zero one,
+    // which is replaced below: a defined shift without a clamp, L15-E837)
+    Value *Lz = B.CreateBinaryIntrinsic(Intrinsic::ctlz,
+                                        B.CreateOr(S, cw(S, 1)), B.getFalse());
     Value *Norm = B.CreateShl(S, Lz);
     Value *Hi = B.CreateTrunc(B.CreateLShr(Norm, 64), I64);
     Value *N = B.CreateOr(Hi, B.CreateZExt(B.CreateICmpNE(B.CreateTrunc(Norm, I64), c64(0)), I64));
