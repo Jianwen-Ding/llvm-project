@@ -1,5 +1,5 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-hoist=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-unlikely=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-hoist=0 -agx-rare-fallbacks-unlikely=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; L15-E505: what follows a branched-around fallback's selects (L15-E504) and
 ; needs neither them nor a write before it goes ahead of the branch: the

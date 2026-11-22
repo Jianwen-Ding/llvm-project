@@ -1,8 +1,9 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=SINS
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-hardware-branch=0 < %s | FileCheck %s --check-prefix=OFF
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-min=1 < %s | FileCheck %s --check-prefix=ONE
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-merge=0 < %s | FileCheck %s --check-prefix=APART
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-unlikely=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=COLD
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-unlikely=0 < %s | FileCheck %s --check-prefix=SINS
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-unlikely=0 -agx-rare-hardware-branch=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-unlikely=0 -agx-rare-fallbacks-min=1 < %s | FileCheck %s --check-prefix=ONE
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-unlikely=0 -agx-rare-fallbacks-merge=0 < %s | FileCheck %s --check-prefix=APART
 
 ; sin and cos past 2^22 take the hardware's reduction (L15-E504): sincos's
 ; two and tan's run in a block of their own, skipped by a SIMD-group none of
@@ -17,6 +18,17 @@
 ; CHECK: fcmpsel lt
 ; CHECK: device_store
 
+; By default the branch to the rare block is weighted unlikely and
+; AGXColdRegions moves the block after the kernel's end: the common path
+; falls through a jmp_exec_any not taken (L15-E862).
+; COLD-LABEL: sincos_f32:
+; COLD: if_fcmp {{r[0-9]+l}}, nlt, {{r[0-9]+}}.abs, {{r[0-9]+}}, 1
+; COLD-NEXT: jmp_exec_any [[R:.LBB[0-9_]+]]
+; COLD: pop_exec
+; COLD: stop
+; COLD: [[R]]:
+; COLD-COUNT-2: sin_pt_1
+; COLD: jmp_exec_any
 ; CHECK-LABEL: sincos_f32:
 ; CHECK: if_fcmp [[E:r[0-9]+l]], nlt, {{r[0-9]+}}.abs, {{r[0-9]+}}, 1
 ; CHECK-NEXT: jmp_exec_none [[J:.LBB[0-9_]+]]

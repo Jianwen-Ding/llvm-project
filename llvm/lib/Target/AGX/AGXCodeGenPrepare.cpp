@@ -10295,6 +10295,10 @@ static cl::opt<bool> AGXRareFallbacksMerge(
 /// conditions is false, each select there of its own (an unrolled loop's
 /// sins, L15-E789). After the SimplifyCFG before structurization, which would
 /// speculate h again (AGXRareFallbacks).
+static cl::opt<bool> AGXRareUnlikely(
+    "agx-rare-fallbacks-unlikely", cl::init(true), cl::Hidden,
+    cl::desc("Weight the branch to a rare fallback's block unlikely"));
+
 static bool branchRareFallbacksOnce(Function &F) {
   MapVector<std::pair<BasicBlock *, Value *>, SmallVector<SelectInst *, 2>>
       Groups;
@@ -10390,15 +10394,22 @@ static bool branchRareFallbacksOnce(Function &F) {
     for (SelectInst *S : Sels)
       Conds.insert(S->getCondition());
     IRBuilder<> BBB(BB);
+    // (L15-E862) the rare side weighted unlikely, so that AGXColdRegions
+    // moves it out of line: skipping it was a taken jump an element
+    MDBuilder RMDB(F.getContext());
     if (Conds.size() == 1) {
-      BBB.CreateCondBr(Conds[0], Tail, Rare);
+      BBB.CreateCondBr(Conds[0], Tail, Rare,
+                       AGXRareUnlikely ? RMDB.createLikelyBranchWeights()
+                                       : nullptr);
     } else {
       // (whether any condition is false, as a chain of selects: each a
       // compare-select of its comparison, no i1 values and'ed)
       Value *Any = BBB.getFalse();
       for (Value *C : Conds)
         Any = BBB.CreateSelect(C, Any, BBB.getTrue());
-      BBB.CreateCondBr(Any, Rare, Tail);
+      BBB.CreateCondBr(Any, Rare, Tail,
+                       AGXRareUnlikely ? RMDB.createUnlikelyBranchWeights()
+                                       : nullptr);
     }
     // (a comparison again in the rare block, which its select there reads:
     // one compare-select, not the condition kept in a register across the
