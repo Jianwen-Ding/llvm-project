@@ -30,6 +30,7 @@ open-source LLVM NVPTX backend; no vendor tools or code are used):
     `@nvvm.<intrinsic>` (the driver renames `@llvm.nvvm.X` to `@nvvm.X` in
     the source), so only the mapping intrinsic -> instruction is checked.
 """
+import os
 import re
 import struct
 import sys
@@ -37,6 +38,8 @@ import sys
 from llvmsig import parse_sig, int_bits, split_top
 import layout
 import narrowcvt
+import mbar
+import probe
 
 
 class Unsupported(Exception):
@@ -77,6 +80,10 @@ class PParam:
         if self.align is None or self.ptr:
             self.align = max(self.size if not m else 1, 1) if not self.ptr else 8
         self.scalar_bits = None if m else ebits
+        # texture/sampler/surface reference parameters hold an opaque handle
+        self.handle = any(t in toks for t in (".texref", ".samplerref", ".surfref"))
+        if self.handle:
+            self.size, self.align, self.scalar_bits = 8, 8, 64
 
 
 class PFunc:
@@ -245,7 +252,10 @@ SREG_PLAIN = {"laneid", "warpid", "nwarpid", "smid", "nsmid", "gridid",
               "globaltimer_lo", "globaltimer_hi", "warpsize",
               "cluster_ctarank", "cluster_nctarank", "is_explicit_cluster",
               "dynamic_smem_size", "total_smem_size", "aggr_smem_size",
-              "current_graph_exec", "pm0", "pm1", "pm2", "pm3", "pm4",
+              "current_graph_exec", "reserved_smem_offset_begin",
+              "reserved_smem_offset_end", "reserved_smem_offset_cap",
+              "reserved_smem_offset_0", "reserved_smem_offset_1",
+              "pm0", "pm1", "pm2", "pm3", "pm4",
               "pm5", "pm6", "pm7"}
 SREG_PURE = {"tid", "ntid", "ctaid", "nctaid", "laneid", "warpsize",
              "nclusterid", "clusterid", "cluster_ctaid", "cluster_nctaid",
@@ -265,6 +275,8 @@ class Lifter:
                  indirect_sigs=None):
         self.typedefs = typedefs or {}
         self.indirect_sigs = indirect_sigs or []
+        self.used_probe = False
+        self.handle_params = {}      # .texref/.samplerref param -> LLVM arg
         self.pf = pfunc
         self.sig = sig
         self.name_map = name_map     # PTX symbol -> LLVM global/function name
@@ -277,6 +289,7 @@ class Lifter:
         self.slots_used = set()
         self.base_of = {}            # 64-bit reg -> base object key
         self.exact = set()           # regs equal to their base address
+        self.const_off = {}          # regs equal to base + constant
         self.slot_base = {}          # param slot -> base key of stored ptr
         self.jump_tables = {}        # label -> [target labels]
         self.last_label = None
@@ -404,6 +417,10 @@ class Lifter:
             v -= 1 << bits
         return str(v)
 
+    def check_entry_retval(self, sym):
+        if sym == "func_retval0" and self.pf.kind == "entry" and not self.pf.ret:
+            raise Unsupported("kernel stores to undeclared func_retval0 (finding 5)")
+
     def symbol_addr(self, sym):
         """i64 address of a PTX symbol (param, global, function, depot)."""
         for sc in reversed(self.scopes):
@@ -431,6 +448,8 @@ class Lifter:
         v = self.imm(s)
         if v is not None:
             return self.const(v, bits)
+        if s == "WARP_SZ":          # PTX constant: the warp size, 32
+            return self.const(32, bits)
         m = re.fullmatch(r"([\w$.]+)(?:\+(-?\d+))?", s)
         if m:
             a = self.symbol_addr(m.group(1))
@@ -455,7 +474,7 @@ class Lifter:
         # lanemask.ge) unless the intrinsic overrides its name
         if not (nm.endswith("_smem_size") or nm.startswith("reserved_smem_offset")):
             nm = nm.replace("_", ".")
-        ty = 64 if nm in ("clock64", "globaltimer", "gridid") else 32
+        ty = 64 if nm in ("clock64", "globaltimer") else 32  # gridid: i32 in LLVM
         fname = "nvvm.read.ptx.sreg." + nm
         attrs = "memory(none)" if base in SREG_PURE else \
             "memory(inaccessiblemem: readwrite)"
@@ -482,11 +501,10 @@ class Lifter:
         if not (s.startswith("[") and s.endswith("]")):
             raise Unsupported("address " + s)
         s = s[1:-1].strip()
+        if re.fullmatch(r"(-?\d+|0x[0-9a-fA-F]+)", s):      # absolute address
+            return "ptr " + self.op("inttoptr i64 %d to ptr" % self.imm(s))
         m = re.fullmatch(r"([%\w$.]+)\s*(?:\+\s*(-?\d+|0x[0-9a-fA-F]+))?", s)
         if not m:
-            m2 = re.fullmatch(r"(-?\d+|0x[0-9a-fA-F]+)", s)
-            if m2:
-                return "ptr " + self.op("inttoptr i64 %d to ptr" % self.imm(s))
             raise Unsupported("address " + s)
         base, off = m.group(1), m.group(2)
         off = self.imm(off) if off else 0
@@ -500,6 +518,13 @@ class Lifter:
         if off:
             a = self.op("add i64 %s, %d" % (a, off))
         key = self.base_of.get(base)
+        if key is not None and base in self.const_off:
+            b = self.base_ptr(key)
+            if b is not None:
+                total = self.const_off[base] + off
+                if total == 0:
+                    return "%s %s" % b
+                return "%s %s" % (b[0], self.op("getelementptr i8, %s %s, i64 %d" % (b[0], b[1], total)))
         if key is not None:
             if base in self.exact and not off:
                 b = self.base_ptr(key)
@@ -512,6 +537,7 @@ class Lifter:
 
     def sym_ptr(self, sym):
         """(pointer type, pointer value) of a PTX symbol."""
+        self.check_entry_retval(sym)
         for sc in reversed(self.scopes):
             if sym in sc:
                 return "ptr", sc[sym][0]
@@ -581,6 +607,27 @@ class Lifter:
             if d not in widths or parts[0] in NO_DEF_OPS:
                 continue
             defs.append((parts[0], parts[1:], d, ops[1:]))
+        # registers whose value is used as an address (or call target),
+        # directly or through add/sub/mov/cvta/and
+        addr_used = set()
+        for it in items:
+            if it[0] != "stmt" or it[1].startswith("."):
+                continue
+            for m in re.finditer(r"\[\s*(%[\w$]+)", it[1]):
+                addr_used.add(m.group(1))
+            mc = re.match(r"(?:@!?%\w+\s+)?call[\w.]*\s+(?:\([^)]*\)\s*,\s*)?(%[\w$]+)", it[1])
+            if mc:
+                addr_used.add(mc.group(1))
+        changed = True
+        while changed:
+            changed = False
+            for b, mods, d, srcs in defs:
+                if d in addr_used and b in ("add", "sub", "mov", "cvta", "and"):
+                    for x in srcs:
+                        x = x.strip()
+                        if x in widths and x not in addr_used:
+                            addr_used.add(x)
+                            changed = True
         base = {r: set() for r in widths}
         NONE = ("none", None)
 
@@ -609,9 +656,13 @@ class Lifter:
                         new = {NONE}
                 elif b == "sub" and len(srcs) == 2 and "cc" not in mods and ob(srcs[1]) == {NONE}:
                     new = ob(srcs[0])
+                elif b == "and" and len(srcs) == 2 and (self.imm(srcs[1]) or 0) < 0:
+                    # clearing low address bits (alignment) stays in the object
+                    new = ob(srcs[0])
                 elif b == "alloca":
                     new = {("dyn", d)}
                 elif b in ("ld", "ldu") and "param" not in mods and len(srcs) == 1 \
+                        and d in addr_used \
                         and any(m in ("b64", "u64", "s64") for m in mods) \
                         and not any(m in ("v2", "v4", "v8") for m in mods):
                     # a loaded 64-bit value may be a pointer: keep its provenance
@@ -642,6 +693,32 @@ class Lifter:
                     exact.discard(d)
                     changed = True
         self.exact = exact
+        # registers holding base + a constant: only defined by an exact base
+        # register (offset 0) or add/sub of an immediate to such a register
+        defs_of = {}
+        for b, mods, d, srcs in defs:
+            defs_of.setdefault(d, []).append((b, mods, srcs))
+        offs = {r: 0 for r in exact}
+        changed = True
+        while changed:
+            changed = False
+            for d, dl in defs_of.items():
+                if d in offs or d not in self.base_of or len(dl) != 1:
+                    continue
+                b, mods, srcs = dl[0]
+                if b in ("add", "sub") and len(srcs) == 2 and "cc" not in mods:
+                    a, c = srcs[0].strip(), srcs[1].strip()
+                    ia, ic = self.imm(a), self.imm(c)
+                    if a in offs and ic is not None:
+                        offs[d] = offs[a] + (ic if b == "add" else -ic)
+                        changed = True
+                    elif b == "add" and c in offs and ia is not None:
+                        offs[d] = offs[c] + ia
+                        changed = True
+                elif b in ("mov", "cvta") and len(srcs) == 1 and srcs[0].strip() in offs:
+                    offs[d] = offs[srcs[0].strip()]
+                    changed = True
+        self.const_off = offs
 
     # ---- function body -----------------------------------------------------
     def lift(self):
@@ -664,6 +741,8 @@ class Lifter:
                 self.scopes[0][pp.name] = (arg.name, pp)
                 continue
             slot = "%%param.%d" % k
+            if pp.handle:
+                self.handle_params[pp.name] = "%s %s" % (arg.ty, arg.name)
             self.allocas.append("%s = alloca [%d x i8], align %d" %
                                 (slot, pp.size, pp.align))
             self.scopes[0][pp.name] = (slot, pp)
@@ -676,7 +755,7 @@ class Lifter:
                                 (rp.size, rp.align))
             self.scopes[0][rp.name] = ("%retval", rp)
             self.retparam = rp
-        elif sig.ret != "void" and not self.zero_sized(sig.ret):
+        elif sig.ret != "void" and not self.zero_sized(sig.ret) and pf.kind != "entry":
             raise Unsupported("non-void function without retval param")
         self.emit("br label %start")
         self.new_block("start")
@@ -742,6 +821,12 @@ class Lifter:
             self.declare("llvm.memcpy.p0.p0.i64",
                          "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)")
             return
+        if ty == "ptr" and pp.size < 8:
+            # 32-bit pointers (e.g. tensor memory, p6:32:32) flattened to ptr
+            iv = self.op("ptrtoint ptr %s to i64" % val)
+            iv = self.op("trunc i64 %s to i%d" % (iv, pp.size * 8))
+            self.emit("store i%d %s, ptr %s" % (pp.size * 8, iv, slot))
+            return
         b = int_bits(ty)
         if b is not None and pp.scalar_bits and pp.scalar_bits > b:
             w = pp.scalar_bits
@@ -761,6 +846,10 @@ class Lifter:
         self.store_mem(layout.parse(ty, self.typedefs), val, slot, 0)
 
     def load_value(self, ty, slot, pp):
+        if ty == "ptr" and pp.size < 8:
+            v = self.op("load i%d, ptr %s" % (pp.size * 8, slot))
+            v = self.op("zext i%d %s to i64" % (pp.size * 8, v))
+            return self.op("inttoptr i64 %s to ptr" % v)
         b = int_bits(ty)
         if b is not None and pp.scalar_bits and pp.scalar_bits > b:
             v = self.op("load i%d, ptr %s" % (pp.scalar_bits, slot))
@@ -838,6 +927,12 @@ class Lifter:
                                 (slot, pp.size, pp.align))
             self.scopes[-1][pp.name] = (slot, pp)
             return
+        if s.startswith(".shared"):
+            # a module-scope shared global the backend demoted into the function
+            m = re.search(r"([\w$]+)(\[\d+\])?\s*$", s)
+            if m and m.group(1) in self.name_map:
+                return
+            raise Unsupported("function-scope .shared")
         if s.startswith(".callprototype"):
             return  # the LLVM type of indirect calls comes from the source
         if s.startswith(".branchtargets"):
@@ -900,15 +995,39 @@ class Lifter:
         "shiftamt", "uni", "sync", "aligned", "warp", "arrive", "up", "down",
         "bfly", "idx", "all", "any", "ballot", "to", "finite", "infinite",
         "number", "notanumber", "normal", "subnormal", "u32", "s32",
-        "u64", "satfinite", "xorsign", "red", "popc", "inc", "dec", "m8n8", "trans",
+        "u64", "satfinite", "xorsign", "oob", "mmio", "red", "popc", "inc", "dec", "m8n8", "trans",
     }
 
     def instr(self, base, mods, ops, opcode):
+        if base == "cvt" and narrowcvt.is_narrow(mods, mods):
+            return self.cvt_narrow(opcode, ops)
+        if base == "mbarrier":
+            return self.mbarrier(opcode, ops)
+        if probe.PTX_FAMILIES.match(base):
+            name = probe.op_name(opcode, ops)
+            if name in self.decls:
+                return self.generic_op(name, ops)
         h = getattr(self, "i_" + base, None)
         if h is None:
             raise Unsupported("opcode " + opcode)
-        if base == "cvt" and narrowcvt.is_narrow(mods, mods):
-            return self.cvt_narrow(opcode, ops)
+        if base in ("fence", "membar", "prefetch", "prefetchu", "cp", "discard",
+                    "spdecompress", "spcompress", "multimem", "applypriority", "tensormap",
+                    "griddepcontrol", "pmevent", "clusterlaunchcontrol", "getctarank", "mapa",
+                    "txq", "suq", "suld", "sust", "tex", "wmma", "mma", "ldmatrix", "stmatrix") or \
+                re.fullmatch(r"v(add|sub|avrg|absdiff|min|max|set)[24]?|vsh[lr]|vmad", base) or \
+                base in ("createpolicy", "istypeof", "tld4", "sured") or \
+                (base == "cvt" and "pack" in mods) or \
+                (base == "barrier" and mods[:1] == ["cluster"]) or \
+                (base == "wgmma" and not set(mods) - {"fence", "commit_group", "wait_group",
+                                                     "sync", "aligned"}) or \
+                (base == "st" and ("bulk" in mods or "async" in mods)) or \
+                (base == "tcgen05" and mods[:1] in (["ld"], ["st"])) or \
+                (base == "tcgen05" and mods[:1] == ["mma"]) or \
+                (base == "tcgen05" and mods[:1] in (["alloc"], ["dealloc"], ["relinquish_alloc_permit"],
+                                                   ["commit"], ["cp"], ["shift"], ["wait::ld"],
+                                                   ["wait::st"], ["fence::before_thread_sync"],
+                                                   ["fence::after_thread_sync"])):
+            return h(mods, ops, opcode)   # check their own modifiers
         for m in mods:
             if m not in self.KNOWN_MODS and not m.startswith(("L1::", "L2::")):
                 raise Unsupported("modifier .%s in %s" % (m, opcode))
@@ -935,6 +1054,9 @@ class Lifter:
             self.emit("ret void")
         elif self.zero_sized(self.sig.ret):
             self.emit("ret %s zeroinitializer" % self.sig.ret)
+        elif self.pf.kind == "entry":
+            # a kernel's return value is not observable (.entry has no retval)
+            self.emit("ret %s poison" % self.sig.ret)
         elif self.sig.ret.startswith("ptr"):
             v = self.ptr_from_slot(self.sig.ret, "%retval")
             self.emit("ret %s %s" % (self.sig.ret, v))
@@ -1110,28 +1232,78 @@ class Lifter:
         t = self.types_of(mods)[0]
         if is_float(t):
             return self.ffma(mods, ops, opc)
-        if "cc" in mods or "sat" in mods:
-            raise Unsupported(opc)
+        return self.imad(mods, ops, opc, False)
+
+    def i_madc(self, mods, ops, opc):
+        """madc{.hi,.lo}{.cc}.{u32,s32,u64,s64}: mad with the carry flag
+        added in."""
+        return self.imad(mods, ops, opc, True)
+
+    def imad(self, mods, ops, opc, use_cin):
+        """mad{.hi,.lo,.wide}{.cc}{.sat}: the PTX ISA's integer multiply-add.
+        .cc writes the carry out of the (unsigned) addition; madc adds the
+        carry in; .sat (.hi.s32 only) saturates the signed addition."""
+        t = self.types_of(mods)[0]
         bits = TBITS[t]
         ext = "sext" if is_signed(t) else "zext"
         a, b = self.get(ops[1], bits), self.get(ops[2], bits)
-        if "lo" in mods:
-            p = self.op("mul i%d %s, %s" % (bits, a, b))
-            c = self.get(ops[3], bits)
-            self.write(ops[0], self.op("add i%d %s, %s" % (bits, p, c)), bits)
-        elif "hi" in mods:
-            p = self.mulhi(a, b, bits, ext)
-            c = self.get(ops[3], bits)
-            self.write(ops[0], self.op("add i%d %s, %s" % (bits, p, c)), bits)
-        elif "wide" in mods:
+        if "wide" in mods:
+            if "cc" in mods or "sat" in mods or use_cin:
+                raise Unsupported(opc)
             w = bits * 2
             ea = self.op("%s i%d %s to i%d" % (ext, bits, a, w))
             eb = self.op("%s i%d %s to i%d" % (ext, bits, b, w))
             p = self.op("mul i%d %s, %s" % (w, ea, eb))
             c = self.get(ops[3], w)
             self.write(ops[0], self.op("add i%d %s, %s" % (w, p, c)), w)
+            return
+        if "lo" in mods:
+            p = self.op("mul i%d %s, %s" % (bits, a, b))
+        elif "hi" in mods:
+            p = self.mulhi(a, b, bits, ext)
         else:
             raise Unsupported(opc)
+        c = self.get(ops[3], bits)
+        if "sat" in mods:
+            if t != "s32" or "hi" not in mods or "cc" in mods or use_cin:
+                raise Unsupported(opc)
+            self.write(ops[0], self.call_intr("i32", "llvm.sadd.sat.i32",
+                                              ["i32 %s" % p, "i32 %s" % c]), bits)
+            return
+        if "cc" not in mods and not use_cin:
+            self.write(ops[0], self.op("add i%d %s, %s" % (bits, p, c)), bits)
+            return
+        w = bits + 1
+        r = self.op("add i%d %s, %s" % (w, self.op("zext i%d %s to i%d" % (bits, p, w)),
+                                          self.op("zext i%d %s to i%d" % (bits, c, w))))
+        if use_cin:
+            cin = self.op("load i1, ptr %s" % self.carry_slot())
+            r = self.op("add i%d %s, %s" % (w, r, self.op("zext i1 %s to i%d" % (cin, w))))
+        if "cc" in mods:
+            co = self.op("trunc i%d %s to i1" % (w, self.op("lshr i%d %s, %d" % (w, r, bits))))
+            self.emit("store i1 %s, ptr %s" % (co, self.carry_slot()))
+        self.write(ops[0], self.op("trunc i%d %s to i%d" % (w, r, bits)), bits)
+
+    def i_slct(self, mods, ops, opc):
+        """slct.dtype.s32 d, a, b, c: d = c >= 0 ? a : b; slct{.ftz}.dtype.f32:
+        the same with c as f32 (-0.0 >= 0; .ftz flushes a subnormal c to a
+        signed zero first, so a negative subnormal selects a).  The ISA leaves the result
+        for a NaN c unspecified: either a or b."""
+        ts = [m for m in mods if m in TBITS]
+        if len(ts) != 2 or ts[1] not in ("s32", "f32") or set(mods) - set(ts) - {"ftz"}:
+            raise Unsupported(opc)
+        bits = TBITS[ts[0]]
+        a, b = self.get(ops[1], bits), self.get(ops[2], bits)
+        if ts[1] == "s32":
+            cond = self.op("icmp sge i32 %s, 0" % self.get(ops[3], 32))
+        else:
+            c = self.op("bitcast i32 %s to float" % self.get(ops[3], 32))
+            c = self.ftz_in(c, "float", "ftz" in mods)
+            ge = self.op("fcmp oge float %s, 0.0" % c)
+            nan = self.op("fcmp uno float %s, 0.0" % c)
+            any_ = self.op("freeze i1 poison")
+            cond = self.op("select i1 %s, i1 %s, i1 %s" % (nan, any_, ge))
+        self.write(ops[0], self.op("select i1 %s, i%d %s, i%d %s" % (cond, bits, a, bits, b)), bits)
 
     def mul24(self, a, b, signed):
         ext = "sext" if signed else "zext"
@@ -1148,15 +1320,435 @@ class Lifter:
             p = self.op("lshr i64 %s, 16" % p)
         self.write(ops[0], self.op("trunc i64 %s to i32" % p), 32)
 
-    def i_mad24(self, mods, ops, opc):
-        t = self.types_of(mods)[0]
-        if "sat" in mods:
+    # ---- opaque state: keyed calls ------------------------------------------
+    def opaque_keyed(self, base, mods, ops, opc, dest):
+        """An instruction whose result depends on state outside the
+        single-thread model (cache policies, texture/surface objects) as an
+        uninterpreted call named by its modifiers; operands (brackets and
+        vectors flattened) as zero-extended i64, the destination (scalar,
+        predicate or vector) from i64 results.  Inline asm using it is lifted
+        the same way on both sides, so the check covers operand binding."""
+        import tma
+        ops = [o.strip() for o in ops]
+        res = []
+        if dest:
+            res = self.vec_ops(ops[0]) or [ops[0]]
+            ops = ops[1:]
+        vals = []
+        for o in tma._flatten(ops):
+            x = o.strip()
+            br = re.fullmatch(r"\[\s*([%\w$.]+)\s*\]", x)
+            x = br.group(1) if br else x
+            if x in self.regs:
+                w = self.regs[x]
+                v = self.get(x, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(x) is not None:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            elif re.fullmatch(r"[-+]?\d+\.\d*(e[-+]?\d+)?|0[fF][0-9a-fA-F]{8}", x):
+                import struct
+                fb = int(x[2:], 16) if x[:2] in ("0f", "0F") else \
+                    struct.unpack("<I", struct.pack("<f", float(x)))[0]
+                vals.append("i64 %d" % fb)        # f32 literal (createpolicy fraction)
+            elif x in self.handle_params and self.handle_params[x].startswith("i64 "):
+                vals.append(self.handle_params[x])
+            elif re.fullmatch(r"[A-Za-z_$][\w$.]*", x):
+                vals.append("i64 %s" % self.get(x, 64))
+            else:
+                raise Unsupported("operand " + opc)
+        kname = "ptx.opaque.%s.%s.r%d.n%d" % (base, "_".join(m.replace("::", "__") for m in mods) or "x",
+                                               len(res), len(vals))
+        rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
+        self.declare(kname, "declare %s @%s(%s) nounwind willreturn" % (
+            rty, kname, ", ".join(["i64"] * len(vals))))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if not res:
+            self.emit(call)
+            return
+        v = self.op(call)
+        for k, d in enumerate(res):
+            if d == "_":
+                continue
+            if d not in self.regs:
+                raise Unsupported("operand " + opc)
+            e = self.op("extractvalue %s %s, %d" % (rty, v, k))
+            w = self.regs[d]
+            self.write(d, self.resize(e, 64, w, False) if w != 64 else e, w)
+
+    def i_createpolicy(self, mods, ops, opc):
+        if not mods or mods[0] not in ("fractional", "range", "cvt") or mods[-1] != "b64":
             raise Unsupported(opc)
+        return self.opaque_keyed("createpolicy", mods, ops, opc, True)
+
+    def i_istypeof(self, mods, ops, opc):
+        if mods not in (["texref"], ["samplerref"], ["surfref"]):
+            raise Unsupported(opc)
+        return self.opaque_keyed("istypeof", mods, ops, opc, True)
+
+    def i_tld4(self, mods, ops, opc):
+        if not mods or mods[0] not in ("r", "g", "b", "a"):
+            raise Unsupported(opc)
+        return self.opaque_keyed("tld4", mods, ops, opc, True)
+
+    def i_sured(self, mods, ops, opc):
+        if not mods or mods[0] not in ("b", "p"):
+            raise Unsupported(opc)
+        return self.opaque_keyed("sured", mods, ops, opc, False)
+
+    def video_sel(self, o):
+        """(register, selector or None) of a video operand `%r.b2` / `%r.h1`."""
+        m = re.fullmatch(r"(.+?)\.(b[0-7]{1,4}|h[0-3]{1,2})", o.strip())
+        return (m.group(1), m.group(2)) if m else (o.strip(), None)
+
+    def video_operand(self, o, t):
+        """A scalar video source operand, its selected byte/halfword (or the
+        whole word) extended by its type, as i128."""
+        r, sel = self.video_sel(o)
+        v = self.get(r, 32)
+        ext = "sext" if t == "s32" else "zext"
+        if sel is None:
+            return self.op("%s i32 %s to i128" % (ext, v))
+        if not re.fullmatch(r"b[0-3]|h[01]", sel):
+            raise Unsupported("video selector ." + sel)
+        w = 8 if sel[0] == "b" else 16
+        x = self.op("lshr i32 %s, %d" % (v, w * int(sel[1])))
+        x = self.op("trunc i32 %s to i%d" % (x, w))
+        return self.op("%s i%d %s to i128" % (ext, w, x))
+
+    def scalar_video(self, op, mods, ops, opc):
+        """Scalar video instructions (PTX ISA pseudo-code): vadd, vsub,
+        vabsdiff, vmin, vmax, vshl, vshr .dtype.atype.btype{.sat}, vset
+        .atype.btype.cmp; operands may select a byte (.b0-.b3) or halfword
+        (.h0/.h1), extended by the operand's type (the shift amount of
+        vshl/vshr is unsigned; .clamp limits it to 32, .wrap takes it mod
+        32; vshr shifts arithmetically for a signed a).  The exact result is
+        saturated to the dtype range, or to the selected destination field's
+        (.sat); then either the secondary .add (wrapping) / .min / .max with
+        c (see below; vset, which has no dtype, takes c unsigned) or,
+        with a destination selector, merged into c at that field (low bits
+        of the result).  Per the ISA's optSaturate/optSecOp, .min/.max see
+        the intermediate wrapped to 33 bits and c extended by the dtype."""
+        ts = [m for m in mods if m in ("u32", "s32")]
+        rest = [m for m in mods if m not in ("u32", "s32")]
+        cmp = shmode = None
+        if op == "vset":
+            if len(ts) != 2:
+                raise Unsupported(opc)
+            dt, (at, bt) = "u32", ts
+            cmps = [m for m in rest if m in ("eq", "ne", "lt", "le", "gt", "ge")]
+            if len(cmps) != 1:
+                raise Unsupported(opc)
+            cmp = cmps[0]
+            rest.remove(cmp)
+        else:
+            if len(ts) != 3:
+                raise Unsupported(opc)
+            dt, at, bt = ts
+            if op in ("vshl", "vshr"):
+                sm = [m for m in rest if m in ("clamp", "wrap")]
+                if len(sm) != 1 or bt != "u32":
+                    raise Unsupported(opc)
+                shmode = sm[0]
+                rest.remove(shmode)
+        op2 = [m for m in rest if m in ("add", "min", "max")]
+        dreg, dsel = self.video_sel(ops[0])
+        if set(rest) - {"sat", "add", "min", "max"} or len(op2) > 1 or \
+                (op == "vset" and "sat" in rest) or (dsel and op2) or \
+                len(ops) != (4 if op2 or dsel else 3) or \
+                (dsel and not re.fullmatch(r"b[0-3]|h[01]", dsel)):
+            raise Unsupported(opc)
+        a, b = self.video_operand(ops[1], at), self.video_operand(ops[2], bt)
+        if op == "vadd":
+            t = self.op("add i128 %s, %s" % (a, b))
+        elif op == "vsub":
+            t = self.op("sub i128 %s, %s" % (a, b))
+        elif op == "vabsdiff":
+            t = self.call_intr("i128", "llvm.abs.i128", ["i128 %s" % self.op("sub i128 %s, %s" % (a, b)), "i1 false"])
+        elif op in ("vmin", "vmax"):
+            t = self.call_intr("i128", "llvm.s%s.i128" % op[1:], ["i128 %s" % a, "i128 %s" % b])
+        elif op in ("vshl", "vshr"):
+            if shmode == "clamp":
+                n = self.call_intr("i128", "llvm.umin.i128", ["i128 %s" % b, "i128 32"])
+            else:
+                n = self.op("and i128 %s, 31" % b)
+            t = self.op("%s i128 %s, %s" % ("shl" if op == "vshl" else
+                                              ("ashr" if at == "s32" else "lshr"), a, n))
+        else:
+            pred = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}[cmp]
+            t = self.op("zext i1 %s to i128" % self.op("icmp %s i128 %s, %s" % (pred, a, b)))
+        fw = 32 if not dsel else (8 if dsel[0] == "b" else 16)
+        if "sat" in rest:
+            lo, hi = (-(1 << (fw - 1)), (1 << (fw - 1)) - 1) if dt == "s32" else (0, (1 << fw) - 1)
+            t = self.call_intr("i128", "llvm.smax.i128", ["i128 %s" % t, "i128 %d" % lo])
+            t = self.call_intr("i128", "llvm.smin.i128", ["i128 %s" % t, "i128 %d" % hi])
+        c = self.get(ops[3], 32) if len(ops) == 4 else None
+        if op2 and op2[0] in ("min", "max"):
+            # optSecOp works on .s33 values: the intermediate (saturated or
+            # not) wraps to 33 bits, c is extended by the dtype (vset:
+            # unsigned), and the comparison is signed
+            t33 = self.op("trunc i128 %s to i33" % t)
+            t = self.op("sext i33 %s to i128" % t33)
+            cx = self.op("%s i32 %s to i128" % ("sext" if dt == "s32" else "zext", c))
+            t = self.call_intr("i128", "llvm.s%s.i128" % op2[0], ["i128 %s" % t, "i128 %s" % cx])
+            op2 = []
+        r = self.op("trunc i128 %s to i32" % t)
+        if dsel:
+            sh = fw * int(dsel[1])
+            mask = ((1 << fw) - 1) << sh
+            f = self.op("and i32 %s, %d" % (self.op("shl i32 %s, %d" % (r, sh)), mask - (1 << 32) if mask >> 31 else mask))
+            keep = ~mask & 0xFFFFFFFF
+            cc = self.op("and i32 %s, %d" % (c, keep - (1 << 32) if keep >> 31 else keep))
+            r = self.op("or i32 %s, %s" % (cc, f))
+        elif op2:
+            r = self.op("add i32 %s, %s" % (r, c))
+        self.write(dreg, r, 32)
+
+    def i_vmad(self, mods, ops, opc):
+        """vmad.dtype.atype.btype{.po}{.sat}{.shr7|.shr15} d, {-}a{.sel},
+        {-}b{.sel}, {-}c (PTX ISA pseudo-code): the 128-bit product of the
+        extended operands; .po adds 1, a negated product is complemented
+        plus 1, else a negated c is complemented plus 1; c is extended signed
+        if any operand type is signed or anything is negated; .shr7/.shr15
+        shift and keep 64 bits (the shift kind does not matter after the mask);
+        .sat clamps to the s32 or u32 range by that signedness; d is the low
+        32 bits."""
+        ts = [m for m in mods if m in ("u32", "s32")]
+        rest = [m for m in mods if m not in ("u32", "s32")]
+        if len(ts) != 3 or set(rest) - {"po", "sat", "shr7", "shr15"} or \
+                ("shr7" in rest and "shr15" in rest) or len(ops) != 4:
+            raise Unsupported(opc)
+        dt, at, bt = ts
+        neg = []
+        srcs = []
+        for o in ops[1:]:
+            o = o.strip()
+            neg.append(o.startswith("-"))
+            srcs.append(o.lstrip("-").strip())
+        if "po" in rest and any(neg):
+            raise Unsupported(opc)
+        if self.video_sel(ops[0])[1] or self.video_sel(srcs[2])[1]:
+            raise Unsupported(opc)
+        signed = at == "s32" or bt == "s32" or (neg[0] != neg[1]) or neg[2]
+        a, b = self.video_operand(srcs[0], at), self.video_operand(srcs[1], bt)
+        t = self.op("mul i128 %s, %s" % (a, b))
+        c = self.get(srcs[2], 32)
+        lsb = 0
+        if "po" in rest:
+            lsb = 1
+        elif neg[0] != neg[1]:
+            t = self.op("xor i128 %s, -1" % t)
+            lsb = 1
+        elif neg[2]:
+            c = self.op("xor i32 %s, -1" % c)
+            lsb = 1
+        c128 = self.op("%s i32 %s to i128" % ("sext" if signed else "zext", c))
+        t = self.op("add i128 %s, %s" % (t, c128))
+        if lsb:
+            t = self.op("add i128 %s, 1" % t)
+        sc = 7 if "shr7" in rest else 15 if "shr15" in rest else 0
+        if sc:
+            t = self.op("%s i128 %s, %d" % ("ashr" if signed else "lshr", t, sc))
+            t = self.op("trunc i128 %s to i64" % t)
+            t = self.op("%s i64 %s to i128" % ("sext" if signed else "zext", t))
+        if "sat" in rest:
+            if signed:
+                t = self.call_intr("i128", "llvm.smax.i128", ["i128 %s" % t, "i128 %d" % -(1 << 31)])
+                t = self.call_intr("i128", "llvm.smin.i128", ["i128 %s" % t, "i128 %d" % ((1 << 31) - 1)])
+            else:
+                t = self.call_intr("i128", "llvm.umin.i128", ["i128 %s" % t, "i128 %d" % ((1 << 32) - 1)])
+        self.write(ops[0].strip(), self.op("trunc i128 %s to i32" % t), 32)
+
+    def i_vshl(self, mods, ops, opc):
+        return self.scalar_video("vshl", mods, ops, opc)
+
+    def i_vshr(self, mods, ops, opc):
+        return self.scalar_video("vshr", mods, ops, opc)
+
+    def i_vadd(self, mods, ops, opc):
+        return self.scalar_video("vadd", mods, ops, opc)
+
+    def i_vsub(self, mods, ops, opc):
+        return self.scalar_video("vsub", mods, ops, opc)
+
+    def i_vabsdiff(self, mods, ops, opc):
+        return self.scalar_video("vabsdiff", mods, ops, opc)
+
+    def i_vmin(self, mods, ops, opc):
+        return self.scalar_video("vmin", mods, ops, opc)
+
+    def i_vmax(self, mods, ops, opc):
+        return self.scalar_video("vmax", mods, ops, opc)
+
+    def i_vset(self, mods, ops, opc):
+        return self.scalar_video("vset", mods, ops, opc)
+
+    # ---- SIMD video instructions -----------------------------------------
+    VOP = {"vadd", "vsub", "vavrg", "vabsdiff", "vmin", "vmax", "vset"}
+
+    def simd_video(self, op, n, mods, ops, opc):
+        """vop2/vop4.dtype.atype.btype{.sat|.add} d, a, b, c and
+        vset2/vset4.atype.btype.cmp{.add} (PTX ISA pseudo-code): lanes of a and
+        b (halfwords or bytes, extended by atype/btype) are combined exactly
+        (vavrg: (s + 1) >> 1 if s >= 0 else s >> 1; vset: 1 or 0); .sat clamps
+        each lane to the dtype lane range; without .add the lanes form d
+        (lanes outside the destination mask .h0/.h1/.b0... taken from c),
+        with .add d = c + the sum of the lanes in the mask.  Source lanes
+        are selected from the halfwords/bytes of the pair b:a (.hxy, .bxyzw;
+        the last digit is lane 0; defaults .h10/.b3210 for a, .h32/.b7654
+        for b)."""
+        L = 32 // n
+        if "." in ops[3].strip().split("%")[-1]:
+            raise Unsupported("video selector on c in " + opc)
+        sels = []
+        for o, dflt in ((ops[1], "10" if n == 2 else "3210"), (ops[2], "32" if n == 2 else "7654")):
+            r, s = self.video_sel(o)
+            if s is None:
+                s = ("h" if n == 2 else "b") + dflt
+            if (s[0] == "h") != (n == 2) or len(s) != n + 1 or any(int(x) >= 2 * n for x in s[1:]):
+                raise Unsupported("video lane selector ." + s)
+            sels.append([int(x) for x in reversed(s[1:])])    # lane i <- element sel[i]
+        dreg, dmask = self.video_sel(ops[0])
+        lanes_on = list(range(n))
+        if dmask is not None:
+            mm = re.fullmatch(r"([hb])([0-3]+)", dmask)
+            if not mm or (mm.group(1) == "h") != (n == 2) or len(set(mm.group(2))) != len(mm.group(2)) \
+                    or any(int(x) >= n for x in mm.group(2)):
+                raise Unsupported("video mask ." + dmask)
+            lanes_on = sorted(int(x) for x in mm.group(2))
+        ts = [m for m in mods if m in ("u32", "s32")]
+        rest = [m for m in mods if m not in ("u32", "s32")]
+        cmp = None
+        if op == "vset":
+            if len(ts) != 2:
+                raise Unsupported(opc)
+            dt, at, bt = None, ts[0], ts[1]
+            cmps = [m for m in rest if m in ("eq", "ne", "lt", "le", "gt", "ge")]
+            if len(cmps) != 1:
+                raise Unsupported(opc)
+            cmp = cmps[0]
+            rest = [m for m in rest if m != cmp]
+        else:
+            if len(ts) != 3:
+                raise Unsupported(opc)
+            dt, at, bt = ts
+        if not set(rest) <= {"sat", "add"} or ("sat" in rest and "add" in rest) or \
+                ("sat" in rest and op == "vset"):
+            raise Unsupported(opc)
+        vt = "<%d x i32>" % n
+
+        # the 2n halfwords/bytes of the pair (b:a): 0..n-1 from a, n..2n-1 from b
+        ra, rb = self.get(self.video_sel(ops[1])[0], 32), self.get(self.video_sel(ops[2])[0], 32)
+        ab = self.op("or i64 %s, %s" % (self.op("zext i32 %s to i64" % ra),
+                                         self.op("shl i64 %s, 32" % self.op("zext i32 %s to i64" % rb))))
+        pair = self.op("bitcast i64 %s to <%d x i%d>" % (ab, 2 * n, L))
+
+        def lanes(sel, t):
+            x = self.op("shufflevector <%d x i%d> %s, <%d x i%d> poison, <%d x i32> <%s>" % (
+                2 * n, L, pair, 2 * n, L, n, ", ".join("i32 %d" % k for k in sel)))
+            return self.op("%s <%d x i%d> %s to %s" % ("sext" if t == "s32" else "zext", n, L, x, vt))
+        va, vb = lanes(sels[0], at), lanes(sels[1], bt)
+        c = self.get(ops[3], 32)
+        sfx = "v%di32" % n
+        if op == "vadd":
+            t = self.op("add %s %s, %s" % (vt, va, vb))
+        elif op == "vsub":
+            t = self.op("sub %s %s, %s" % (vt, va, vb))
+        elif op == "vavrg":
+            s = self.op("add %s %s, %s" % (vt, va, vb))
+            nonneg = self.op("icmp sge %s %s, zeroinitializer" % (vt, s))
+            s1 = self.op("add %s %s, %s" % (vt, s, "<" + ", ".join(["i32 1"] * n) + ">"))
+            up = self.op("ashr %s %s, %s" % (vt, s1, "<" + ", ".join(["i32 1"] * n) + ">"))
+            dn = self.op("ashr %s %s, %s" % (vt, s, "<" + ", ".join(["i32 1"] * n) + ">"))
+            t = self.op("select <%d x i1> %s, %s %s, %s %s" % (n, nonneg, vt, up, vt, dn))
+        elif op == "vabsdiff":
+            d0 = self.op("sub %s %s, %s" % (vt, va, vb))
+            t = self.call_intr(vt, "llvm.abs." + sfx, ["%s %s" % (vt, d0), "i1 false"])
+        elif op in ("vmin", "vmax"):
+            t = self.call_intr(vt, "llvm.s%s.%s" % (op[1:], sfx), ["%s %s" % (vt, va), "%s %s" % (vt, vb)])
+        else:
+            pred = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}[cmp]
+            b1 = self.op("icmp %s %s %s, %s" % (pred, vt, va, vb))
+            t = self.op("zext <%d x i1> %s to %s" % (n, b1, vt))
+        if "sat" in rest:
+            if dt == "s32":
+                lo, hi = -(1 << (L - 1)), (1 << (L - 1)) - 1
+            else:
+                lo, hi = 0, (1 << L) - 1
+            spl = lambda k: "<" + ", ".join(["i32 %d" % k] * n) + ">"
+            t = self.call_intr(vt, "llvm.smax." + sfx, ["%s %s" % (vt, t), "%s %s" % (vt, spl(lo))])
+            t = self.call_intr(vt, "llvm.smin." + sfx, ["%s %s" % (vt, t), "%s %s" % (vt, spl(hi))])
+        if "add" in rest:
+            acc = c
+            for k in lanes_on:
+                e = self.op("extractelement %s %s, i32 %d" % (vt, t, k))
+                acc = self.op("add i32 %s, %s" % (acc, e))
+            self.write(dreg, acc, 32)
+        else:
+            tr = self.op("trunc %s %s to <%d x i%d>" % (vt, t, n, L))
+            if len(lanes_on) < n:
+                # lanes outside the mask come from c
+                cv = self.op("bitcast i32 %s to <%d x i%d>" % (c, n, L))
+                sel = "<" + ", ".join("i1 %s" % ("true" if k in lanes_on else "false") for k in range(n)) + ">"
+                tr = self.op("select <%d x i1> %s, <%d x i%d> %s, <%d x i%d> %s" % (n, sel, n, L, tr, n, L, cv))
+            self.write(dreg, self.op("bitcast <%d x i%d> %s to i32" % (n, L, tr)), 32)
+
+    def i_vadd2(self, mods, ops, opc):
+        return self.simd_video("vadd", 2, mods, ops, opc)
+
+    def i_vadd4(self, mods, ops, opc):
+        return self.simd_video("vadd", 4, mods, ops, opc)
+
+    def i_vsub2(self, mods, ops, opc):
+        return self.simd_video("vsub", 2, mods, ops, opc)
+
+    def i_vsub4(self, mods, ops, opc):
+        return self.simd_video("vsub", 4, mods, ops, opc)
+
+    def i_vavrg2(self, mods, ops, opc):
+        return self.simd_video("vavrg", 2, mods, ops, opc)
+
+    def i_vavrg4(self, mods, ops, opc):
+        return self.simd_video("vavrg", 4, mods, ops, opc)
+
+    def i_vabsdiff2(self, mods, ops, opc):
+        return self.simd_video("vabsdiff", 2, mods, ops, opc)
+
+    def i_vabsdiff4(self, mods, ops, opc):
+        return self.simd_video("vabsdiff", 4, mods, ops, opc)
+
+    def i_vmin2(self, mods, ops, opc):
+        return self.simd_video("vmin", 2, mods, ops, opc)
+
+    def i_vmin4(self, mods, ops, opc):
+        return self.simd_video("vmin", 4, mods, ops, opc)
+
+    def i_vmax2(self, mods, ops, opc):
+        return self.simd_video("vmax", 2, mods, ops, opc)
+
+    def i_vmax4(self, mods, ops, opc):
+        return self.simd_video("vmax", 4, mods, ops, opc)
+
+    def i_vset2(self, mods, ops, opc):
+        return self.simd_video("vset", 2, mods, ops, opc)
+
+    def i_vset4(self, mods, ops, opc):
+        return self.simd_video("vset", 4, mods, ops, opc)
+
+    def i_mad24(self, mods, ops, opc):
+        """mad24{.hi,.lo}{.sat}: 24x24-bit product (48 bits), its low 32 or
+        bits 47..16, plus c; .sat (.hi.s32 only) saturates the addition."""
+        t = self.types_of(mods)[0]
         p = self.mul24(self.get(ops[1], 32), self.get(ops[2], 32), is_signed(t))
         if "hi" in mods:
             p = self.op("lshr i64 %s, 16" % p)
         p = self.op("trunc i64 %s to i32" % p)
-        self.write(ops[0], self.op("add i32 %s, %s" % (p, self.get(ops[3], 32))), 32)
+        c = self.get(ops[3], 32)
+        if "sat" in mods:
+            if t != "s32" or "hi" not in mods:
+                raise Unsupported(opc)
+            self.write(ops[0], self.call_intr("i32", "llvm.sadd.sat.i32", ["i32 %s" % p, "i32 %s" % c]), 32)
+            return
+        self.write(ops[0], self.op("add i32 %s, %s" % (p, c)), 32)
 
     def divrem(self, mods, ops, opc, signed_op, unsigned_op):
         t = self.types_of(mods)[0]
@@ -1528,6 +2120,24 @@ class Lifter:
         self.write(dsts[0], self.op("extractelement <2 x i1> %s, i32 0" % c), 1)
         self.write(dsts[1], self.op("extractelement <2 x i1> %s, i32 1" % c), 1)
 
+    def i_set(self, mods, ops, opc):
+        """set.cmp{.boolop}{.ftz}.dtype.stype d, a, b{, {!}c}: like setp, then
+        d = all ones (u32/s32) or 1.0 (f32) if true, else 0."""
+        ts = self.types_of(mods)
+        if len(ts) != 2 or ts[0] not in ("u32", "s32", "f32"):
+            raise Unsupported(opc)
+        dt, st = ts
+        boolop = [m for m in mods if m in ("and", "or", "xor")]
+        r = self.compare(mods[0], st, ops[1:3], "ftz" in mods)
+        if boolop:
+            c = ops[3].strip()
+            cv = self.get(c.lstrip("!"), 1)
+            if c.startswith("!"):
+                cv = self.op("xor i1 %s, true" % cv)
+            r = self.op("%s i1 %s, %s" % (boolop[0], r, cv))
+        one = 0x3F800000 if dt == "f32" else 0xFFFFFFFF
+        self.write(ops[0], self.op("select i1 %s, i32 %d, i32 0" % (r, one - (1 << 32) if one >> 31 else one)), 32)
+
     def i_setp(self, mods, ops, opc):
         cmp = mods[0]
         t = self.types_of(mods)[0]
@@ -1549,9 +2159,6 @@ class Lifter:
         self.write(dsts[0].strip(), r, 1)
         if len(dsts) > 1:
             self.write(dsts[1].strip(), nr, 1)
-
-    def i_set(self, mods, ops, opc):
-        raise Unsupported(opc)
 
     # ---- floating point ----------------------------------------------------
     def ftz_in(self, v, fty, ftz):
@@ -1708,7 +2315,8 @@ class Lifter:
 
     def i_fma(self, mods, ops, opc):
         if "oob" in mods:
-            raise Unsupported(opc)
+            # .oob: special handling of "out-of-bounds" NaN inputs; uninterpreted
+            return self.uninterp(mods, ops, opc, 3)
         self.ffma(mods, ops, opc)
 
     def fdiv(self, mods, ops, opc):
@@ -1742,8 +2350,11 @@ class Lifter:
     def fminmax(self, mods, ops, opc, is_min):
         t = self.types_of(mods)[0]
         fty = FPTY[t]
+        # PTX ISA semantics of min/max: a NaN operand yields the other operand,
+        # two NaNs give NaN, and -0.0 < +0.0 -- LLVM's minimumnum/maximumnum;
+        # with .NaN any NaN gives NaN -- minimum/maximum
         fn = ("minimum" if is_min else "maximum") if "NaN" in mods else \
-            ("minnum" if is_min else "maxnum")
+            ("minimumnum" if is_min else "maximumnum")
         args = [self.ftz_in(self.getf(o, t), fty, "ftz" in mods) for o in ops[1:]]
         if "xorsign" in mods:
             # min/max.xorsign.abs: |a| op |b| with sign bit sign(a) ^ sign(b)
@@ -1781,9 +2392,14 @@ class Lifter:
         fty = FPTY[t]
         a = self.ftz_in(self.getf(ops[1], t), fty, "ftz" in mods)
         rm = self.rounding(mods)
-        if rm != "rn":
-            raise Unsupported(opc)
-        r = self.call_intr(fty, "llvm.sqrt.%s" % intname(fty), ["%s %s" % (fty, a)])
+        if rm == "rn":
+            r = self.call_intr(fty, "llvm.sqrt.%s" % intname(fty), ["%s %s" % (fty, a)])
+        else:
+            # directed rounding: the correctly rounded square root in that mode
+            name = "llvm.experimental.constrained.sqrt.%s" % intname(fty)
+            self.declare(name, "declare %s @%s(%s, metadata, metadata)" % (fty, name, fty))
+            r = self.op('call %s @%s(%s %s, metadata !"%s", metadata !"fpexcept.ignore") strictfp'
+                        % (fty, name, fty, a, MODES[rm]))
         self.writef(ops[0], self.post(r, fty, mods), t)
 
     def i_rcp(self, mods, ops, opc):
@@ -1838,7 +2454,34 @@ class Lifter:
         self.write(ops[0], r, 1)
 
     # ---- conversions -------------------------------------------------------
+    def cvt_pack(self, mods, ops, opc):
+        """cvt.pack.sat.{u16,s16}.s32 d, a, b: d = sat(a) << 16 | sat(b);
+        cvt.pack.sat.{u8,s8,u4,s4,u2,s2}.s32.b32 d, a, b, c: the two
+        saturated fields (w bits each, a above b) below c shifted left by 2w
+        (PTX ISA).  Saturation clamps the signed 32-bit inputs to the
+        destination type's range."""
+        rest = [m for m in mods if m not in ("pack", "sat")]
+        if "sat" not in mods or len(rest) not in (2, 3) or rest[1] != "s32" or \
+                not re.fullmatch(r"[us](16|8|4|2)", rest[0]) or \
+                (len(rest) == 3) != (rest[0][1:] != "16") or (len(rest) == 3 and rest[2] != "b32"):
+            raise Unsupported(opc)
+        w = int(rest[0][1:])
+        lo, hi = (-(1 << (w - 1)), (1 << (w - 1)) - 1) if rest[0][0] == "s" else (0, (1 << w) - 1)
+
+        def sat(o):
+            v = self.get(o, 32)
+            v = self.call_intr("i32", "llvm.smax.i32", ["i32 %s" % v, "i32 %d" % lo])
+            v = self.call_intr("i32", "llvm.smin.i32", ["i32 %s" % v, "i32 %d" % hi])
+            return self.op("and i32 %s, %d" % (v, (1 << w) - 1))
+        r = self.op("or i32 %s, %s" % (self.op("shl i32 %s, %d" % (sat(ops[1]), w)), sat(ops[2])))
+        if len(rest) == 3:
+            c = self.op("shl i32 %s, %d" % (self.get(ops[3], 32), 2 * w))
+            r = self.op("or i32 %s, %s" % (c, r))
+        self.write(ops[0], r, 32)
+
     def i_cvt(self, mods, ops, opc):
+        if "pack" in mods:
+            return self.cvt_pack(mods, ops, opc)
         ts = self.types_of(mods)
         if len(ts) != 2:
             raise Unsupported(opc)
@@ -1914,6 +2557,93 @@ class Lifter:
         v = self.post(v, df, mods)
         self.writef(ops[0], v, dt)
 
+    def mbarrier(self, opcode, ops):
+        """mbarrier.* as an uninterpreted call (see mbar.py)."""
+        k = mbar.ptx_key(opcode)
+        dst = None
+        if ops and not ops[0].strip().startswith("["):
+            dst = ops[0].strip()
+            ops = ops[1:]
+        args = []
+        for o in ops:
+            o = o.strip()
+            if o.startswith("["):
+                args.append(self.address(o, "generic"))
+            else:
+                w = self.regs.get(o, 32)
+                args.append("i%d %s" % (w, self.get(o, w)))
+        if dst is None:
+            rty = "void"
+        elif dst == "_":
+            # arrive on shared::cluster has no state result
+            rty = "void" if "shared::cluster" in opcode else "i64"
+        else:
+            rty = "i%d" % self.regs[dst]
+        from llvmsig import parse_type
+        self.declare(k, "declare %s @%s(%s) nounwind" % (rty, k, ", ".join(parse_type(a)[0] for a in args)))
+        if rty == "void":
+            self.emit("call void @%s(%s)" % (k, ", ".join(args)))
+        else:
+            r = self.op("call %s @%s(%s)" % (rty, k, ", ".join(args)))
+            if dst != "_":
+                self.write(dst, r, int(rty[1:]))
+
+    def generic_op(self, name, ops):
+        """Instruction modelled through a probe-derived opaque call (probe.py)."""
+        self.used_probe = True
+        csig = self.decls[name]
+        flat = probe.flatten_operands(ops)
+        if flat is None:
+            raise Unsupported("generic op operands")
+        nd = 0 if csig.ret == "void" else csig.ret.count("i64")
+        dsts, args = flat[:nd], flat[nd:]
+        if len(args) != len(csig.args):
+            raise Unsupported("generic op arity")
+        vals = []
+        for (kind, text), carg in zip(args, csig.args):
+            if text.strip() in self.handle_params and carg.ty == "i64":
+                vals.append(self.handle_params[text.strip()])
+                continue
+            if kind == "addr" and carg.ty == "i64":
+                base = text.split("+")[0].strip()
+                if base not in self.regs and "+" not in text and base in self.name_map:
+                    # a texture/surface reference named directly: its handle is
+                    # what the source obtains with texsurf.handle on the global
+                    # (texsurf.handle(@g) is modelled as the address of @g,
+                    # which is what PTX uses as the handle: mov.u64 %rd, g)
+                    vals.append("i64 " + self.symbol_addr(base))
+                    continue
+                if base not in self.regs or "+" in text:
+                    raise Unsupported("generic op narrow address")
+                w = self.regs[base]
+                vals.append("i64 " + self.resize(self.read_reg(base, w), w, 64, False))
+            elif kind == "addr":
+                p = self.address("[" + text + "]", "generic")
+                if p.rsplit(" ", 1)[0] != carg.ty:
+                    raise Unsupported("generic op pointer type")
+                vals.append(p)
+            else:
+                cw = int(carg.ty[1:]) if re.fullmatch(r"i\d+", carg.ty) else 64
+                if text in self.regs:
+                    w = self.regs[text]
+                    v = self.read_reg(text, w)
+                    v = self.resize(v, w, cw, False)
+                else:
+                    v = self.get(text, cw)
+                vals.append("i%d %s" % (cw, v))
+        if nd == 0:
+            self.emit("call void @%s(%s)" % (name, ", ".join(vals)))
+            return
+        r = self.op("call %s @%s(%s)" % (csig.ret, name, ", ".join(vals)))
+        for q, (kind, d) in enumerate(dsts):
+            if d == "_":
+                continue
+            e = self.op("extractvalue %s %s, %d" % (csig.ret, r, q))
+            w = self.regs.get(d)
+            if w is None:
+                raise Unsupported("generic op destination " + d)
+            self.write(d, self.resize(e, 64, w, False), w)
+
     def cvt_narrow(self, opcode, ops):
         """Narrow-format conversion as an uninterpreted function (narrowcvt)."""
         k = narrowcvt.ptx_key(opcode)
@@ -1924,8 +2654,11 @@ class Lifter:
             raise Unsupported("narrow cvt destination " + d)
         w = self.regs[d]
         args, tys = [], []
+        flat = []
         for o in ops[1:]:
-            o = o.strip()
+            vo = self.vec_ops(o)
+            flat.extend(vo if vo else [o.strip()])   # {a, b, c, d}: one arg per lane
+        for o in flat:
             if o not in self.regs:
                 raise Unsupported("narrow cvt operand " + o)
             ow = self.regs[o]
@@ -1982,7 +2715,9 @@ class Lifter:
         return t[0], vec, space[0] if space else "generic"
 
     def check_mem_mods(self, mods, opc):
-        bad = [m for m in mods if m in ("mmio", "async", "bulk", "multimem", "tensor")
+        # .mmio only orders the access for memory-mapped I/O: a plain access
+        # under single-thread semantics
+        bad = [m for m in mods if m in ("async", "bulk", "multimem", "tensor")
                or m.startswith("unified") or m.startswith("mbarrier")]
         if bad:
             raise Unsupported(opc)
@@ -2003,6 +2738,17 @@ class Lifter:
             pv = self.op("load ptr, %s, align 8" % p)
             self.emit("store ptr %s, ptr %s" % (pv, self.dyn_slot(d0)))
             v = self.op("ptrtoint ptr %s to i64" % pv)
+        elif vec > 1 and eb >= 8 and SCALARIZE:
+            # a vector access as one access per element (Alive2 relates these
+            # to the source's element accesses far more easily than a single
+            # wide integer); the first keeps the whole vector's alignment
+            for k, d in enumerate(dsts):
+                q = self.lane_ptr(p, k * eb // 8)
+                x = self.op("load i%d, %s, align %d" % (eb, q, total // 8 if k == 0 else
+                                                        lane_align(total // 8, k * eb // 8)))
+                if d != "_":
+                    self.write(d, x, eb, is_signed(t))
+            return
         else:
             v = self.op("load i%d, %s, align %d" % (total, p, total // 8))
         for k, d in enumerate(dsts):
@@ -2012,10 +2758,536 @@ class Lifter:
             x = self.resize(x, total, eb, False)
             self.write(d, x, eb, is_signed(t))
 
+    def lane_ptr(self, p, off):
+        """Typed pointer operand p ("ptr %x") advanced by off bytes."""
+        if not off:
+            return p
+        ty, v = p.rsplit(" ", 1)
+        return "%s %s" % (ty, self.op("getelementptr i8, %s, i64 %d" % (p, off)))
+
+    # ---- non-bulk asynchronous copy (cp.async) ------------------------------
+    CP_ASYNC_MODS = {"async", "ca", "cg", "shared", "shared::cta", "global",
+                     "L2::cache_hint", "L2::64B", "L2::128B", "L2::256B"}
+
+    def i_cp(self, mods, ops, opc):
+        """cp.async.{ca,cg}.shared{::cta}.global [d], [s], cp-size{, src-size |
+        , ignore-src}{, cache-policy}: copy src-size bytes (default cp-size)
+        and zero-fill the rest up to cp-size; ignore-src copies zeros.  The
+        copy is modelled as completing at once: reading the destination
+        before cp.async.wait_* is a data race in PTX, so this only removes
+        behaviours.  commit_group/wait_group/wait_all are then no-ops."""
+        ms = set(mods)
+        import prio
+        pr = prio.ptx("cp", mods, ops)
+        if pr is not None:
+            return self.prio_call(pr, opc)
+        import bulkkey
+        bq = bulkkey.ptx(mods, ops)
+        if bq is not None and (bulkkey.OPAQUE or not bulkkey.semantic(bq[0])):
+            return self.prio_call(bq, opc, bulkkey.name_of(bq[0], len(bq[1])))
+        import tma
+        tg = tma.ptx(mods, ops)
+        if tg is not None:
+            toks, canon = tg
+            vals, tys = [], []
+            for o in canon:
+                br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+                r = br.group(1) if br else o
+                if r not in self.regs:
+                    raise Unsupported("operand " + opc)
+                w = self.regs[r]
+                vals.append("i%d %s" % (w, self.get(r, w)))
+                tys.append("i%d" % w)
+            kname = tma.name_of(toks) + "." + "_".join(tys)
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(tys)))
+            self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+            return
+        if "bulk" in ms and "tensor" not in ms:
+            return self.cp_async_bulk(ms, ops, opc)
+        if ms == {"async", "commit_group"} or ms == {"async", "wait_group"} or \
+                ms == {"async", "wait_all"}:
+            return
+        if "async" not in ms or not ms <= self.CP_ASYNC_MODS or \
+                len(ms & {"ca", "cg"}) != 1 or "global" not in ms or \
+                not ms & {"shared", "shared::cta"}:
+            raise Unsupported("opcode " + opc)
+        rest = [o.strip() for o in ops[3:]]
+        if "L2::cache_hint" in ms:
+            if not rest:
+                raise Unsupported("opcode " + opc)
+            rest = rest[:-1]      # cache-policy: a hint only
+        size = self.imm(ops[2].strip())
+        if size not in (4, 8, 16) or ("cg" in ms and size != 16) or len(rest) > 1:
+            raise Unsupported("opcode " + opc)
+        d = self.address(ops[0], "shared")
+        s = self.address(ops[1], "global")
+        if not rest:
+            n = self.const(size, 32)
+        elif rest[0] in self.regs and self.regs[rest[0]] == 1:
+            ign = self.get(rest[0], 1)
+            n = self.op("select i1 %s, i32 0, i32 %d" % (ign, size))
+        else:
+            n = self.get(rest[0], 32)
+        self.cp_async_copy(size, d, s, n)
+
+    def cp_async_bulk(self, ms, ops, opc):
+        """Non-tensor cp.async.bulk without multicast/masks/validation, as a
+        copy completing at once (see i_cp), plus an opaque complete-tx on the
+        mbarrier for the global/shared::cta -> shared forms.  Bulk prefetch
+        and the bulk-group operations are then no-ops."""
+        hint = "L2::cache_hint" in ms
+        ms = ms - {"L2::cache_hint"}
+        if ms in ({"async", "bulk", "commit_group"}, {"async", "bulk", "wait_group"},
+                  {"async", "bulk", "wait_group", "read"}):
+            return
+        if ms == {"async", "bulk", "prefetch", "L2", "global"}:
+            return
+        ops = [o.strip() for o in ops]
+        mb = "mbarrier::complete_tx::bytes"
+        if ms in ({"async", "bulk", "shared::cluster", "global", mb},
+                  {"async", "bulk", "shared::cta", "global", mb}) and \
+                len(ops) == 4 + hint:
+            dsp, ssp, mbar = "shared", "global", ops[3]
+        elif ms == {"async", "bulk", "shared::cluster", "shared::cta", mb} and \
+                not hint and len(ops) == 4:
+            dsp, ssp, mbar = "shared", "shared", ops[3]
+        elif ms == {"async", "bulk", "global", "shared::cta", "bulk_group"} and \
+                len(ops) == 3 + hint:
+            dsp, ssp, mbar = "global", "shared", None
+        else:
+            raise Unsupported("opcode " + opc)
+        # operand order is [dst], [src] for every form; a bare register or
+        # symbol in brackets
+        d = self.address(ops[0], dsp)
+        sp = self.address(ops[1], ssp)
+        n = self.get(ops[2], 32)
+        mp = self.address(mbar, "shared") if mbar else None
+        lines, decls = bulk_copy_ir(d, sp, n, mp, self.tmp)
+        for l in lines:
+            self.emit(l)
+        self.extra_decls.update(decls)
+
+    def cp_async_copy(self, size, d, s, n):
+        """d, s: typed pointer operands; n: i32 number of bytes to copy."""
+        lines, decls = cp_async_ir(size, d, s, n, self.tmp)
+        for l in lines:
+            self.emit(l)
+        self.extra_decls.update(decls)
+
+    def st_async(self, mods, ops, opc):
+        """st.async.shared::cluster.mbarrier::complete_tx::bytes{.vN}.T [a], v,
+        [mbar]: a store, then an opaque complete-tx of its size on mbar (as
+        for cp.async.bulk); st.async{.mmio}.release.{sys,gpu}.global.T [a], v:
+        a store (single-thread semantics).  multimem forms are not modelled."""
+        ms = [m for m in mods if m != "async"]
+        rest = [m for m in ms if m in TBITS or m in ("v2", "v4")]
+        other = set(ms) - set(rest)
+        mb = "mbarrier::complete_tx::bytes"
+        if other == {"shared::cluster", mb} and len(ops) == 3:
+            self.i_st(["shared::cluster"] + rest, ops[:2], opc)
+            t, vec, _ = self.mem_info(rest)
+            mp = self.address(ops[2], "shared")
+            self.declare("ptx.cp.async.bulk.complete_tx",
+                         "declare void @ptx.cp.async.bulk.complete_tx(ptr, i32) nounwind")
+            self.emit("call void @ptx.cp.async.bulk.complete_tx(%s, i32 %d)"
+                      % (mp, TBITS[t] * vec // 8))
+            return
+        if other - {"mmio"} in ({"release", "sys", "global"}, {"release", "gpu", "global"}) \
+                and not ("mmio" in other and "gpu" in other) and len(ops) == 2:
+            return self.i_st(["global"] + rest, ops, opc)
+        raise Unsupported("opcode " + opc)
+
+    def i_discard(self, mods, ops, opc):
+        """discard{.global}.L2 [a], 128: the 128-byte line at a (128-byte
+        aligned) becomes indeterminate; modelled as a store of poison."""
+        if mods not in (["global", "L2"], ["L2"]) or len(ops) != 2 or \
+                self.imm(ops[1].strip()) != 128:
+            raise Unsupported("opcode " + opc)
+        p = self.address(ops[0], "global" if "global" in mods else "generic")
+        self.emit(discard_ir(p))
+
+    def i_tcgen05(self, mods, ops, opc):
+        """tcgen05.ld/st as uninterpreted calls (see tcgen05ls.py); the
+        other tcgen05 instructions are probe-derived."""
+        import tcgen05ls
+        import tcgen05ops
+        import tcgen05mma
+        mm_ = tcgen05mma.ptx(mods, ops)
+        if mm_ is not None:
+            toks, canon = mm_
+            vals, tys = [], []
+            for o in canon:
+                if o.startswith("{"):
+                    rs = self.vec_ops(o)
+                    acc = "poison"
+                    for k, r in enumerate(rs):
+                        acc = self.op("insertelement <%d x i32> %s, i32 %s, i32 %d" % (
+                            len(rs), acc, self.get(r, 32), k))
+                    vals.append("<%d x i32> %s" % (len(rs), acc))
+                    tys.append("v%di32" % len(rs))
+                    continue
+                br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+                r = br.group(1) if br else o
+                if r in self.regs:
+                    w = self.regs[r]
+                    vals.append("i%d %s" % (w, self.get(r, w)))
+                    tys.append("i%d" % w)
+                elif self.imm(r) is not None:
+                    vals.append("i64 %d" % self.imm(r))
+                    tys.append("i64")
+                else:
+                    raise Unsupported("operand " + opc)
+            kname = tcgen05mma.name_of(toks).replace("::", "__") + "." + "_".join(tys)
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(
+                "<%s x i32>" % t[1:-3] if t.startswith("v") else t for t in tys)))
+            self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+            return
+        rr = tcgen05ls.red_ptx(mods)
+        if rr is not None:
+            shape, num, ty, op, ab, nan = rr
+            n = tcgen05ls.nregs(shape, num)
+            kname = tcgen05ls.red_key(*rr)
+            self.declare(kname, tcgen05ls.red_decl(*rr))
+            ops_ = [o.strip() for o in ops]
+            regs = self.vec_ops(ops_[0])
+            mm = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", ops_[2]) if len(ops_) >= 3 else None
+            if regs is None or len(regs) != n or not mm:
+                raise Unsupported("operands " + opc)
+            args = ["i32 %s" % self.get(mm.group(1), 32)]
+            if shape == "16x32bx2":
+                if len(ops_) != 4:
+                    raise Unsupported("operands " + opc)
+                args.append("i64 %s" % self.get(ops_[3], 64))
+            st = "{ <%d x i32>, i32 }" % n
+            v = self.op("call %s @%s(%s)" % (st, kname, ", ".join(args)))
+            vec = self.op("extractvalue %s %s, 0" % (st, v))
+            for k, r in enumerate(regs):
+                self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (n, vec, k)), 32)
+            self.write(ops_[1], self.op("extractvalue %s %s, 1" % (st, v)), 32)
+            return
+        t = tcgen05ls.ptx(mods)
+        if t is None:
+            toks = tcgen05ops.ptx(mods)
+            if toks is None:
+                raise Unsupported("opcode " + opc)
+            # operands as integers of their register width (addresses too)
+            vals, tys = [], []
+            for o in [o.strip() for o in ops]:
+                mm = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+                r = mm.group(1) if mm else o
+                if r not in self.regs or self.regs[r] == 1:
+                    raise Unsupported("operand " + opc)
+                w = self.regs[r]
+                vals.append("i%d %s" % (w, self.get(r, w)))
+                tys.append("i%d" % w)
+            kname = tcgen05ops.name_of(toks) + ("." + "_".join(tys) if tys else "")
+            self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(tys)))
+            self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+            return
+        kind, shape, num, packed = t
+        n = tcgen05ls.nregs(shape, num)
+        name = tcgen05ls.key(kind, shape, num, packed)
+        self.declare(name, tcgen05ls.decl(kind, shape, num, packed))
+        ops = [o.strip() for o in ops]
+        # ld {regs}, [a]{, off};   st [a]{, off}, {regs}
+        regs = self.vec_ops(ops[0] if kind == "ld" else ops[-1])
+        addr = ops[1] if kind == "ld" else ops[0]
+        m = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", addr)
+        if not m or regs is None or len(regs) != n:
+            raise Unsupported("operands " + opc)
+        args = ["i32 %s" % self.get(m.group(1), 32)]
+        if shape == "16x32bx2":
+            if len(ops) != 3:
+                raise Unsupported("operands " + opc)
+            args.append("i64 %s" % self.get(ops[2] if kind == "ld" else ops[1], 64))
+        vt = "<%d x i32>" % n
+        if kind == "ld":
+            v = self.op("call %s @%s(%s)" % (vt, name, ", ".join(args)))
+            for k, r in enumerate(regs):
+                self.write(r, self.op("extractelement %s %s, i32 %d" % (vt, v, k)), 32)
+        else:
+            acc = "poison"
+            for k, r in enumerate(regs):
+                acc = self.op("insertelement %s %s, i32 %s, i32 %d" % (vt, acc, self.get(r, 32), k))
+            self.emit("call void @%s(%s)" % (name, ", ".join(args + ["%s %s" % (vt, acc)])))
+
+    def prio_call(self, pr, opc, kname=None):
+        """An uninterpreted call of prio.py, every operand as a zero-extended
+        i64 (registers at their width, immediates as constants)."""
+        import prio
+        toks, flat = pr
+        vals = []
+        for o in flat:
+            br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+            r = br.group(1) if br else o
+            if r in self.regs and self.regs[r] > 1:
+                w = self.regs[r]
+                v = self.get(r, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(r) is not None:
+                vals.append("i64 %d" % (self.imm(r) & ((1 << 64) - 1)))
+            else:
+                raise Unsupported("operand " + opc)
+        kname = kname or prio.name_of(toks) + ".n%d" % len(vals)
+        self.declare(kname, "declare void @%s(%s) nounwind" % (kname, ", ".join(["i64"] * len(vals))))
+        self.emit("call void @%s(%s)" % (kname, ", ".join(vals)))
+
+    def cluster_call(self, base, mods, ops, opc):
+        """Keyed cluster/grid operation (prio.cluster_ptx); operands as
+        zero-extended i64 (128-bit as i128), result as i64 truncated to the
+        destination register."""
+        import prio
+        r = prio.cluster_ptx(base, mods, ops)
+        if r is None:
+            raise Unsupported("opcode " + opc)
+        toks, flat, res = r
+        vals, tys = [], []
+        for o in flat:
+            br = re.fullmatch(r"\[\s*([%\w$]+)\s*\]", o)
+            x = br.group(1) if br else o
+            if x in self.regs and self.regs[x] == 128:
+                vals.append("i128 %s" % self.get(x, 128))
+                tys.append("i128")
+            elif x in self.regs and self.regs[x] > 1:
+                w = self.regs[x]
+                v = self.get(x, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+                tys.append("i64")
+            elif self.imm(x) is not None:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+                tys.append("i64")
+            else:
+                raise Unsupported("operand " + opc)
+        kname = prio.name_of(toks) + ".n" + "_".join(tys) + (".r" if res else "")
+        rty = "i64" if res else "void"
+        self.declare(kname, "declare %s @%s(%s) nounwind" % (rty, kname, ", ".join(tys)))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if res is None:
+            self.emit(call)
+            return
+        v = self.op(call)
+        w = self.regs.get(res)
+        if w is None:
+            raise Unsupported("result " + opc)
+        self.write(res, self.resize(v, 64, w, False) if w != 64 else v, w)
+
+    def i_griddepcontrol(self, mods, ops, opc):
+        return self.cluster_call("griddepcontrol", mods, ops, opc)
+
+    def i_pmevent(self, mods, ops, opc):
+        if not mods:
+            # pmevent N: signal a performance-monitor event (no effect on
+            # program state; a keyed call keeps it in place)
+            return self.opaque_keyed("pmevent", mods, ops, opc, False)
+        return self.cluster_call("pmevent", mods, ops, opc)
+
+    def i_clusterlaunchcontrol(self, mods, ops, opc):
+        return self.cluster_call("clusterlaunchcontrol", mods, ops, opc)
+
+    def i_getctarank(self, mods, ops, opc):
+        return self.cluster_call("getctarank", mods, ops, opc)
+
+    def i_mapa(self, mods, ops, opc):
+        return self.cluster_call("mapa", mods, ops, opc)
+
+    def texsurf_call(self, base, mods, ops, opc):
+        import texsurf
+        import tma
+        r = texsurf.ptx(base, mods)
+        if r is None:
+            raise Unsupported("opcode " + opc)
+        toks, res_first = r
+        if base == "tex" and len(ops) >= 2 and texsurf.tex_has_sampler(ops[1]):
+            toks = toks | {"sampler"}
+        flat = tma._flatten(ops)
+        res = []
+        if res_first:
+            o0 = ops[0].strip()
+            res = self.vec_ops(o0) or [o0]
+            flat = tma._flatten(ops[1:])
+        vals = []
+        for o in flat:
+            x = o.strip()
+            br = re.fullmatch(r"\[\s*([%\w$.]+)\s*\]", x)
+            if br:
+                x = br.group(1)
+            if x in self.regs and self.regs[x] > 1:
+                w = self.regs[x]
+                v = self.get(x, w)
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(x) is not None:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            elif x in self.handle_params and self.handle_params[x].startswith("i64 "):
+                vals.append(self.handle_params[x])           # .texref/.surfref parameter
+            elif re.fullmatch(r"[\w$.]+", x):
+                vals.append("i64 %s" % self.get(x, 64))     # texture/surface symbol
+            else:
+                raise Unsupported("operand " + opc)
+        kname = texsurf.name_of(toks, len(res), len(vals))
+        rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
+        self.declare(kname, "declare %s @%s(%s) " % (rty, kname, ", ".join(["i64"] * len(vals)))
+                     + texsurf.attrs(toks))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if not res:
+            self.emit(call)
+            return
+        v = self.op(call)
+        for k, d in enumerate(res):
+            if d == "_":
+                continue
+            e = self.op("extractvalue %s %s, %d" % (rty, v, k))
+            w = self.regs[d]
+            self.write(d, self.resize(e, 64, w, False) if w != 64 else e, w)
+
+    def i_txq(self, mods, ops, opc):
+        return self.texsurf_call("txq", mods, ops, opc)
+
+    def i_suq(self, mods, ops, opc):
+        return self.texsurf_call("suq", mods, ops, opc)
+
+    def i_suld(self, mods, ops, opc):
+        return self.texsurf_call("suld", mods, ops, opc)
+
+    def i_sust(self, mods, ops, opc):
+        return self.texsurf_call("sust", mods, ops, opc)
+
+    def i_tex(self, mods, ops, opc):
+        return self.texsurf_call("tex", mods, ops, opc)
+
+    def i_tensormap(self, mods, ops, opc):
+        import prio
+        pr = prio.ptx("tensormap", mods, ops)
+        if pr is None:
+            raise Unsupported("opcode " + opc)
+        return self.prio_call(pr, opc)
+
+    def i_applypriority(self, mods, ops, opc):
+        import prio
+        pr = prio.ptx("applypriority", mods, ops)
+        if pr is None:
+            raise Unsupported("opcode " + opc)
+        return self.prio_call(pr, opc)
+
+    def i_wgmma(self, mods, ops, opc):
+        """wgmma.fence / commit_group / wait_group (.sync.aligned) only order
+        the asynchronous warpgroup MMA (itself opaque): no-ops under
+        single-thread semantics, like the other fences."""
+        if mods in (["fence", "sync", "aligned"], ["commit_group", "sync", "aligned"],
+                    ["wait_group", "sync", "aligned"]):
+            return
+        raise Unsupported("opcode " + opc)
+
+    def i_multimem(self, mods, ops, opc):
+        """multimem.st.async.release.{sys,gpu}.global.T [a], v: a store to every
+        replica of a multimem address; in the single-memory model, a store to
+        a (the same as the source's st.async with isMultimem).  multimem
+        loads/reductions combine replicas and are not modelled."""
+        rest = [m for m in mods if m in TBITS]
+        other = set(mods) - set(rest)
+        if other in ({"st", "async", "release", "sys", "global"},
+                     {"st", "async", "release", "gpu", "global"}) and len(ops) == 2:
+            return self.i_st(["global"] + rest, ops, opc)
+        raise Unsupported("opcode " + opc)
+
+    def st_bulk(self, mods, ops, opc):
+        """st.bulk{.weak}{.shared::cta} [a], size, 0: zero `size` bytes
+        (size a multiple of 8, a 8-byte aligned; initval must be 0)."""
+        import bulkkey
+        if bulkkey.OPAQUE:
+            bq = bulkkey.st_ptx(mods, ops)
+            if bq is None:
+                raise Unsupported("opcode " + opc)
+            return self.prio_call(bq, opc, bulkkey.name_of(bq[0], len(bq[1])))
+        if not set(mods) <= {"bulk", "weak", "shared::cta"} or len(ops) != 3 or \
+                self.imm(ops[2].strip()) != 0:
+            raise Unsupported("opcode " + opc)
+        p = self.address(ops[0], "shared" if "shared::cta" in mods else "generic")
+        sz = ops[1].strip()
+        if sz in self.regs and self.regs[sz] == 32:
+            n = self.resize(self.get(sz, 32), 32, 64, False)
+        else:
+            n = self.get(sz, 64)
+        lines, decls = st_bulk_ir(p, n, self.tmp)
+        for l in lines:
+            self.emit(l)
+        self.extra_decls.update(decls)
+
+    def i_spdecompress(self, mods, ops, opc):
+        """spdecompress.elemsize.idxsize.sp::X:Y.xN {data}, {mdata}, {cdata}
+        (see sparse.py)."""
+        import sparse
+        if len(mods) != 4 or mods[0] not in ("b8", "b16") or mods[1] not in ("b2", "b4") \
+                or not sparse.SPF.fullmatch(mods[2]) or not re.fullmatch(r"x\d+", mods[3]):
+            raise Unsupported("opcode " + opc)
+        E, I = int(mods[0][1:]), int(mods[1][1:])
+        X, Y = map(int, sparse.SPF.fullmatch(mods[2]).groups())
+        num = int(mods[3][1:])
+        if not sparse.check(E, I, X, Y, num):
+            raise Unsupported("opcode " + opc)
+        bundles = [self.vec_ops(o) or [o.strip()] for o in ops[:3]]
+        if len(ops) != 3 or [len(b) for b in bundles] != [
+                sparse.regs(Y * E * num), sparse.regs(X * I * num), sparse.regs(X * E * num)]:
+            raise Unsupported("operand count " + opc)
+
+        m = [self.get(r, 32) for r in bundles[1]]
+        c = [self.get(r, 32) for r in bundles[2]]
+        lines, v = sparse.spdecompress_ir(E, I, X, Y, num, m, c, self.tmp)
+        for l in lines:
+            self.emit(l)
+        D = Y * E * num // 32
+        iv = self.op("bitcast <%d x i%d> %s to <%d x i32>" % (Y * num, E, v, D))
+        for k, r in enumerate(bundles[0]):
+            self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (D, iv, k)), 32)
+
+    # stacksave/stackrestore: opaque calls, matching the source's
+    # llvm.stacksave/llvm.stackrestore (renamed by tv.py)
+    def i_stacksave(self, mods, ops, opc):
+        if mods not in (["u64"], ["u32"]):
+            raise Unsupported("opcode " + opc)
+        self.declare("ptx.stacksave", "declare ptr @ptx.stacksave() nounwind")
+        p = self.op("call ptr @ptx.stacksave()")
+        bits = 64 if mods == ["u64"] else 32
+        v = self.op("ptrtoint ptr %s to i%d" % (p, bits))
+        self.write(ops[0], v, bits)
+
+    def i_stackrestore(self, mods, ops, opc):
+        if mods not in (["u64"], ["u32"]):
+            raise Unsupported("opcode " + opc)
+        self.declare("ptx.stackrestore", "declare void @ptx.stackrestore(ptr) nounwind")
+        p = self.address("[%s]" % ops[0].strip(), "local")
+        self.emit("call void @ptx.stackrestore(%s)" % p)
+
+    def i_spcompress(self, mods, ops, opc):
+        """spcompress (keyed, sparse.spc_*): {mdata}, {cdata}, {data}, spdesc."""
+        import sparse
+        k = sparse.spc_ptx(mods)
+        if k is None or len(ops) != 4:
+            raise Unsupported("opcode " + opc)
+        E, I, num = k
+        d, c, mr = sparse.spc_regs(E, I, num)
+        md, cd, dd = (self.vec_ops(o) for o in ops[:3])
+        if not md or not cd or not dd or (len(md), len(cd), len(dd)) != (mr, c, d):
+            raise Unsupported("operands " + opc)
+        name = sparse.spc_key(E, I, num)
+        self.declare(name, sparse.spc_decl(E, I, num))
+        acc = "poison"
+        for i, r in enumerate(dd):
+            acc = self.op("insertelement <%d x i32> %s, i32 %s, i32 %d" % (d, acc, self.get(r, 32), i))
+        st = "{ <%d x i32>, <%d x i32> }" % (mr, c)
+        v = self.op("call %s @%s(<%d x i32> %s, i32 %s)" % (st, name, d, acc, self.get(ops[3].strip(), 32)))
+        for idx, regs, n in ((0, md, mr), (1, cd, c)):
+            vec = self.op("extractvalue %s %s, %d" % (st, v, idx))
+            for i, r in enumerate(regs):
+                self.write(r, self.op("extractelement <%d x i32> %s, i32 %d" % (n, vec, i)), 32)
+
     def i_ldu(self, mods, ops, opc):
         self.i_ld(mods, ops, opc)
 
     def i_st(self, mods, ops, opc):
+        if "bulk" in mods:
+            return self.st_bulk(mods, ops, opc)
+        if "async" in mods:
+            return self.st_async(mods, ops, opc)
         self.check_mem_mods(mods, opc)
         t, vec, space = self.mem_info(mods)
         eb = TBITS[t]
@@ -2035,6 +3307,12 @@ class Lifter:
         if len(srcs) != vec:
             raise Unsupported("vector arity " + opc)
         total = eb * vec
+        if vec > 1 and eb >= 8 and SCALARIZE:
+            for k, s_ in enumerate(srcs):
+                q = self.lane_ptr(p, k * eb // 8)
+                self.emit("store i%d %s, %s, align %d" % (
+                    eb, self.get(s_, eb), q, total // 8 if k == 0 else lane_align(total // 8, k * eb // 8)))
+            return
         acc = None
         for k, s in enumerate(srcs):
             x = self.resize(self.get(s, eb), eb, total, False)
@@ -2043,11 +3321,25 @@ class Lifter:
             acc = x if acc is None else self.op("or i%d %s, %s" % (total, acc, x))
         self.emit("store i%d %s, %s, align %d" % (total, acc, p, total // 8))
 
+    def atomic_lane(self, kind, t, p, b, dst):
+        """One floating-point read-modify-write lane of a vector atom/red."""
+        bits = TBITS[t]
+        it = "i%d" % bits
+        fty = FPTY[t]
+        old = self.op("load %s, %s, align %d" % (it, p, bits // 8))
+        fo = self.op("bitcast %s %s to %s" % (it, old, fty))
+        fb = self.op("bitcast %s %s to %s" % (it, b, fty))
+        if kind == "add":
+            fr = self.op("fadd %s %s, %s" % (fty, fo, fb))
+        else:
+            fr = self.call_intr(fty, "llvm.%snum.%s" % (kind, intname(fty)), ["%s %s" % (fty, fo), "%s %s" % (fty, fb)])
+        self.emit("store %s %s, %s, align %d" % (it, self.op("bitcast %s %s to %s" % (fty, fr, it)), p, bits // 8))
+        if dst is not None:
+            self.write(dst, old, bits)
+
     def atomic_rmw(self, mods, ops, opc, has_result):
         self.check_mem_mods(mods, opc)
         t, vec, space = self.mem_info(mods)
-        if vec != 1:
-            raise Unsupported(opc)
         bits = TBITS[t]
         it = "i%d" % bits
         ops_ = ["add", "min", "max", "inc", "dec", "and", "or", "xor", "exch", "cas"]
@@ -2056,6 +3348,21 @@ class Lifter:
             raise Unsupported(opc)
         kind = kind[0]
         o = ops if has_result else ["_"] + ops
+        if vec != 1:
+            # vector atom/red (.v2/.v4/.v8 of f32, f16, bf16 or their x2
+            # packs; .add/.min/.max): under single-thread semantics one
+            # read-modify-write per lane on consecutive elements
+            if not is_float(t) or kind not in ("add", "min", "max"):
+                raise Unsupported(opc)
+            ds = self.vec_ops(o[0]) if has_result else None
+            bs = self.vec_ops(o[2])
+            if bs is None or len(bs) != vec or (has_result and (ds is None or len(ds) != vec)):
+                raise Unsupported(opc)
+            base = self.address(o[1], space)
+            for k in range(vec):
+                pk = base if k == 0 else "ptr " + self.op("getelementptr i8, %s, i64 %d" % (base, k * bits // 8))
+                self.atomic_lane(kind, t, pk, self.get(bs[k], bits), ds[k] if has_result else None)
+            return
         p = self.address(o[1], space)
         old = self.op("load %s, %s, align %d" % (it, p, bits // 8))
         b = self.get(o[2], bits)
@@ -2122,18 +3429,43 @@ class Lifter:
             if len(ops) > 1 and ops[1].startswith("(") else []
         indirect = callee.startswith("%")
         if indirect:
-            sigs = {(x.ret, tuple(a.ty for a in x.args), x.vararg): x for x in self.indirect_sigs}
+            key = self.base_of.get(callee)
+            target = None
+            if key is not None and key[0] == "sym" and callee in self.exact and \
+                    key[1] in self.name_map:
+                target = self.name_map[key[1]]     # mov %rd, func: a known function
+            cands = [x for x in self.indirect_sigs
+                     if getattr(x, "callee", None) == target and len(self.sized_args(x.args)) == len(args)
+                     and (x.ret == "void" or self.zero_sized(x.ret)) == (not rets)]
+            sigs = {(x.ret, tuple(a.ty for a in x.args), x.vararg): x for x in cands}
+            if not sigs and target is not None and target in self.decls and \
+                    self.decls[target].vararg:
+                # a variadic function called through a prototype: the PTX has
+                # the fixed arguments plus the buffer; use the call site's
+                # return type (it may differ from the declaration's)
+                import copy
+                dsig = self.decls[target]
+                rts = {x.ret for x in self.indirect_sigs if getattr(x, "callee", None) == target}
+                if len(rts) == 1:
+                    csig = copy.copy(dsig)
+                    csig.ret = next(iter(rts))
+                    csig.ret_attrs = ""
+                    return self.vararg_call(target, csig, rets, args)
             if len(sigs) != 1:
                 raise Unsupported("indirect call with ambiguous source signature")
             csig = next(iter(sigs.values()))
-            fv = self.get(callee, 64)
-            key = self.base_of.get(callee)
-            if key is not None and callee in self.exact:
-                b = self.base_ptr(key)
-                fp = "%s %s" % b if b else None
+            if csig.vararg:
+                raise Unsupported("vararg")
+            if target is not None:
+                fname = "@" + target
             else:
-                fp = self.rebase(key, fv) if key is not None else None
-            fname = fp.rsplit(" ", 1)[1] if fp else self.op("inttoptr i64 %s to ptr" % fv)
+                fv = self.get(callee, 64)
+                if key is not None and callee in self.exact:
+                    b = self.base_ptr(key)
+                    fp = "%s %s" % b if b else None
+                else:
+                    fp = self.rebase(key, fv) if key is not None else None
+                fname = fp.rsplit(" ", 1)[1] if fp else self.op("inttoptr i64 %s to ptr" % fv)
         else:
             if len(ops) > 2:
                 raise Unsupported("call with prototype")
@@ -2141,6 +3473,8 @@ class Lifter:
             if fname is None or fname not in self.decls:
                 raise Unsupported("unknown callee " + callee)
             csig = self.decls[fname]
+            if csig.vararg:
+                return self.vararg_call(fname, csig, rets, args)
         cargs = self.sized_args(csig.args)
         if csig.vararg or len(args) != len(cargs):
             raise Unsupported("call arity")
@@ -2160,6 +3494,8 @@ class Lifter:
             vals = [next(it) if a in cargs else "%s zeroinitializer" % a.ty for a in csig.args]
         self.callees.append(fname)
         call = "call %s %s(%s)" % (csig.ret, fname if indirect else "@" + fname, ", ".join(vals))
+        if indirect and fname.startswith("@"):
+            self.callees.append(fname[1:])
         if csig.ret == "void":
             if rets:
                 raise Unsupported("void call with retval")
@@ -2171,6 +3507,61 @@ class Lifter:
         r = self.op(call)
         if len(rets) != 1:
             raise Unsupported("call without retval param")
+        slot, pp = self.lookup(rets[0])
+        from llvmsig import Arg
+        self.store_value(csig.ret, r, Arg(csig.ret, csig.ret_attrs, None), slot, pp, True)
+
+    def vararg_call(self, fname, csig, rets, args):
+        """Call to a variadic function: NVPTX passes the variable arguments in
+        a buffer (natural alignment, in order) whose address is the last
+        parameter.  The variable arguments' types come from the source call."""
+        fixed = self.sized_args(csig.args)
+        if len(args) != len(fixed) + 1:
+            raise Unsupported("vararg call arity")
+        # the source call sites of fname, in order (all, including those
+        # without variable arguments)
+        sites = [x for x in self.indirect_sigs if getattr(x, "callee", None) == fname
+                 and len(x.args) >= len(csig.args)]
+        kinds = {tuple(a.ty for a in x.args) for x in sites}
+        if not hasattr(self, "vcall_idx"):
+            self.vcall_idx = {}
+        k = self.vcall_idx.get(fname, 0)
+        self.vcall_idx[fname] = k + 1
+        if len(kinds) == 1:
+            site = sites[0]
+        elif k < len(sites):
+            # different variable argument types at different call sites:
+            # match the k-th call in the PTX with the k-th in the source
+            # (calls have side effects, so their order is preserved; a wrong
+            # match gives a counterexample, not a proof)
+            site = sites[k]
+        else:
+            raise Unsupported("vararg call with ambiguous source types")
+        vtys = [a.ty for a in site.args[len(csig.args):]]
+        vals = []
+        for a, carg in zip(args, fixed):
+            slot, pp = self.lookup(a)
+            if carg.byval_type():
+                vals.append("%s %s %s" % (carg.ty, carg.attrs, slot))
+                continue
+            if carg.ty.startswith("ptr"):
+                v = self.ptr_from_slot(carg.ty, slot)
+            else:
+                v = self.load_value(carg.ty, slot, pp)
+            vals.append("%s %s %s" % (carg.ty, carg.attrs, v))
+        bslot, _ = self.lookup(args[-1])
+        buf = self.ptr_from_slot("ptr", bslot)
+        st = layout.parse("{ %s }" % ", ".join(vtys), self.typedefs) if vtys else None
+        for t, off in zip(vtys, layout.offsets(st) if vtys else []):
+            p = self.gep(buf, off)
+            vals.append("%s %s" % (t, self.load_mem(layout.parse(t, self.typedefs), p, 0)))
+        fty = "%s (%s)" % (csig.ret, ", ".join([a.ty for a in csig.args] + ["..."]))
+        self.callees.append(fname)
+        call = "call %s @%s(%s)" % (fty, fname, ", ".join(vals))
+        if csig.ret == "void":
+            self.emit(call)
+            return
+        r = self.op(call)
         slot, pp = self.lookup(rets[0])
         from llvmsig import Arg
         self.store_value(csig.ret, r, Arg(csig.ret, csig.ret_attrs, None), slot, pp, True)
@@ -2205,6 +3596,8 @@ class Lifter:
         self.barrier(mods, ops, opc, True)
 
     def i_barrier(self, mods, ops, opc):
+        if mods[:1] == ["cluster"]:
+            return self.cluster_call("barrier", mods, ops, opc)
         self.barrier(mods, ops, opc, "aligned" in mods)
 
     def barrier(self, mods, ops, opc, aligned):
@@ -2242,6 +3635,76 @@ class Lifter:
             self.write(ops[0], self.ucall("i32", name, args), 32)
         else:
             self.write(ops[0], self.ucall("i1", name, args), 1)
+
+    def wmma_call(self, base, mods, ops, opc):
+        """Keyed warp-level matrix instruction (wmmakey.py): fragments
+        register by register and addresses as zero-extended i64, results as
+        i64 truncated to the destination registers."""
+        import wmmakey
+        r = wmmakey.ptx(base, mods)
+        if r is None:
+            raise Unsupported("opcode " + opc)
+        toks, kind = r
+        ops = [o.strip() for o in ops]
+        if base == "wmma" and kind in ("load", "store") and len(ops) == 3:
+            toks = toks | {"stride"}        # the PTX names it by the extra operand
+        res, srcs = [], []
+        if kind == "mma":
+            # {d}, {a}, {b}, {c}[, e, selector][, scale operands]: the
+            # intrinsic's argument order
+            if len(ops) < 4:
+                raise Unsupported("operand " + opc)
+            res = self.vec_ops(ops[0]) or [ops[0]]
+            for o in ops[1:]:
+                srcs += self.vec_ops(o) or [o]
+        elif kind == "load":
+            res = self.vec_ops(ops[0]) or [ops[0]]
+            srcs = ops[1:]
+        else:
+            srcs = [ops[0]]
+            for o in ops[1:]:
+                srcs += self.vec_ops(o) or [o]
+        vals = []
+        for o in srcs:
+            am = re.fullmatch(r"\[\s*([%\w$]+)\s*(?:\+\s*(-?\d+))?\s*\]", o)
+            x = am.group(1) if am else o
+            if x in self.regs and self.regs[x] > 1:
+                w = self.regs[x]
+                v = self.get(x, w)
+                if am and am.group(2):
+                    v = self.op("add i%d %s, %d" % (w, v, int(am.group(2))))
+                vals.append("i64 %s" % (v if w == 64 else self.op("zext i%d %s to i64" % (w, v))))
+            elif self.imm(x) is not None and not am:
+                vals.append("i64 %d" % (self.imm(x) & ((1 << 64) - 1)))
+            else:
+                raise Unsupported("operand " + opc)
+        kname = wmmakey.name_of(toks, len(res), len(vals))
+        rty = "void" if not res else "{ %s }" % ", ".join(["i64"] * len(res))
+        self.declare(kname, "declare %s @%s(%s) nounwind willreturn" % (
+            rty, kname, ", ".join(["i64"] * len(vals))))
+        call = "call %s @%s(%s)" % (rty, kname, ", ".join(vals))
+        if not res:
+            self.emit(call)
+            return
+        v = self.op(call)
+        for k, d in enumerate(res):
+            if d not in self.regs:
+                raise Unsupported("operand " + opc)
+            e = self.op("extractvalue %s %s, %d" % (rty, v, k))
+            w = self.regs[d]
+            self.write(d, self.resize(e, 64, w, False) if w != 64 else e, w)
+
+    def i_wmma(self, mods, ops, opc):
+        return self.wmma_call("wmma", mods, ops, opc)
+
+    def i_mma(self, mods, ops, opc):
+        return self.wmma_call("mma", mods, ops, opc)
+
+    def i_ldmatrix(self, mods, ops, opc):
+        return self.wmma_call("ldmatrix", mods, ops, opc)
+
+    def i_stmatrix(self, mods, ops, opc):
+        return self.wmma_call("stmatrix", mods, ops, opc)
 
     def i_movmatrix(self, mods, ops, opc):
         # movmatrix.sync.aligned.m8n8.trans.b16 d, a  (cross-lane data movement)
@@ -2361,6 +3824,10 @@ class Lifter:
 
     def i_isspacep(self, mods, ops, opc):
         space = [m for m in mods if m in ("global", "shared", "local", "const", "param")]
+        if "shared::cluster" in mods:
+            space = ["shared.cluster"]
+        elif "shared::cta" in mods:
+            space = ["shared"]
         if not space:
             raise Unsupported(opc)
         a = self.get(ops[1], 64)
@@ -2423,6 +3890,98 @@ class Lifter:
 
     def i_nanosleep(self, mods, ops, opc):
         self.ucall("void", "nanosleep", ["i32 " + self.get(ops[0], 32)])
+
+
+# PTXTV_SCALARIZE=1: vector ld/st as one access per element (tv.py does the
+# same to the source); a fallback for timeouts, since it helps when source
+# and PTX use the same element width and hurts when they do not
+SCALARIZE = os.environ.get("PTXTV_SCALARIZE", "0") == "1"
+
+
+def lane_align(A, off):
+    a = A
+    while off % a:
+        a //= 2
+    return a
+
+
+def cp_async_ir(size, d, s, n, fresh):
+    """IR for one cp.async of cp-size `size`: n (an i32) bytes from s, zeros
+    up to `size`, both addresses aligned to `size`, n <= size.  d, s are
+    typed pointer operands ("ptr %x"); fresh() returns a new value name."""
+    L, decls = [], {"llvm.assume": "declare void @llvm.assume(i1)"}
+
+    def op(text):
+        t = fresh()
+        L.append("%s = %s" % (t, text))
+        return t
+    ok = op("icmp ule i32 %s, %d" % (n, size))
+    L.append("call void @llvm.assume(i1 %s)" % ok)            # src-size <= cp-size
+    for p in (d, s):                                            # aligned to cp-size
+        a = op("ptrtoint %s to i64" % p)
+        z = op("icmp eq i64 %s, 0" % op("and i64 %s, %d" % (a, size - 1)))
+        L.append("call void @llvm.assume(i1 %s)" % z)
+    # bytes [0, n) from s, zeros after: one masked byte-vector load
+    vt = "<%d x i8>" % size
+    mname = "llvm.masked.load.v%di8.p0" % size
+    decls[mname] = "declare %s @%s(ptr, <%d x i1>, %s)" % (vt, mname, size, vt)
+    ins = op("insertelement <%d x i32> poison, i32 %s, i64 0" % (size, n))
+    spl = op("shufflevector <%d x i32> %s, <%d x i32> poison, <%d x i32> zeroinitializer"
+             % (size, ins, size, size))
+    idx = ", ".join("i32 %d" % k for k in range(size))
+    mask = op("icmp ult <%d x i32> <%s>, %s" % (size, idx, spl))
+    sp = s.split(" ", 1)
+    v = op("call %s @%s(%s align %d %s, <%d x i1> %s, %s zeroinitializer)"
+           % (vt, mname, sp[0], size, sp[1], size, mask, vt))
+    L.append("store %s %s, %s, align %d" % (vt, v, d, size))
+    return L, decls
+
+
+def bulk_copy_ir(d, s, n, mbar, fresh):
+    """IR for a non-tensor cp.async.bulk: copy n (an i32, a multiple of 16)
+    bytes from s to d (both 16-byte aligned), then, if mbar is given, an
+    opaque complete-tx of n bytes on it."""
+    L = []
+    decls = {"llvm.assume": "declare void @llvm.assume(i1)",
+             "llvm.memcpy.p0.p0.i64": "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)"}
+
+    def op(text):
+        t = fresh()
+        L.append("%s = %s" % (t, text))
+        return t
+    n64 = op("zext i32 %s to i64" % n)
+    for v in (n64, op("ptrtoint %s to i64" % d), op("ptrtoint %s to i64" % s)):
+        z = op("icmp eq i64 %s, 0" % op("and i64 %s, 15" % v))
+        L.append("call void @llvm.assume(i1 %s)" % z)
+    L.append("call void @llvm.memcpy.p0.p0.i64(%s, %s, i64 %s, i1 false)" % (d, s, n64))
+    if mbar:
+        decls["ptx.cp.async.bulk.complete_tx"] = \
+            "declare void @ptx.cp.async.bulk.complete_tx(ptr, i32) nounwind"
+        L.append("call void @ptx.cp.async.bulk.complete_tx(%s, i32 %s)" % (mbar, n))
+    return L, decls
+
+
+def discard_ir(p):
+    """discard.L2: 128 bytes at p (128-byte aligned) become indeterminate."""
+    return "store <128 x i8> poison, %s, align 128" % p
+
+
+def st_bulk_ir(p, n, fresh):
+    """IR for st.bulk: zero n (an i64) bytes at p (a typed pointer operand);
+    n must be a multiple of 8 and p 8-byte aligned."""
+    L = []
+    decls = {"llvm.assume": "declare void @llvm.assume(i1)",
+             "llvm.memset.p0.i64": "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)"}
+
+    def op(text):
+        t = fresh()
+        L.append("%s = %s" % (t, text))
+        return t
+    for v in (n, op("ptrtoint %s to i64" % p)):
+        z = op("icmp eq i64 %s, 0" % op("and i64 %s, 7" % v))
+        L.append("call void @llvm.assume(i1 %s)" % z)
+    L.append("call void @llvm.memset.p0.i64(%s, i8 0, i64 %s, i1 false)" % (p, n))
+    return L, decls
 
 
 def lift_function(ptx_text, sig, name_map, decls, globals_, ptx_name,

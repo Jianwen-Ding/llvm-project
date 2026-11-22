@@ -33,12 +33,52 @@ def main(path, out, title, config):
     for k, v in st.most_common():
         L.append("| `%s` | %d | %.1f%% |" % (k, v, 100.0 * v / n))
     concl = st["correct"] + st["mismatch"] + st["mismatch-known"] + st["mismatch-param-oob"]
+    nprobe = sum(1 for r in fn if r["status"] == "correct" and r.get("probe"))
+    nweak = sum(1 for r in fn if r["status"] == "correct" and r.get("alive_extra"))
     L.append("")
+    L.append("%d of the correct results were obtained only with a weaker check "
+             "(`--disable-poison-input`: inputs assumed not to be poison) after the "
+             "full check timed out." % nweak)
+    L.append("")
+    L.append("Of the correct results, %d rely on probe-derived opaque instructions "
+             "(probe.py): they check the surrounding code and operand plumbing, not "
+             "the instruction selection of the intrinsic itself." % nprobe)
+    L.append("")
+    nop = sum(1 for r in fn if r["status"] == "correct" and r.get("copy_model") == "opaque")
+    if nop:
+        L.append("%d of the correct results used the opaque copy model (`PTXTV_OPAQUE_COPIES=1`: "
+                 "copies as keyed calls, bulkkey.py) after the check with cp.async/cp.async.bulk "
+                 "copy semantics timed out." % nop)
+        L.append("")
+    nsc = sum(1 for r in fn if r["status"] == "correct" and r.get("scalarized"))
+    if nsc:
+        L.append("%d of the correct results were obtained with vector accesses split into "
+                 "element accesses on both sides (`scalarized`, PTXTV_SCALARIZE=1) after a "
+                 "timeout." % nsc)
+        L.append("")
+    nla = sum(1 for r in fn if r["status"] == "correct" and r.get("lanes"))
+    if nla:
+        L.append("%d of the correct results were obtained by checking a vector result one "
+                 "lane at a time (`lanes`, PTXTV_LANES=1) after a timeout." % nla)
+        L.append("")
+    nfm = sum(1 for r in fn if r["status"] == "correct" and r.get("stripped_fmf"))
+    if nfm:
+        L.append("%d of the correct results were proved against the source without the "
+                 "fast-math flags Alive2 approximates (`stripped_fmf`; a stricter source)." % nfm)
+        L.append("")
+    nun = sum(1 for r in fn if r["status"] == "correct" and r.get("unroll"))
+    if nun:
+        L.append("%d of the correct results involve loops and were checked with bounded "
+                 "unrolling (`unroll` field)." % nun)
+        L.append("")
     L.append("Conclusive (proved correct or counterexample): %d (%.1f%%)." % (concl, 100.0 * concl / n))
     L.append("")
     oob = [r for r in fn if r["status"] == "mismatch-param-oob"]
     if oob:
-        L.append("## Counterexamples with out-of-bounds `.param` accesses (finding 1)")
+        L.append("## Counterexamples with out-of-bounds `.param` accesses")
+        L.append("")
+        L.append("All are finding 1 (sub-byte vectors) except `param-vectorize-device.ll` "
+                 "`callee_St4x*`, the lower-severity over-read into alignment padding.")
         L.append("")
         for r in sorted(oob, key=lambda r: (r["file"], r["function"])):
             L.append("* `%s` `%s`: %s" % (r["file"], r["function"], "; ".join(r.get("param_oob", [])[:2])))

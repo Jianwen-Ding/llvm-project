@@ -1,6 +1,10 @@
 # ptx-tv findings
 
-Defects in LLVM's NVPTX backend found by ptx-tv (lifting llc's PTX back to
+Defects in LLVM's NVPTX backend found by ptx-tv. This directory only
+documents them; no backend code has been changed. The "fix direction"
+notes are suggestions for whoever fixes them.
+
+Defects found by ptx-tv (lifting llc's PTX back to
 LLVM IR and checking refinement with Alive2), each with a reproducer in this
 directory. Reproducers are ordinary lit-style tests: the RUN line's llc
 output passes the CHECK lines, i.e. they pin down the current (incorrect)
@@ -98,12 +102,130 @@ same technique (or a sticky bit) fixes the integer paths.
 Severity: medium (silently wrong results, one ulp, for integers with more
 than 24 significant bits).
 
+## 4. `llvm.minimum`/`llvm.maximum` return an unflushed subnormal under `preservesign`
+
+Reproducer: `minimum-maximum-ftz.ll` (found in `math-intrins.ll`
+`minimum_float_ftz`)
+
+With `denormal_fpenv(float: preservesign)` inputs must be treated as zero.
+The lowering of `llvm.minimum.f32`/`llvm.maximum.f32` orders signed zeros by
+checking `setp.eq.ftz.f32 p, a, b` and, if equal, selecting one of the
+*original* operands:
+
+```
+setp.eq.b32      %p1, %r1, -2147483648;   // a == -0.0 ?
+selp.f32         %r3, %r1, %r2, %p1;      // a or b, unflushed
+setp.nan.ftz.f32 %p2, %r1, %r2;
+min.ftz.f32      %r4, %r1, %r2;
+selp.f32         %r5, 0f7FC00000, %r4, %p2;
+setp.eq.ftz.f32  %p3, %r1, %r2;           // a subnormal equals 0 here
+selp.f32         %r6, %r3, %r5, %p3;      // ... and is returned as is
+```
+
+`minimum(+0.0, 0x00000001)` returns `0x00000001` (1e-45) and
+`maximum(+0.0, 0x00000008)` returns `0x00000008`; with flushed inputs the
+result must be a zero. The default (`ieee`) lowering is correct.
+
+Severity: low (subnormal inputs, flush-to-zero functions only).
+
+Fix direction: select from flushed operands (or from the `min.ftz` result
+with its sign fixed) in the equal case.
+
+## 5. Kernels with a non-void return type store to an undeclared `func_retval0`
+
+Reproducer: `kernel-nonvoid-return.ll` (found in `lower-args-gridconstant.ll`
+`grid_const_ptrtoint`, `grid_const_partial_escapemem`; `entry_retval_scan.py`
+finds no others in the suite)
+
+A `ptx_kernel` function whose LLVM return type is not `void` becomes a
+`.entry` with no return parameter, but its `ret` is still lowered to
+`st.param.b32 [func_retval0], ...`. `func_retval0` is not declared in a
+`.entry`, so the PTX names an undefined symbol (invalid PTX). The tests'
+CHECK lines encode this output.
+
+Severity: low (kernels returning values are unusual; the value is not
+observable). Fix direction: drop the store for kernels (or reject non-void
+kernels in the verifier).
+
+## 6. `llvm.convert.from.arbitrary.fp` quiets signaling NaNs
+
+Reproducer: `arbitrary-fp-snan.ll` (found in `arbitrary-fp-to-float.ll`
+`from_f8e5m2_nan` and the `*_dynamic`/vector variants)
+
+LangRef for this intrinsic: "the NaN representation is preserved (quiet
+NaNs remain quiet, signaling NaNs remain signaling)". `Float8E5M2` `0x7D`
+(`S.11111.01`) is a signaling NaN, but the result is the quiet f32 NaN
+`0x7FC00000`, both when the call is constant folded and in the expanded
+code for a dynamic input, which maps every NaN input to that constant (the
+NaN's sign is dropped as well; LangRef does not say whether the sign must be
+kept). The same holds for `half`/`bfloat` results. The lowering is
+target-independent; it is observed here through NVPTX.
+
+Severity: low (signaling-NaN inputs only); either the lowering or the
+LangRef text should change.
+
+## 7. NVPTXUsage documents wrong intrinsic signatures and names (tcgen05, TMA)
+
+Reproducer: `tcgen05-st-doc-order.ll` (found while deriving the
+`tcgen05.st` model from the documentation)
+
+`llvm/docs/NVPTXUsage.md` gives
+
+```
+declare void @llvm.nvvm.tcgen05.st.16x32bx2.<num>(ptr addrspace(6) %tmem_addr,
+                                                  <n x i32> %args, i64 %offset, i1 %unpack)
+```
+
+but `IntrinsicsNVVM.td` (`NVVM_TCGEN05_ST`) defines the immediate offset
+before the data, `(ptr addrspace(6), i64, <n x i32>, i1)`, and the IR
+verifier rejects the documented form ("intrinsic argument 1 type expected
+i64"). The code generator and the tests use the defined order; only the
+documentation is wrong. (The `tcgen05.ld.16x32bx2` entry, whose offset
+precedes the flag, is consistent.)
+
+The `tcgen05.ld.red` entry is wrong too (reproducer
+`tcgen05-ld-red-doc-type.ll`): it documents a `<n x i32>` result for both
+the `.i32` and the `.f32` forms, but `NVVM_TCGEN05_LD_RED` returns
+`{<n x T>, T}` (the loaded values and the reduction result, `T` = `float`
+for `.f32`), which is what the backend and its tests use.
+
+A smaller slip in the same document: the `tcgen05.mma.ws` syntax block lists
+`@llvm.nvvm.tcgen05.mma.ws.shared.zero_col_mask` twice, the second time with
+a tensor-memory A operand (`ptr addrspace(6) %atensor`), which is the
+`ws.tensor.zero_col_mask` form listed on the next line.
+
+A fourth (reproducer `tma-override-dim-doc-name.ll`): the documented names
+`@llvm.nvvm.cp.async.bulk.tensor.g2s.tile.override.addr.dim.1d.i32` and
+`...override.addr.dim.stride.[2-5]d.i32` do not exist. These intrinsics
+support only a 32-bit multicast mask and are not overloaded, so their names
+have no `.i32` suffix; the documented name is rejected by the backend as an
+unknown intrinsic.
+
+A fifth, an omission: the `tcgen05.mma` `decompress_b` intrinsics
+(`@llvm.nvvm.tcgen05.mma.{shared,tensor}.f8f6f4.decompress_b`, the
+`.disable_output_lane.cg{1,2}` and the `mxf8f6f4.block_scale.block32`
+variants, tested by `tcgen05-mma*-decompress-b.ll`) are defined in
+`IntrinsicsNVVM.td` but not described in NVPTXUsage; their argument layout
+(the decompression-table pointer after the common arguments and scale
+pointers, before the disable-output-lane mask and the flags) can only be
+read from the TableGen definitions.
+
+Severity: documentation only. Fix direction: swap `%args` and `%offset` in
+the documented `tcgen05.st.16x32bx2` signature and give `tcgen05.ld.red`
+its two-element struct result.
+
 ## Lower-severity observations
 
 * `param-vectorize-device.ll` `callee_St4x3` / `callee_St4x7`: a 12-byte
   `byval` struct declared `.param .align 16 .b8 [12]` is read with
   `ld.param.v4.b32`, 4 bytes past the declared size (inside the alignment
   padding; the extra lane is discarded). The test's CHECK lines expect this.
+* `bf16-instructions.ll` `test_maxnum_v2` (no native bf16 max), and the same
+  in `atomicrmw-elementwise-sm60.ll` `fmin_acq_rel_v2bf16_global_cta` (found
+  with the larger solver budget): `minnum`/`maxnum` of `<2 x bfloat>` is
+  done in f32 and rounded back, so signaling-NaN inputs come back with a
+  different NaN bit pattern. LangRef allows NaN results of `minnum`/`maxnum`
+  to vary, so this is only a note.
 * `rsqrt-opt.ll`: `1.0 / llvm.nvvm.sqrt.approx.f(x)` becomes
   `rsqrt.approx.f32` without fast-math flags (`-nvptx-rsqrt-approx-opt`,
   default on). Intentional, but it replaces an exactly rounded division.
@@ -123,22 +245,62 @@ than 24 significant bits).
   (the source is UB): `forward-ld-param.ll` `test_ld_param_const`,
   `lower-byval-args.ll` `memcpy_from_param{,_noalign}`.
 
-## Unresolved
+## Resolved: `minimumnum`/`maximumnum` lowered to `min`/`max`
 
-* `math-intrins.ll` `maximumnum_float` (and presumably the other
-  `minimumnum`/`maximumnum` tests): lowered to `max.f32`/`min.f32`. Correct
-  only if PTX `min`/`max` order -0.0 below +0.0; the lifter does not assume
-  that (it models them like `maxnum`), so this stays open.
+`llvm.minimumnum`/`llvm.maximumnum` are lowered to plain `min.f32`/`max.f32`
+(`math-intrins.ll` `minimumnum_float`, `maximumnum_float`,
+`maximumnum_double`; `fmax3.ll` `test_fminimumnum3`, `test_fmaximumnum3`;
+`reduction-intrinsics.ll` `reduce_fmaximumnum_float`). This was open while
+the lifter modelled PTX `min`/`max` like `minnum`/`maxnum`. The PTX ISA's
+semantics for `min`/`max` settle it: a NaN operand yields the other
+operand, two NaNs give NaN, and `-0.0 < +0.0`, which is exactly
+`minimumnum`/`maximumnum`. With that model all of these verify: not a
+defect.
 
 ## Test-suite run
 
-`RESULTS.md` has the numbers from the final pass (generated from
-`results.jsonl` by `gen_results.py`). In short: 2111 functions sampled from
-620 test files; 949 proved correct, 5 counterexamples of finding 1 (plus 1
-padding over-read), 2 of
-findings 2/3, 1 unresolved, 40 in known modelling classes, 648 not lifted
-(mostly asynchronous/tensor-core instructions: tcgen05, cp.async.bulk,
-mbarrier, sparse (de)compression), 407 solver timeouts or inconclusive.
-The other instances of findings 1 and 2b were found by the static scan and
-by targeted runs (`subbyte-vector-params.ll`, `fabs-fneg-ftz.ll`,
-`math-intrins.ll` `abs_float_ftz`).
+`RESULTS.md` has the numbers (generated from `results.jsonl` by
+`gen_results.py`). Three passes were combined (up to 6, 8 and 10 further
+functions per test file, so files with up to 24 functions are fully
+covered); every result was re-checked with the final lifter (including a
+regression re-run of all previously correct functions), and timeouts were
+re-run with larger budgets and, separately, the weaker
+`--disable-poison-input` check (tagged). In short: 6334 functions from 623
+test files (including the 2130 distinct functions of the generated `wmma*.py`
+tests); 5595 proved correct (none through probe-derived opaque instructions,
+55 only with the weaker check); 33 counterexamples with out-of-bounds
+`.param` accesses (finding 1, plus the padding over-reads); findings
+2/2b/3/4/5/6/7; 1 NaN-bits note; 1 Alive2 artifact (`vaargs.ll` `foo`); 171 in
+known modelling classes; 2 not lifted; 525 solver timeouts or inconclusive.
+
+Not lifted (2): the two finding-5 kernels (invalid PTX). Variadic
+functions are compared after LLVM's
+ExpandVariadics (which the backend runs; the pass itself is trusted). One
+function still has inline asm the model does not handle
+(`nvvm-reflect-arch-O0.ll` `baz`: `valid;` is not a PTX instruction).
+Variadic functions are compared after LLVM's
+ExpandVariadics (which the backend runs; the pass itself is trusted).
+
+The remaining timeouts: about three quarters involve floating point; the
+rest are 64-bit division and vector atomics expanded into CAS loops. A 24x
+larger per-query budget resolved 7 of 81 integer ones tried; a 2x budget
+with the weaker check resolved 20 of about 360. A final sweep of all 666
+remaining timeouts at 10 s per query proved 9 more and classified 5; the same sweep with the
+weaker check proved 15 more and classified 10. Lifting vector accesses as
+element accesses on both sides (`scalarized`) then proved 46 more, and
+checking vector results one lane at a time (`lanes`) 32 more; both together
+at 10 s per query 17 more; all of these with the weaker check 18 more. Of the results Alive2 left
+inconclusive because of approximated fast-math flags, 9 were proved
+against the source without those flags (`stripped_fmf`), and 1 timeouts
+with such flags likewise. Another solver seed
+(`--smt-random-seed=1`) proved 5 more. Some proofs are
+sensitive to machine load: a regression re-run under load turned 28
+previously correct functions into timeouts; 19 of them were proved again
+with a 30 s per-query budget (recorded as `smt_to`), 9 remain timeouts.
+
+## Observations not counted as defects
+
+* `intrinsic-old.ll` `test_gridid`: `llvm.nvvm.read.ptx.sreg.gridid` is a
+  32-bit intrinsic and is lowered to `mov.u32 %r, %gridid`; the PTX ISA
+  documents `%gridid` as 64-bit (since PTX 3.0). Not checkable without the
+  vendor toolchain; noted only.
