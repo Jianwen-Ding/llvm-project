@@ -728,6 +728,15 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
     `air.wg.barrier`, SIMD-group functions and matrices), kernels are marked
     `air-kernel`, and the other dialects are converted to the LLVM dialect in
     AIR's address spaces.
+
+    Before the conversion the pass lowers what the LLVM dialect patterns do
+    not take: affine ops and memref views (subview, expand_shape,
+    collapse_shape) to arith and reinterpret casts; n-D vectors, transfers
+    and masks to 1-D ones; `gpu.subgroup_mma_*` to AIR's 8x8 SIMD-group
+    matrices; f64 math functions as fdlibm's algorithms; complex functions;
+    conversions of small floats (f8, f6, f4) exactly, and their arithmetic
+    in f32; extensions of i4 vectors as shifts of bytes; and `cf.assert` as a
+    trap.
   }];
   let dependentDialects = [
     "air::AIRDialect",
