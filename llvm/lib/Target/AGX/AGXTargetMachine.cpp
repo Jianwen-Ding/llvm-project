@@ -333,6 +333,12 @@ static cl::opt<unsigned> AGXSchedCoreManyPerLoad(
     cl::desc("agx-sched-core-occupancy-many-cut only for regions of at most "
              "this many instructions a device load"));
 
+static cl::opt<unsigned> AGXSchedCoreStoreCut(
+    "agx-sched-core-occupancy-store-cut", cl::init(12), cl::Hidden,
+    cl::desc("agx-sched-core-occupancy-many-cut for regions with a device "
+             "store for every two device loads or more, counting the stores "
+             "with the loads, at this cut in tenths (0: never)"));
+
 static cl::opt<bool> AGXSchedKnownGrid(
     "agx-sched-known-grid", cl::init(true), cl::Hidden,
     cl::desc("Keep a schedule whose registers still let every SIMD-group of "
@@ -518,6 +524,23 @@ public:
               return false;
       return true;
     };
+    // (and a stream of word loads and stores, at E761's cut: a column's
+    // values loaded, scaled and stored, the free order's loads all ahead,
+    // 96 -> 68 groups; in order col_softmax_norm -10.2%; with fewer stores,
+    // matvec8's eight to 32 loads, +1.1%, L15-E765)
+    unsigned DeviceStores = 0;
+    for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
+      DeviceStores += MI.mayStore() && !MI.mayLoad() &&
+                      any_of(MI.memoperands(), [](const MachineMemOperand *M) {
+                        return M->getAddrSpace() == AGX::DEVICE_ADDRESS;
+                      });
+    Core |= AGXSchedCoreOccupancy && !FewLoads && AGXSchedCoreStoreCut &&
+            DeviceStores && 2 * DeviceStores >= DeviceLoads &&
+            Index.size() <=
+                AGXSchedCoreManyPerLoad * (DeviceLoads + DeviceStores) &&
+            AGXSchedCoreStoreCut * CoreGroups(After) <
+                10 * CoreGroups(Before) &&
+            WordLoads();
     Core |= AGXSchedCoreOccupancy && !FewLoads && AGXSchedCoreManyCut &&
             Index.size() <= AGXSchedCoreManyPerLoad * DeviceLoads &&
             AGXSchedCoreManyCut * CoreGroups(After) <
