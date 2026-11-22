@@ -1,6 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-hardware-branch=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-min=1 < %s | FileCheck %s --check-prefix=ONE
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-merge=0 < %s | FileCheck %s --check-prefix=APART
 
 ; sin and cos past 2^22 take the hardware's reduction (L15-E504): sincos's
 ; two and tan's run in a block of their own, skipped by a SIMD-group none of
@@ -50,6 +51,23 @@
 ; ONE: sin_pt_1
 ; ONE: pop_exec
 ; ONE: stop
+
+; Four sins of four arguments in one block (an unrolled loop's): four
+; conditions, one fallback each, too few apart; merged, one branch to a block
+; of all four hardware sins where any argument needs one, each value there
+; the select of its own condition (L15-E789).
+; CHECK-LABEL: four_sins:
+; CHECK-COUNT-4: fcmpsel lt, {{r[0-9]+}}, {{r[0-9]+}}.abs
+; CHECK: if_icmp
+; CHECK: jmp_exec_none [[J:.LBB[0-9_]+]]
+; CHECK-COUNT-4: sin_pt_1
+; CHECK: [[J]]:
+; CHECK-NEXT: pop_exec
+; CHECK-NOT: sin_pt_1
+; CHECK: device_store
+; APART-LABEL: four_sins:
+; APART-NOT: if_
+; APART: device_store
 
 declare i32 @llvm.agx.thread.position.in.grid.x()
 declare float @llvm.sin.f32(float)
@@ -104,3 +122,14 @@ define agx_kernel void @two_sins(ptr addrspace(1) %p) {
   store float %s, ptr addrspace(1) %b
   ret void
 }
+
+define agx_kernel void @four_sins(ptr addrspace(1) %p) {
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %a = getelementptr <4 x float>, ptr addrspace(1) %p, i32 %i
+  %x = load <4 x float>, ptr addrspace(1) %a
+  %r = call <4 x float> @llvm.sin.v4f32(<4 x float> %x)
+  store <4 x float> %r, ptr addrspace(1) %a
+  ret void
+}
+
+declare <4 x float> @llvm.sin.v4f32(<4 x float>)

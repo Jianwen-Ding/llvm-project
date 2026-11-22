@@ -10280,13 +10280,22 @@ static cl::opt<bool> AGXRareFallbacksHoist(
     cl::desc("what follows a branched-around fallback's selects and needs "
              "neither them nor a write before it, ahead of the branch"));
 
+static cl::opt<bool> AGXRareFallbacksMerge(
+    "agx-rare-fallbacks-merge", cl::init(true), cl::Hidden,
+    cl::desc("the fallbacks of every condition in a block (an unrolled "
+             "loop's sins) in one block branched around where no thread "
+             "needs any of them"));
+
 /// The expansions' selects sel(c, a, h) whose h is a fallback for rare
 /// arguments (a call marked agx.rare: sin and cos's hardware reduction past
 /// 2^22) take h from a block branched to only where c is false: a SIMD-group
 /// whose threads all have c skips it (L15-E504). The selects of one block and
-/// condition share the block (sincos's two). After the SimplifyCFG before
-/// structurization, which would speculate h again (AGXRareFallbacks).
-static bool branchRareFallbacks(Function &F) {
+/// condition share the block (sincos's two); with -agx-rare-fallbacks-merge
+/// those of every condition in the block do, branched to where any of the
+/// conditions is false, each select there of its own (an unrolled loop's
+/// sins, L15-E789). After the SimplifyCFG before structurization, which would
+/// speculate h again (AGXRareFallbacks).
+static bool branchRareFallbacksOnce(Function &F) {
   MapVector<std::pair<BasicBlock *, Value *>, SmallVector<SelectInst *, 2>>
       Groups;
   for (Instruction &I : instructions(F)) {
@@ -10299,40 +10308,35 @@ static bool branchRareFallbacks(Function &F) {
     if (!H || !H->getMetadata("agx.rare") || !H->hasOneUse() ||
         H->getParent() != S->getParent())
       continue;
-    Groups[{S->getParent(), S->getCondition()}].push_back(S);
+    Groups[{S->getParent(),
+            AGXRareFallbacksMerge ? nullptr : S->getCondition()}]
+        .push_back(S);
   }
   bool Changed = false;
-  for (auto &[Key, Sels] : Groups) {
+  for (auto &[Key, Group] : Groups) {
     // (one hardware sin or cos is 8 instructions, which AGXLowerControlFlow
     // runs with an empty mask rather than jump over: the if would only add
     // its own two)
-    if (Sels.size() < AGXRareFallbacksMin)
+    if (Group.size() < AGXRareFallbacksMin)
       continue;
     // (the block the selects are in now: an earlier group's split of their
     // block moved them to its tail)
-    Value *C = Key.second;
-    SelectInst *First = Sels.front();
-    BasicBlock *BB = First->getParent();
-    if (any_of(Sels, [&](SelectInst *S) { return S->getParent() != BB; }))
+    BasicBlock *BB = Group.front()->getParent();
+    if (any_of(Group, [&](SelectInst *S) { return S->getParent() != BB; }))
       continue;
-    auto Before = [&](Value *V) {
-      auto *I = dyn_cast<Instruction>(V);
-      return !I || I->getParent() != BB || I->comesBefore(First);
-    };
-    if (!Before(C) || !all_of(Sels, [&](SelectInst *S) {
-          // (h moves to the new block: its operands must be there before)
-          return Before(S->getTrueValue()) &&
-                 all_of(cast<Instruction>(S->getFalseValue())->operands(),
-                        Before);
-        }))
-      continue;
+    SelectInst *First = Group.front();
+    for (SelectInst *S : Group)
+      if (S->comesBefore(First))
+        First = S;
     // The rest of the block that needs neither the selects nor a write
     // before it goes ahead of them, out of the join: a load of the tail
-    // starts before the branch, as the scheduler had it (L15-E505).
+    // starts before the branch, as the scheduler had it (L15-E505), and a
+    // later select's operands are ready at the branch.
+    SmallPtrSet<Instruction *, 16> Stay(Group.begin(), Group.end());
+    SmallVector<Instruction *, 16> Hoist;
+    SmallPtrSet<Instruction *, 16> Hoisted;
     if (AGXRareFallbacksHoist) {
-      SmallPtrSet<Instruction *, 16> Stay(Sels.begin(), Sels.end());
       bool Wrote = false;
-      SmallVector<Instruction *, 16> Hoist;
       for (Instruction &I : make_range(std::next(First->getIterator()),
                                        BB->getTerminator()->getIterator())) {
         bool Needs = any_of(I.operands(), [&](Value *V) {
@@ -10343,34 +10347,106 @@ static bool branchRareFallbacks(Function &F) {
                        (isa<CallBase>(I) && cast<CallBase>(I).isConvergent());
         Wrote |= Effects;
         if (Needs || Effects || (Wrote && I.mayReadFromMemory()) ||
-            any_of(Sels, [&](SelectInst *S) {
+            any_of(Group, [&](SelectInst *S) {
               return S->getFalseValue() == &I;
             }))
           Stay.insert(&I);
         else
-          Hoist.push_back(&I);
+          Hoist.push_back(&I), Hoisted.insert(&I);
       }
-      for (Instruction *I : Hoist)
-        I->moveBefore(First->getIterator());
     }
+    auto Before = [&](Value *V) {
+      auto *I = dyn_cast<Instruction>(V);
+      // (without -agx-rare-fallbacks-merge, as before the hoist: E504)
+      return !I || I->getParent() != BB || I->comesBefore(First) ||
+             (AGXRareFallbacksMerge && Hoisted.count(I));
+    };
+    // (h moves to the new block: its operands must be there before)
+    auto Ready = [&](SelectInst *S) {
+      return Before(S->getCondition()) && Before(S->getTrueValue()) &&
+             all_of(cast<Instruction>(S->getFalseValue())->operands(),
+                    Before);
+    };
+    SmallVector<SelectInst *, 4> Sels;
+    if (AGXRareFallbacksMerge) {
+      for (SelectInst *S : Group)
+        if (Ready(S))
+          Sels.push_back(S);
+      if (Sels.empty() || Sels.size() < AGXRareFallbacksMin)
+        continue;
+    } else {
+      if (!all_of(Group, Ready))
+        continue;
+      Sels.assign(Group.begin(), Group.end());
+    }
+    for (Instruction *I : Hoist)
+      I->moveBefore(First->getIterator());
     BasicBlock *Tail = SplitBlock(BB, First);
     BasicBlock *Rare =
         BasicBlock::Create(F.getContext(), BB->getName() + ".rare", &F, Tail);
     IRBuilder<>(Rare).CreateBr(Tail);
     BB->getTerminator()->eraseFromParent();
-    IRBuilder<>(BB).CreateCondBr(C, Tail, Rare);
+    SetVector<Value *> Conds;
+    for (SelectInst *S : Sels)
+      Conds.insert(S->getCondition());
+    IRBuilder<> BBB(BB);
+    if (Conds.size() == 1) {
+      BBB.CreateCondBr(Conds[0], Tail, Rare);
+    } else {
+      // (whether any condition is false, as a chain of selects: each a
+      // compare-select of its comparison, no i1 values and'ed)
+      Value *Any = BBB.getFalse();
+      for (Value *C : Conds)
+        Any = BBB.CreateSelect(C, Any, BBB.getTrue());
+      BBB.CreateCondBr(Any, Rare, Tail);
+    }
+    // (a comparison again in the rare block, which its select there reads:
+    // one compare-select, not the condition kept in a register across the
+    // branch)
+    DenseMap<Value *, Value *> RareConds;
+    for (Value *C : Conds) {
+      auto *CI = dyn_cast<CmpInst>(C);
+      RareConds[C] = C;
+      if (Conds.size() > 1 && CI) {
+        Instruction *Clone = CI->clone();
+        Clone->insertBefore(Rare->getTerminator()->getIterator());
+        RareConds[C] = Clone;
+      }
+    }
     for (SelectInst *S : Sels) {
       auto *H = cast<Instruction>(S->getFalseValue());
       H->moveBefore(Rare->getTerminator()->getIterator());
+      // (branched around: a later round must not take its select in the
+      // rare block for another group)
+      H->setMetadata("agx.rare", nullptr);
+      // (where another condition is false, this one may be true: its value
+      // there the select of the two)
+      Value *R = H;
+      if (Conds.size() > 1)
+        R = SelectInst::Create(RareConds[S->getCondition()],
+                               S->getTrueValue(), H, S->getName() + ".rare",
+                               Rare->getTerminator()->getIterator());
       PHINode *P = PHINode::Create(S->getType(), 2, S->getName(),
                                    Tail->begin());
       P->addIncoming(S->getTrueValue(), BB);
-      P->addIncoming(H, Rare);
+      P->addIncoming(R, Rare);
       S->replaceAllUsesWith(P);
       S->eraseFromParent();
     }
     Changed = true;
   }
+  return Changed;
+}
+
+/// branchRareFallbacksOnce until no group is left: with
+/// -agx-rare-fallbacks-merge, the selects a block's branch could not take
+/// (an operand behind a store) are in its tail, a block of their own.
+static bool branchRareFallbacks(Function &F) {
+  if (!AGXRareFallbacksMerge)
+    return branchRareFallbacksOnce(F);
+  bool Changed = false;
+  while (branchRareFallbacksOnce(F))
+    Changed = true;
   return Changed;
 }
 

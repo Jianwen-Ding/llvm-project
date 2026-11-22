@@ -1,6 +1,6 @@
 ; REQUIRES: asserts
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -debug-only=agx-mem-cluster -o /dev/null < %s 2>&1 | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -debug-only=agx-mem-cluster -agx-sched-heavy-stores-apart=128 -o /dev/null < %s 2>&1 | FileCheck %s --check-prefix=LIGHT --allow-empty
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-merge=0 -debug-only=agx-mem-cluster -o /dev/null < %s 2>&1 | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-merge=0 -debug-only=agx-mem-cluster -agx-sched-heavy-stores-apart=128 -o /dev/null < %s 2>&1 | FileCheck %s --check-prefix=LIGHT --allow-empty
 ;
 ; A region of more than 64 instructions for every 32-bit word it stores
 ; clusters no device stores (L15-E648): held together, each store waits for
