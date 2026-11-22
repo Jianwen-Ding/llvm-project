@@ -313,6 +313,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStreamsWord(
     cl::desc("agx-device-unroll-streams' factor where every device load is "
              "of 4 bytes at most (0: the same)"));
 
+static cl::opt<bool> AGXDeviceUnrollStreamsDWord(
+    "agx-device-unroll-streams-dword", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-streams-word's factor also where every "
+             "device load is of 8 bytes at most"));
+
 static cl::opt<bool> AGXDeviceUnrollStreamsVectors(
     "agx-device-unroll-streams-vectors", cl::init(true), cl::Hidden,
     cl::desc("agx-device-unroll-streams only for loops whose device loads are "
@@ -537,7 +542,8 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
                                    const DataLayout &DL, unsigned Trips,
                                    bool &DeviceLoads) {
   bool Narrow = true, Stores = false, Strided = true, Word = true,
-       Vectors = true, SomeStrided = false, Store32 = true, Light = true;
+       DWord = true, Vectors = true, SomeStrided = false, Store32 = true,
+       Light = true;
   unsigned NumLoads = 0;
   DeviceLoads = false;
   // The pointer bases the device loads step through (a dot product's two
@@ -569,6 +575,7 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
       ++NumLoads;
       Narrow &= DL.getTypeStoreSize(LI->getType()) <= 2;
       Word &= DL.getTypeStoreSize(LI->getType()) <= 4;
+      DWord &= DL.getTypeStoreSize(LI->getType()) <= 8;
       Vectors &= LI->getType()->isVectorTy();
       if (const SCEV *P = SE.getSCEV(const_cast<Value *>(LI->getPointerOperand()));
           isa<SCEVAddRecExpr>(P) &&
@@ -615,7 +622,10 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
   // waiting; one stream (a row sum, maximum or softmax) keeps 4.
   // (loads of a word at most: 16, as their iterations' loads are a fourth
   // of a 16-byte vector's, L15-E507)
-  if (!Narrow && !Stores && Streams.size() >= 2 && Word &&
+  // (and of 8 bytes at most: four halves, dot_f16x4 -7.3%, bf16_dot_rows
+  // -6.6%; 16-byte vectors keep 8, dot_vec4 +1.3% at 16, L15-E750)
+  if (!Narrow && !Stores && Streams.size() >= 2 &&
+      (Word || (DWord && AGXDeviceUnrollStreamsDWord)) &&
       (Vectors || !AGXDeviceUnrollStreamsVectors) &&
       Divides(AGXDeviceUnrollStreamsWord))
     return AGXDeviceUnrollStreamsWord;
