@@ -297,13 +297,19 @@ static cl::opt<bool> AGXSchedCoreOccupancy(
     "agx-sched-core-occupancy", cl::init(true), cl::Hidden,
     cl::desc("Also keep the original order of a region with fewer than 4 "
              "device loads where its schedule would cut the SIMD-groups its "
-             "registers let reside on a core by 1.8 times or more"));
+             "registers let reside on a core by agx-sched-core-occupancy-cut "
+             "or more"));
 
 static cl::opt<unsigned> AGXSchedCoreOccupancyPerLoad(
     "agx-sched-core-occupancy-per-load", cl::init(16), cl::Hidden,
     cl::desc("agx-sched-core-occupancy also for a region of more device "
              "loads with at least this many instructions for each (0: "
              "never)"));
+
+static cl::opt<unsigned> AGXSchedCoreOccupancyCut(
+    "agx-sched-core-occupancy-cut", cl::init(12), cl::Hidden,
+    cl::desc("agx-sched-core-occupancy's cut of the core's SIMD-groups, in "
+             "tenths (1.8 times until L15-E761)"));
 
 static cl::opt<bool> AGXSchedKnownGrid(
     "agx-sched-known-grid", cl::init(true), cl::Hidden,
@@ -431,10 +437,12 @@ public:
     // may have, or, for a region of few device loads (whose clustered loads
     // E187 and the like rely on), cuts the SIMD-groups resident on a
     // core (min(96, 2 floor(3328 / (2 halves))), AGX Performance Simulator
-    // dispatch, registers allocated by 8 halves) by 1.8 times or more: a tiled
+    // dispatch, registers allocated by 8 halves) by 1.2 times or more: a tiled
     // matrix product's threadgroup loads, all hoisted ahead of their fmas,
     // doubled its registers for a latency the resident groups hide anyway
-    // (L15-E239).
+    // (L15-E239; 1.8 times until a row loop of transcendentals, 48 -> 74
+    // halves and 68 -> 40 groups, was seen slower than its original order:
+    // row_exp, row_sigmoid, cond_compute, sincos_rows -5%, L15-E761).
     auto CoreGroups = [](unsigned H) {
       H = alignTo(std::max(16u, H), 8);
       return std::min(96u, 2 * (3328 / (2 * H)));
@@ -472,7 +480,8 @@ public:
                 AGXSubtarget::maxThreadsForHalves(After + 16) < Need;
     }
     bool Core = AGXSchedCoreOccupancy && FewLoads &&
-                9 * CoreGroups(After) < 5 * CoreGroups(Before);
+                AGXSchedCoreOccupancyCut * CoreGroups(After) <
+                    10 * CoreGroups(Before);
     // A known grid whose SIMD-groups all reside on one core with the new
     // registers (and whose threadgroups still fit) loses no occupancy
     // anywhere: the new order stays, its loads' latencies hidden behind each
