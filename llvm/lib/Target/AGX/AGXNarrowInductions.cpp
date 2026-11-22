@@ -1462,6 +1462,58 @@ static bool rebaseCompares(Loop &L, ScalarEvolution &SE, const Function &F) {
   return Changed;
 }
 
+static cl::opt<bool> AGXMergeLaggingCounters(
+    "agx-merge-lagging-counters", cl::init(true), cl::Hidden,
+    cl::desc("A counter one step behind another of the same step: its "
+             "increment as the other counter"));
+
+/// Two header phis stepped by the same constant k, p = c, c + k, ... and
+/// q = c - k, c, c + k, ...: q's increment q + k is p at every iteration
+/// (find_first: loop strength reduction's count from -1 for the exit value
+/// beside the narrowed index from 0). Where q has no other use, the uses of
+/// its increment take p, and q and the increment go: an add an iteration and
+/// a register fewer. p's increment keeps only the wrap flags both have (it
+/// computes what q's did: p_n = p_{n-1} + k, q'_n = p_{n-1} + k), so p is
+/// poison no more often than q' was (L15-E794).
+static bool mergeLaggingCounters(Loop &L) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch)
+    return false;
+  struct Counter {
+    PHINode *P;
+    BinaryOperator *Inc;
+    APInt Start, Step;
+  };
+  SmallVector<Counter, 4> Counters;
+  for (PHINode &P : L.getHeader()->phis()) {
+    if (!P.getType()->isIntegerTy() || P.getNumIncomingValues() != 2)
+      continue;
+    auto *C = dyn_cast<ConstantInt>(P.getIncomingValueForBlock(Pre));
+    auto *Inc = dyn_cast<BinaryOperator>(P.getIncomingValueForBlock(Latch));
+    const APInt *K;
+    if (!C || !Inc || !L.contains(Inc) ||
+        !match(Inc, m_Add(m_Specific(&P), m_APInt(K))))
+      continue;
+    Counters.push_back({&P, Inc, C->getValue(), *K});
+  }
+  for (Counter &Q : Counters)
+    for (Counter &P : Counters) {
+      if (&P == &Q || P.P->getType() != Q.P->getType() || P.Step != Q.Step ||
+          Q.Start + Q.Step != P.Start || !Q.P->hasOneUse() ||
+          Q.P->user_back() != Q.Inc)
+        continue;
+      if (!Q.Inc->hasNoUnsignedWrap())
+        P.Inc->setHasNoUnsignedWrap(false);
+      if (!Q.Inc->hasNoSignedWrap())
+        P.Inc->setHasNoSignedWrap(false);
+      Q.Inc->replaceAllUsesWith(P.P);
+      RecursivelyDeleteDeadPHINode(Q.P);
+      return true;
+    }
+  return false;
+}
+
 static cl::opt<bool> AGXNarrowAfterCounters(
     "agx-narrow-bounded-after-counters", cl::init(true), cl::Hidden,
     cl::desc("agx-narrow-bounded-i64 again after the counters are narrowed"));
@@ -1884,6 +1936,11 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
           break;
         }
     }
+    if (AGXMergeLaggingCounters)
+      while (mergeLaggingCounters(*L)) {
+        SE.forgetLoop(L);
+        Changed = true;
+      }
     if (AGXSplitOffsetInductions && L->isInnermost()) {
       SmallVector<PHINode *, 4> Wide;
       for (PHINode &Phi : L->getHeader()->phis())
