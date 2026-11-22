@@ -2024,6 +2024,51 @@ static cl::opt<bool> AGXShiftedFieldInsert(
     cl::desc("(x << s) | q, s above 4 and q zero in x's field, as one bfi "
              "of x into q"));
 
+static cl::opt<bool> AGXBoundedFieldInsert(
+    "agx-bounded-field-insert", cl::init(true), cl::Hidden,
+    cl::desc("(x << s) + p or (x << s) | p, p a thread or threadgroup "
+             "position whose upper_bound is at most 2^s, as one bfi"));
+
+/// Whether Q is a thread or threadgroup position (perhaps extended or
+/// truncated) below Limit by the kernel's upper_bound or known grid
+/// (AGX::knownUpperBound), which the DAG's known bits do not see.
+static bool positionBelow(SDValue Q, uint64_t Limit, SelectionDAG &DAG) {
+  while (Q.getOpcode() == ISD::TRUNCATE || Q.getOpcode() == ISD::ZERO_EXTEND ||
+         Q.getOpcode() == ISD::AssertZext)
+    Q = Q.getOperand(0);
+  if (Q.getOpcode() != ISD::INTRINSIC_WO_CHAIN ||
+      !isa<ConstantSDNode>(Q.getOperand(0)))
+    return false;
+  std::optional<uint64_t> B = AGX::knownUpperBound(
+      DAG.getMachineFunction().getFunction(), Q.getConstantOperandVal(0));
+  return B && *B <= Limit;
+}
+
+/// (x << s) + p or | p, p below 2^s by its upper_bound, s above 4: one bfi of
+/// x into p (a 2-D index i * 1024 + j), not the shift's bfi and an add
+/// (L15-E864).
+static SDValue performBoundedFieldInsert(SDNode *N,
+                                         TargetLowering::DAGCombinerInfo &DCI) {
+  if (!AGXBoundedFieldInsert || !DCI.isAfterLegalizeDAG() ||
+      N->getValueType(0) != MVT::i32)
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue P = N->getOperand(I), Q = N->getOperand(1 - I);
+    if (P.getOpcode() != ISD::SHL || !isa<ConstantSDNode>(P.getOperand(1)) ||
+        !P.hasOneUse())
+      continue;
+    uint64_t S = P.getConstantOperandVal(1);
+    if (S <= 4 || S >= 32 || !positionBelow(Q, uint64_t(1) << S, DAG))
+      continue;
+    SDLoc DL(N);
+    return DAG.getNode(AGXISD::BFI_FIELD, DL, MVT::i32, Q, P.getOperand(0),
+                       DAG.getConstant(S, DL, MVT::i32),
+                       DAG.getTargetConstant(32 - S, DL, MVT::i32));
+  }
+  return SDValue();
+}
+
 static cl::opt<bool> BranchLowBitXor(
     "agx-branch-low-bit-xor",
     cl::desc("a branch on (a ^ x) & 1, a boolean, as a != (x & 1)"),
@@ -2396,6 +2441,9 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   }
   case ISD::ADD:
   case ISD::SUB: {
+    if (N->getOpcode() == ISD::ADD)
+      if (SDValue V = performBoundedFieldInsert(N, DCI))
+        return V;
     // a 64-bit value plus (or minus) one with a zero low word: the high
     // words only (L15-E660)
     if (AGXAddHighWords && N->getValueType(0) == MVT::i64 &&
@@ -2718,6 +2766,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     if (SDValue V = performBooleanLogicCombine(N, DCI))
       return V;
     if (SDValue V = performBfiInsertCombine(N, DCI))
+      return V;
+    if (SDValue V = performBoundedFieldInsert(N, DCI))
       return V;
     // or(Q, P) where P is x << s (with masks around the shift) whose bits
     // that may be set are one field [s, s + w) and Q is known zero there:
