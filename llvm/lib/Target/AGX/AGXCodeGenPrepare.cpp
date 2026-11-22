@@ -10410,6 +10410,15 @@ static bool branchRareFallbacksOnce(Function &F) {
       if (Conds.size() > 1 && CI) {
         Instruction *Clone = CI->clone();
         Clone->insertBefore(Rare->getTerminator()->getIterator());
+        // (and its fabs, which the compare-select reads as a modifier: one
+        // used across the branch is an and of the bits there)
+        for (Use &U : Clone->operands())
+          if (auto *A = dyn_cast<IntrinsicInst>(U.get());
+              A && A->getIntrinsicID() == Intrinsic::fabs) {
+            Instruction *AC = A->clone();
+            AC->insertBefore(Clone->getIterator());
+            U.set(AC);
+          }
         RareConds[C] = Clone;
       }
     }

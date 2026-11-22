@@ -1,4 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=SINS
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-hardware-branch=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-min=1 < %s | FileCheck %s --check-prefix=ONE
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-merge=0 < %s | FileCheck %s --check-prefix=APART
@@ -60,11 +61,20 @@
 ; CHECK-COUNT-4: fcmpsel lt, {{r[0-9]+}}, {{r[0-9]+}}.abs
 ; CHECK: if_icmp
 ; CHECK: jmp_exec_none [[J:.LBB[0-9_]+]]
-; CHECK-COUNT-4: sin_pt_1
+; (the rare block's compares read abs(x) as a modifier, no and of the bits)
+; CHECK-NOT: {{^}}	and
+; CHECK: fcmpsel lt, {{r[0-9]+}}, {{r[0-9]+}}.abs
+; CHECK-NOT: {{^}}	and
 ; CHECK: [[J]]:
 ; CHECK-NEXT: pop_exec
 ; CHECK-NOT: sin_pt_1
 ; CHECK: device_store
+; SINS-LABEL: four_sins:
+; SINS: jmp_exec_none
+; SINS-COUNT-4: sin_pt_1
+; SINS: pop_exec
+; SINS-NOT: sin_pt_1
+; SINS: device_store
 ; APART-LABEL: four_sins:
 ; APART-NOT: if_
 ; APART: device_store
