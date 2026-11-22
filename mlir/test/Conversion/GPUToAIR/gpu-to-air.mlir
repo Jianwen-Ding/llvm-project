@@ -1605,6 +1605,30 @@ gpu.module @dynamic_shared_memory {
 
 // -----
 
+// An i1 in memory (L15-E831; AIR has none): a byte, loaded and truncated,
+// stored zero-extended, its GEPs over i8.
+gpu.module @i1_memory {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK: llvm.getelementptr {{.*}} -> !llvm.ptr<1>, i8
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<1> -> i8
+  // CHECK: llvm.trunc {{.*}} : i8 to i1
+  // CHECK: llvm.zext {{.*}} : i1 to i8
+  // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
+  // CHECK-NOT: -> i1
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xi1, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v = memref.load %a[%c1] : memref<8xi1, 1>
+    %t = arith.constant true
+    %e = arith.xori %v, %t : i1
+    memref.store %e, %a[%c0] : memref<8xi1, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

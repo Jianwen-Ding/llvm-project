@@ -4857,6 +4857,43 @@ struct LowerGpuOpsToAIROpsPass final
     if (failed(applyPartialConversion(m, target, std::move(llvmPatterns))))
       return signalPassFailure();
 
+    // An i1 in memory (memref<...xi1>) as a byte, which AIR has (it has no
+    // i1 in memory; LLVM gives an i1 element a byte already): loads of i8
+    // truncated, stores of the bit zero-extended, GEPs over i8 (L15-E831).
+    {
+      Type i1 = IntegerType::get(ctx, 1), i8 = IntegerType::get(ctx, 8);
+      SmallVector<Operation *> work;
+      m.walk([&](Operation *op) {
+        if (auto ld = dyn_cast<LLVM::LoadOp>(op); ld && ld.getType() == i1)
+          work.push_back(op);
+        else if (auto st = dyn_cast<LLVM::StoreOp>(op);
+                 st && st.getValue().getType() == i1)
+          work.push_back(op);
+        else if (auto gep = dyn_cast<LLVM::GEPOp>(op);
+                 gep && gep.getElemType() == i1)
+          gep.setElemType(i8);
+      });
+      for (Operation *op : work) {
+        OpBuilder b(op);
+        if (auto ld = dyn_cast<LLVM::LoadOp>(op)) {
+          auto wide = LLVM::LoadOp::create(b, ld.getLoc(), i8, ld.getAddr(),
+                                           ld.getAlignment().value_or(1),
+                                           ld.getVolatile_(),
+                                           ld.getNontemporal());
+          Value bit = LLVM::TruncOp::create(b, ld.getLoc(), i1, wide);
+          ld.getResult().replaceAllUsesWith(bit);
+          ld.erase();
+        } else {
+          auto st = cast<LLVM::StoreOp>(op);
+          Value byte = LLVM::ZExtOp::create(b, st.getLoc(), i8, st.getValue());
+          LLVM::StoreOp::create(b, st.getLoc(), byte, st.getAddr(),
+                                st.getAlignment().value_or(1),
+                                st.getVolatile_(), st.getNontemporal());
+          st.erase();
+        }
+      }
+    }
+
     // Kernels carry the "air-kernel" function attribute, and the threadgroup
     // size when it is known as an AGX hint, which AIR ignores (the AGX
     // backend budgets registers and barriers by it).
