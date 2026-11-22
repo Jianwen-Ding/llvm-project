@@ -791,6 +791,10 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            /*default=*/"true",
            "f64 sin and cos with one polynomial chain of selected "
            "coefficients, not both kernels">,
+    Option<"subByteRewrites", "sub-byte-rewrites", "bool",
+           /*default=*/"true",
+           "Rewrite extensions of sub-byte integer vectors (bitcasts of bytes "
+           "to i4) as shifts of the bytes">,
     Option<"smallFloatExtViaHalf", "small-float-ext-via-half", "bool",
            /*default=*/"true",
            "Extend a small float of at most 5 exponent bits as the half its "

@@ -1929,3 +1929,35 @@ gpu.module @small_float_arith {
     gpu.return
   }
 }
+
+// -----
+
+// int4 weights (L15-E850): a vector.bitcast of bytes to i4 converted to f32
+// as each nibble under a half's 0x6400 (xor 0x6408 for a signed one) minus
+// 1032, extended to i32 by shifts at 32 bits, the nibbles interleaved; no i4
+// vector (which the backend scalarized into a byte load an element).
+gpu.module @int4 {
+  // CHECK-LABEL: gpu.module @int4
+  // CHECK: llvm.func @k(
+  // CHECK-NOT: i4>
+  // CHECK: llvm.load {{.*}} -> vector<2xi8>
+  // CHECK: llvm.and {{.*}} : vector<2xi16>
+  // CHECK: llvm.xor {{.*}} : vector<2xi16>
+  // CHECK: llvm.fadd {{.*}} : vector<2xf16>
+  // CHECK: llvm.lshr {{.*}} : vector<2xi16>
+  // CHECK: llvm.shufflevector {{.*}} [0, 2, 1, 3] : vector<2xf16>
+  // CHECK: llvm.and {{.*}} : vector<2xi32>
+  // CHECK: llvm.lshr {{.*}} : vector<2xi32>
+  // CHECK-NOT: i4>
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<64xi8, 1>, %o: memref<64xf32, 1>, %p: memref<64xi32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %b = vector.load %a[%c0] : memref<64xi8, 1>, vector<2xi8>
+    %q = vector.bitcast %b : vector<2xi8> to vector<4xi4>
+    %f = arith.sitofp %q : vector<4xi4> to vector<4xf32>
+    vector.store %f, %o[%c0] : memref<64xf32, 1>, vector<4xf32>
+    %u = arith.extui %q : vector<4xi4> to vector<4xi32>
+    vector.store %u, %p[%c0] : memref<64xi32, 1>, vector<4xi32>
+    gpu.return
+  }
+}

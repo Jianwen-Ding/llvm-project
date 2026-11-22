@@ -2929,6 +2929,7 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
 }
 
 static thread_local bool smallFloatExtViaHalf = true;
+static thread_local bool subByteRewrites = true;
 
 namespace {
 /// A float type of at most 8 bits with a sign, a zero and a significand (f4,
@@ -3356,6 +3357,97 @@ static LogicalResult rewriteSmallFloatTruncF(arith::TruncFOp op,
   Value narrow = arith::TruncIOp::create(
       b, smallFloatShaped(x.getType(), b.getIntegerType(s->w)), code);
   rewriter.replaceOp(op, arith::BitcastOp::create(b, dstTy, narrow));
+  return success();
+}
+
+/// (L15-E850) an extension or conversion (extsi, extui, sitofp, uitofp) of
+/// a 1-D vector of i4 that is a vector.bitcast of bytes: each byte's nibbles
+/// in 16 bits (where a byte is loaded), the low one (z << 12) >> 12 and the
+/// high (z << 8) >> 12 signed, z & 15 and z >> 4 unsigned, interleaved (the
+/// bitcast's order, low nibble first), then the op from i16 (a 16-bit
+/// source converts in one instruction).
+template <typename OpTy>
+static LogicalResult rewriteNibbleExt(OpTy op, PatternRewriter &rewriter) {
+  auto bc = op.getIn().template getDefiningOp<vector::BitCastOp>();
+  if (!subByteRewrites || !bc)
+    return failure();
+  auto dst = dyn_cast<VectorType>(bc.getType());
+  auto src = dyn_cast<VectorType>(bc.getSource().getType());
+  if (!dst || !src || dst.getRank() != 1 || src.getRank() != 1 ||
+      dst.isScalable() || !dst.getElementType().isInteger(4) ||
+      !src.getElementType().isInteger(8))
+    return failure();
+  constexpr bool isSigned =
+      std::is_same_v<OpTy, arith::ExtSIOp> || std::is_same_v<OpTy, arith::SIToFPOp>;
+  Type outEt = getElementTypeOrSelf(op.getType());
+  if (outEt.isInteger() && outEt.getIntOrFloatBitWidth() < 8)
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  auto v16 = VectorType::get(src.getShape(), b.getI16Type());
+  auto cst = [&](int64_t v) {
+    return arith::ConstantOp::create(
+        b, v16, DenseElementsAttr::get(v16, b.getI16IntegerAttr(v)));
+  };
+  Value z = arith::ExtUIOp::create(b, v16, bc.getSource());
+  Value lo, hi;
+  if (!outEt.isInteger()) {
+    // to a float: each nibble under a half's 0x6400 (1024 + u: 2^10 and
+    // 10 fraction bits), u = nibble ^ 8 for a signed one (n + 8), and the
+    // half minus 1024 (+ 8): exact, two full-rate operations and a half
+    // addition an element, no conversion instruction
+    uint64_t key = isSigned ? 0x6408 : 0x6400;
+    auto h16 = VectorType::get(src.getShape(), b.getF16Type());
+    auto keyed = [&](Value n) {
+      Value k = isSigned ? arith::XOrIOp::create(b, n, cst(key)).getResult()
+                         : arith::OrIOp::create(b, n, cst(key)).getResult();
+      return arith::AddFOp::create(
+          b, arith::BitcastOp::create(b, h16, k),
+          arith::ConstantOp::create(
+              b, h16,
+              DenseElementsAttr::get(
+                  h16, b.getF16FloatAttr(isSigned ? -1032.0 : -1024.0))));
+    };
+    Value fl = keyed(arith::AndIOp::create(b, z, cst(15)));
+    Value fh = keyed(arith::ShRUIOp::create(b, z, cst(4)));
+    Value w = vector::InterleaveOp::create(b, fl, fh);
+    Type outTy = op.getType();
+    unsigned ow = outEt.getIntOrFloatBitWidth();
+    Value r = w;
+    if (outEt.isF16())
+      r = w;
+    else if (ow > 16)
+      r = arith::ExtFOp::create(b, outTy, w);
+    else
+      r = arith::TruncFOp::create(
+          b, outTy,
+          arith::ExtFOp::create(
+              b, VectorType::get(dst.getShape(), b.getF32Type()), w));
+    rewriter.replaceOp(op, r);
+    return success();
+  }
+  // to an integer: the shifts at the result's width (from 16 bits), no
+  // extension after them
+  unsigned ow = outEt.getIntOrFloatBitWidth(), iw = std::max(ow, 16u);
+  auto vi = VectorType::get(src.getShape(), b.getIntegerType(iw));
+  auto ci = [&](int64_t v) {
+    return arith::ConstantOp::create(
+        b, vi, DenseElementsAttr::get(vi, b.getIntegerAttr(b.getIntegerType(iw), v)));
+  };
+  Value zi = iw == 16 ? z : arith::ExtUIOp::create(b, vi, bc.getSource()).getResult();
+  if (isSigned) {
+    lo = arith::ShRSIOp::create(b, arith::ShLIOp::create(b, zi, ci(iw - 4)),
+                                ci(iw - 4));
+    hi = arith::ShRSIOp::create(b, arith::ShLIOp::create(b, zi, ci(iw - 8)),
+                                ci(iw - 4));
+  } else {
+    lo = arith::AndIOp::create(b, zi, ci(15));
+    hi = arith::ShRUIOp::create(b, zi, ci(4));
+  }
+  Value w = vector::InterleaveOp::create(b, lo, hi);
+  Value r = w;
+  if (ow < iw)
+    r = arith::TruncIOp::create(b, op.getType(), w);
+  rewriter.replaceOp(op, r);
   return success();
 }
 
@@ -4906,6 +4998,7 @@ struct LowerGpuOpsToAIROpsPass final
     ::log1pF64Direct = log1pF64Direct;
     ::trigSharedPolynomial = trigF64SharedPolynomial;
     ::smallFloatExtViaHalf = smallFloatExtViaHalf;
+    ::subByteRewrites = subByteRewrites;
     ::f64PolynomialFma = f64PolynomialFma;
     if (speculateGuardedLoads)
       ::speculateGuardedLoads(m);
@@ -5112,6 +5205,31 @@ struct LowerGpuOpsToAIROpsPass final
           if (auto t = dyn_cast<arith::TruncFOp>(op); t && isSmall(t.getType()))
             t.setFastmath(arith::FastMathFlags::none);
         });
+      }
+    }
+    // (L15-E850) sub-byte integer vectors (an int4 weight's vector.bitcast
+    // of bytes to i4 and its extension): upstream's narrow-type rewrites,
+    // shifts of the bytes, no i4 vector (which the backend scalarized into a
+    // byte load an element)
+    {
+      bool narrow = false;
+      m.walk([&](Operation *op) {
+        for (Type t : op->getResultTypes())
+          if (auto vt = dyn_cast<VectorType>(t);
+              vt && vt.getElementType().isInteger() &&
+              vt.getElementType().getIntOrFloatBitWidth() < 8)
+            narrow = true;
+        return narrow ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (narrow && subByteRewrites) {
+        RewritePatternSet patterns(ctx);
+        patterns.add(rewriteNibbleExt<arith::ExtSIOp>, /*benefit=*/4);
+        patterns.add(rewriteNibbleExt<arith::ExtUIOp>, /*benefit=*/4);
+        patterns.add(rewriteNibbleExt<arith::SIToFPOp>, /*benefit=*/4);
+        patterns.add(rewriteNibbleExt<arith::UIToFPOp>, /*benefit=*/4);
+        vector::populateVectorNarrowTypeRewritePatterns(patterns);
+        vector::populateVectorInterleaveLoweringPatterns(patterns);
+        (void)applyPatternsGreedily(m, std::move(patterns));
       }
     }
     // (L15-E840) views of memrefs (subview, expand_shape, collapse_shape),
