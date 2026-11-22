@@ -1315,6 +1315,348 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
   return success();
 }
 
+/// 2/pi's bits after the binary point, 64 a word, the most significant
+/// first, after a word of zeros (L15-E822): remPio2F64's window of a large x.
+static const uint64_t twoOverPiWords[20] = {
+    0x0000000000000000ULL, 0xa2f9836e4e441529ULL, 0xfc2757d1f534ddc0ULL,
+    0xdb6295993c439041ULL, 0xfe5163abdebbc561ULL, 0xb7246e3a424dd2e0ULL,
+    0x06492eea09d1921cULL, 0xfe1deb1cb129a73eULL, 0xe88235f52ebb4484ULL,
+    0xe99c7026b45f7e41ULL, 0x3991d639835339f4ULL, 0x9c845f8bbdf9283bULL,
+    0x1ff897ffde05980fULL, 0xef2f118b5a0a6d1fULL, 0x6d367ecf27cb09b7ULL,
+    0x4f463f669e5fea2dULL, 0x7527bac7ebe5f17bULL, 0x3d0739f78a5292eaULL,
+    0x6bfb5fb11f8d5d08ULL, 0x56033046fc7b6babULL};
+
+/// x = n pi/2 + (y0 + y1) for an f64 x, |y0 + y1| <= pi/4 about, n's low
+/// bits as i64 (L15-E822). fdlibm's e_rem_pio2.c: below 2^19 pi/2 three
+/// rounds of Cody and Waite's reduction by pi/2 in 33-bit parts (fdlibm's
+/// rounds two and three where its cancellation test asks for them; here
+/// always, branch-free, with the second round's rounding error kept, which
+/// fdlibm's third round, taken only after a cancellation, has none of),
+/// n = roundeven(|x| 2/pi).
+/// From 2^19 pi/2 (and for infinities and NaNs, whose results the callers
+/// replace) Payne and Hanek's: x = M 2^e, M the 53-bit significand, and
+/// x 2/pi mod 4 = M W 2^-190 mod 4 for W the 192 bits of 2/pi from the one
+/// of weight 2^-(e + 63) (2/pi's bits above it give multiples of 4): three
+/// 64 x 64-bit products, n the sum's bits 190 and 191, the fraction its 128
+/// bits below, past one half less one (n + 1), normalized to two doubles
+/// times pi/2 in two parts (the product's error by an fma). In an scf.if: a
+/// SIMD group with no such lane runs none of it.
+static std::tuple<Value, Value, Value> remPio2F64(ImplicitLocOpBuilder &b,
+                                                  Value x) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type(), i1 = b.getI1Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto ci = [&](int64_t v) {
+    return arith::ConstantIntOp::create(b, i64, v).getResult();
+  };
+  auto add = [&](Value u, Value v) {
+    return arith::AddFOp::create(b, u, v).getResult();
+  };
+  auto sub = [&](Value u, Value v) {
+    return arith::SubFOp::create(b, u, v).getResult();
+  };
+  auto mul = [&](Value u, Value v) {
+    return arith::MulFOp::create(b, u, v).getResult();
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto iadd = [&](Value u, Value v) {
+    return arith::AddIOp::create(b, u, v).getResult();
+  };
+  auto isub = [&](Value u, Value v) {
+    return arith::SubIOp::create(b, u, v).getResult();
+  };
+  auto iand = [&](Value u, Value v) {
+    return arith::AndIOp::create(b, u, v).getResult();
+  };
+  auto ior = [&](Value u, Value v) {
+    return arith::OrIOp::create(b, u, v).getResult();
+  };
+  auto shl = [&](Value u, Value v) {
+    return arith::ShLIOp::create(b, u, v).getResult();
+  };
+  auto shr = [&](Value u, Value v) {
+    return arith::ShRUIOp::create(b, u, v).getResult();
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v).getResult();
+  };
+  auto bits = [&](Value v) {
+    return arith::BitcastOp::create(b, i64, v).getResult();
+  };
+  auto dbl = [&](Value v) {
+    return arith::BitcastOp::create(b, f64, v).getResult();
+  };
+  Value a = math::AbsFOp::create(b, x);
+  Value neg = icmp(arith::CmpIPredicate::slt, bits(x), ci(0));
+  Value large = arith::CmpFOp::create(b, arith::CmpFPredicate::UGE, a,
+                                      c(0x1.921fbp+19));
+  auto ifOp = scf::IfOp::create(b, TypeRange{f64, f64, i64}, large,
+                                /*withElseRegion=*/true);
+  {
+    OpBuilder::InsertionGuard guard(b);
+    // Payne and Hanek's
+    b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    Value bx = bits(a);
+    Value m = ior(iand(bx, ci(0xfffffffffffffLL)), ci(1LL << 52));
+    // the window's first bit, from twoOverPiWords' first: e + 62 for x =
+    // M 2^e (e = field - 1075), and its word and the bit in it
+    Value q = isub(shr(bx, ci(52)), ci(1075 - 62));
+    Value wi = shr(q, ci(6)), bo = iand(q, ci(63));
+    auto word = [&](Value idx) {
+      Value w = ci(0);
+      for (int k = 19; k >= 0; --k)
+        w = sel(icmp(arith::CmpIPredicate::eq, idx, ci(k)),
+                ci(int64_t(twoOverPiWords[k])), w);
+      return w;
+    };
+    Value g0 = word(wi), g1 = word(iadd(wi, ci(1))),
+          g2 = word(iadd(wi, ci(2))), g3 = word(iadd(wi, ci(3)));
+    // (u << bo) | (v >> (64 - bo)), the second as two shifts for bo = 0
+    Value rbo = isub(ci(63), bo);
+    auto window = [&](Value u, Value v) {
+      return ior(shl(u, bo), shr(shr(v, ci(1)), rbo));
+    };
+    Value w0 = window(g0, g1), w1 = window(g1, g2), w2 = window(g2, g3);
+    auto p2 = arith::MulUIExtendedOp::create(b, m, w2);
+    auto p1 = arith::MulUIExtendedOp::create(b, m, w1);
+    Value lo0 = arith::MulIOp::create(b, m, w0);
+    Value s1 = iadd(p2.getHigh(), p1.getLow());
+    Value carry = arith::ExtUIOp::create(
+        b, i64, icmp(arith::CmpIPredicate::ult, s1, p2.getHigh()));
+    Value s2 = iadd(iadd(p1.getHigh(), lo0), carry);
+    Value n = shr(s2, ci(62));
+    Value fhi = ior(shl(s2, ci(2)), shr(s1, ci(62)));
+    Value flo = ior(shl(s1, ci(2)), shr(p2.getLow(), ci(62)));
+    // from one half: 1 - f, and n + 1
+    Value half = icmp(arith::CmpIPredicate::slt, fhi, ci(0));
+    n = iadd(n, arith::ExtUIOp::create(b, i64, half));
+    Value nlo = isub(ci(0), flo);
+    Value nhi = isub(isub(ci(0), fhi),
+                     arith::ExtUIOp::create(
+                         b, i64, icmp(arith::CmpIPredicate::ne, flo, ci(0))));
+    fhi = sel(half, nhi, fhi);
+    flo = sel(half, nlo, flo);
+    // normalized: the high word's top bit set (it is not zero: a double's
+    // fraction of pi/2 is at least 2^-62 or so of it)
+    Value sh = math::CountLeadingZerosOp::create(b, fhi);
+    sh = arith::MinUIOp::create(b, sh, ci(63));
+    Value nh = ior(shl(fhi, sh), shr(shr(flo, ci(1)), isub(ci(63), sh)));
+    Value nl = shl(flo, sh);
+    Value h53 = shr(nh, ci(11));
+    Value rest = ior(shl(iand(nh, ci(0x7ff)), ci(53)), shr(nl, ci(11)));
+    auto pow2 = [&](Value e) { return dbl(shl(iadd(e, ci(1023)), ci(52))); };
+    Value hi = mul(arith::UIToFPOp::create(b, f64, h53),
+                   pow2(isub(ci(-53), sh)));
+    Value lo = mul(arith::UIToFPOp::create(b, f64, rest),
+                   pow2(isub(ci(-117), sh)));
+    // (hi + lo) pi/2
+    Value pio2Hi = c(1.5707963267948966), pio2Lo = c(6.123233995736766e-17);
+    Value p = mul(hi, pio2Hi);
+    Value e = math::FmaOp::create(b, hi, pio2Hi,
+                                  arith::NegFOp::create(b, p).getResult());
+    e = add(e, add(mul(hi, pio2Lo), mul(lo, pio2Hi)));
+    Value y0 = add(p, e);
+    Value y1 = sub(e, sub(y0, p));
+    y0 = sel(half, arith::NegFOp::create(b, y0).getResult(), y0);
+    y1 = sel(half, arith::NegFOp::create(b, y1).getResult(), y1);
+    scf::YieldOp::create(b, ValueRange{y0, y1, n});
+  }
+  {
+    OpBuilder::InsertionGuard guard(b);
+    // Cody and Waite's, three rounds
+    b.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    Value fn = math::RoundEvenOp::create(b, mul(a, c(6.36619772367581382433e-01)));
+    // (r1 exact; each later round's rounding error e kept: fdlibm takes its
+    // third round only where the second's subtraction cancelled, exactly)
+    Value r1 = sub(a, mul(fn, c(1.57079632673412561417e+00)));
+    Value w2 = mul(fn, c(6.07710050630396597660e-11));
+    Value r2 = sub(r1, w2);
+    Value e2 = sub(sub(r1, r2), w2);
+    Value w3 = mul(fn, c(2.02226624871116645580e-21));
+    Value r = sub(r2, w3);
+    Value e3 = sub(sub(r2, r), w3);
+    Value w = sub(sub(mul(fn, c(8.47842766036889956997e-32)), e3), e2);
+    Value y0 = sub(r, w);
+    Value y1 = sub(sub(r, y0), w);
+    // (an infinite or NaN |x| goes to the other branch)
+    Value n = arith::FPToSIOp::create(b, i64, fn);
+    scf::YieldOp::create(b, ValueRange{y0, y1, n});
+  }
+  (void)i1;
+  Value y0 = ifOp.getResult(0), y1 = ifOp.getResult(1), n = ifOp.getResult(2);
+  y0 = sel(neg, arith::NegFOp::create(b, y0).getResult(), y0);
+  y1 = sel(neg, arith::NegFOp::create(b, y1).getResult(), y1);
+  n = sel(neg, isub(ci(0), n), n);
+  return {y0, y1, n};
+}
+
+/// fdlibm's __kernel_sin(y0, y1) and FreeBSD's __kernel_cos(y0, y1) on
+/// |y0 + y1| <= pi/4 (L15-E822).
+static Value kernelSinF64(ImplicitLocOpBuilder &b, Value x, Value y) {
+  Type f64 = b.getF64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  Value z = mul(x, x), v = mul(z, x);
+  Value r = c(1.58969099521155010221e-10);
+  for (double k : {-2.50507602534068634195e-08, 2.75573137070700676789e-06,
+                   -1.98412698298579493134e-04, 8.33333333332248946124e-03})
+    r = f64Fma(b, z, r, c(k));
+  // x - ((z (y/2 - v r) - y) - v S1)
+  return sub(x, sub(sub(mul(z, sub(mul(c(0.5), y), mul(v, r))), y),
+                    mul(v, c(-1.66666666666666324348e-01))));
+}
+static Value kernelCosF64(ImplicitLocOpBuilder &b, Value x, Value y) {
+  Type f64 = b.getF64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  Value z = mul(x, x), w = mul(z, z);
+  Value r1 = f64Fma(b, z, f64Fma(b, z, c(2.48015872894767294178e-05),
+                                 c(-1.38888888888741095749e-03)),
+                    c(4.16666666666666019037e-02));
+  Value r2 = f64Fma(b, z, f64Fma(b, z, c(-1.13596475577881948265e-11),
+                                 c(2.08757232129817482790e-09)),
+                    c(-2.75573143513906633035e-07));
+  Value r = add(mul(z, r1), mul(mul(w, w), r2));
+  Value hz = mul(c(0.5), z);
+  Value wv = sub(c(1.0), hz);
+  return add(wv, add(sub(sub(c(1.0), wv), hz), sub(mul(z, r), mul(x, y))));
+}
+/// FreeBSD's __kernel_tan(y0, y1, odd ? -1 : 1): tan, or -1/tan for odd n;
+/// from |y| 0.6744 tan(pi/4 - y)'s identity; the two divisions (that
+/// form's and -1 / (x + r)'s) one, of operands selected (L15-E822).
+static Value kernelTanF64(ImplicitLocOpBuilder &b, Value x, Value y,
+                          Value odd) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto lowCleared = [&](Value v) {
+    return arith::BitcastOp::create(
+               b, f64,
+               arith::AndIOp::create(
+                   b, arith::BitcastOp::create(b, i64, v),
+                   arith::ConstantIntOp::create(
+                       b, i64, int64_t(0xffffffff00000000ULL))))
+        .getResult();
+  };
+  Value ax = math::AbsFOp::create(b, x);
+  Value big = arith::CmpFOp::create(b, arith::CmpFPredicate::OGE, ax,
+                                    c(0x1.59428p-1));
+  Value negx = arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, x, c(0.0));
+  // big: pi/4 - |x| (with y's sign as x's), y = 0
+  Value xs = sel(negx, arith::NegFOp::create(b, x).getResult(), x);
+  Value ys = sel(negx, arith::NegFOp::create(b, y).getResult(), y);
+  Value xb = add(sub(c(7.85398163397448278999e-01), xs),
+                 sub(c(3.06161699786838301793e-17), ys));
+  x = sel(big, xb, x);
+  y = sel(big, c(0.0), y);
+  Value z = mul(x, x), w = mul(z, z);
+  Value r = c(-1.85586374855275456654e-05);
+  for (double k : {7.81794442939557092300e-05, 5.88041240820264096874e-04,
+                   3.59207910759131235356e-03, 2.18694882948595424599e-02,
+                   1.33333333333201242699e-01})
+    r = f64Fma(b, w, r, c(k));
+  Value v = c(2.59073051863633712884e-05);
+  for (double k : {7.14072491382608190305e-05, 2.46463134818469906812e-04,
+                   1.45620945432529025516e-03, 8.86323982359930005737e-03,
+                   5.39682539762260521377e-02})
+    v = f64Fma(b, w, v, c(k));
+  v = mul(z, v);
+  Value s = mul(z, x);
+  r = add(add(y, mul(z, add(mul(s, add(r, v)), y))),
+          mul(s, c(3.33333333333334091986e-01)));
+  Value wv = add(x, r);
+  Value iy = sel(odd, c(-1.0), c(1.0));
+  // the one division: w^2 / (w + iy) (big), -1 / w (odd)
+  Value q = arith::DivFOp::create(b, sel(big, mul(wv, wv), c(-1.0)),
+                                  sel(big, add(wv, iy), wv));
+  Value bigV = mul(sel(negx, c(-1.0), c(1.0)),
+                   sub(iy, mul(c(2.0), sub(x, sub(q, r)))));
+  // -1 / (x + r) to full precision: t = -1 / w's high word, its correction
+  Value zh = lowCleared(wv);
+  Value vv = sub(r, sub(zh, x));
+  Value t = lowCleared(q);
+  Value sv = add(c(1.0), mul(t, zh));
+  Value oddV = add(t, mul(q, add(sv, mul(t, vv))));
+  return sel(big, bigV, sel(odd, oddV, wv));
+}
+
+/// sin, cos and tan of f64 (L15-E822; before, llvm.sin.f64 and the others
+/// had no emulation and the kernel did not compile): fdlibm's s_sin.c,
+/// s_cos.c and s_tan.c, x reduced by remPio2F64 and the kernels selected by
+/// n mod 4 (sin: sin, cos, -sin, -cos; cos: cos, -sin, -cos, sin; tan: tan
+/// or -1/tan); x itself for sin and tan of |x| below 2^-27 (and -0), 1 for
+/// cos; NaN for infinities and NaNs.
+template <typename OpTy>
+static LogicalResult rewriteTrigF64(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto bit = [&](Value n, int64_t k) {
+    return arith::CmpIOp::create(
+               b, arith::CmpIPredicate::ne,
+               arith::AndIOp::create(b, n,
+                                     arith::ConstantIntOp::create(b, i64, k)),
+               arith::ConstantIntOp::create(b, i64, 0))
+        .getResult();
+  };
+  auto neg = [&](Value v) { return arith::NegFOp::create(b, v).getResult(); };
+  Value x = op.getOperand();
+  Value a = math::AbsFOp::create(b, x);
+  auto [y0, y1, n] = remPio2F64(b, x);
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::TanOp>) {
+    r = kernelTanF64(b, y0, y1, bit(n, 1));
+    r = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, a, c(0x1p-27)),
+            x, r);
+  } else {
+    Value s = kernelSinF64(b, y0, y1), co = kernelCosF64(b, y0, y1);
+    constexpr bool isCos = std::is_same_v<OpTy, math::CosOp>;
+    // cos is sin a quadrant ahead
+    Value odd = bit(n, 1), minus = bit(isCos ? arith::AddIOp::create(
+                                                   b, n,
+                                                   arith::ConstantIntOp::create(
+                                                       b, i64, 1))
+                                                   .getResult()
+                                             : n,
+                                         2);
+    Value v = isCos ? sel(odd, s, co) : sel(odd, co, s);
+    r = sel(minus, neg(v), v);
+    Value tiny =
+        arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, a, c(0x1p-27));
+    r = sel(tiny, isCos ? c(1.0) : x, r);
+  }
+  r = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::UGE, a,
+                                c(std::numeric_limits<double>::infinity())),
+          c(std::numeric_limits<double>::quiet_NaN()), r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
 /// atan of an f64 a >= 0 (or NaN): fdlibm's s_atan.c, branch-free. Below
 /// 0.4375 a itself is the polynomial's argument; above, (2a - 1) / (2 + a),
 /// (a - 1) / (a + 1), (a - 1.5) / (1 + 1.5a) or -1 / a by the range (one
@@ -3703,6 +4045,9 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteF64Function<math::SinhOp>);
       patterns.add(rewriteF64Function<math::TanhOp>);
       patterns.add(rewriteInverseTrigF64<math::AtanOp>);
+      patterns.add(rewriteTrigF64<math::SinOp>);
+      patterns.add(rewriteTrigF64<math::CosOp>);
+      patterns.add(rewriteTrigF64<math::TanOp>);
       patterns.add(rewriteInverseTrigF64<math::Atan2Op>);
       patterns.add(rewriteInverseTrigF64<math::AsinOp>);
       patterns.add(rewriteInverseTrigF64<math::AcosOp>);

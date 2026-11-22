@@ -1404,6 +1404,37 @@ gpu.module @f64_inverse_trig {
 
 // -----
 
+// f64 sin, cos and tan (L15-E822; llvm.sin.f64 and the others had no
+// emulation): fdlibm's kernels on x reduced by pi/2, Cody and Waite's below
+// 2^19 pi/2, Payne and Hanek's from it in a branch of its own (its window of
+// 2/pi's bits, its product's normalization and error fma); tan's one
+// division. No intrinsic call of theirs left.
+gpu.module @f64_trig {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.{{(sin|cos|tan)}}(
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.intr.ctlz
+  // CHECK: llvm.intr.fma
+  // CHECK: llvm.intr.roundeven
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: llvm.intr.{{(sin|cos|tan)}}(
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.sin %v : f64
+    %f = math.cos %e : f64
+    %g = math.tan %f : f64
+    memref.store %g, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.
