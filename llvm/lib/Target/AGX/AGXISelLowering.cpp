@@ -479,8 +479,12 @@ static cl::opt<unsigned> AGXSignedBytesALU(
              "2 every byte, 3 every byte in functions with register headroom "
              "(-agx-headroom-gprs), else the low byte"));
 
+// 64 since L15-E757 (24 before): the soft doubles' 64-bit counts of
+// leading zeros at a half (cosh_f64, expm1_f64, sinh_f64, tanh_f64 -3%,
+// agx-bench ddot -3.1%, their registers the same or two more at the same
+// threads per threadgroup).
 static cl::opt<unsigned> AGXHeadroomGPRs(
-    "agx-headroom-gprs", cl::Hidden, cl::init(24),
+    "agx-headroom-gprs", cl::Hidden, cl::init(64),
     cl::desc(
         "Functions whose estimated register pressure (agxEstimatePressure, "
         "32-bit registers) is at most this take the forms that trade "
@@ -3420,7 +3424,8 @@ SDValue AGXTargetLowering::lowerCTLZ_CTTZ64(SDValue Op,
     // 63 - ffs(second) where the first half is zero (64 for x = 0), instead
     // of counting both halves. Both halves stay live up to the select, so
     // only where the function has register headroom (ddot, without it:
-    // 64 -> 66 GPRs, 832 -> 768 threads per threadgroup).
+    // 64 -> 66 GPRs, 832 -> 768 threads per threadgroup; since L15-E757
+    // 62 -> 64 at 832, and faster).
     SDValue V = DAG.getSelect(DL, MVT::i32, FirstZero, Second, First);
     if (!IsCTLZ)
       V = DAG.getNode(ISD::BITREVERSE, DL, MVT::i32, V);
