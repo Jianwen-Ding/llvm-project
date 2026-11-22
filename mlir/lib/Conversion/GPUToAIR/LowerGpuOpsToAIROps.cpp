@@ -3105,6 +3105,53 @@ static LogicalResult rewriteSmallFloatExtF(arith::ExtFOp op,
                              b, hx, arith::ConstantOp::create(b, rt, sa))
                              .getResult();
       }
+      // (L15-E851) specials that are all NaNs whose formula values share a
+      // magnitude no other code gives (FN's 0x7f and 0xff, +-480): one
+      // compare of that magnitude for both, the NaN the result type's
+      {
+        std::optional<float> m;
+        bool merge = specials.size() > 1;
+        auto formulaOf = [&](uint32_t c) {
+          uint32_t mag = c & magMask;
+          uint16_t hbv = uint16_t(((c >> (s->w - 1)) << 15) | (mag << up));
+          APFloat hh(APFloat::IEEEhalf(), APInt(16, hbv));
+          bool lost;
+          hh.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &lost);
+          return std::fabs(hh.convertToFloat() * scale);
+        };
+        for (auto [c, f] : specials) {
+          if ((f & 0x7fffffffu) <= 0x7f800000u)
+            merge = false;
+          float fm = formulaOf(c);
+          if (m && *m != fm)
+            merge = false;
+          m = fm;
+        }
+        for (uint32_t c = 0; merge && c < (1u << s->w); ++c)
+          if (!llvm::any_of(specials, [&](auto p) { return p.first == c; }) &&
+              formulaOf(c) == *m)
+            merge = false;
+        if (merge && !std::isnan(*m)) {
+          Type et = getElementTypeOrSelf(rt);
+          auto splat = [&](TypedAttr a) -> TypedAttr {
+            if (auto vt = dyn_cast<VectorType>(rt))
+              return DenseElementsAttr::get(vt, a);
+            return a;
+          };
+          Value mc = arith::ConstantOp::create(
+              b, rt, splat(b.getFloatAttr(et, *m)));
+          Value nanc = arith::ConstantOp::create(
+              b, rt,
+              splat(b.getFloatAttr(
+                  et, APFloat::getQNaN(cast<FloatType>(et).getFloatSemantics()))));
+          r = arith::SelectOp::create(
+              b,
+              arith::CmpFOp::create(b, arith::CmpFPredicate::OEQ,
+                                    math::AbsFOp::create(b, r), mc),
+              nanc, r);
+          specials.clear();
+        }
+      }
       for (auto [c, f] : specials) {
         APFloat v(APFloat::IEEEsingle(), APInt(32, f));
         bool lost;

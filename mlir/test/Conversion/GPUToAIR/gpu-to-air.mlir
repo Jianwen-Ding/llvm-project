@@ -1857,7 +1857,7 @@ gpu.module @assert_transfer {
 
 // Conversions of small floats (L15-E844): an f8E4M3FN code extended to f32
 // as the half its fields make (the sign moved up by a multiply-add), scaled
-// by 2^8, its NaN codes selected
+// by 2^8, its two NaN codes by one compare of their magnitude (L15-E851)
 // (L15-E846; with small-float-ext-via-half=0 in integer operations, its
 // denormals by uitofp and a scale), f32 rounded to f8E5M2 through the
 // hardware's half made round-to-odd (L15-E848) and f64 to f4E2M1FN on its
@@ -1871,7 +1871,8 @@ gpu.module @small_floats {
   // CHECK: llvm.shl
   // CHECK: llvm.fpext {{.*}} : f16 to f32
   // CHECK: llvm.fmul
-  // CHECK: llvm.select
+  // CHECK: llvm.intr.fabs
+  // CHECK: llvm.fcmp "oeq"
   // CHECK: llvm.select
   // CHECK: llvm.store {{.*}} : f32, !llvm.ptr<1>
   // SFINT-LABEL: gpu.module @small_floats
