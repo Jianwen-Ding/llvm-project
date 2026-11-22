@@ -2203,6 +2203,19 @@ static void expandPowI(IntrinsicInst &II) {
 /// llvm.exp / llvm.log of a double as fdlibm's e_exp.c / e_log.c in double
 /// and integer operations, which the lowering below takes (as
 /// convert-gpu-to-air does for math.exp / math.log of f64): within 1 ulp.
+static cl::opt<bool> AGXSoftF64PolynomialFma(
+    "agx-soft-f64-polynomial-fma", cl::init(false), cl::Hidden,
+    cl::desc("Evaluate llvm.exp.f64's and llvm.log.f64's polynomials with "
+             "fma, not fdlibm's multiplies and adds (L15-E816)"));
+
+/// U V + W in the expansions' polynomials: fdlibm's multiply and add (the
+/// emulated fma costs more than both: L15-E815), or an fma.
+static Value *polyFma(IRBuilder<> &B, Value *U, Value *V, Value *W) {
+  if (AGXSoftF64PolynomialFma)
+    return B.CreateIntrinsic(Intrinsic::fma, {U->getType()}, {U, V, W});
+  return B.CreateFAdd(B.CreateFMul(U, V), W);
+}
+
 static Value *expandExpF64(IRBuilder<> &B, Value *X) {
   Type *F = B.getDoubleTy(), *I = B.getInt64Ty();
   auto C = [&](double V) { return ConstantFP::get(F, V); };
@@ -2218,7 +2231,7 @@ static Value *expandExpF64(IRBuilder<> &B, Value *X) {
   Value *P = C(4.13813679705723846039e-08);
   for (double Coef : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
                       -2.77777777770155933842e-03, 1.66666666666666019037e-01})
-    P = B.CreateIntrinsic(Intrinsic::fma, {F}, {T, P, C(Coef)});
+    P = polyFma(B, T, P, C(Coef));
   Value *CC = B.CreateFSub(R, B.CreateFMul(T, P));
   Value *Y = B.CreateFSub(
       C(1.0), B.CreateFSub(B.CreateFSub(Lo, B.CreateFDiv(B.CreateFMul(R, CC),
@@ -2245,7 +2258,7 @@ static Value *expandLogF64(IRBuilder<> &B, Value *X) {
   auto C = [&](double V) { return ConstantFP::get(F, V); };
   auto CI = [&](int64_t V) { return ConstantInt::get(I, V); };
   auto Fma = [&](Value *A, Value *Bv, Value *Cv) {
-    return B.CreateIntrinsic(Intrinsic::fma, {F}, {A, Bv, Cv});
+    return polyFma(B, A, Bv, Cv);
   };
   Value *Tiny = B.CreateFCmpOLT(X, C(0x1p-1022));
   Value *X2 = B.CreateSelect(Tiny, B.CreateFMul(X, C(0x1p54)), X);
