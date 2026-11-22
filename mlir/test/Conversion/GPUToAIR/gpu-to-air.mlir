@@ -1884,3 +1884,31 @@ gpu.module @small_floats {
     gpu.return
   }
 }
+
+// -----
+
+// Arithmetic and comparisons of small floats in f32 (L15-E845): the product
+// rounded to f8E4M3FN, and the comparison of the rounded product (extended
+// again), not of the f32 product.
+gpu.module @small_float_arith {
+  // CHECK-LABEL: gpu.module @small_float_arith
+  // CHECK: llvm.func @k(
+  // (the operands' denormal scales, then the product)
+  // CHECK: llvm.fmul
+  // CHECK: llvm.fmul
+  // CHECK: %[[P:.*]] = llvm.fmul %{{.*}}, %{{.*}} : f32
+  // CHECK-NOT: llvm.fcmp "olt" %[[P]],
+  // CHECK: llvm.fcmp "olt"
+  // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
+  gpu.func @k(%a: memref<64xf8E4M3FN, 1>, %b: memref<64xi1, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v = memref.load %a[%c0] : memref<64xf8E4M3FN, 1>
+    %w = memref.load %a[%c1] : memref<64xf8E4M3FN, 1>
+    %s = arith.mulf %v, %w : f8E4M3FN
+    %c = arith.cmpf olt, %s, %v : f8E4M3FN
+    memref.store %s, %a[%c0] : memref<64xf8E4M3FN, 1>
+    memref.store %c, %b[%c0] : memref<64xi1, 1>
+    gpu.return
+  }
+}

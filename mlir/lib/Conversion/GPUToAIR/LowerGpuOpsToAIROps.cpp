@@ -4880,6 +4880,67 @@ struct LowerGpuOpsToAIROpsPass final
         (void)applyPatternsGreedily(m, std::move(patterns));
       }
     }
+    // (L15-E845) arithmetic, comparisons, conversions and math on small
+    // floats (f8, f6, f4) in f32, as arith-emulate-unsupported-floats does:
+    // the operands extended, the result truncated, both by E844's exact
+    // expansions below. Correctly rounded for +, -, *, / and sqrt (f32's 24
+    // bits are at least twice a small float's precision plus 2, so the second
+    // rounding is innocuous) and exact for comparisons, extrema and negation.
+    {
+      SmallVector<Type> small;
+      for (Type t : {Type(Float4E2M1FNType::get(ctx)), Type(Float6E2M3FNType::get(ctx)),
+                     Type(Float6E3M2FNType::get(ctx)),
+                     Type(Float8E3M4Type::get(ctx)),
+                     Type(Float8E4M3Type::get(ctx)),
+                     Type(Float8E4M3B11FNUZType::get(ctx)),
+                     Type(Float8E4M3FNType::get(ctx)),
+                     Type(Float8E4M3FNUZType::get(ctx)),
+                     Type(Float8E5M2Type::get(ctx)),
+                     Type(Float8E5M2FNUZType::get(ctx)),
+                     Type(Float8E8M0FNUType::get(ctx))})
+        small.push_back(t);
+      auto isSmall = [&](Type t) {
+        return llvm::is_contained(small, getElementTypeOrSelf(t));
+      };
+      bool any = false;
+      m.walk([&](Operation *op) {
+        if (isa<arith::ExtFOp, arith::TruncFOp, arith::BitcastOp,
+                arith::ConstantOp, arith::SelectOp, arith::ScalingExtFOp,
+                arith::ScalingTruncFOp>(op) ||
+            !isa_and_nonnull<arith::ArithDialect, math::MathDialect>(
+                op->getDialect()))
+          return WalkResult::advance();
+        any = llvm::any_of(op->getOperandTypes(), isSmall) ||
+              llvm::any_of(op->getResultTypes(), isSmall);
+        return any ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (any) {
+        TypeConverter emulated;
+        arith::populateEmulateUnsupportedFloatsConversions(
+            emulated, small, Float32Type::get(ctx));
+        ConversionTarget target(*ctx);
+        arith::populateEmulateUnsupportedFloatsLegality(target, emulated);
+        target.addDynamicallyLegalDialect<math::MathDialect>(
+            [&](Operation *op) -> std::optional<bool> {
+              return emulated.isLegal(op);
+            });
+        target.addLegalOp<arith::ScalingExtFOp, arith::ScalingTruncFOp>();
+        RewritePatternSet patterns(ctx);
+        arith::populateEmulateUnsupportedFloatsPatterns(patterns, emulated);
+        if (failed(applyPartialConversion(m, target, std::move(patterns))))
+          return signalPassFailure();
+        // (its conversions marked contract, which lets canonicalize fold
+        // extf(truncf(x)) to x: a later use of a result would read it
+        // unrounded; cleared, every operation rounds to its type)
+        m.walk([&](Operation *op) {
+          if (auto e = dyn_cast<arith::ExtFOp>(op);
+              e && isSmall(e.getIn().getType()))
+            e.setFastmath(arith::FastMathFlags::none);
+          if (auto t = dyn_cast<arith::TruncFOp>(op); t && isSmall(t.getType()))
+            t.setFastmath(arith::FastMathFlags::none);
+        });
+      }
+    }
     // (L15-E840) views of memrefs (subview, expand_shape, collapse_shape),
     // which MemRefToLLVM no longer lowers, as reinterpret_casts of their
     // sources' metadata, their offsets and strides by affine.apply, lowered
