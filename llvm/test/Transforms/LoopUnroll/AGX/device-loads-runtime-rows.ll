@@ -1,6 +1,6 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-contiguous=0 -S < %s | FileCheck %s --check-prefix=OFF
-; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-exp=0 -S < %s | FileCheck %s --check-prefix=NOEXP
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-exp=0 -agx-device-unroll-runtime-heavy-factor=1 -S < %s | FileCheck %s --check-prefix=NOEXP
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-max=0 -S < %s | FileCheck %s --check-prefix=NOMAX
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-narrow-rows=0 -S < %s | FileCheck %s --check-prefix=WIDE
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-heavy-max=0 -S < %s | FileCheck %s --check-prefix=LIGHTMAX

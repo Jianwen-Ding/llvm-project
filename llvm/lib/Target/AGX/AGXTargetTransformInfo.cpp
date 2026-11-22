@@ -286,6 +286,12 @@ static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowRows(
     cl::desc("-agx-device-unroll-runtime-contiguous's factor times 4 over "
              "the bytes of a row's narrowest load (halves, bytes)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeHeavyFactor(
+    "agx-device-unroll-runtime-heavy-factor", cl::init(2), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores times this for a plain row "
+             "of sines, cosines, exponentials, tanh, square roots or "
+             "divisions (logarithms where it stores nothing)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
     "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
     cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
@@ -1049,11 +1055,42 @@ void AGXTTIImpl::getUnrollingPreferences(
           OwnRowFactor = AGXDeviceUnrollRuntimeInPlaceFactor;
         // (a column's 8 times since E729's word indices: col_scale_dyn
         // 473.6 -> 458.8, col_relu_dyn and col_axpy_dyn -2.5%, L15-E747)
+        // (twice for a plain row of heavy math: a sine, cosine, exponential,
+        // tanh, square root or division an element, or a logarithm in a row
+        // that stores nothing; the transcendental unit's latency hides
+        // behind more iterations' loads: sin_dyn 5453.6 -> 3656.9, entropy_dyn
+        // -6.3%, sqrtsum_dyn -6.0%, silu_dyn -4.2%; log_dyn's stored logs
+        // +0.8%, light rows up to +162%, L15-E809)
+        bool Stores = any_of(*L->getHeader(),
+                             [](const Instruction &I) { return isa<StoreInst>(I); });
+        bool Heavy = AGXDeviceUnrollRuntimeHeavyFactor > 1 &&
+                     any_of(*L->getHeader(), [&](const Instruction &I) {
+                       if (I.getOpcode() == Instruction::FDiv)
+                         return true;
+                       auto *II = dyn_cast<IntrinsicInst>(&I);
+                       if (!II)
+                         return false;
+                       switch (II->getIntrinsicID()) {
+                       case Intrinsic::sin:
+                       case Intrinsic::cos:
+                       case Intrinsic::exp:
+                       case Intrinsic::exp2:
+                       case Intrinsic::tanh:
+                       case Intrinsic::sqrt:
+                         return true;
+                       case Intrinsic::log:
+                       case Intrinsic::log2:
+                         return !Stores;
+                       default:
+                         return false;
+                       }
+                     });
         UP.DefaultUnrollRuntimeCount = UP.MaxCount =
             AGXDeviceUnrollRuntimeStores *
             (NarrowRow || ColumnOnly ? 4
              : Column               ? AGXDeviceUnrollRuntimeColumnFactor
              : OwnRow               ? OwnRowFactor
+             : Heavy                ? AGXDeviceUnrollRuntimeHeavyFactor
                                     : 1);
         UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
       }

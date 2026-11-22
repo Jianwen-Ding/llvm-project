@@ -9,6 +9,7 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-column-stores=0 -S < %s | FileCheck %s --check-prefix=COL4
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-own-rows=0 -S < %s | FileCheck %s --check-prefix=OWN4
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-in-place-factor=0 -S < %s | FileCheck %s --check-prefix=PLACE16
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-runtime-heavy-factor=1 -S < %s | FileCheck %s --check-prefix=ONE
 
 ; A row loop of a runtime length that stores (L15-E565): its contiguous word
 ; loads and stores, light arithmetic, unrolled 4 times with a remainder loop,
@@ -237,9 +238,15 @@ exit:
 }
 
 ; tanh too, a GELU row (L15-E577).
+; (8 times: a heavy row, L15-E809)
 ; CHECK-LABEL: @gelu(
-; CHECK-COUNT-4: call float @llvm.tanh.f32
+; CHECK-COUNT-8: call float @llvm.tanh.f32
+; CHECK-NOT: call float @llvm.tanh.f32
 ; CHECK: .epil
+; ONE-LABEL: @gelu(
+; ONE-COUNT-4: call float @llvm.tanh.f32
+; ONE-NOT: call float @llvm.tanh.f32
+; ONE: .epil
 ; NOTANH-LABEL: @gelu(
 ; NOTANH: call float @llvm.tanh.f32
 ; NOTANH-NOT: call float @llvm.tanh.f32
@@ -265,9 +272,15 @@ exit:
 declare float @llvm.tanh.f32(float)
 
 ; A division too, a SiLU row (L15-E578).
+; (8 times: a heavy row, L15-E809)
 ; CHECK-LABEL: @silu(
-; CHECK-COUNT-4: fdiv float
+; CHECK-COUNT-8: fdiv float
+; CHECK-NOT: fdiv float
 ; CHECK: .epil
+; ONE-LABEL: @silu(
+; ONE-COUNT-4: fdiv float
+; ONE-NOT: fdiv float
+; ONE: .epil
 ; NODIV-LABEL: @silu(
 ; NODIV: fdiv float
 ; NODIV-NOT: fdiv float
@@ -295,9 +308,15 @@ exit:
 declare float @llvm.exp.f32(float)
 
 ; sin (log, log2, cos, sqrt) too (L15-E579).
+; (8 times: a heavy row, L15-E809)
 ; CHECK-LABEL: @sine(
-; CHECK-COUNT-4: call float @llvm.sin.f32
+; CHECK-COUNT-8: call float @llvm.sin.f32
+; CHECK-NOT: call float @llvm.sin.f32
 ; CHECK: .epil
+; ONE-LABEL: @sine(
+; ONE-COUNT-4: call float @llvm.sin.f32
+; ONE-NOT: call float @llvm.sin.f32
+; ONE: .epil
 ; NOMATH-LABEL: @sine(
 ; NOMATH: call float @llvm.sin.f32
 ; NOMATH-NOT: call float @llvm.sin.f32
