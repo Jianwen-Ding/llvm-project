@@ -714,6 +714,7 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
                     AggregateRoundsUnlikely
                         ? MDBuilder(Ctx).createUnlikelyBranchWeights()
                         : nullptr);
+
     IRBuilder<> QB(Plain);
     PlainRMW = RMW.clone();
     QB.Insert(PlainRMW);
@@ -727,6 +728,11 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
     Round->addIncoming(B.getInt32(0), Pre);
   }
   Value *Pending = B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {B.getTrue()});
+  // (the rounds cold for AGXColdRegions where the neighbour test makes them
+  // unlikely: the structurizer keeps the block, not always the edge's
+  // probability, L15-E860)
+  if (Plain && AggregateRoundsUnlikely)
+    cast<Instruction>(Pending)->setMetadata("agx.cold", MDNode::get(Ctx, {}));
   Value *First = B.CreateBinaryIntrinsic(Intrinsic::cttz, Pending, B.getTrue());
   Value *Multi = nullptr;
   if (Uniform) {

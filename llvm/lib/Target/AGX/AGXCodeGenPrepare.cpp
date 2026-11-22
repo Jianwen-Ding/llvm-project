@@ -10670,14 +10670,69 @@ bool AGXCodeGenPrepare::fenceHostCoherentAccesses(Function &F) {
 namespace {
 /// branchRareFallbacks as a pass of its own, after the SimplifyCFG before
 /// structurization.
+static cl::opt<bool> AGXWideDivisionUnlikely(
+    "agx-wide-division-unlikely", cl::init(true), cl::Hidden,
+    cl::desc("Weight the 64-bit side of a bypassed division (CodeGenPrepare's "
+             "test that both operands fit 32 bits) unlikely"));
+
+/// (L15-E860) CodeGenPrepare's slow-division bypass branches on whether a
+/// 64-bit division's operands fit 32 bits (icmp ult (or a, b), 2^32, or the
+/// test reused as icmp ugt (or a, b), 2^32 - 1) to a 32-bit division and to
+/// the 64-bit one, with no weights. On a GPU the
+/// operands are an index and a size nearly always within 32 bits, and the
+/// 64-bit side is a long expansion that a jump not taken skipping it would
+/// save 34 cycles a division for: weighted unlikely, AGXColdRegions moves it
+/// out of line.
+static bool weightBypassedDivisions(Function &F) {
+  using namespace PatternMatch;
+  if (!AGXWideDivisionUnlikely)
+    return false;
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    auto *Br = dyn_cast<CondBrInst>(BB.getTerminator());
+    if (!Br || Br->hasMetadata(LLVMContext::MD_prof) ||
+        Br->getSuccessor(0) == Br->getSuccessor(1))
+      continue;
+    // (a | b) < 2^32: the fits side true; (a | b) > 2^32 - 1: false
+    Value *Or;
+    bool FitsTrue;
+    if (match(Br->getCondition(),
+              m_SpecificICmp(ICmpInst::ICMP_ULT, m_Value(Or),
+                             m_SpecificInt(APInt(64, 1) << 32))))
+      FitsTrue = true;
+    else if (match(Br->getCondition(),
+                   m_SpecificICmp(ICmpInst::ICMP_UGT, m_Value(Or),
+                                  m_SpecificInt(APInt::getLowBitsSet(64, 32)))))
+      FitsTrue = false;
+    else
+      continue;
+    if (!match(Or, m_Or(m_Value(), m_Value())))
+      continue;
+    MDBuilder MDB(F.getContext());
+    Br->setMetadata(LLVMContext::MD_prof,
+                    FitsTrue ? MDB.createLikelyBranchWeights()
+                             : MDB.createUnlikelyBranchWeights());
+    // (and the 64-bit side marked cold, for AGXColdRegions: the structurizer
+    // keeps the block but not always the probabilities of the edges into it)
+    BasicBlock *Slow = Br->getSuccessor(FitsTrue ? 1 : 0);
+    if (Slow->getSinglePredecessor() == &BB)
+      Slow->getFirstNonPHIIt()->setMetadata("agx.cold",
+                                               MDNode::get(F.getContext(), {}));
+    Changed = true;
+  }
+  return Changed;
+}
+
 class AGXRareFallbacks : public FunctionPass {
 public:
   static char ID;
   AGXRareFallbacks() : FunctionPass(ID) {}
   StringRef getPassName() const override { return "AGX Rare Fallbacks"; }
   bool runOnFunction(Function &F) override {
-    return AGXRareHardwareBranch && !skipFunction(F) &&
-           branchRareFallbacks(F);
+    if (skipFunction(F))
+      return false;
+    bool Changed = weightBypassedDivisions(F);
+    return (AGXRareHardwareBranch && branchRareFallbacks(F)) || Changed;
   }
 };
 } // namespace
