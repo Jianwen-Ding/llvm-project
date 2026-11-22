@@ -321,6 +321,18 @@ static cl::opt<unsigned> AGXSchedNeedCut(
     cl::desc("agx-sched-keep-occupancy-need's cut of the core's SIMD-groups "
              "past which the original order stays, in tenths"));
 
+static cl::opt<unsigned> AGXSchedCoreManyCut(
+    "agx-sched-core-occupancy-many-cut", cl::init(20), cl::Hidden,
+    cl::desc("agx-sched-core-occupancy also for the other regions of word "
+             "loads and at most agx-sched-core-occupancy-many-per-load "
+             "instructions a load, at this cut of the core's SIMD-groups in "
+             "tenths (0: never)"));
+
+static cl::opt<unsigned> AGXSchedCoreManyPerLoad(
+    "agx-sched-core-occupancy-many-per-load", cl::init(3), cl::Hidden,
+    cl::desc("agx-sched-core-occupancy-many-cut only for regions of at most "
+             "this many instructions a device load"));
+
 static cl::opt<bool> AGXSchedKnownGrid(
     "agx-sched-known-grid", cl::init(true), cl::Hidden,
     cl::desc("Keep a schedule whose registers still let every SIMD-group of "
@@ -493,6 +505,24 @@ public:
     bool Core = AGXSchedCoreOccupancy && FewLoads &&
                 AGXSchedCoreOccupancyCut * CoreGroups(After) <
                     10 * CoreGroups(Before);
+    // (and a region of little but word loads, at a cut of 2 times: a naive
+    // matrix product's A and B columns, all issued ahead of their fmas by the
+    // free order, 96 -> 40 groups; in order, 55 groups hide them,
+    // matmul_naive -15.1%, L15-E764)
+    auto WordLoads = [&] {
+      for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
+        if (isAGXDeviceLoad(MI))
+          for (const MachineMemOperand *MMO : MI.memoperands())
+            if (!MMO->getSize().hasValue() ||
+                MMO->getSize().getValue().getKnownMinValue() < 4)
+              return false;
+      return true;
+    };
+    Core |= AGXSchedCoreOccupancy && !FewLoads && AGXSchedCoreManyCut &&
+            Index.size() <= AGXSchedCoreManyPerLoad * DeviceLoads &&
+            AGXSchedCoreManyCut * CoreGroups(After) <
+                10 * CoreGroups(Before) &&
+            WordLoads();
     // A known grid whose SIMD-groups all reside on one core with the new
     // registers (and whose threadgroups still fit) loses no occupancy
     // anywhere: the new order stays, its loads' latencies hidden behind each
