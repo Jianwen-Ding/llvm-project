@@ -1,7 +1,8 @@
 ; AIR's SIMD-group matrices become AGX's fragments: each thread holds the
 ; elements (r, c) and (r, c + 1), r = 4 * (t / 16) + (t / 2) % 4 and
 ; c = 4 * ((t / 8) % 2) + 2 * (t % 2). Loads and stores move those two
-; elements at (c + j + origin.x) * stride.x + (r + origin.y) * stride.y,
+; elements at (c + j + origin.x) * stride.x + (r + origin.y) * stride.y (as
+; one <2 x T> access where stride.x is 1, L15-E856; else one each),
 ; multiply-accumulate is llvm.agx.simdgroup.matrix.fma (f16 operands of an
 ; f32 one extended first), and element-wise operations, AIR's element-wise
 ; functions, element-wise intrinsics, casts, phis and comparisons with the
@@ -17,23 +18,24 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 ; CHECK: %matrix.col = zext i32 %{{.*}} to i64
 ; CHECK: loop:
 ; CHECK: %acc = phi <2 x float> [ zeroinitializer, %entry ], [ %next, %loop ]
+; CHECK: %ma = load <2 x float>, ptr addrspace(1) %{{.*}}, align 4
 ; CHECK: load float, ptr addrspace(1)
 ; CHECK: %next = call <2 x float> @llvm.agx.simdgroup.matrix.fma.v2f32(<2 x float> %{{.*}}, <2 x float> %{{.*}}, <2 x float> %acc)
 ; CHECK: done:
 ; CHECK: %scaled = fmul <2 x float> %next, splat (float 2.000000e+00)
 ; CHECK: %fused = call <2 x float> @llvm.fma.v2f32(<2 x float> %scaled, <2 x float> %scaled, <2 x float> %next)
-; CHECK: store float %{{.*}}, ptr addrspace(1)
+; CHECK: store <2 x float> %fused, ptr addrspace(1) %{{.*}}, align 4
 ; CHECK-NOT: <64 x float>
 
 ; CHECK-LABEL: define agx_kernel void @mixed(
-; CHECK: %ha = insertelement <2 x half>
+; CHECK: %ha = load <2 x half>, ptr addrspace(1) %{{.*}}, align 2
 ; CHECK: %hc32 = fpext <2 x half> %hc to <2 x float>
 ; CHECK: %[[EA:.*]] = fpext <2 x half> %ha to <2 x float>
 ; CHECK: %[[EB:.*]] = fpext <2 x half> %hb to <2 x float>
 ; CHECK: %d = call <2 x float> @llvm.agx.simdgroup.matrix.fma.v2f32(<2 x float> %[[EA]], <2 x float> %[[EB]], <2 x float> %hc32)
 ; CHECK: %m = call <2 x float> @llvm.maxnum.v2f32(<2 x float> %d, <2 x float> zeroinitializer)
 ; CHECK: %h = fptrunc <2 x float> %m to <2 x half>
-; CHECK: store half
+; CHECK: store <2 x half> %h
 ; CHECK-NOT: <64 x
 
 ; CHECK-LABEL: define agx_kernel void @compare(

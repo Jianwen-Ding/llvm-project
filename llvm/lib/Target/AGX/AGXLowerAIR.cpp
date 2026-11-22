@@ -1364,7 +1364,28 @@ void LowerAIR::lowerMatrices(Function &F) {
                Arg(First + 1)->getType() == V2I64 &&
                Arg(First + 2)->getType() == V2I64;
       };
+      // (L15-E856) a row stride of 1: a thread's two elements, (r, c) and
+      // (r, c + 1), adjacent, moved by one access of the pair (aligned as an
+      // element)
+      auto UnitX = [&](Value *Strides) {
+        auto *C = dyn_cast<Constant>(Strides);
+        auto *X = C ? dyn_cast_or_null<ConstantInt>(C->getAggregateElement(0u))
+                    : nullptr;
+        return X && X->isOne();
+      };
       if (Name.starts_with("load.") && Shape(1) &&
+          Arg(0)->getType()->isPointerTy() && UnitX(Arg(2))) {
+        Type *EltTy = cast<VectorType>(CI->getType())->getElementType();
+        Frag[&I] = IB.CreateAlignedLoad(
+            FragTy(CI->getType()), Element(IB, EltTy, Arg(0), Arg(2), Arg(3), 0),
+            Align(EltTy->getPrimitiveSizeInBits() / 8));
+      } else if (Name.starts_with("store.") && Shape(2) &&
+                 Arg(1)->getType()->isPointerTy() && UnitX(Arg(3))) {
+        Type *EltTy = cast<VectorType>(Arg(0)->getType())->getElementType();
+        IB.CreateAlignedStore(Get(Arg(0)),
+                              Element(IB, EltTy, Arg(1), Arg(3), Arg(4), 0),
+                              Align(EltTy->getPrimitiveSizeInBits() / 8));
+      } else if (Name.starts_with("load.") && Shape(1) &&
           Arg(0)->getType()->isPointerTy()) {
         Type *EltTy = cast<VectorType>(CI->getType())->getElementType();
         Value *V = PoisonValue::get(FragTy(CI->getType()));
