@@ -44,6 +44,7 @@
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/AIR/IR/AIRDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -2927,6 +2928,265 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
   return success();
 }
 
+namespace {
+/// A float type of at most 8 bits with a sign, a zero and a significand (f4,
+/// f6 and f8 but f8E8M0FNU), and what its conversions need: every code's f32
+/// bits by APFloat, the largest finite magnitude, the infinity's and a quiet
+/// NaN's codes (L15-E844).
+struct SmallFloat {
+  unsigned w = 0, m = 0;
+  int emin = 0;
+  bool hasInf = false, hasNaN = false, nanNegZero = false;
+  uint32_t table[256];
+  uint32_t maxMag = 0, infMag = 0, nanMag = 0;
+  // f32 bits of a normal code: (magnitude << (23 - m)) + k
+  uint32_t k = 0;
+  // the codes whose f32 bits the expansion's formula does not give
+  SmallVector<std::pair<uint32_t, uint32_t>> specials;
+};
+} // namespace
+
+/// The f32 bits the extension's formula gives for code \p c (the IR below
+/// computes the same): a normal code's magnitude shifted into f32's fields
+/// and rebiased, a denormal's significand times its scale, an infinity or
+/// NaN (where the format has them) its f32 counterpart, quieted, and the
+/// sign.
+static uint32_t smallFloatFormula(const SmallFloat &s, uint32_t c) {
+  uint32_t mag = c & ((1u << (s.w - 1)) - 1), e = mag >> s.m,
+           mm = mag & ((1u << s.m) - 1);
+  uint32_t bits;
+  if (s.hasInf && mag >= s.infMag)
+    bits = 0x7f800000u | (mm << (23 - s.m)) | (mm ? 0x400000u : 0);
+  else if (e == 0)
+    bits = llvm::bit_cast<uint32_t>(float(mm) *
+                                    std::ldexp(1.0f, s.emin - int(s.m)));
+  else
+    bits = (mag << (23 - s.m)) + s.k;
+  return bits | ((c >> (s.w - 1)) << 31);
+}
+
+static std::optional<SmallFloat> smallFloat(Type t) {
+  auto ft = dyn_cast<FloatType>(t);
+  if (!ft || ft.getWidth() > 8 || isa<Float8E8M0FNUType>(ft))
+    return std::nullopt;
+  const llvm::fltSemantics &sem = ft.getFloatSemantics();
+  SmallFloat s;
+  s.w = APFloat::semanticsSizeInBits(sem);
+  s.m = APFloat::semanticsPrecision(sem) - 1;
+  s.emin = APFloat::semanticsMinExponent(sem);
+  if (s.w > 8 || s.m == 0 || s.m >= s.w - 1 ||
+      !APFloat::semanticsHasSignedRepr(sem) || !APFloat::semanticsHasZero(sem))
+    return std::nullopt;
+  s.hasInf = APFloat::semanticsHasInf(sem);
+  s.hasNaN = APFloat::semanticsHasNaN(sem);
+  for (uint32_t c = 0; c < (1u << s.w); ++c) {
+    APFloat v(sem, APInt(s.w, c));
+    bool lost;
+    v.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &lost);
+    s.table[c] = v.bitcastToAPInt().getZExtValue();
+  }
+  s.maxMag = APFloat::getLargest(sem).bitcastToAPInt().getZExtValue();
+  if (s.hasInf)
+    s.infMag = APFloat::getInf(sem).bitcastToAPInt().getZExtValue();
+  if (s.hasNaN) {
+    s.nanMag = APFloat::getQNaN(sem).bitcastToAPInt().getZExtValue();
+    s.nanNegZero = s.nanMag == (1u << (s.w - 1));
+  }
+  // an IEEE-like format's specials are the codes from the infinity's up
+  if (s.hasInf && (s.infMag & ((1u << s.m) - 1)) != 0)
+    return std::nullopt;
+  s.k = s.table[1u << s.m] - ((1u << s.m) << (23 - s.m));
+  if (s.k & ((1u << 23) - 1))
+    return std::nullopt;
+  for (uint32_t c = 0; c < (1u << s.w); ++c)
+    if (smallFloatFormula(s, c) != s.table[c])
+      s.specials.push_back({c, s.table[c]});
+  if (s.specials.size() > 4)
+    return std::nullopt;
+  return s;
+}
+
+/// An integer constant of \p ty (a scalar or a vector of it).
+static Value smallFloatConst(ImplicitLocOpBuilder &b, Type ty, uint64_t v) {
+  Type et = getElementTypeOrSelf(ty);
+  TypedAttr a = b.getIntegerAttr(et, APInt(et.getIntOrFloatBitWidth(), v));
+  if (auto vt = dyn_cast<VectorType>(ty))
+    a = DenseElementsAttr::get(vt, a);
+  return arith::ConstantOp::create(b, ty, a);
+}
+
+static Type smallFloatShaped(Type like, Type et) {
+  if (auto vt = dyn_cast<VectorType>(like))
+    return vt.clone(et);
+  return et;
+}
+
+/// arith.extf of a small float (L15-E844): its f32 bits from integer
+/// operations on the code (smallFloatFormula), the specials selected, then
+/// extended or truncated (exactly: every small float is a half, bfloat and
+/// float) to the result type. Exact, as APFloat converts.
+static LogicalResult rewriteSmallFloatExtF(arith::ExtFOp op,
+                                           PatternRewriter &rewriter) {
+  Type srcTy = op.getIn().getType();
+  auto s = smallFloat(getElementTypeOrSelf(srcTy));
+  if (!s)
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type iw = smallFloatShaped(srcTy, b.getIntegerType(s->w));
+  Type i32 = smallFloatShaped(srcTy, b.getI32Type());
+  Type f32 = smallFloatShaped(srcTy, b.getF32Type());
+  auto c32 = [&](uint64_t v) { return smallFloatConst(b, i32, v); };
+  Value c = arith::ExtUIOp::create(
+      b, i32, arith::BitcastOp::create(b, iw, op.getIn()));
+  Value mag = arith::AndIOp::create(b, c, c32((1u << (s->w - 1)) - 1));
+  Value mm = arith::AndIOp::create(b, mag, c32((1u << s->m) - 1));
+  Value normal = arith::AddIOp::create(
+      b, arith::ShLIOp::create(b, mag, c32(23 - s->m)), c32(s->k));
+  TypedAttr scaleAttr =
+      b.getF32FloatAttr(std::ldexp(1.0f, s->emin - int(s->m)));
+  if (auto vt = dyn_cast<VectorType>(f32))
+    scaleAttr = DenseElementsAttr::get(vt, scaleAttr);
+  Value denormal = arith::BitcastOp::create(
+      b, i32,
+      arith::MulFOp::create(b, arith::UIToFPOp::create(b, f32, mm),
+                            arith::ConstantOp::create(b, f32, scaleAttr)));
+  Value bits = arith::SelectOp::create(
+      b,
+      arith::CmpIOp::create(b, arith::CmpIPredicate::ult, mag,
+                            c32(1u << s->m)),
+      denormal, normal);
+  if (s->hasInf) {
+    Value mmUp = arith::ShLIOp::create(b, mm, c32(23 - s->m));
+    Value quiet = arith::SelectOp::create(
+        b, arith::CmpIOp::create(b, arith::CmpIPredicate::ne, mm, c32(0)),
+        c32(0x400000), c32(0));
+    Value special = arith::OrIOp::create(
+        b, arith::OrIOp::create(b, mmUp, quiet), c32(0x7f800000));
+    bits = arith::SelectOp::create(
+        b,
+        arith::CmpIOp::create(b, arith::CmpIPredicate::uge, mag,
+                              c32(s->infMag)),
+        special, bits);
+  }
+  Value sign = arith::ShLIOp::create(
+      b, arith::ShRUIOp::create(b, c, c32(s->w - 1)), c32(31));
+  bits = arith::OrIOp::create(b, bits, sign);
+  for (auto [code, f] : s->specials)
+    bits = arith::SelectOp::create(
+        b, arith::CmpIOp::create(b, arith::CmpIPredicate::eq, c, c32(code)),
+        c32(f), bits);
+  Value r = arith::BitcastOp::create(b, f32, bits);
+  Type dstTy = op.getType();
+  unsigned dw = getElementTypeOrSelf(dstTy).getIntOrFloatBitWidth();
+  if (dw > 32)
+    r = arith::ExtFOp::create(b, dstTy, r);
+  else if (dw < 32)
+    r = arith::TruncFOp::create(b, dstTy, r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// arith.truncf to a small float (L15-E844), rounding to nearest even as
+/// APFloat converts, in integer operations on the source's bits (a half or
+/// bfloat extended to f32 first, exactly; a double on its own 64 bits, with
+/// no double rounding): a normal result by the magnitude's rounding bias and
+/// shift, rebiased; a denormal one by the significand's shift with its round
+/// and sticky bits; past the largest finite magnitude an infinity, the NaN or
+/// (a format with neither) the largest; a NaN the format's NaN; no negative
+/// zero where the NaN is its encoding.
+static LogicalResult rewriteSmallFloatTruncF(arith::TruncFOp op,
+                                             PatternRewriter &rewriter) {
+  Type dstTy = op.getType();
+  auto s = smallFloat(getElementTypeOrSelf(dstTy));
+  if (!s || op.getRoundingmodeAttr())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Value x = op.getIn();
+  Type srcEt = getElementTypeOrSelf(x.getType());
+  if (!srcEt.isF32() && !srcEt.isF64()) {
+    if (srcEt.getIntOrFloatBitWidth() > 32)
+      return failure();
+    x = arith::ExtFOp::create(b, smallFloatShaped(x.getType(), b.getF32Type()),
+                              x);
+    srcEt = b.getF32Type();
+  }
+  bool d64 = srcEt.isF64();
+  unsigned S = d64 ? 64 : 32, F = d64 ? 52 : 23;
+  int64_t srcBias = d64 ? 1023 : 127;
+  int64_t tbias = 127 - int64_t(int32_t(s->k) >> 23);
+  Type is = smallFloatShaped(x.getType(), b.getIntegerType(S));
+  auto cs = [&](uint64_t v) { return smallFloatConst(b, is, v); };
+  auto cmp = [&](arith::CmpIPredicate p, Value l, Value r) {
+    return arith::CmpIOp::create(b, p, l, r);
+  };
+  auto sel = [&](Value cnd, Value t, Value f) {
+    return arith::SelectOp::create(b, cnd, t, f);
+  };
+  using P = arith::CmpIPredicate;
+  uint64_t absMask = (S == 64 ? ~0ull : 0xffffffffull) >> 1;
+  uint64_t fracMask = (1ull << F) - 1;
+  uint64_t infBits = d64 ? 0x7ff0000000000000ull : 0x7f800000ull;
+  unsigned shift = F - s->m;
+  Value xb = arith::BitcastOp::create(b, is, x);
+  Value a = arith::AndIOp::create(b, xb, cs(absMask));
+  Value sgn = arith::ShRUIOp::create(b, xb, cs(S - 1));
+  // a normal result
+  Value lsb = arith::AndIOp::create(b, arith::ShRUIOp::create(b, a, cs(shift)),
+                                    cs(1));
+  Value r = arith::AddIOp::create(
+      b, arith::AddIOp::create(b, a, cs((1ull << (shift - 1)) - 1)), lsb);
+  Value codeN = arith::SubIOp::create(
+      b, arith::ShRUIOp::create(b, r, cs(shift)),
+      cs(uint64_t(srcBias - tbias) << s->m));
+  // a denormal result: the significand's shift d = F - m + emin - E, clamped
+  // to [1, F + 2] (from F + 2 nothing is left, not even the round bit)
+  Value frac = arith::AndIOp::create(b, a, cs(fracMask));
+  Value ef = arith::ShRUIOp::create(b, a, cs(F));
+  Value sig = arith::OrIOp::create(
+      b, frac, sel(cmp(P::ne, ef, cs(0)), cs(1ull << F), cs(0)));
+  Value eun = arith::MaxSIOp::create(b, ef, cs(1));
+  Value dd = arith::SubIOp::create(
+      b, cs(uint64_t(int64_t(F) - s->m + s->emin + srcBias)), eun);
+  dd = arith::MinSIOp::create(b, arith::MaxSIOp::create(b, dd, cs(1)),
+                              cs(F + 2));
+  Value k = arith::ShRUIOp::create(b, sig, dd);
+  Value one = cs(1);
+  Value lowMask =
+      arith::SubIOp::create(b, arith::ShLIOp::create(b, one, dd), one);
+  Value rem = arith::AndIOp::create(b, sig, lowMask);
+  Value half = arith::ShLIOp::create(b, one, arith::SubIOp::create(b, dd, one));
+  Value kOdd = cmp(P::ne, arith::AndIOp::create(b, k, one), cs(0));
+  Value inc = arith::OrIOp::create(
+      b, cmp(P::ugt, rem, half),
+      arith::AndIOp::create(b, cmp(P::eq, rem, half), kOdd));
+  k = arith::AddIOp::create(b, k, arith::ExtUIOp::create(b, is, inc));
+  Value isSub = cmp(P::ult, a, cs(uint64_t(s->emin + srcBias) << F));
+  Value mag = sel(isSub, k, codeN);
+  // past the largest finite magnitude, and a NaN
+  uint64_t ovf = s->hasInf ? s->infMag : s->hasNaN ? s->nanMag : s->maxMag;
+  mag = sel(cmp(P::ugt, mag, cs(s->maxMag)), cs(ovf), mag);
+  Value nan;
+  if (s->hasInf)
+    nan = arith::OrIOp::create(
+        b, arith::ShRUIOp::create(b, frac, cs(shift)),
+        cs(s->infMag | (1u << (s->m - 1))));
+  else
+    nan = cs(s->hasNaN ? s->nanMag : s->maxMag);
+  Value isNaN = cmp(P::ugt, a, cs(infBits));
+  mag = sel(isNaN, nan, mag);
+  Value code = arith::OrIOp::create(
+      b, mag, arith::ShLIOp::create(b, sgn, cs(s->w - 1)));
+  if (s->nanNegZero) {
+    // no -0 (its code is the NaN): +0; the NaN whatever the sign
+    code = sel(cmp(P::eq, mag, cs(0)), cs(0), code);
+    code = sel(cmp(P::eq, mag, cs(s->nanMag)), cs(s->nanMag), code);
+  }
+  Value narrow = arith::TruncIOp::create(
+      b, smallFloatShaped(x.getType(), b.getIntegerType(s->w)), code);
+  rewriter.replaceOp(op, arith::BitcastOp::create(b, dstTy, narrow));
+  return success();
+}
+
 /// math.isinf (no MathToLLVM pattern): |x| == +inf, ordered (false for NaN).
 static LogicalResult rewriteIsInf(math::IsInfOp op, PatternRewriter &rewriter) {
   Type type = op.getOperand().getType();
@@ -4672,6 +4932,12 @@ struct LowerGpuOpsToAIROpsPass final
           },
           /*benefit=*/2);
       patterns.add(rewriteIsInf);
+      // (L15-E844) small floats' conversions; f8E8M0FNU's and the scaling
+      // conversions by upstream's expansions
+      patterns.add(rewriteSmallFloatExtF);
+      patterns.add(rewriteSmallFloatTruncF);
+      arith::populateExpandF8E8M0Patterns(patterns);
+      arith::populateExpandScalingExtTruncPatterns(patterns);
       patterns.add(rewriteExpF64);
       patterns.add(rewriteLogF64);
       patterns.add(rewriteF64Function<math::Exp2Op>);

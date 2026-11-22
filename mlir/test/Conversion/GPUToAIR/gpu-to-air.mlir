@@ -1851,3 +1851,36 @@ gpu.module @assert_transfer {
     gpu.return
   }
 }
+
+// -----
+
+// Conversions of small floats in integer operations (L15-E844): an f8E4M3FN
+// code extended to f32 (its denormals by uitofp and a scale), f32 rounded to
+// f8E5M2 and f64 to f4E2M1FN on their own bits (no double rounding), the
+// codes stored as integers.
+gpu.module @small_floats {
+  // CHECK-LABEL: gpu.module @small_floats
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.load {{.*}} -> i8
+  // CHECK: llvm.uitofp {{.*}} : i32 to f32
+  // CHECK: llvm.fmul
+  // CHECK: llvm.store {{.*}} : f32, !llvm.ptr<1>
+  // CHECK: llvm.trunc {{.*}} : i32 to i8
+  // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
+  // CHECK: llvm.load {{.*}} -> f64
+  // CHECK-NOT: llvm.fptrunc
+  // CHECK: llvm.trunc {{.*}} : i64 to i4
+  // CHECK: llvm.store {{.*}} : i4, !llvm.ptr<1>
+  gpu.func @k(%a: memref<64xf8E4M3FN, 1>, %b: memref<64xf32, 1>, %c: memref<64xf8E5M2, 1>, %d: memref<64xf64, 1>, %e: memref<64xf4E2M1FN, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf8E4M3FN, 1>
+    %x = arith.extf %v : f8E4M3FN to f32
+    memref.store %x, %b[%c0] : memref<64xf32, 1>
+    %t = arith.truncf %x : f32 to f8E5M2
+    memref.store %t, %c[%c0] : memref<64xf8E5M2, 1>
+    %w = memref.load %d[%c0] : memref<64xf64, 1>
+    %u = arith.truncf %w : f64 to f4E2M1FN
+    memref.store %u, %e[%c0] : memref<64xf4E2M1FN, 1>
+    gpu.return
+  }
+}

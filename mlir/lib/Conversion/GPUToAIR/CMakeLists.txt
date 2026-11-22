@@ -9,6 +9,7 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
   MLIRAffineDialect
   MLIRAffineToStandard
   MLIRArithToLLVM
+  MLIRArithTransforms
   MLIRComplexToStandard
   MLIRFuncToLLVM
   MLIRGPUDialect
