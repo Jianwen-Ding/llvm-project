@@ -309,9 +309,10 @@ static cl::opt<unsigned> AGXSchedCoreOccupancyPerLoad(
              "never)"));
 
 static cl::opt<unsigned> AGXSchedCoreOccupancyCut(
-    "agx-sched-core-occupancy-cut", cl::init(12), cl::Hidden,
+    "agx-sched-core-occupancy-cut", cl::init(10), cl::Hidden,
     cl::desc("agx-sched-core-occupancy's cut of the core's SIMD-groups, in "
-             "tenths (1.8 times until L15-E761)"));
+             "tenths: 10, any (1.8 times until L15-E761, 1.2 until "
+             "L15-E799)"));
 
 static cl::opt<unsigned> AGXSchedLoadsFirstCut(
     "agx-sched-loads-first-cut", cl::init(18), cl::Hidden,
