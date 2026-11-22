@@ -11,7 +11,9 @@ c a second memref at the thread's row (column) or at j + o'' alone (every thread
 passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
 vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16, f32 or f16 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
-and a guarded statement's c load inside its scf.if (speculate-guarded-loads). An eighth of the seeds instead compute float math over a row (exp, e^(x - k), x > k ? e^(x - k) : x, tanh, the
+and a guarded statement's c load inside its scf.if (speculate-guarded-loads). An eighth of the seeds instead share a threadgroup tile: each of rounds tile[l] = f(c[g, l + 16 r]), a
+gpu.barrier, another thread's place (l + sh mod 128 or 256) combined with the thread's own value, a barrier, and
+the result stored (threadgroup accesses, barriers, block barriers of 128 threads). An eighth compute float math over a row (exp, e^(x - k), x > k ? e^(x - k) : x, tanh, the
 sigmoid, log(abs(x) + 1), e^x k + 1, and e^(x - m) of the row's maximum m from a loop before: E731 / E732 / E743's
 range analyses), against double with each arithmetic step rounded to float and 16 ulps of each function's value,
 over inputs up to 100 in magnitude (overflows and flushes). A quarter of the seeds instead run a SIMD-group a row: each lane's running value
@@ -612,7 +614,122 @@ def run_math(seed, a, tmp):
     return src, None
 
 
+def gen_tg(seed):
+    R = random.Random(seed)
+    return dict(ty=R.choice(['i32', 'f32']), bs=R.choice([128, 256]), rounds=R.choice([1, 2, 3]),
+                sh=R.choice([1, 5, 31, 64, 127]), op=R.choice(['add', 'sub', 'max', 'xor']),
+                op2=R.choice(['add', 'sub', 'max']), kc=R.choice([1, 3]))
+
+
+def emit_tg(k):
+    """A threadgroup tile: each round tile[l] = f(c[g, l + 16 r]) by every thread, a barrier, the tile at another
+    thread's place (l + sh mod bs) combined with the thread's own value, a barrier, the result stored at
+    b[g, l + 16 r]."""
+    T = k['ty']
+    flt = T == 'f32'
+    if flt and k['op'] == 'xor':
+        k['op'] = 'add'
+    fop = {'add': 'addf' if flt else 'addi', 'sub': 'subf' if flt else 'subi', 'xor': 'xori',
+           'max': 'maximumf' if flt else 'maxui'}
+    M = 'memref<256x512x%s, 1>' % T
+    W = 'memref<%dx%s, 3>' % (k['bs'], T)
+    L = ['gpu.module @k {',
+         '  gpu.func @k(%%c: %s, %%b: %s, %%n: i32) workgroup(%%tile: %s) kernel' % (M, M, W),
+         '      attributes {known_block_size = array<i32: %d, 1, 1>} {' % k['bs'],
+         '    %c0 = arith.constant 0 : index', '    %c1 = arith.constant 1 : index',
+         '    %c16 = arith.constant 16 : index',
+         '    %%R = arith.constant %d : index' % k['rounds'],
+         '    %%sh = arith.constant %d : index' % k['sh'],
+         '    %%bs = arith.constant %d : index' % k['bs'],
+         '    %g = gpu.block_id x upper_bound 256',
+         '    %%l = gpu.thread_id x upper_bound %d' % k['bs'],
+         '    %%kc = arith.constant %s : %s' % (('%d.0' % k['kc']) if flt else str(k['kc']), T),
+         '    scf.for %r = %c0 to %R step %c1 {',
+         '      %o = arith.muli %r, %c16 : index',
+         '      %j = arith.addi %l, %o : index',
+         '      %%v = memref.load %%c[%%g, %%j] : %s' % M,
+         '      %%u = arith.%s %%v, %%kc : %s' % (fop[k['op']], T),
+         '      memref.store %%u, %%tile[%%l] : %s' % W,
+         '      gpu.barrier',
+         '      %ls = arith.addi %l, %sh : index',
+         '      %li = arith.remui %ls, %bs : index',
+         '      %%w = memref.load %%tile[%%li] : %s' % W,
+         '      gpu.barrier',
+         '      %%y = arith.%s %%w, %%v : %s' % (fop[k['op2']], T),
+         '      memref.store %%y, %%b[%%g, %%j] : %s' % M,
+         '    }', '    gpu.return', '  }', '}']
+    return '\n'.join(L) + '\n'
+
+
+def model_tg(k, c, b):
+    T = k['ty']
+    flt = T == 'f32'
+    FT = DT[T]
+    bs = k['bs']
+    l = np.arange(bs)
+
+    def f(o, x, y):
+        if flt:
+            return {'add': x + y, 'sub': x - y, 'max': np.maximum(x, y)}[o].astype(FT)
+        x64, y64 = x.astype(np.int64), y.astype(np.int64)
+        return ({'add': x64 + y64, 'sub': x64 - y64, 'xor': x64 ^ y64, 'max': np.maximum(x64, y64)}[o]
+                & 0xffffffff).astype(FT)
+    kc = np.full((256, bs), k['kc'], FT)
+    for r in range(k['rounds']):
+        j = l + 16 * r
+        v = c[:, j]
+        tile = f(k['op'], v, kc)
+        w = tile[:, (l + k['sh']) % bs]
+        b[:, j] = f(k['op2'], w, v)
+    return b
+
+
+def run_tg(seed, a, tmp):
+    k = gen_tg(seed)
+    src = emit_tg(k)
+    sp = os.path.join(tmp, 'k.mlir.src')
+    open(sp, 'w').write(src)
+    try:
+        code, consts = compile_kernel(a, sp, tmp, seed % 2 == 1)
+    except subprocess.CalledProcessError as e:
+        return src, 'compile failure: ' + ((e.stderr or '').strip().splitlines() or [''])[-1][:200]
+    rng = np.random.default_rng(seed)
+    T = k['ty']
+    if T == 'f32':
+        c = rng.integers(-40, 40, (256, 512)).astype(np.float32)
+        b = rng.integers(-40, 40, (256, 512)).astype(np.float32)
+    else:
+        c = rng.integers(0, 1 << 32, (256, 512), dtype=np.uint64).astype(np.uint32)
+        b = rng.integers(0, 1 << 32, (256, 512), dtype=np.uint64).astype(np.uint32)
+    fb, fc, fo = (os.path.join(tmp, x) for x in ('b.bin', 'c.bin', 'o.bin'))
+    b.tofile(fb)
+    c.tofile(fc)
+    vb, vc = BASE, BASE + 0x1000000
+    # (the tile's bytes of threadgroup memory)
+    cmd = [a.run, code, '--grid', '%d,1,1' % (256 * k['bs']), '--wg', '%d,1,1' % k['bs'],
+           '--shared', str(4 * k['bs']),
+           '--map', '%#x=%s' % (vb, fb), '--map', '%#x=%s' % (vc, fc), '--dump', '%#x=%d:%s' % (vb, b.nbytes, fo),
+           '--uniform', '0=%d' % (vc & 0xffffffff), '--uniform', '1=%d' % (vc >> 32),
+           '--uniform', '2=%d' % (vb & 0xffffffff), '--uniform', '3=%d' % (vb >> 32),
+           '--uniform', '4=0'] + consts
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return src, 'agx_run timed out'
+    if r.returncode:
+        return src, 'agx_run failed: ' + ((r.stderr + r.stdout).strip().splitlines() or [''])[-1][:200]
+    got = np.fromfile(fo, DT[T]).reshape(b.shape)
+    ref = model_tg(k, c, b.copy())
+    bad = np.argwhere(got != ref)
+    if bad.size:
+        e = tuple(bad[0])
+        return src, 'tg: element %s: %r, the model %r (%d elements differ)' % (e, got[e], ref[e], len(bad))
+    return src, None
+
+
 def run_seed(seed, a, tmp):
+    if seed % 8 == 5:
+        return run_tg(seed, a, tmp)
     # (a quarter of the seeds: a SIMD-group a row; an eighth: float math)
     if seed % 4 == 3:
         return run_lanes(seed, a, tmp)
