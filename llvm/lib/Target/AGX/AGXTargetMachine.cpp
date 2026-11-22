@@ -285,6 +285,14 @@ static cl::opt<bool> AGXSchedKeepOccupancy(
     cl::desc("Keep a region's original order where scheduling it would lower "
              "the threads its register pressure lets reside"));
 
+static cl::opt<bool> AGXSchedKeepOccupancyNeed(
+    "agx-sched-keep-occupancy-need", cl::init(true), cl::Hidden,
+    cl::desc("agx-sched-keep-occupancy not for a region without stores, of "
+             "fewer than agx-sched-core-occupancy-per-load instructions a "
+             "device load, whose new order keeps a third of the core's "
+             "SIMD-groups and (with 16 halves of margin) the kernel's "
+             "threadgroups"));
+
 static cl::opt<bool> AGXSchedCoreOccupancy(
     "agx-sched-core-occupancy", cl::init(true), cl::Hidden,
     cl::desc("Also keep the original order of a region with fewer than 4 "
@@ -422,6 +430,61 @@ public:
         DeviceLoads < 4 ||
         (AGXSchedCoreOccupancyPerLoad &&
          Index.size() >= AGXSchedCoreOccupancyPerLoad * DeviceLoads);
+    // Fewer threads than before matter only where the threadgroups no longer
+    // fit, or the core's groups must hide the latency: a loop of light work
+    // a load without stores whose loads the new order issues ahead of their
+    // uses, the original one each load waited for at its first use (a
+    // matrix product's B rows, gemm_reg4 -4.2%, gemv_q8f -11.0% at 34 -> 18
+    // and 58 -> 26 groups; with stores, a row normalization's 58 -> 26 lost
+    // 43%; bf16_dot_rows' 58 -> 12, 18%, L15-E753).
+    // Fewer threads than before matter only where the threadgroups no longer
+    // fit, or the core's groups must hide the latency: a loop of light work
+    // a load without stores whose loads the new order issues ahead of their
+    // uses, the original one each load waited for at its first use (a
+    // matrix product's B rows, gemm_reg4 -4.2%, gemv_q8f -11.0% at 34 -> 18
+    // and 58 -> 26 groups; with stores, a row normalization's 58 -> 26 lost
+    // 43%; bf16_dot_rows' 58 -> 12, 18%, L15-E753).
+    {
+      // issue cycles of an order: one instruction a cycle, each after its
+      // predecessors' latencies
+      auto Length = [&](ArrayRef<SUnit *> Order) {
+        DenseMap<const SUnit *, unsigned> Start;
+        unsigned T = 0, End = 0;
+        for (SUnit *SU : Order) {
+          unsigned S = T;
+          for (const SDep &D : SU->Preds)
+            if (auto It = Start.find(D.getSUnit()); It != Start.end())
+              S = std::max(S, It->second + D.getLatency());
+          Start[SU] = S;
+          T = S + 1;
+          End = std::max(End, S + SU->Latency);
+        }
+        return End;
+      };
+      SmallVector<SUnit *, 64> Orig, New;
+      for (SUnit &SU : SUnits)
+        Orig.push_back(&SU);
+      llvm::sort(Orig, [&](SUnit *A, SUnit *B) {
+        return Index.lookup(A->getInstr()) < Index.lookup(B->getInstr());
+      });
+      for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
+        if (SUnit *SU = getSUnit(&MI))
+          New.push_back(SU);
+      LLVM_DEBUG(dbgs() << "agx-occupancy lengths: " << Length(Orig) << " -> "
+                        << Length(New) << "\n");
+    }
+    if (Threads && AGXSchedKeepOccupancyNeed) {
+      unsigned Need = MF.getFunction().getFnAttributeAsParsedInteger(
+          "agx-max-threads-per-threadgroup", 1024);
+      if (Need == 0 || Need > 1024)
+        Need = 1024;
+      bool Stores = false;
+      for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
+        Stores |= MI.mayStore();
+      Threads = Stores || FewLoads ||
+                3 * CoreGroups(After) < CoreGroups(Before) ||
+                AGXSubtarget::maxThreadsForHalves(After + 16) < Need;
+    }
     bool Core = AGXSchedCoreOccupancy && FewLoads &&
                 9 * CoreGroups(After) < 5 * CoreGroups(Before);
     // A known grid whose SIMD-groups all reside on one core with the new

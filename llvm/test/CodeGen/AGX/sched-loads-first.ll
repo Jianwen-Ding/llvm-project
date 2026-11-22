@@ -1,6 +1,8 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-loads-first-min-groups=0 < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-original-order-loads-first=0 < %s | FileCheck %s --check-prefix=OFF
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=DEF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-keep-occupancy-need=0 -agx-sched-loads-first-min-groups=0 < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-keep-occupancy-need=0 -agx-sched-original-order-loads-first=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-sched-keep-occupancy-need=0 < %s | FileCheck %s --check-prefix=DEF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s --check-prefix=NEED
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-uniform-constants < %s | FileCheck %s --check-prefix=UNIF
 ;
 ; MLIR's attention decode (mlir/utils/agx-kernels/bench/attn_decode_f16):
 ; its loop's free schedule needs registers that cut its resident groups, so
@@ -12,10 +14,18 @@
 ; dropped where it leaves the core fewer than 28 SIMD-groups: this loop's 26
 ; (40 in the plain order) hid less latency than they saved. (OFF 50 since
 ; L15-E681's selects on b - a.)
+;
+; Since L15-E753 (-agx-sched-keep-occupancy-need) the per-key loop of 64 loads
+; and no stores keeps its free order, its 40 -> 28 groups a third and its
+; threadgroups of 32 still in (the NEED order 2.8% slower in agx_cost here,
+; with the constants in registers); with them in uniforms, as agx-bench and
+; agx-build-fatbin.py build it, the same 51 registers either way (UNIF).
 
 ; CHECK: general purpose registers: 75 x 32-bit
 ; OFF: general purpose registers: 50 x 32-bit
 ; DEF: general purpose registers: 52 x 32-bit
+; NEED: general purpose registers: 68 x 32-bit
+; UNIF: general purpose registers: 51 x 32-bit
 
 target datalayout = "e-m:e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-i1:8-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-v16:16-v32:32-v64:64-v96:32-v128:128-n16:32:64-S32-A5-G1"
 target triple = "agx"
