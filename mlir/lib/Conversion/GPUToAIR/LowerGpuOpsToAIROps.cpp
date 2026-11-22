@@ -1315,6 +1315,116 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
   return success();
 }
 
+/// asinh, acosh, atanh and cbrt of f64 (L15-E820; before, none lowered):
+/// fdlibm's forms, from math.log1p and math.sqrt of f64 (each rewritten or
+/// emulated in turn), a = |x| and x's sign copied back, x itself for a NaN:
+///   asinh = log1p(a + a^2 / (1 + sqrt(1 + a^2))), from 2^28 log1p(a - 1) +
+///           ln 2 (log(a) + ln 2: a - 1 exact to 2^53, past it its rounding
+///           far below an ulp); x below 2^-28;
+///   acosh = log1p(t + sqrt(2 t + t^2)), t = x - 1, from 2^28 log1p(t) + ln 2;
+///           NaN below 1;
+///   (each one log1p, of the argument the range picks);
+///   atanh = log1p(2a + 2a a / (1 - a)) / 2 below 1/2, log1p(2a / (1 - a)) / 2
+///           from it (one division, its dividend selected); inf at 1, NaN
+///           beyond; x below 2^-28;
+///   cbrt  = s_cbrt.c: a quotient of the high word by 3 (denormals scaled by
+///           2^54 first) for 5 bits, a polynomial to 23 bits, rounded away
+///           from zero to 23 bits, and a Newton step to 53 (within 0.667
+///           ulp); zeros, infinities and NaNs themselves.
+template <typename OpTy>
+static LogicalResult rewriteInverseHyperbolicF64(OpTy op,
+                                                 PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto log1p = [&](Value v) { return math::Log1pOp::create(b, v); };
+  auto sqrt = [&](Value v) { return math::SqrtOp::create(b, v); };
+  Value x = op.getOperand();
+  Value a = math::AbsFOp::create(b, x);
+  const double ln2 = 6.93147180559945286227e-01;
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::AsinhOp>) {
+    Value near = fcmp(arith::CmpFPredicate::OLT, a, c(0x1p28));
+    Value a2 = mul(a, a);
+    Value arg = sel(near, add(a, div(a2, add(c(1.0), sqrt(add(c(1.0), a2))))),
+                    sub(a, c(1.0)));
+    r = add(log1p(arg), sel(near, c(0.0), c(ln2)));
+    r = math::CopySignOp::create(b, r, x);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
+  } else if constexpr (std::is_same_v<OpTy, math::AcoshOp>) {
+    Value t = sub(x, c(1.0));
+    Value near = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p28));
+    Value arg = sel(near, add(t, sqrt(add(add(t, t), mul(t, t)))), t);
+    r = add(log1p(arg), sel(near, c(0.0), c(ln2)));
+    r = sel(fcmp(arith::CmpFPredicate::OLT, x, c(1.0)),
+            c(std::numeric_limits<double>::quiet_NaN()), r);
+  } else if constexpr (std::is_same_v<OpTy, math::AtanhOp>) {
+    Value t = add(a, a);
+    Value small = fcmp(arith::CmpFPredicate::OLT, a, c(0.5));
+    Value d = div(sel(small, mul(t, a), t), sub(c(1.0), a));
+    r = mul(c(0.5), log1p(sel(small, add(t, d), d)));
+    r = math::CopySignOp::create(b, r, x);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
+  } else {
+    static_assert(std::is_same_v<OpTy, math::CbrtOp>);
+    auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v); };
+    auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v); };
+    Value bx = bits(x);
+    Value sign = arith::AndIOp::create(b, bx, ci(INT64_MIN));
+    // (a denormal scaled by 2^54, its high word's third less 18 << 20)
+    Value tiny = fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-1022));
+    Value as = sel(tiny, mul(a, c(0x1p54)), a);
+    Value hx = arith::ShRUIOp::create(b, bits(as), ci(32));
+    Value hi = arith::AddIOp::create(
+        b, arith::DivUIOp::create(b, hx, ci(3)),
+        sel(tiny, ci(696219795), ci(715094163)));
+    Value t = dbl(arith::OrIOp::create(b, sign,
+                                       arith::ShLIOp::create(b, hi, ci(32))));
+    Value rr = mul(mul(t, t), div(t, x));
+    Value p1 = add(c(1.87595182427177009643),
+                   mul(rr, add(c(-1.88497979543377169875),
+                               mul(rr, c(1.621429720105354466140)))));
+    Value p2 = mul(mul(mul(rr, rr), rr),
+                   add(c(-0.758397934778766047437),
+                       mul(rr, c(0.145996192886612446982))));
+    t = mul(t, add(p1, p2));
+    // rounded away from zero to 23 bits
+    t = dbl(arith::AndIOp::create(
+        b, arith::AddIOp::create(b, bits(t), ci(0x80000000LL)),
+        ci(int64_t(0xffffffffc0000000ULL))));
+    Value s2 = mul(t, t);
+    Value q = div(x, s2);
+    Value w = add(t, t);
+    q = div(sub(q, t), add(w, q));
+    r = add(t, mul(t, q));
+    // zeros, infinities and NaNs themselves
+    r = sel(fcmp(arith::CmpFPredicate::UEQ, a, c(0.0)), x, r);
+    r = sel(fcmp(arith::CmpFPredicate::UEQ, a,
+                 c(std::numeric_limits<double>::infinity())),
+            x, r);
+    rewriter.replaceOp(op, r);
+    return success();
+  }
+  r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
 /// math.erfc of f32: upstream's approximation (PolynomialApproximation.cpp,
 /// ErfcPolynomialApproximation: Shepherd and Laframboise's Chebyshev
 /// approximation of (1 + 2x) exp(x^2) erfc(x), 2.65 ulps) but for its last
@@ -3324,6 +3434,10 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteAccurateM1<math::ExpM1Op>);
       patterns.add(rewriteAccurateM1<math::Log1pOp>);
       patterns.add(rewriteInverseHyperbolic<math::AsinhOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::AsinhOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::AcoshOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::AtanhOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::CbrtOp>);
       patterns.add(rewriteInverseHyperbolic<math::AcoshOp>);
       patterns.add(rewriteInverseHyperbolic<math::AtanhOp>);
       patterns.add(rewriteInverseHyperbolic<math::CbrtOp>);

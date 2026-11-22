@@ -1355,6 +1355,30 @@ gpu.module @f64_log1p {
 
 // -----
 
+// f64 asinh, acosh, atanh and cbrt (L15-E820; none lowered before): fdlibm's
+// forms from f64 log1p and sqrt: asinh 1 division and log1p's, acosh log1p's,
+// atanh 1 and log1p's, cbrt 3 (8 of doubles; log1p's f32 corrections 3).
+gpu.module @f64_inverse_hyperbolic {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: math.
+  // CHECK-COUNT-8: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: math.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.asinh %v : f64
+    %f = math.acosh %e : f64
+    %g = math.atanh %f : f64
+    %h = math.cbrt %g : f64
+    memref.store %h, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.
