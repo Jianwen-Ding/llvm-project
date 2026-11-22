@@ -1499,6 +1499,27 @@ gpu.module @f64_vector_math {
 
 // -----
 
+// gpu.subgroup_reduce of f64 (L15-E826): AIR has no SIMD-group reduction of
+// doubles (it was air.simd_sum.s.i64 of the double, an integer sum of its
+// bits that the backend could not select): a butterfly of 32-bit shuffles of
+// both halves and the emulated adds, as for i64.
+gpu.module @f64_subgroup_reduce {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: air.simd_sum
+  // CHECK-COUNT-5: llvm.fadd {{.*}} : f64
+  // CHECK-NOT: air.simd_sum
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = gpu.subgroup_reduce add %v : (f64) -> f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

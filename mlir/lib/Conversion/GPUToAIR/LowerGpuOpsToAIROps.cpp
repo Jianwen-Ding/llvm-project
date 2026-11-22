@@ -2986,7 +2986,9 @@ static bool airSubgroupReduce(gpu::SubgroupReduceOp op) {
     if (op.getClusterStride() != 1 || (*cluster != 4 && *cluster != 32))
       return false;
   Type type = op.getValue().getType();
-  if (!isa<FloatType>(type) && !type.isInteger(32))
+  // (f64: no AIR SIMD-group float of it; a shuffle butterfly of the emulated
+  // adds, as i64's, L15-E826)
+  if (!(type.isF32() || type.isF16() || type.isBF16()) && !type.isInteger(32))
     return false;
   if (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
       op.getOp() == gpu::AllReduceOperation::MINIMUMF)
@@ -3015,8 +3017,8 @@ struct GPUSubgroupReduceOpLowering
     }
     Type type = adaptor.getValue().getType();
     bool isFloat = isa<FloatType>(type);
-    if (!isFloat && !type.isInteger(32))
-      return rewriter.notifyMatchFailure(op, "only i32 and floats");
+    if (!airSubgroupReduce(op))
+      return rewriter.notifyMatchFailure(op, "only i32, f32, f16 and bf16");
     if (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
         op.getOp() == gpu::AllReduceOperation::MINIMUMF) {
       if (!type.isF32())
