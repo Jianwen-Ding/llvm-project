@@ -216,6 +216,16 @@ def emit(k):
 DT = {'i32': np.uint32, 'i16': np.uint16, 'f32': np.float32, 'f16': np.float16}
 
 
+def fminmax(mx, a, b):
+    """llvm.maximum / minimum: a NaN if either is one, -0 below +0."""
+    a, b = np.broadcast_arrays(a, b)
+    r = np.where(a > b, a, b) if mx else np.where(a < b, a, b)
+    eq = a == b
+    zs = np.where(np.signbit(a), b, a) if mx else np.where(np.signbit(a), a, b)
+    r = np.where(eq, zs, r)
+    return np.where(np.isnan(a) | np.isnan(b), np.nan, r)
+
+
 def model(k, t, c, b):
     """b (updated in place) after every thread's loop; c is b where aliased."""
     T = k['ty']
@@ -244,8 +254,11 @@ def model(k, t, c, b):
                     return (a - x).astype(FT)
                 if o == 'mul':
                     return (a + (x * FT(kc)).astype(FT)).astype(FT)
-                # (no NaN arises: the values are small integers)
-                return (np.maximum if o in ('max', 'maxnum') else np.minimum)(a, x).astype(FT)
+                # (values that grow past the type's range give infinities and NaNs: maxnumf / minnumf
+                # ignore a NaN, maximumf / minimumf give it and order -0 below +0)
+                if o in ('maxnum', 'minnum'):
+                    return (np.fmax if o == 'maxnum' else np.fmin)(a, x).astype(FT)
+                return fminmax(o == 'max', a, x).astype(FT)
         a64, x64 = a.astype(np.int64), x.astype(np.int64)
         if o == 'add':
             r = a64 + x64
@@ -278,6 +291,11 @@ def model(k, t, c, b):
             return (acc.astype(np.int64).sum(axis=1) & MW).astype(DT[T])
         if rop == 'xor':
             return np.bitwise_xor.reduce(acc, axis=1)
+        if flt:
+            r = acc[:, 0]
+            for l in range(1, 4):
+                r = f(rop, r, acc[:, l], 0)
+            return r
         return (acc.max(axis=1) if rop in ('max', 'maxnum') else acc.min(axis=1)).astype(DT[T])
     if not 0 < t:
         if k.get('red'):
