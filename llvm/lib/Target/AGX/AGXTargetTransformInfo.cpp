@@ -297,6 +297,11 @@ static cl::opt<unsigned> AGXDeviceUnrollStoreLight(
              "most two words an iteration is unrolled by (0: the store "
              "factor)"));
 
+static cl::opt<unsigned> AGXDeviceUnrollStoreLightOneBlock(
+    "agx-device-unroll-store-light-one-block", cl::init(16), cl::Hidden,
+    cl::desc("agx-device-unroll-store-light for a loop of one block (0: "
+             "the same)"));
+
 static cl::opt<unsigned> AGXDeviceUnrollStreams(
     "agx-device-unroll-streams", cl::init(8), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
@@ -585,6 +590,13 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
   // arithmetic, 256 trips or more: 16 iterations' loads held 32 registers,
   // 8 keep the groups, L15-E564; byte stores, three loads, transcendental
   // or shared-unit work, a column and 128 trips lost at 8)
+  // (16 in one block since E729's word indices: reverse_rows -9.9%,
+  // inplace, row_relu, row_axpy, row_residual -4.7 to -5.3%; a conditional
+  // store's blocks lost, cond_store +9.1%, L15-E749)
+  if (AGXDeviceUnrollStoreLightOneBlock && !Narrow && Stores && Store32 &&
+      Word && Light && !SomeStrided && NumLoads <= 2 && Trips >= 256 &&
+      L->getNumBlocks() == 1 && Divides(AGXDeviceUnrollStoreLightOneBlock))
+    return AGXDeviceUnrollStoreLightOneBlock;
   if (AGXDeviceUnrollStoreLight && !Narrow && Stores && Store32 && Word &&
       Light && !SomeStrided && NumLoads <= 2 && Trips >= 256 &&
       Divides(AGXDeviceUnrollStoreLight))

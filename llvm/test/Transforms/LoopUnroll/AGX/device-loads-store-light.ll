@@ -1,18 +1,28 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -S < %s | FileCheck %s
-; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-store-light=0 -S < %s | FileCheck %s --check-prefix=SIXTEEN
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-store-light=0 -agx-device-unroll-store-light-one-block=0 -S < %s | FileCheck %s --check-prefix=SIXTEEN
+; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-store-light-one-block=0 -S < %s | FileCheck %s --check-prefix=EIGHT
 
 ; A row loop of at most two word loads, word stores and light arithmetic
 ; (L15-E564): 8 iterations, not the store factor's 16, whose loads held 32
-; registers. An exponential a step keeps 16.
+; registers; in one block 16 again since E729's word indices (L15-E749), a
+; conditional store's blocks 8. An exponential a step keeps 16.
 
 ; CHECK-LABEL: @scale(
-; CHECK-COUNT-8: store float
+; CHECK-COUNT-16: store float
 ; CHECK-NOT: store float
 ; CHECK: br i1
+; EIGHT-LABEL: @scale(
+; EIGHT-COUNT-8: store float
+; EIGHT-NOT: store float
+; EIGHT: br i1
 ; SIXTEEN-LABEL: @scale(
 ; SIXTEEN-COUNT-16: store float
 ; CHECK-LABEL: @expo(
 ; CHECK-COUNT-16: store float
+; CHECK-LABEL: @condstore(
+; CHECK-COUNT-8: store float
+; CHECK-NOT: store float
+; CHECK: ret void
 define void @scale(ptr addrspace(1) %x, ptr addrspace(1) %w, ptr addrspace(1) %y) {
 entry:
   br label %loop
@@ -49,3 +59,24 @@ exit:
   ret void
 }
 declare float @llvm.exp.f32(float)
+
+define void @condstore(ptr addrspace(1) %x, ptr addrspace(1) %y, float %t) {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %latch ]
+  %px = getelementptr inbounds float, ptr addrspace(1) %x, i64 %i
+  %v = load float, ptr addrspace(1) %px, align 4
+  %g = fcmp ogt float %v, %t
+  br i1 %g, label %st, label %latch
+st:
+  %py = getelementptr inbounds float, ptr addrspace(1) %y, i64 %i
+  store float %v, ptr addrspace(1) %py, align 4
+  br label %latch
+latch:
+  %i1 = add nuw nsw i64 %i, 1
+  %c = icmp ult i64 %i1, 512
+  br i1 %c, label %loop, label %exit
+exit:
+  ret void
+}
