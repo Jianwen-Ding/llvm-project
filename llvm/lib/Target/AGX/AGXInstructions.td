@@ -707,22 +707,25 @@ def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), i64:$c)),
           (IMADD_I64_FROM32 0, $a, 0, $b, 0, $c, 0)>;
 def : Pat<(i64 (add (AGXmul_wide_s i32:$a, i32:$b), i64:$c)),
           (IMADD_I64_FROM32 MOD_SX, $a, MOD_SX, $b, 0, $c, 0)>;
-// and a zero-extended 32-bit addend: the multiply-add's, as a pair with a
-// zero high word (a move), not an iadd of the product after it (the 64-bit
-// add on the unit the multiply-add uses too: L15-E661)
+// and a zero-extended 32-bit addend: the 32-bit register itself as the
+// addend (the hardware extends it, as iadd's 32-bit sources: recorded as
+// imadd r14_r15, r6, r7, r8), not a pair with a zero high word (a move), nor
+// an iadd of the product after it (the 64-bit add on the unit the
+// multiply-add uses too: L15-E661; L15-E832)
+def IMADD_I64_C32 : AGXALUPseudo<IMADD_g13, (outs GPR64:$dst),
+                                 (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                      SrcMods:$src1_mods, Src32Op:$src1,
+                                      SrcMods:$src2_mods, Src32Op:$src2,
+                                      i32imm:$shift), [], [WriteALU64]>;
 let AddedComplexity = 1 in {
 def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), (zext i32:$c))),
-          (IMADD_I64_FROM32 0, $a, 0, $b, 0,
-             (REG_SEQUENCE GPR64, $c, sub0, (MOV_IMM32 0), sub1), 0)>;
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
 def : Pat<(i64 (add (mul (zext i32:$a), (zext i32:$b)), (zext i32:$c))),
-          (IMADD_I64_FROM32 0, $a, 0, $b, 0,
-             (REG_SEQUENCE GPR64, $c, sub0, (MOV_IMM32 0), sub1), 0)>;
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
 def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), (agx_build_pair i32:$c, (i32 0)))),
-          (IMADD_I64_FROM32 0, $a, 0, $b, 0,
-             (REG_SEQUENCE GPR64, $c, sub0, (MOV_IMM32 0), sub1), 0)>;
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
 def : Pat<(i64 (add (mul (zext i32:$a), (zext i32:$b)), (agx_build_pair i32:$c, (i32 0)))),
-          (IMADD_I64_FROM32 0, $a, 0, $b, 0,
-             (REG_SEQUENCE GPR64, $c, sub0, (MOV_IMM32 0), sub1), 0)>;
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
 }
 def : Pat<(i32 (mulhu i32:$a, i32:$b)),
           (EXTRACT_SUBREG (IMADD_I64_FROM32 0, $a, 0, $b, 0, (i64 0), 0), sub1)>;

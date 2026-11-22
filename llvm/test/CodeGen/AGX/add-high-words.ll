@@ -35,11 +35,12 @@ define agx_kernel void @sub_hi(ptr addrspace(1) %p, i64 %x, i32 %y) {
 }
 
 ; A 32 x 32 -> 64-bit product plus a zero-extended 32-bit value: the
-; multiply-add's addend (a pair with a zero high word), not an iadd of the
-; product after it (L15-E661).
+; multiply-add's addend, the 32-bit source itself (L15-E832; before, a pair
+; with a zero high word, a move), not an iadd of the product after it
+; (L15-E661).
 ; CHECK-LABEL: mad_zext:
-; CHECK: mov_imm r3, 0
-; CHECK-NEXT: imadd r2_r3, u2, u3, r2_r3
+; CHECK-NOT: mov_imm
+; CHECK: imadd r2_r3, u2, u3, u4
 ; CHECK-NOT: iadd
 ; CHECK: device_store
 define agx_kernel void @mad_zext(ptr addrspace(1) %p, i32 %a, i32 %b, i32 %c) {
