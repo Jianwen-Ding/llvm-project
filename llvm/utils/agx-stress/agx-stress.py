@@ -14,7 +14,7 @@ buffer with a Python model of the kernel:
   sunk-scan      a SIMD-group add scan by shuffles up whose last add only feeds the last thread's store of the total
                  (sunk into that branch: the recognized scan must stay with its shuffles, L15-E365);
   fuzz-*         the differential fuzzers beside this script (agx-int / fp / half / f64 / mem / simd / cf / loop / exact /
-                 rmw-fuzz.py) and mlir/utils/agx-kernels/agx-mlir-fuzz.py (where mlir-opt is beside llc),
+                 rmw / atomic-fuzz.py) and mlir/utils/agx-kernels/agx-mlir-fuzz.py (where mlir-opt is beside llc),
                  --fuzz-seeds seeds of each (default 100; 0 skips them).
 
   agx-stress.py --llc build/bin/llc --run path/to/agx_run [--objcopy build/bin/llvm-objcopy] [--only NAME]
@@ -291,7 +291,7 @@ def main():
                 print("%-24s %-9s %s" % (name, chip, status))
     here = os.path.dirname(os.path.abspath(__file__))
     mlir_fuzz = os.path.join(here, "..", "..", "..", "mlir", "utils", "agx-kernels", "agx-mlir-fuzz.py")
-    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf", "loop", "exact", "rmw", "mlir"):
+    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf", "loop", "exact", "rmw", "atomic", "mlir"):
         name = "fuzz-" + fz
         if a.fuzz_seeds <= 0 or (a.only and a.only != name):
             continue
