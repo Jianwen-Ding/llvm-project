@@ -148,7 +148,7 @@ static cl::opt<bool> AGXDeviceUnrollCarriedSelect(
              "selects on one compare"));
 
 static cl::opt<unsigned> AGXDeviceUnrollArgMax(
-    "agx-device-unroll-argmax", cl::init(16), cl::Hidden,
+    "agx-device-unroll-argmax", cl::init(32), cl::Hidden,
     cl::desc("Iterations a device-load arg-max / arg-min loop (a carried "
              "value selected on a compare against it, and an index) is "
              "unrolled by (0: no such rule)"));
@@ -636,7 +636,8 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
   // An arg-max / arg-min (a carried value chosen by a select on a compare
   // against it, the index beside it): its compare-selects of 4 iterations
   // leave it waiting on each 16-byte load; 16 keep 4 in flight
-  // (argmax_rows, L15-E552; a sum's carried adds lost, rowsum +16%).
+  // (argmax_rows, L15-E552; a sum's carried adds lost, rowsum +16%); 32
+  // since E729 (argmax_thread -5.6%, argmax_rows -4.9%, L15-E752).
   if (AGXDeviceUnrollArgMax && !Narrow && !Stores &&
       any_of(L->getHeader()->phis(), [](const PHINode &P) {
         return any_of(P.users(), [&](const User *U) {

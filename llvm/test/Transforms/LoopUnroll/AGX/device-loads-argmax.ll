@@ -3,11 +3,11 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-carried-select=0 -S < %s | FileCheck %s --check-prefix=NOSEL
 
 ; An arg-max over a thread's row (a running maximum chosen by a select on a
-; compare against it, its index by the same compare) is unrolled 16 times
-; (L15-E552), 4 before. A running sum keeps 4.
+; compare against it, its index by the same compare) is unrolled 32 times
+; (L15-E552's 16, 32 since L15-E752), 4 before. A running sum keeps 4.
 
 ; CHECK-LABEL: @argmax(
-; CHECK-COUNT-16: fcmp ogt float
+; CHECK-COUNT-32: fcmp ogt float
 ; CHECK-NOT: fcmp ogt float
 ; CHECK: br i1
 ; FOUR-LABEL: @argmax(
@@ -17,7 +17,7 @@
 ; A conditional count and sum (the values kept by selects on one compare
 ; against a threshold) likewise (L15-E555).
 ; CHECK-LABEL: @count_above(
-; CHECK-COUNT-16: fcmp ogt float
+; CHECK-COUNT-32: fcmp ogt float
 ; CHECK-NOT: fcmp ogt float
 ; CHECK: br i1
 ; NOSEL-LABEL: @count_above(
