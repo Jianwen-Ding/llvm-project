@@ -90,6 +90,37 @@ static bool endsWithoutFallthrough(const MachineBasicBlock &MBB) {
   return jumpsAlways(MBB) != nullptr;
 }
 
+static cl::opt<bool> ColdElseBodies(
+    "agx-cold-else-bodies", cl::init(true), cl::Hidden,
+    cl::desc("Also move an else-body out of line where its if's then-body is "
+             "entered with a likely edge (the structurizer's flow block that "
+             "heads the else keeps no probabilities, L15-E859)"));
+
+/// Whether H heads an else (its first instruction an else_icmp / else_fcmp)
+/// whose if, the block jumping to H over the then-body, enters that body
+/// with probability at least 1 - Cold: the else-body is then entered at most
+/// as rarely.
+static bool elseOfLikelyThen(const MachineBasicBlock &H,
+                             BranchProbability Cold) {
+  auto First = H.getFirstNonDebugInstr();
+  if (First == H.end() || (First->getOpcode() != AGX::ELSE_FCMP &&
+                           First->getOpcode() != AGX::ELSE_ICMP))
+    return false;
+  for (const MachineBasicBlock *I : H.predecessors()) {
+    if (I->empty() || I->back().getOpcode() != AGX::JMP_EXEC_NONE ||
+        I->back().getOperand(0).getMBB() != &H)
+      continue;
+    auto Then = std::next(I->getIterator());
+    if (Then == I->getParent()->end() || &*Then == &H ||
+        !I->isSuccessor(&*Then))
+      continue;
+    if (I->getSuccProbability(llvm::find(I->successors(), &*Then)) >=
+        BranchProbability::getOne() - Cold)
+      return true;
+  }
+  return false;
+}
+
 bool AGXColdRegions::runOnMachineFunction(MachineFunction &MF) {
   if (!EnableColdRegions || skipFunction(MF.getFunction()))
     return false;
@@ -119,8 +150,10 @@ bool AGXColdRegions::runOnMachineFunction(MachineFunction &MF) {
     if (BodyBegin == MF.end() || &*BodyBegin == T)
       continue;
     MachineBasicBlock *B = &*BodyBegin;
-    if (!H->isSuccessor(B) || !H->isSuccessor(T) || H->succ_size() != 2 ||
-        H->getSuccProbability(llvm::find(H->successors(), B)) > Cold)
+    if (!H->isSuccessor(B) || !H->isSuccessor(T) || H->succ_size() != 2)
+      continue;
+    if (H->getSuccProbability(llvm::find(H->successors(), B)) > Cold &&
+        !(ColdElseBodies && elseOfLikelyThen(*H, Cold)))
       continue;
     // The body: the blocks from B up to T in layout, entered from H only and
     // left to T only.

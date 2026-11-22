@@ -1,6 +1,7 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-move-cold-regions=false < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -mattr=+ieee-fp32 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-cold-else-bodies=false < %s | FileCheck %s --check-prefix=NOELSE
 
 ; An if-body entered with an unlikely edge (here double precision's general
 ; code, behind its short path) moves to the end of the kernel: skipping it is
@@ -47,5 +48,28 @@ then:
   %old = atomicrmw add ptr addrspace(1) %a, i32 %w4 monotonic
   br label %end
 end:
+  ret void
+}
+
+; An else-body whose if enters its then-body with a likely edge moves out of
+; line too (the structurizer's flow block that heads the else keeps no
+; probabilities, L15-E859): a scatter-add's aggregation rounds, unlikely
+; behind the plain atomic of threads whose addresses differ, follow the stop.
+; CHECK-LABEL: scatter_add:
+; CHECK: atomic.agg.plain
+; CHECK: else_fcmp
+; CHECK-NEXT: jmp_exec_any [[ROUNDS:\.LBB[0-9_]+]]
+; CHECK: stop
+; CHECK: [[ROUNDS]]:
+; CHECK: atomic.agg
+; NOELSE-LABEL: scatter_add:
+; NOELSE: else_fcmp
+; NOELSE-NEXT: jmp_exec_none
+define agx_kernel void @scatter_add(ptr addrspace(1) %p, ptr addrspace(1) %idx, float %v) {
+  %t = call i32 @llvm.agx.thread.position.in.grid.x()
+  %gi = getelementptr i32, ptr addrspace(1) %idx, i32 %t
+  %i = load i32, ptr addrspace(1) %gi
+  %g = getelementptr float, ptr addrspace(1) %p, i32 %i
+  %r = atomicrmw fadd ptr addrspace(1) %g, float %v monotonic, align 4
   ret void
 }

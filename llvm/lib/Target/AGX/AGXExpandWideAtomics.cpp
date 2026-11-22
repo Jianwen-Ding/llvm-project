@@ -43,6 +43,7 @@
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsAGX.h"
@@ -652,6 +653,11 @@ static cl::opt<bool> AggregateNeighborTest(
              "cyclically): every thread its own address takes the plain "
              "atomic, without the rounds' ballots and shuffles"));
 
+static cl::opt<bool> AggregateRoundsUnlikely(
+    "agx-aggregate-atomics-rounds-unlikely", cl::init(true), cl::Hidden,
+    cl::desc("The neighbour test's branch to the aggregation rounds weighted "
+             "unlikely, so that the plain atomics fall through"));
+
 static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
   LLVMContext &Ctx = RMW.getContext();
   const DataLayout &DL = RMW.getDataLayout();
@@ -700,7 +706,14 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
         PB.getInt32(0));
     Pre->getTerminator()->eraseFromParent();
     PB.SetInsertPoint(Pre);
-    PB.CreateCondBr(Any, Head, Plain);
+    // (L15-E859) the rounds unlikely: a group whose addresses repeat is
+    // bound by its atomics' serialization, a scatter's plain atomics are not,
+    // so the plain path falls through (AGXColdRegions) where the rounds' is
+    // the jump taken
+    PB.CreateCondBr(Any, Head, Plain,
+                    AggregateRoundsUnlikely
+                        ? MDBuilder(Ctx).createUnlikelyBranchWeights()
+                        : nullptr);
     IRBuilder<> QB(Plain);
     PlainRMW = RMW.clone();
     QB.Insert(PlainRMW);
