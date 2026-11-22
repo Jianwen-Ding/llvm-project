@@ -459,42 +459,6 @@ public:
     // matrix product's B rows, gemm_reg4 -4.2%, gemv_q8f -11.0% at 34 -> 18
     // and 58 -> 26 groups; with stores, a row normalization's 58 -> 26 lost
     // 43%; bf16_dot_rows' 58 -> 12, 18%, L15-E753).
-    // Fewer threads than before matter only where the threadgroups no longer
-    // fit, or the core's groups must hide the latency: a loop of light work
-    // a load without stores whose loads the new order issues ahead of their
-    // uses, the original one each load waited for at its first use (a
-    // matrix product's B rows, gemm_reg4 -4.2%, gemv_q8f -11.0% at 34 -> 18
-    // and 58 -> 26 groups; with stores, a row normalization's 58 -> 26 lost
-    // 43%; bf16_dot_rows' 58 -> 12, 18%, L15-E753).
-    {
-      // issue cycles of an order: one instruction a cycle, each after its
-      // predecessors' latencies
-      auto Length = [&](ArrayRef<SUnit *> Order) {
-        DenseMap<const SUnit *, unsigned> Start;
-        unsigned T = 0, End = 0;
-        for (SUnit *SU : Order) {
-          unsigned S = T;
-          for (const SDep &D : SU->Preds)
-            if (auto It = Start.find(D.getSUnit()); It != Start.end())
-              S = std::max(S, It->second + D.getLatency());
-          Start[SU] = S;
-          T = S + 1;
-          End = std::max(End, S + SU->Latency);
-        }
-        return End;
-      };
-      SmallVector<SUnit *, 64> Orig, New;
-      for (SUnit &SU : SUnits)
-        Orig.push_back(&SU);
-      llvm::sort(Orig, [&](SUnit *A, SUnit *B) {
-        return Index.lookup(A->getInstr()) < Index.lookup(B->getInstr());
-      });
-      for (MachineInstr &MI : make_range(RegionBegin, RegionEnd))
-        if (SUnit *SU = getSUnit(&MI))
-          New.push_back(SU);
-      LLVM_DEBUG(dbgs() << "agx-occupancy lengths: " << Length(Orig) << " -> "
-                        << Length(New) << "\n");
-    }
     if (Threads && AGXSchedKeepOccupancyNeed) {
       unsigned Need = MF.getFunction().getFnAttributeAsParsedInteger(
           "agx-max-threads-per-threadgroup", 1024);
