@@ -1520,6 +1520,26 @@ gpu.module @f64_subgroup_reduce {
 
 // -----
 
+// vector.reduction of f64 (L15-E827): its scalar operations in order (LLVM's
+// ordered llvm.vector.reduce.fadd.v4f64 had no f64 emulation in the AIR
+// target).
+gpu.module @f64_vector_reduction {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.vector.reduce
+  // CHECK-COUNT-3: llvm.fadd {{.*}} : f64
+  // CHECK-NOT: llvm.intr.vector.reduce
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<8xf64, 1>, vector<4xf64>
+    %e = vector.reduction <add>, %v : vector<4xf64> into f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

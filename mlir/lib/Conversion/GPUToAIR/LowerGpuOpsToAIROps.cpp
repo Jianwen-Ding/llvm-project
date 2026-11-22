@@ -2039,6 +2039,53 @@ static LogicalResult rewriteErfF64(OpTy op, PatternRewriter &rewriter) {
   return success();
 }
 
+/// vector.reduction of a 1-D vector of f64 as its scalar operations in
+/// order, from the accumulator if any (LLVM's ordered llvm.vector.reduce.*,
+/// which the AIR target's f64 emulation does not take: L15-E827); the
+/// operations the f64 emulation then expands.
+struct UnrollVectorF64Reduction : public OpRewritePattern<vector::ReductionOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::ReductionOp op,
+                                PatternRewriter &rewriter) const override {
+    VectorType vt = op.getSourceVectorType();
+    if (vt.getRank() != 1 || vt.isScalable() || !vt.getElementType().isF64() ||
+        vt.getNumElements() > 16)
+      return failure();
+    Location loc = op.getLoc();
+    auto combine = [&](Value a, Value b) -> Value {
+      switch (op.getKind()) {
+      case vector::CombiningKind::ADD:
+        return arith::AddFOp::create(rewriter, loc, a, b, op.getFastmath());
+      case vector::CombiningKind::MUL:
+        return arith::MulFOp::create(rewriter, loc, a, b, op.getFastmath());
+      case vector::CombiningKind::MINNUMF:
+        return arith::MinNumFOp::create(rewriter, loc, a, b);
+      case vector::CombiningKind::MAXNUMF:
+        return arith::MaxNumFOp::create(rewriter, loc, a, b);
+      case vector::CombiningKind::MINIMUMF:
+        return arith::MinimumFOp::create(rewriter, loc, a, b);
+      case vector::CombiningKind::MAXIMUMF:
+        return arith::MaximumFOp::create(rewriter, loc, a, b);
+      default:
+        return {};
+      }
+    };
+    Value r = op.getAcc();
+    for (int64_t i = 0, e = vt.getNumElements(); i < e; ++i) {
+      Value x = vector::ExtractOp::create(rewriter, loc, op.getVector(), i);
+      if (!r) {
+        r = x;
+        continue;
+      }
+      r = combine(r, x);
+      if (!r)
+        return failure();
+    }
+    rewriter.replaceOp(op, r);
+    return success();
+  }
+};
+
 /// A math dialect op on a 1-D vector of f64 as one op per element (L15-E825):
 /// the f64 rewrites above take scalars, and a vector op left for MathToLLVM
 /// became a vector intrinsic whose scalarized calls (llvm.exp.f64 and the
@@ -4442,6 +4489,7 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteAccurateM1<math::ExpM1Op>);
       patterns.add(rewriteAccurateM1<math::Log1pOp>);
       patterns.add<UnrollVectorF64Math>(ctx);
+      patterns.add<UnrollVectorF64Reduction>(ctx);
       patterns.add(rewriteInverseHyperbolic<math::AsinhOp>);
       patterns.add(rewriteInverseHyperbolicF64<math::AsinhOp>);
       patterns.add(rewriteInverseHyperbolicF64<math::AcoshOp>);
