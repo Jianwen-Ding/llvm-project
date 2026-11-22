@@ -860,7 +860,19 @@ public:
     Value *D = B.CreateSub(EA, EC);
     Value *Swap = B.CreateICmpSLT(D, c32(0));
     Value *Big = select(Swap, C, A), *Lo = select(Swap, A, C);
-    Lo = lshrSticky(Lo, B.CreateBinaryIntrinsic(Intrinsic::abs, D, B.getFalse()));
+    Value *AD = B.CreateBinaryIntrinsic(Intrinsic::abs, D, B.getFalse());
+    if (ByField && AGXSoftF64FmaOperandChecks) {
+      // (L15-E838) Lo is below 2^117: the distance clamped at 127 shifts it
+      // to 0 from 118 on with no select, and a zero Lo's 128 trailing zeros
+      // are past any clamped distance, so no test of Lo against zero either
+      Value *DC = umin(AD, c32(127));
+      Value *Tz = B.CreateTrunc(
+          B.CreateBinaryIntrinsic(Intrinsic::cttz, Lo, B.getFalse()), I32);
+      Lo = B.CreateOr(B.CreateLShr(Lo, B.CreateZExt(DC, Lo->getType())),
+                      B.CreateZExt(B.CreateICmpULT(Tz, DC), Lo->getType()));
+    } else {
+      Lo = lshrSticky(Lo, AD);
+    }
     Value *Base = select(Swap, EC, EA);
     Value *SignP = B.CreateICmpSLT(B.CreateXor(X, Y), c64(0));
     Value *SignZ = B.CreateICmpSLT(Z, c64(0));
