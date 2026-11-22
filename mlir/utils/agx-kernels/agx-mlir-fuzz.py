@@ -443,7 +443,7 @@ def run_lanes(seed, a, tmp):
     return src, None
 
 
-MATH = ['exp', 'expk', 'condexp', 'tanh', 'sigmoid', 'log1', 'expscale', 'maxexp']
+MATH = ['exp', 'expk', 'condexp', 'tanh', 'sigmoid', 'log1', 'expscale', 'maxexp', 'online', 'online']
 
 
 def gen_math(seed):
@@ -473,6 +473,24 @@ def emit_math(k):
               '      %a2 = arith.maximumf %a, %v : f32',
               '      scf.yield %a2 : f32',
               '    }']
+    if k['f'] == 'online':
+        # the online softmax's running maximum m and sum s of e^(x - m), rescaled by e^(m - m') (E446 / E681),
+        # stored at the row's elements 0 and 1
+        L += ['    %ninf = arith.constant 0xFF800000 : f32',
+              '    %zero = arith.constant 0.0 : f32',
+              '    %r:2 = scf.for %j = %c0 to %T step %c1 iter_args(%m = %ninf, %s = %zero) -> (f32, f32) {',
+              '      %%x = memref.load %%c[%%t, %%j] : %s' % M,
+              '      %m2 = arith.maximumf %m, %x : f32',
+              '      %d1 = arith.subf %m, %m2 : f32', '      %e1 = math.exp %d1 : f32',
+              '      %d2 = arith.subf %x, %m2 : f32', '      %e2 = math.exp %d2 : f32',
+              '      %s2 = math.fma %s, %e1, %e2 : f32',
+              '      scf.yield %m2, %s2 : f32, f32',
+              '    }',
+              '    %i0 = arith.constant 0 : index', '    %i1 = arith.constant 1 : index',
+              '    memref.store %%r#0, %%b[%%t, %%i0] : %s' % M,
+              '    memref.store %%r#1, %%b[%%t, %%i1] : %s' % M,
+              '    gpu.return', '  }', '}']
+        return '\n'.join(L) + '\n'
     L += ['    scf.for %j = %c0 to %T step %c1 {',
           '      %%x = memref.load %%c[%%t, %%j] : %s' % M]
     f = k['f']
@@ -518,6 +536,14 @@ def model_math(k, c):
         return np.where(np.isfinite(u), u, 0)
     with np.errstate(all='ignore'):
         f = k['f']
+        if f == 'online':
+            m = x.max(axis=1)
+            ssum = np.exp(F(x) - F(m)[:, None]).sum(axis=1)
+            y = np.zeros(x.shape)
+            e = np.full(x.shape, np.inf)
+            y[:, 0], e[:, 0] = F(m), 0.0
+            y[:, 1], e[:, 1] = ssum, 1e-4 * ssum
+            return y, e + 2.0 ** -126
         if f == 'exp':
             y = F(np.exp(F(x))); e = 16 * ulp(y)
         elif f in ('expk', 'maxexp'):
