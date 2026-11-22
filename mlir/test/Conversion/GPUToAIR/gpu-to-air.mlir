@@ -1379,6 +1379,31 @@ gpu.module @f64_inverse_hyperbolic {
 
 // -----
 
+// f64 atan, atan2, asin and acos (L15-E821; llvm.atan.f64 and the others had
+// no emulation): fdlibm's forms, atan one division (its operands selected),
+// atan2 y / x and its atan's, asin and acos their rational's and the square
+// root's correction (7), no intrinsic call of theirs left.
+gpu.module @f64_inverse_trig {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.{{a(tan|sin|cos)}}
+  // CHECK-COUNT-7: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: llvm.intr.{{a(tan|sin|cos)}}
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.atan %v : f64
+    %f = math.atan2 %e, %v : f64
+    %g = math.asin %f : f64
+    %h = math.acos %g : f64
+    memref.store %h, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.
