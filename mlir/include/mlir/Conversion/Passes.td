@@ -731,6 +731,7 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
   }];
   let dependentDialects = [
     "air::AIRDialect",
+    "affine::AffineDialect",
     "cf::ControlFlowDialect",
     "math::MathDialect",
     "memref::MemRefDialect",

@@ -29,7 +29,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/GPUToAIR/GPUToAIRPass.h"
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ComplexToStandard/ComplexToStandard.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
@@ -51,6 +53,7 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
@@ -4577,7 +4580,7 @@ struct LowerGpuOpsToAIROpsPass final
       m.walk([&](Operation *op) {
         if (isa<vector::ContractionOp, vector::TransposeOp,
                 vector::MultiDimReductionOp, vector::OuterProductOp,
-                vector::ShapeCastOp>(op))
+                vector::ShapeCastOp, vector::ConstantMaskOp>(op))
           nd = true;
         for (Type t : op->getResultTypes())
           if (auto vt = dyn_cast<VectorType>(t); vt && vt.getRank() > 1)
@@ -4608,6 +4611,25 @@ struct LowerGpuOpsToAIROpsPass final
         vector::populateVectorRankReducingFMAPattern(patterns);
         vector::populateVectorFromElementsUnrollPatterns(patterns);
         vector::populateVectorToElementsUnrollPatterns(patterns);
+        (void)applyPatternsGreedily(m, std::move(patterns));
+      }
+    }
+    // (L15-E840) views of memrefs (subview, expand_shape, collapse_shape),
+    // which MemRefToLLVM no longer lowers, as reinterpret_casts of their
+    // sources' metadata, their offsets and strides by affine.apply, lowered
+    // to arith; only where the module has such a view
+    {
+      bool views = false;
+      m.walk([&](Operation *op) {
+        views = isa<memref::SubViewOp, memref::ExpandShapeOp,
+                    memref::CollapseShapeOp>(op);
+        return views ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (views) {
+        RewritePatternSet patterns(ctx);
+        memref::populateExpandStridedMetadataPatterns(patterns);
+        memref::populateResolveExtractStridedMetadataPatterns(patterns);
+        populateAffineToStdConversionPatterns(patterns);
         (void)applyPatternsGreedily(m, std::move(patterns));
       }
     }
@@ -4677,6 +4699,33 @@ struct LowerGpuOpsToAIROpsPass final
       // f16 and bf16 maximumf / minimumf likewise in f32 (exact both ways:
       // the result is one of the values, or a NaN), its ordered-key
       // reduction instead of shuffles (L15-E280).
+      // (L15-E840) a reduction of a 1-D vector as reductions of its
+      // elements, which the patterns below take as scalars (AIR's SIMD-group
+      // reductions are of scalars; upstream's break-down keeps elements of
+      // the shuffle width whole)
+      {
+        SmallVector<gpu::SubgroupReduceOp> vectors;
+        m.walk([&](gpu::SubgroupReduceOp op) {
+          if (auto vt = dyn_cast<VectorType>(op.getValue().getType());
+              vt && vt.getRank() == 1 && !vt.isScalable())
+            vectors.push_back(op);
+        });
+        for (gpu::SubgroupReduceOp op : vectors) {
+          OpBuilder b(op);
+          Location loc = op.getLoc();
+          auto vt = cast<VectorType>(op.getValue().getType());
+          SmallVector<Value> elems;
+          for (int64_t k = 0, n = vt.getNumElements(); k < n; ++k) {
+            Value e = vector::ExtractOp::create(b, loc, op.getValue(), k);
+            elems.push_back(gpu::SubgroupReduceOp::create(
+                b, loc, e, op.getOp(), op.getUniform(), op.getClusterSize(),
+                op.getClusterStride()));
+          }
+          op.replaceAllUsesWith(
+              vector::FromElementsOp::create(b, loc, vt, elems).getResult());
+          op.erase();
+        }
+      }
       SmallVector<gpu::SubgroupReduceOp> narrow;
       m.walk([&](gpu::SubgroupReduceOp op) {
         Type type = op.getType();

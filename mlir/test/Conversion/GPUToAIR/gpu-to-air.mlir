@@ -1749,3 +1749,52 @@ gpu.module @k {
     gpu.return
   }
 }
+
+// -----
+
+// Views of memrefs (L15-E840): a subview, an expand_shape and a
+// collapse_shape as their sources' pointers with offsets computed in i64 (the
+// subview's from its dynamic offsets, r * 64 + q), no memref op left.
+gpu.module @memref_views {
+  // CHECK-LABEL: gpu.module @memref_views
+  // CHECK: llvm.func @k(
+  // CHECK: %[[RQ:.*]] = llvm.mul %arg2, %{{.*}} overflow<nsw> : i64
+  // CHECK: llvm.add %[[RQ]], %arg3 : i64
+  // CHECK-NOT: memref.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<16x64xf32, 1>, %b: memref<256xf32, 1>, %r: index, %q: index) kernel {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %s = memref.subview %a[%r, %q] [4, 8] [2, 3] : memref<16x64xf32, 1> to memref<4x8xf32, strided<[128, 3], offset: ?>, 1>
+    %v = memref.load %s[%c1, %c2] : memref<4x8xf32, strided<[128, 3], offset: ?>, 1>
+    %e = memref.expand_shape %b [[0, 1]] output_shape [16, 16] : memref<256xf32, 1> into memref<16x16xf32, 1>
+    %w = memref.load %e[%c2, %c1] : memref<16x16xf32, 1>
+    %c = memref.collapse_shape %a [[0, 1]] : memref<16x64xf32, 1> into memref<1024xf32, 1>
+    %x = arith.addf %v, %w : f32
+    memref.store %x, %c[%q] : memref<1024xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A SIMD-group reduction of a vector as reductions of its elements, and a
+// constant mask as a constant (L15-E840).
+gpu.module @subgroup_reduce_vector {
+  // CHECK-LABEL: gpu.module @subgroup_reduce_vector
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.mlir.constant(dense<[true, false]> : vector<2xi1>)
+  // CHECK: llvm.extractelement
+  // CHECK: llvm.call @air.simd_sum.f32(
+  // CHECK: llvm.extractelement
+  // CHECK: llvm.call @air.simd_sum.f32(
+  // CHECK: llvm.intr.masked.store
+  gpu.func @k(%a: memref<64xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<64xf32, 1>, vector<2xf32>
+    %r = gpu.subgroup_reduce add %v : (vector<2xf32>) -> vector<2xf32>
+    %m = vector.constant_mask [1] : vector<2xi1>
+    vector.maskedstore %a[%c0], %m, %r : memref<64xf32, 1>, vector<2xi1>, vector<2xf32>
+    gpu.return
+  }
+}

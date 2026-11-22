@@ -6,6 +6,8 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
 
   LINK_LIBS PUBLIC
   MLIRAIRDialect
+  MLIRAffineDialect
+  MLIRAffineToStandard
   MLIRArithToLLVM
   MLIRComplexToStandard
   MLIRFuncToLLVM
@@ -17,6 +19,7 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
   MLIRMathDialect
   MLIRMathTransforms
   MLIRMemRefToLLVM
+  MLIRMemRefTransforms
   MLIRPass
   MLIRSCFDialect
   MLIRSCFToControlFlow
