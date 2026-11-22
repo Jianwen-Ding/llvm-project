@@ -10126,8 +10126,13 @@ static bool branchRareFallbacks(Function &F) {
     // its own two)
     if (Sels.size() < AGXRareFallbacksMin)
       continue;
-    auto [BB, C] = Key;
+    // (the block the selects are in now: an earlier group's split of their
+    // block moved them to its tail)
+    Value *C = Key.second;
     SelectInst *First = Sels.front();
+    BasicBlock *BB = First->getParent();
+    if (any_of(Sels, [&](SelectInst *S) { return S->getParent() != BB; }))
+      continue;
     auto Before = [&](Value *V) {
       auto *I = dyn_cast<Instruction>(V);
       return !I || I->getParent() != BB || I->comesBefore(First);

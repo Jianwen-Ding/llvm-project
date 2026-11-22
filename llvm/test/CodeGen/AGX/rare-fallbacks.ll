@@ -1,5 +1,6 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-hardware-branch=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-rare-fallbacks-min=1 < %s | FileCheck %s --check-prefix=ONE
 
 ; sin and cos past 2^22 take the hardware's reduction (L15-E504): sincos's
 ; two and tan's run in a block of their own, skipped by a SIMD-group none of
@@ -38,6 +39,18 @@
 ; OFF: fcmpsel lt
 ; OFF: device_store
 
+; CHECK-LABEL: two_sins:
+; CHECK-NOT: if_
+; CHECK: stop
+; ONE-LABEL: two_sins:
+; ONE: if_fcmp
+; ONE: sin_pt_1
+; ONE: pop_exec
+; ONE: if_
+; ONE: sin_pt_1
+; ONE: pop_exec
+; ONE: stop
+
 declare i32 @llvm.agx.thread.position.in.grid.x()
 declare float @llvm.sin.f32(float)
 declare { float, float } @llvm.sincos.f32(float)
@@ -71,5 +84,23 @@ define agx_kernel void @tan_f32(ptr addrspace(1) %p) {
   %x = load float, ptr addrspace(1) %a
   %r = call float @llvm.tan.f32(float %x)
   store float %r, ptr addrspace(1) %a
+  ret void
+}
+
+; Two sins of two arguments in one block: two conditions, a group each. With
+; one fallback a group enough, the first group's split of the block moves the
+; second's selects to its tail (after the first store, the second load and
+; sin stay behind the first's selects), where the second branches from (that
+; split once asserted on the stale block).
+define agx_kernel void @two_sins(ptr addrspace(1) %p) {
+  %i = call i32 @llvm.agx.thread.position.in.grid.x()
+  %a = getelementptr float, ptr addrspace(1) %p, i32 %i
+  %x = load float, ptr addrspace(1) %a
+  %r = call float @llvm.sin.f32(float %x)
+  store float %r, ptr addrspace(1) %a
+  %b = getelementptr float, ptr addrspace(1) %a, i32 1024
+  %y = load float, ptr addrspace(1) %b
+  %s = call float @llvm.sin.f32(float %y)
+  store float %s, ptr addrspace(1) %b
   ret void
 }
