@@ -1595,7 +1595,9 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     // below 2^-9: a - a^3/3 + 2a^5/15 (next term 2^-58 relative), as expm1's
     // error would otherwise reach 3 ulp there
     Value a2 = mul(a, a);
-    Value series = fma(mul(a, a2), fma(a2, c(2.0 / 15.0), c(-1.0 / 3.0)), a);
+    // (multiplies and adds: E815's f64Fma)
+    Value series = f64Fma(b, mul(a, a2),
+                          f64Fma(b, a2, c(2.0 / 15.0), c(-1.0 / 3.0)), a);
     z = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-9)), series, z);
     z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(22.0)), c(1.0), z);
     r = math::CopySignOp::create(b, z, x);
