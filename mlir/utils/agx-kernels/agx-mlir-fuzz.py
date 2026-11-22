@@ -11,7 +11,9 @@ c a second memref at the thread's row (column) or at j + o'' alone (every thread
 passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
 vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16, f32 or f16 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
-and a guarded statement's c load inside its scf.if (speculate-guarded-loads). A sixteenth of the seeds instead divide: b[t, j] = op(x, d) + k, op divui / divsi / remui / remsi / floordivsi /
+and a guarded statement's c load inside its scf.if (speculate-guarded-loads). A sixteenth of the seeds instead exit early: an scf.while from j = 0 while j < T and pred(c[t, j], K), its load
+guarded by an scf.if (speculate-guarded-loads) or clamped, a running f of the elements passed, j and the value
+stored after it (the structurizer's loop exits, E735's merged exits). A sixteenth divide: b[t, j] = op(x, d) + k, op divui / divsi / remui / remsi / floordivsi /
 ceildivsi / ceildivui, x the element (or its low bits), d a constant (powers of two, odd, negative), the kernel's
 argument, an element or j + 1 (the division expansions; division by zero and INT_MIN / -1 left out). An eighth
 share a threadgroup tile: each of rounds tile[l] = f(c[g, l + 16 r]), a
@@ -873,7 +875,144 @@ def run_idiv(seed, a, tmp):
     return src, None
 
 
+def gen_while(seed):
+    R = random.Random(seed)
+    k = dict(ty=R.choice(['i32', 'i32', 'f32']), T=R.choice([0, 1, 16, 100, 255, 256]),
+             pred=R.choice(['lt', 'le', 'ne', 'gt']), K=R.choice([0, 3, 20, 35]),
+             op=R.choice(['add', 'xor', 'max', 'sub']), init=R.choice([0, 7]), guard=R.random() < 0.7)
+    if k['ty'] == 'f32' and k['op'] == 'xor':
+        k['op'] = 'add'
+    return k
+
+
+def emit_while(k):
+    """An early exit: j from 0 while j < T and pred(c[t, j], K), a running f(acc, c[t, j]) of the elements passed;
+    j and acc stored at b[t, 0] and b[t, 1] (scf.while, its load guarded by j < T in an scf.if or not)."""
+    T = k['ty']
+    flt = T == 'f32'
+    M = 'memref<1024x256x%s, 1>' % T
+    lit = (lambda v: '%d.0' % v) if flt else str
+    cmp = ('arith.cmpf %s,' % {'lt': 'olt', 'le': 'ole', 'ne': 'une', 'gt': 'ogt'}[k['pred']]) if flt else \
+        ('arith.cmpi %s,' % {'lt': 'ult', 'le': 'ule', 'ne': 'ne', 'gt': 'ugt'}[k['pred']])
+    fop = {'add': 'addf' if flt else 'addi', 'sub': 'subf' if flt else 'subi', 'xor': 'xori',
+           'max': 'maximumf' if flt else 'maxui'}[k['op']]
+    L = ['gpu.module @k {',
+         '  gpu.func @k(%%c: %s, %%b: %s, %%n: i32) kernel' % (M, M),
+         '      attributes {known_block_size = array<i32: 256, 1, 1>} {',
+         '    %c0 = arith.constant 0 : index', '    %c1 = arith.constant 1 : index',
+         '    %%T = arith.constant %d : index' % k['T'],
+         '    %%K = arith.constant %s : %s' % (lit(k['K']), T),
+         '    %%init = arith.constant %s : %s' % (lit(k['init']), T),
+         '    %%zero = arith.constant %s : %s' % (lit(0), T),
+         '    %t = gpu.global_id x upper_bound 1024',
+         '    %%res:3 = scf.while (%%j = %%c0, %%acc = %%init) : (index, %s) -> (index, %s, %s) {' % (T, T, T),
+         '      %in = arith.cmpi ult, %j, %T : index']
+    if k['guard']:
+        L += ['      %%v = scf.if %%in -> (%s) {' % T,
+              '        %%l = memref.load %%c[%%t, %%j] : %s' % M,
+              '        scf.yield %%l : %s' % T,
+              '      } else {',
+              '        scf.yield %%zero : %s' % T,
+              '      }']
+    else:
+        # (the load at min(j, 255): in bounds whatever j)
+        L += ['      %c255 = arith.constant 255 : index',
+              '      %jc = arith.minui %j, %c255 : index',
+              '      %%v = memref.load %%c[%%t, %%jc] : %s' % M]
+    L += ['      %%p = %s %%v, %%K : %s' % (cmp, T),
+          '      %go = arith.andi %in, %p : i1',
+          '      scf.condition(%%go) %%j, %%acc, %%v : index, %s, %s' % (T, T),
+          '    } do {',
+          '    ^bb0(%%j: index, %%acc: %s, %%v: %s):' % (T, T),
+          '      %j1 = arith.addi %j, %c1 : index',
+          '      %%a1 = arith.%s %%acc, %%v : %s' % (fop, T),
+          '      scf.yield %%j1, %%a1 : index, %s' % T,
+          '    }',
+          '    %i0 = arith.constant 0 : index', '    %i1 = arith.constant 1 : index',
+          '    %%rj = arith.index_cast %%res#0 : index to %s' % ('i32'),
+          ]
+    if flt:
+        L += ['    %rjf = arith.uitofp %rj : i32 to f32',
+              '    memref.store %%rjf, %%b[%%t, %%i0] : %s' % M]
+    else:
+        L += ['    memref.store %%rj, %%b[%%t, %%i0] : %s' % M]
+    L += ['    memref.store %%res#1, %%b[%%t, %%i1] : %s' % M, '    gpu.return', '  }', '}']
+    return '\n'.join(L) + '\n'
+
+
+def model_while(k, c, b):
+    T = k['ty']
+    flt = T == 'f32'
+    FT = DT[T]
+    tid = np.arange(1024)
+    j = np.zeros(1024, np.int64)
+    acc = np.full(1024, k['init'], FT)
+    alive = np.ones(1024, bool)
+    K = FT(k['K'])
+    for _ in range(k['T'] + 1):
+        inb = j < k['T']
+        v = np.where(inb, c[tid, np.minimum(j, 255)], FT(0)).astype(FT)
+        if flt:
+            p = {'lt': v < K, 'le': v <= K, 'ne': ~(v == K), 'gt': v > K}[k['pred']]
+        else:
+            p = {'lt': v < K, 'le': v <= K, 'ne': v != K, 'gt': v > K}[k['pred']]
+        go = alive & inb & p
+        if flt:
+            a1 = {'add': acc + v, 'sub': acc - v, 'max': np.maximum(acc, v)}[k['op']].astype(FT)
+        else:
+            a64, v64 = acc.astype(np.int64), v.astype(np.int64)
+            a1 = ({'add': a64 + v64, 'sub': a64 - v64, 'xor': a64 ^ v64, 'max': np.maximum(a64, v64)}[k['op']]
+                  & 0xffffffff).astype(FT)
+        acc = np.where(go, a1, acc).astype(FT)
+        j = np.where(go, j + 1, j)
+        alive = go
+        if not alive.any():
+            break
+    b[:, 0] = j.astype(FT)
+    b[:, 1] = acc
+    return b
+
+
+def run_while(seed, a, tmp):
+    k = gen_while(seed)
+    src = emit_while(k)
+    sp = os.path.join(tmp, 'k.mlir.src')
+    open(sp, 'w').write(src)
+    try:
+        code, consts = compile_kernel(a, sp, tmp, seed % 2 == 1)
+    except subprocess.CalledProcessError as e:
+        return src, 'compile failure: ' + ((e.stderr or '').strip().splitlines() or [''])[-1][:200]
+    rng = np.random.default_rng(seed)
+    T = k['ty']
+    c = rng.integers(0, 40, (1024, 256)).astype(DT[T])
+    b = np.zeros((1024, 256), DT[T])
+    fb, fc, fo = (os.path.join(tmp, x) for x in ('b.bin', 'c.bin', 'o.bin'))
+    b.tofile(fb)
+    c.tofile(fc)
+    vb, vc = BASE, BASE + 0x1000000
+    cmd = [a.run, code, '--grid', '1024,1,1', '--wg', '256,1,1',
+           '--map', '%#x=%s' % (vb, fb), '--map', '%#x=%s' % (vc, fc), '--dump', '%#x=%d:%s' % (vb, b.nbytes, fo),
+           '--uniform', '0=%d' % (vc & 0xffffffff), '--uniform', '1=%d' % (vc >> 32),
+           '--uniform', '2=%d' % (vb & 0xffffffff), '--uniform', '3=%d' % (vb >> 32),
+           '--uniform', '4=0'] + consts
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return src, 'agx_run timed out'
+    if r.returncode:
+        return src, 'agx_run failed: ' + ((r.stderr + r.stdout).strip().splitlines() or [''])[-1][:200]
+    got = np.fromfile(fo, DT[T]).reshape(b.shape)
+    ref = model_while(k, c, b.copy())
+    bad = np.argwhere(got != ref)
+    if bad.size:
+        e = tuple(bad[0])
+        return src, 'while: element %s: %r, the model %r (%d elements differ)' % (e, got[e], ref[e], len(bad))
+    return src, None
+
+
 def run_seed(seed, a, tmp):
+    if seed % 16 == 8:
+        return run_while(seed, a, tmp)
     if seed % 16 == 0:
         return run_idiv(seed, a, tmp)
     if seed % 8 == 5:
