@@ -14,7 +14,7 @@ buffer with a Python model of the kernel:
   sunk-scan      a SIMD-group add scan by shuffles up whose last add only feeds the last thread's store of the total
                  (sunk into that branch: the recognized scan must stay with its shuffles, L15-E365);
   fuzz-*         the differential fuzzers beside this script (agx-int / fp / half / f64 / mem / simd / cf / loop / exact /
-                 rmw-fuzz.py),
+                 rmw-fuzz.py) and mlir/utils/agx-kernels/agx-mlir-fuzz.py (where mlir-opt is beside llc),
                  --fuzz-seeds seeds of each (default 100; 0 skips them).
 
   agx-stress.py --llc build/bin/llc --run path/to/agx_run [--objcopy build/bin/llvm-objcopy] [--only NAME]
@@ -290,13 +290,20 @@ def main():
                 failed += bool(bad)
                 print("%-24s %-9s %s" % (name, chip, status))
     here = os.path.dirname(os.path.abspath(__file__))
-    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf", "loop", "exact", "rmw"):
+    mlir_fuzz = os.path.join(here, "..", "..", "..", "mlir", "utils", "agx-kernels", "agx-mlir-fuzz.py")
+    for fz in ("int", "fp", "half", "f64", "mem", "simd", "cf", "loop", "exact", "rmw", "mlir"):
         name = "fuzz-" + fz
         if a.fuzz_seeds <= 0 or (a.only and a.only != name):
             continue
+        # (the MLIR fuzzer where mlir-opt and mlir-translate are beside llc)
+        if fz == "mlir" and not all(os.path.exists(os.path.join(os.path.dirname(a.llc), t))
+                                    for t in ("mlir-opt", "mlir-translate", "opt")):
+            continue
         for chip in CHIPS:
-            tool = [sys.executable, "-W", "ignore", os.path.join(here, "agx-%s-fuzz.py" % fz)]
-            tool += (["--bin", os.path.dirname(a.llc)] if fz == "cf" else ["--llc", a.llc, "--objcopy", a.objcopy])
+            path = mlir_fuzz if fz == "mlir" else os.path.join(here, "agx-%s-fuzz.py" % fz)
+            tool = [sys.executable, "-W", "ignore", path]
+            tool += (["--bin", os.path.dirname(a.llc)] if fz in ("cf", "mlir")
+                     else ["--llc", a.llc, "--objcopy", a.objcopy])
             r = subprocess.run(tool + ["--run", a.run, "--mcpu", chip, "--seeds", "0:%d" % a.fuzz_seeds],
                                capture_output=True, text=True)
             ok = r.returncode == 0

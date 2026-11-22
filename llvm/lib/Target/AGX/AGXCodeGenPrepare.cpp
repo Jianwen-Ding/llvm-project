@@ -7485,7 +7485,12 @@ static bool deferredMinMaxReductions(Function &F) {
                 !llvm::is_contained(Ins, LP->getIncomingBlock(K)))
               Ins.push_back(LP->getIncomingBlock(K));
           for (BasicBlock *In : Ins) {
-            BasicBlock *E = SplitEdge(In, LP->getParent(), &DT, &LI);
+            // (a block of the edge's own whether or not it is critical:
+            // SplitEdge splits a lone exit block after its phis instead,
+            // and the phi's value from In was left to the erased chain:
+            // a guarded loop's LCSSA phi, L15-E773)
+            BasicBlock *E = SplitBlockPredecessors(LP->getParent(), {In},
+                                                   ".deferred", &DT, &LI);
             IRBuilder<> RB(E->getTerminator());
             Value *R = Result(RB, M2, N2, Z2);
             for (unsigned K = 0; K < LP->getNumIncomingValues(); ++K)

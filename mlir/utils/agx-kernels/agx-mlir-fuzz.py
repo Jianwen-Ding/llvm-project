@@ -48,6 +48,12 @@ def gen(seed):
              targ=R.choice([0, 1, 5, 31, 64, 129, 192]),
              step=R.choice([1, 1, 1, 2]),
              stmts=[])
+    # a running value carried by the loop (iter_args), f(acc, c[...]) each
+    # iteration, stored after the loop at the row's last element
+    k['red'] = R.random() < 0.35
+    k['rop'] = R.choice(['add', 'sub', 'mul', 'max'] + (['xor'] if k['ty'] != 'f32' else []))
+    k['rlc'] = R.randrange(0, 64)
+    k['rinit'] = R.choice([0, 1, 5])
     # c at the thread's row (column) or at j + o alone, for every statement
     cw = 'own' if k['alias'] or R.random() < 0.7 else 'shared'
     ops = ['add', 'sub', 'mul', 'max'] + (['xor'] if k['ty'] != 'f32' else [])
@@ -79,7 +85,11 @@ def emit(k):
         L.append('    %%T = arith.constant %d : index' % k['tconst'])
     else:
         L.append('    %T = arith.index_cast %n : i32 to index')
-    L.append('    scf.for %j = %c0 to %T step %st {')
+    if k['red']:
+        L.append('    %%init = arith.constant %s : %s' % (('%d.0' % k['rinit']) if flt else str(k['rinit']), T))
+        L.append('    %%res = scf.for %%j = %%c0 to %%T step %%st iter_args(%%acc = %%init) -> (%s) {' % T)
+    else:
+        L.append('    scf.for %j = %c0 to %T step %st {')
     n = [0]
 
     def nv():
@@ -144,7 +154,19 @@ def emit(k):
             L.append('      %s = memref.load %s' % (cv, access(cmem, s['lc'], own, bshape)))
             r = op(s['op'], bv, cv, s['kc'])
         L.append('      memref.store %s, %s' % (r, access('%b', s['st'], True, bshape)))
-    L += ['    }', '    gpu.return', '  }', '}']
+    if k['red']:
+        cv = nv()
+        L.append('      %s = memref.load %s' % (cv, access(cmem, k['rlc'], k['stmts'][0]['cw'] == 'own', bshape)))
+        acc = op(k['rop'], '%acc', cv, 3)
+        L.append('      scf.yield %s : %s' % (acc, T))
+        L.append('    }')
+        last = nv()
+        L.append('    %s = arith.constant 255 : index' % last)
+        sub = '%s, %%t' % last if k['col'] else '%%t, %s' % last
+        L.append('    memref.store %%res, %%b[%s] : memref<%sx%s, 1>' % (sub, bshape, T))
+    else:
+        L.append('    }')
+    L += ['    gpu.return', '  }', '}']
     return '\n'.join(L) + '\n'
 
 
@@ -188,7 +210,11 @@ def model(k, t, c, b):
         return (r & MW).astype(DT[T])
 
     j = 0
+    acc = np.full(N, k['rinit'], DT[T]) if k.get('red') else None
+    last = (255, tid) if k['col'] else (tid, 255)
     if not 0 < t:
+        if k.get('red'):
+            b[last] = acc
         return b
     while j < t:
         for s in k['stmts']:
@@ -205,7 +231,15 @@ def model(k, t, c, b):
                 g = (bv < np.float32(16)) if flt else (bv.astype(np.int64) < 16)
                 r = np.where(g, r, bv).astype(DT[T])
             b[at(b, s['st'], True, j)] = r
+        if k.get('red'):
+            own = k['stmts'][0]['cw'] == 'own'
+            cm = b if k['alias'] else c
+            cv = cm[at(cm, k['rlc'], own, j)]
+            cv = cv.copy() if own else np.full(N, cv, DT[T])
+            acc = f(k['rop'], acc, cv, 3)
         j += k['step']
+    if k.get('red'):
+        b[last] = acc
     return b
 
 
