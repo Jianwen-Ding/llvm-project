@@ -420,8 +420,51 @@ public:
 /// pressure against the whole register file, not against the occupancy
 /// steps below it: on large straight-line blocks (emulated tensor-core and
 /// matrix operations) their latency ordering kept dozens more values live.
+static cl::opt<bool> AGXSchedCoreOccupancyFinal(
+    "agx-sched-core-occupancy-final", cl::init(true), cl::Hidden,
+    cl::desc("A region agx-sched-core-occupancy put back in its original "
+             "order is scheduled freely again at the function's end where "
+             "its free order's SIMD-groups are no fewer than the function's "
+             "most pressed block leaves"));
+
+/// SIMD-groups a core holds for a register count in halves (the launch's
+/// unit of 8, AGX Performance Simulator dispatch.rs).
+static unsigned coreGroupsForHalves(unsigned H) {
+  H = alignTo(std::max(16u, H), 8);
+  return std::min(96u, 2 * (3328 / (2 * H)));
+}
+
 class AGXScheduleDAGMILive : public ScheduleDAGMILive {
   int GPRSet = -1;
+  /// Regions put back in their original order only for the core's
+  /// SIMD-groups, with the halves of their free order.
+  struct Reverted {
+    MachineBasicBlock *MBB;
+    MachineInstr *First;
+    MachineBasicBlock::iterator End;
+    unsigned NumInstrs;
+    unsigned FreeHalves;
+  };
+  SmallVector<Reverted, 4> Reverts;
+  bool ForceFree = false;
+
+  /// The most GPR16 pressure of any block of the function as it is now.
+  unsigned functionHalves() {
+    unsigned H = 0;
+    for (MachineBasicBlock &MBB : MF) {
+      if (MBB.empty())
+        continue;
+      IntervalPressure IP;
+      RegPressureTracker T(IP);
+      T.init(&MF, RegClassInfo, LIS, &MBB, MBB.end(), ShouldTrackLaneMasks,
+             /*TrackUntiedDefs=*/false);
+      while (T.getPos() != MBB.begin())
+        T.recede();
+      T.closeRegion();
+      H = std::max(H, IP.MaxSetPressure[GPRSet]);
+    }
+    return H;
+  }
   /// The tracker of regionHalves, kept across regions: a new one's set of
   /// live registers is allocated and zeroed for all the function's virtual
   /// registers, twice per region (quadratic in large functions); init resets
@@ -451,7 +494,7 @@ public:
   }
 
   void schedule() override {
-    if (!AGXSchedKeepOccupancy || GPRSet < 0) {
+    if (!AGXSchedKeepOccupancy || GPRSet < 0 || ForceFree) {
       ScheduleDAGMILive::schedule();
       return;
     }
@@ -656,6 +699,36 @@ public:
     }
     LLVM_DEBUG(dbgs() << "agx-occupancy reverted: halves " << regionHalves()
                       << "\n");
+    if (AGXSchedCoreOccupancyFinal && Core && !Threads && !LoadsFirst &&
+        RegionBegin != RegionEnd)
+      Reverts.push_back({BB, &*RegionBegin, RegionEnd, NumRegionInstrs, After});
+  }
+
+  /// The regions reverted for the core's SIMD-groups alone whose free order
+  /// keeps as many as the function's most pressed block now leaves (another
+  /// region sets the count: where_rows' first region, 96 -> 82 groups beside
+  /// one of 46) are scheduled freely again: the groups do not change and
+  /// the free order hides more latency (L15-E804).
+  void finalizeSchedule() override {
+    if (!Reverts.empty()) {
+      unsigned Final = functionHalves();
+      for (Reverted &R : Reverts) {
+        if (coreGroupsForHalves(R.FreeHalves) < coreGroupsForHalves(Final))
+          continue;
+        LLVM_DEBUG(dbgs() << "agx-occupancy final: free again, halves "
+                          << R.FreeHalves << " beside " << Final << "\n");
+        startBlock(R.MBB);
+        enterRegion(R.MBB, R.First->getIterator(), R.End, R.NumInstrs);
+        ForceFree = true;
+        schedule();
+        ForceFree = false;
+        exitRegion();
+        finishBlock();
+        Final = std::max(Final, R.FreeHalves);
+      }
+      Reverts.clear();
+    }
+    ScheduleDAGMILive::finalizeSchedule();
   }
 };
 } // namespace
