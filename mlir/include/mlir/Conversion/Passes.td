@@ -786,6 +786,10 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            /*default=*/"false",
            "Evaluate the f64 exp, log and expm1 expansions' polynomials with "
            "fma, not fdlibm's multiplies and adds">,
+    Option<"trigF64SharedPolynomial", "trig-f64-shared-polynomial", "bool",
+           /*default=*/"true",
+           "f64 sin and cos with one polynomial chain of selected "
+           "coefficients, not both kernels">,
     Option<"log1pF64Direct", "log1p-f64-direct", "bool",
            /*default=*/"true",
            "math.log1p of f64 as fdlibm's log1p, not log with Kahan's "

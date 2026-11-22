@@ -1090,6 +1090,8 @@ static thread_local bool approximateHalfFunctions = true;
 static thread_local bool expm1F64Direct = true;
 /// Whether convert-gpu-to-air's log1p-f64-direct is on (set as above).
 static thread_local bool log1pF64Direct = true;
+/// Whether convert-gpu-to-air's trig-f64-shared-polynomial is on.
+static thread_local bool trigSharedPolynomial = true;
 
 /// For a half result computed in f32 from \p x: fastmath afn on the f32
 /// operations of the kinds in \p kinds computing \p r, the kinds for which
@@ -1637,7 +1639,6 @@ static LogicalResult rewriteTrigF64(OpTy op, PatternRewriter &rewriter) {
     r = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, a, c(0x1p-27)),
             x, r);
   } else {
-    Value s = kernelSinF64(b, y0, y1), co = kernelCosF64(b, y0, y1);
     constexpr bool isCos = std::is_same_v<OpTy, math::CosOp>;
     // cos is sin a quadrant ahead
     Value odd = bit(n, 1), minus = bit(isCos ? arith::AddIOp::create(
@@ -1647,7 +1648,57 @@ static LogicalResult rewriteTrigF64(OpTy op, PatternRewriter &rewriter) {
                                                    .getResult()
                                              : n,
                                          2);
-    Value v = isCos ? sel(odd, s, co) : sel(odd, co, s);
+    Value v;
+    if (trigSharedPolynomial) {
+      // (L15-E835) one Horner chain in z = y0^2 of the kernel each lane
+      // reads, its coefficients selected: fdlibm's __kernel_cos's six
+      // (C6 .. C1, its original form: r = z (C1 + ... + z C6)) or
+      // __kernel_sin's five (S6 .. S2) after a zero (0 z + S6 is S6: the
+      // same operations), then each kernel's own final steps
+      Value cosK = isCos ? arith::XOrIOp::create(
+                               b, odd,
+                               arith::ConstantIntOp::create(b, b.getI1Type(), 1))
+                               .getResult()
+                         : odd;
+      static const double sinC[6] = {0.0,
+                                     1.58969099521155010221e-10,
+                                     -2.50507602534068634195e-08,
+                                     2.75573137070700676789e-06,
+                                     -1.98412698298579493134e-04,
+                                     8.33333333332248946124e-03};
+      static const double cosC[6] = {-1.13596475577881948265e-11,
+                                     2.08757232129817482790e-09,
+                                     -2.75573143513906633035e-07,
+                                     2.48015872894767294178e-05,
+                                     -1.38888888888741095749e-03,
+                                     4.16666666666666019037e-02};
+      auto add = [&](Value u, Value w) {
+        return arith::AddFOp::create(b, u, w).getResult();
+      };
+      auto sub = [&](Value u, Value w) {
+        return arith::SubFOp::create(b, u, w).getResult();
+      };
+      auto mul = [&](Value u, Value w) {
+        return arith::MulFOp::create(b, u, w).getResult();
+      };
+      Value z = mul(y0, y0);
+      Value p = sel(cosK, c(cosC[0]), c(sinC[0]));
+      for (int k = 1; k < 6; ++k)
+        p = f64Fma(b, p, z, sel(cosK, c(cosC[k]), c(sinC[k])));
+      // sin: x - ((z (y/2 - v r) - y) - v S1), v = z x
+      Value vv = mul(z, y0);
+      Value sinV = sub(y0, sub(sub(mul(z, sub(mul(c(0.5), y1), mul(vv, p))), y1),
+                               mul(vv, c(-1.66666666666666324348e-01))));
+      // cos: w + (((1 - w) - z/2) + (z r - x y)), r = z p, w = 1 - z/2
+      Value hz = mul(c(0.5), z);
+      Value w = sub(c(1.0), hz);
+      Value cosV = add(w, add(sub(sub(c(1.0), w), hz),
+                              sub(mul(z, mul(z, p)), mul(y0, y1))));
+      v = sel(cosK, cosV, sinV);
+    } else {
+      Value s = kernelSinF64(b, y0, y1), co = kernelCosF64(b, y0, y1);
+      v = isCos ? sel(odd, s, co) : sel(odd, co, s);
+    }
     r = sel(minus, neg(v), v);
     Value tiny =
         arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, a, c(0x1p-27));
@@ -4417,6 +4468,7 @@ struct LowerGpuOpsToAIROpsPass final
     ::approximateHalfFunctions = approximateHalfFunctions;
     ::expm1F64Direct = expm1F64Direct;
     ::log1pF64Direct = log1pF64Direct;
+    ::trigSharedPolynomial = trigF64SharedPolynomial;
     ::f64PolynomialFma = f64PolynomialFma;
     if (speculateGuardedLoads)
       ::speculateGuardedLoads(m);
