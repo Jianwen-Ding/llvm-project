@@ -74,10 +74,11 @@ exit:
   ret void
 }
 
-; The same row stored in place, its one store at its load's address: 32
-; times (L15-E748; another row's stores lost at that count, row_axpy_dyn).
+; The same row stored in place, its one store at its load's address: 64
+; times (32 since L15-E748, 64 since L15-E768; another row's stores lost at
+; 32, row_axpy_dyn).
 ; CHECK-LABEL: @inplace(
-; CHECK-COUNT-32: store float
+; CHECK-COUNT-64: store float
 ; CHECK-NOT: store float
 ; CHECK: .epil
 ; PLACE16-LABEL: @inplace(

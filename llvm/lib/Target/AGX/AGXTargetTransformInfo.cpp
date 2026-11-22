@@ -253,7 +253,7 @@ static cl::opt<unsigned> AGXDeviceUnrollRuntimeOwnRowFactor(
              "of words whose loads are all the thread's own"));
 
 static cl::opt<unsigned> AGXDeviceUnrollRuntimeInPlaceFactor(
-    "agx-device-unroll-runtime-in-place-factor", cl::init(8), cl::Hidden,
+    "agx-device-unroll-runtime-in-place-factor", cl::init(16), cl::Hidden,
     cl::desc("agx-device-unroll-runtime-own-row-factor for a row stored in "
              "place (0: the own row's)"));
 
@@ -1034,7 +1034,8 @@ void AGXTTIImpl::getUnrollingPreferences(
                 : AGXDeviceUnrollRuntimeOwnRowFactor;
         // (8 times for an in-place row, its one store at a load's address:
         // inplace_dyn 300.2 -> 278.7; a row stored elsewhere lost at 8,
-        // row_axpy_dyn +141%, L15-E748)
+        // row_axpy_dyn +141%, L15-E748; 16 since L15-E768, inplace_dyn
+        // 278.7 -> 264.1)
         if (OwnRowFactor == AGXDeviceUnrollRuntimeOwnRowFactor &&
             AGXDeviceUnrollRuntimeInPlaceFactor &&
             any_of(*L->getHeader(), [&](const Instruction &I) {
