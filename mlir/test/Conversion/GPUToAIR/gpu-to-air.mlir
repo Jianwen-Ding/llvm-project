@@ -1435,6 +1435,27 @@ gpu.module @f64_trig {
 
 // -----
 
+// f64 pow (L15-E823; llvm.pow.f64 had no emulation): fdlibm's e_pow.c,
+// branch-free: log2|x| in two parts (a reciprocal), times y in two parts,
+// 2^z by exp's rational (a division); no intrinsic call of its left.
+gpu.module @f64_pow {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.pow
+  // CHECK-COUNT-2: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: llvm.intr.pow
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.powf %v, %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
 // f16 functions computed in f32 with the hardware's approximations of the
 // steps for which every f16 input's result is the same (L15-E330): cbrt all
 // of them, asinh its square root only; off with approximate-half-functions=0.

@@ -1500,7 +1500,6 @@ static Value kernelSinF64(ImplicitLocOpBuilder &b, Value x, Value y) {
   auto c = [&](double v) {
     return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
   };
-  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
   auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
   auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
   Value z = mul(x, x), v = mul(z, x);
@@ -1654,6 +1653,231 @@ static LogicalResult rewriteTrigF64(OpTy op, PatternRewriter &rewriter) {
                                 c(std::numeric_limits<double>::infinity())),
           c(std::numeric_limits<double>::quiet_NaN()), r);
   rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// pow of f64 (L15-E823; before, llvm.pow.f64 had no emulation and the
+/// kernel did not compile): fdlibm's e_pow.c, branch-free. log2|x| as
+/// t1 + t2 (|x| = 2^n m, m within [sqrt(3)/2, sqrt(3)) about 1 or 1.5,
+/// s = (m - b) / (m + b) by a reciprocal in two parts, its polynomial in
+/// s^2, 2/(3 ln 2) in two parts; for |y| from 2^31, fdlibm's series of
+/// |x| near 1 instead), times y = y1 + y2 (high words), z = p_h + p_l, its
+/// overflow and underflow tests, 2^z as 2^n e^(z - n) (n = roundeven(z),
+/// exp's rational with one division), scaled by 2^n in two exact steps (a
+/// denormal result rounded once). The special cases as e_pow.c and C99:
+/// y = 0 or x = 1: 1; NaN; y infinite (|x| = 1: 1); |x| zero or infinite;
+/// x negative: NaN for y not an integer, the sign for y odd; |y| above 2^64
+/// over or underflow.
+static LogicalResult rewritePowF64(math::PowFOp op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto ci = [&](int64_t v) {
+    return arith::ConstantIntOp::create(b, i64, v).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v).getResult(); };
+  auto fma = [&](Value u, Value v, Value w) -> Value { return f64Fma(b, u, v, w); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v).getResult();
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v).getResult();
+  };
+  auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v).getResult(); };
+  auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v).getResult(); };
+  auto iadd = [&](Value u, Value v) { return arith::AddIOp::create(b, u, v).getResult(); };
+  auto isub = [&](Value u, Value v) { return arith::SubIOp::create(b, u, v).getResult(); };
+  auto iand = [&](Value u, Value v) { return arith::AndIOp::create(b, u, v).getResult(); };
+  auto ior = [&](Value u, Value v) { return arith::OrIOp::create(b, u, v).getResult(); };
+  auto shl = [&](Value u, Value v) { return arith::ShLIOp::create(b, u, v).getResult(); };
+  auto shr = [&](Value u, Value v) { return arith::ShRUIOp::create(b, u, v).getResult(); };
+  auto bnot = [&](Value v) {
+    return arith::XOrIOp::create(
+               b, v, arith::ConstantIntOp::create(b, b.getI1Type(), 1))
+        .getResult();
+  };
+  auto band = [&](Value u, Value v) { return arith::AndIOp::create(b, u, v).getResult(); };
+  auto bor = [&](Value u, Value v) { return arith::OrIOp::create(b, u, v).getResult(); };
+  // a double with its low word cleared
+  auto lowCleared = [&](Value v) {
+    return dbl(iand(bits(v), ci(int64_t(0xffffffff00000000ULL))));
+  };
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  Value x = op.getLhs(), y = op.getRhs();
+  Value ax = math::AbsFOp::create(b, x), ay = math::AbsFOp::create(b, y);
+  // y an integer (|y| from 2^53 is), odd
+  Value yInt = fcmp(arith::CmpFPredicate::OEQ, math::FloorOp::create(b, y), y);
+  Value yHalf = mul(y, c(0.5));
+  Value yOdd = band(yInt, fcmp(arith::CmpFPredicate::ONE,
+                               math::FloorOp::create(b, yHalf), yHalf));
+  Value xNeg = icmp(arith::CmpIPredicate::slt, bits(x), ci(0));
+  // the result's sign: - for x negative and y odd
+  Value minus = band(xNeg, yOdd);
+
+  // log2 |x| = t1 + t2 (|y| below 2^31: fdlibm's general form)
+  Value tinyX = fcmp(arith::CmpFPredicate::OLT, ax, c(0x1p-1022));
+  Value axs = sel(tinyX, mul(ax, c(0x1p53)), ax);
+  Value hx = shr(bits(axs), ci(32));
+  Value n = iadd(isub(shr(hx, ci(20)), ci(0x3ff)), sel(tinyX, ci(-53), ci(0)));
+  Value j = iand(hx, ci(0xfffff));
+  Value k1 = band(icmp(arith::CmpIPredicate::sgt, j, ci(0x3988E)),
+                  icmp(arith::CmpIPredicate::slt, j, ci(0xBB67A)));
+  Value up = icmp(arith::CmpIPredicate::sge, j, ci(0xBB67A));
+  n = iadd(n, sel(up, ci(1), ci(0)));
+  Value ixh = isub(ior(j, ci(0x3ff00000)), sel(up, ci(0x00100000), ci(0)));
+  Value m = dbl(ior(shl(ixh, ci(32)), iand(bits(axs), ci(0xffffffffLL))));
+  Value bp = sel(k1, c(1.5), c(1.0));
+  Value u = sub(m, bp);
+  Value v = div(c(1.0), add(m, bp));
+  Value ss = mul(u, v);
+  Value sH = lowCleared(ss);
+  // t_h = m + bp's high part, from the bits: ((ix >> 1) | 0x20000000) +
+  // 0x00080000 + (k << 18) as its high word
+  Value tH = dbl(shl(iadd(iadd(ior(shr(ixh, ci(1)), ci(0x20000000)),
+                               ci(0x00080000)),
+                          sel(k1, ci(1 << 18), ci(0))),
+                     ci(32)));
+  Value tL = sub(m, sub(tH, bp));
+  Value sL = mul(v, sub(sub(u, mul(sH, tH)), mul(sH, tL)));
+  Value s2 = mul(ss, ss);
+  Value r = c(2.06975017800338417784e-01);
+  for (double kk : {2.30660745775561754067e-01, 2.72728123808534006489e-01,
+                    3.33333329818377432918e-01, 4.28571428578550184252e-01,
+                    5.99999999999994648725e-01})
+    r = fma(s2, r, c(kk));
+  r = mul(mul(s2, s2), r);
+  r = add(r, mul(sL, add(sH, ss)));
+  s2 = mul(sH, sH);
+  Value tHi = lowCleared(add(add(c(3.0), s2), r));
+  Value tLo = sub(r, sub(sub(tHi, c(3.0)), s2));
+  Value uu = mul(sH, tHi);
+  Value vv = add(mul(sL, tHi), mul(tLo, ss));
+  Value pH = lowCleared(add(uu, vv));
+  Value pL = sub(vv, sub(pH, uu));
+  Value zH = mul(c(9.61796700954437255859e-01), pH);
+  Value zL = add(add(mul(c(-7.02846165095275826516e-09), pH),
+                     mul(pL, c(9.61796693925975554329e-01))),
+                 sel(k1, c(1.35003920212974897128e-08), c(0.0)));
+  Value dpH = sel(k1, c(5.84962487220764160156e-01), c(0.0));
+  Value tn = arith::SIToFPOp::create(b, f64, n);
+  Value t1 = lowCleared(add(add(add(zH, zL), dpH), tn));
+  Value t2 = sub(zL, sub(sub(sub(t1, tn), dpH), zH));
+  // |y| from 2^31: |x| near 1's series (a farther x over or underflows)
+  {
+    Value t = sub(ax, c(1.0));
+    Value w = mul(mul(t, t), sub(c(0.5), mul(t, sub(c(0.3333333333333333333333),
+                                                     mul(t, c(0.25))))));
+    // (fdlibm's u = ivln2_h t is not exact: ivln2_h has 24 bits, t up to
+    // 33, and the error, times y, reached 973 units of 2^-53 in z where z
+    // stays in range (2^-20 near 1, |y| to 2^64); t split at its high word,
+    // ivln2_h t's high part exact and the rest in v, 0.0018)
+    Value th = lowCleared(t);
+    Value uN = mul(c(1.44269502162933349609e+00), th);
+    Value vN = sub(add(mul(sub(t, th), c(1.44269502162933349609e+00)),
+                       mul(t, c(1.92596299112661746887e-08))),
+                   mul(w, c(1.44269504088896338700e+00)));
+    Value t1N = lowCleared(add(uN, vN));
+    Value t2N = sub(vN, sub(t1N, uN));
+    Value bigY = fcmp(arith::CmpFPredicate::OGT, ay, c(0x1p31));
+    t1 = sel(bigY, t1N, t1);
+    t2 = sel(bigY, t2N, t2);
+  }
+  // (y1 + y2)(t1 + t2)
+  Value y1 = lowCleared(y);
+  Value pl = add(mul(sub(y, y1), t1), mul(y, t2));
+  Value ph = mul(y1, t1);
+  Value z = add(pl, ph);
+  // overflow from 1024, underflow below -1075 (at the edges by p_l's part)
+  Value over = bor(fcmp(arith::CmpFPredicate::OGT, z, c(1024.0)),
+                   band(fcmp(arith::CmpFPredicate::OEQ, z, c(1024.0)),
+                        fcmp(arith::CmpFPredicate::OGT,
+                             add(pl, c(8.0085662595372944372e-17)),
+                             sub(z, ph))));
+  Value under = bor(fcmp(arith::CmpFPredicate::OLT, z, c(-1075.0)),
+                    band(fcmp(arith::CmpFPredicate::OEQ, z, c(-1075.0)),
+                         fcmp(arith::CmpFPredicate::OLE, pl, sub(z, ph))));
+  // 2^(p_h + p_l): n = roundeven(z) taken off p_h (exact)
+  Value zc = sel(bor(over, under), c(0.0), z);
+  Value nf = math::RoundEvenOp::create(b, zc);
+  ph = sub(sel(bor(over, under), c(0.0), ph), nf);
+  pl = sel(bor(over, under), c(0.0), pl);
+  Value t = lowCleared(add(pl, ph));
+  Value ue = mul(t, c(6.93147182464599609375e-01));
+  Value ve = add(mul(sub(pl, sub(t, ph)), c(6.93147180559945286227e-01)),
+                 mul(t, c(-1.90465429995776804525e-09)));
+  Value ze = add(ue, ve);
+  Value we = sub(ve, sub(ze, ue));
+  Value tt = mul(ze, ze);
+  Value pe = c(4.13813679705723846039e-08);
+  for (double kk : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
+                    -2.77777777770155933842e-03, 1.66666666666666019037e-01})
+    pe = fma(tt, pe, c(kk));
+  Value t1e = sub(ze, mul(tt, pe));
+  Value re = sub(div(mul(ze, t1e), sub(t1e, c(2.0))), add(we, mul(ze, we)));
+  Value e = sub(c(1.0), sub(re, ze));
+  // e 2^n, n within [-1075, 1024], in two exact steps (e within [0.7, 1.42])
+  Value ni = arith::FPToSIOp::create(b, i64, nf);
+  Value n1 = arith::ShRSIOp::create(b, ni, ci(1));
+  auto pow2 = [&](Value k) { return dbl(shl(iadd(k, ci(1023)), ci(52))); };
+  Value res = mul(dbl(iadd(bits(e), shl(n1, ci(52)))), pow2(isub(ni, n1)));
+  res = sel(over, c(inf), sel(under, c(0.0), res));
+  res = sel(minus, arith::NegFOp::create(b, res).getResult(), res);
+
+  // special cases, the last select the first rule
+  Value xZero = fcmp(arith::CmpFPredicate::OEQ, x, c(0.0));
+  Value xInf = fcmp(arith::CmpFPredicate::OEQ, ax, c(inf));
+  Value yPos = fcmp(arith::CmpFPredicate::OGT, y, c(0.0));
+  // |y| above 2^64 (finite): 1 + or - an ulp's power is past any range
+  Value hugeY = band(fcmp(arith::CmpFPredicate::OGT, ay, c(0x1p64)),
+                     fcmp(arith::CmpFPredicate::ONE, ay, c(inf)));
+  Value axBig = fcmp(arith::CmpFPredicate::OGT, ax, c(1.0));
+  Value axOne = fcmp(arith::CmpFPredicate::OEQ, ax, c(1.0));
+  // (|x| above 1 and y positive, or below 1 and y negative: inf; else 0)
+  Value grow = arith::CmpIOp::create(b, arith::CmpIPredicate::eq, axBig, yPos);
+  res = sel(band(hugeY, bnot(axOne)), sel(grow, c(inf), c(0.0)), res);
+  // |y| from 2^31 with |x| not within 2^-20 of 1: the series does not hold,
+  // and the result over or underflows (e_pow.c)
+  Value bigYFar = band(
+      fcmp(arith::CmpFPredicate::OGT, ay, c(0x1p31)),
+      bor(fcmp(arith::CmpFPredicate::OLT, ax, c(0x1.fffffp-1)),
+          fcmp(arith::CmpFPredicate::OGE, ax, c(0x1.00001p+0))));
+  Value farV = sel(grow, c(inf), c(0.0));
+  res = sel(bigYFar, sel(minus, arith::NegFOp::create(b, farV).getResult(), farV),
+            res);
+  // y = 1: x; y = 2: x x (e_pow.c's exact cases)
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, y, c(2.0)), mul(x, x), res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, y, c(1.0)), x, res);
+  // x negative, y not an integer
+  res = sel(band(xNeg, bnot(yInt)), c(nan), res);
+  // |x| zero or infinite: |x|^y (inf or 0 by y's sign and x's size), the
+  // sign for y odd
+  Value zeroInf = sel(bor(band(xZero, yPos), band(xInf, bnot(yPos))),
+                      c(0.0), c(inf));
+  zeroInf = sel(minus, arith::NegFOp::create(b, zeroInf).getResult(), zeroInf);
+  res = sel(bor(xZero, xInf), zeroInf, res);
+  // y infinite: |x| = 1 1, else inf or 0
+  Value yInf = fcmp(arith::CmpFPredicate::OEQ, ay, c(inf));
+  res = sel(yInf, sel(axOne, c(1.0), sel(grow, c(inf), c(0.0))), res);
+  // NaN operands
+  res = sel(bor(fcmp(arith::CmpFPredicate::UNO, x, x),
+                fcmp(arith::CmpFPredicate::UNO, y, y)),
+            add(x, y), res);
+  // y = 0 or x = 1: 1, whatever the other
+  res = sel(bor(fcmp(arith::CmpFPredicate::OEQ, y, c(0.0)),
+                fcmp(arith::CmpFPredicate::OEQ, x, c(1.0))),
+            c(1.0), res);
+  rewriter.replaceOp(op, res);
   return success();
 }
 
@@ -4046,6 +4270,7 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteF64Function<math::TanhOp>);
       patterns.add(rewriteInverseTrigF64<math::AtanOp>);
       patterns.add(rewriteTrigF64<math::SinOp>);
+      patterns.add(rewritePowF64);
       patterns.add(rewriteTrigF64<math::CosOp>);
       patterns.add(rewriteTrigF64<math::TanOp>);
       patterns.add(rewriteInverseTrigF64<math::Atan2Op>);
