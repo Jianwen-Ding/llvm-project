@@ -2301,12 +2301,37 @@ static Value *expandLogF64(IRBuilder<> &B, Value *X) {
   return Res;
 }
 
+static cl::opt<bool> AGXSoftF64FmulAddFused(
+    "agx-soft-f64-fmuladd-fused", cl::init(false), cl::Hidden,
+    cl::desc("llvm.fmuladd of doubles as the emulated fma, not a multiply "
+             "and an add (L15-E833)"));
+
 bool AGXSoftF64::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
   const TargetMachine &TM =
       getAnalysis<TargetPassConfig>().getTM<TargetMachine>();
   const auto &ST = TM.getSubtarget<AGXSubtarget>(F);
+  // llvm.fmuladd of doubles (fused or not, as the implementation chooses):
+  // a multiply and an add, which the emulation does for less than its fma
+  // (newk tput 27.2 + 35.6 against 83.0, L15-E815; L15-E833)
+  if (!AGXSoftF64FmulAddFused) {
+    SmallVector<IntrinsicInst *, 4> MulAdds;
+    for (Instruction &I : instructions(F))
+      if (auto *II = dyn_cast<IntrinsicInst>(&I);
+          II && II->getIntrinsicID() == Intrinsic::fmuladd && isDouble(II))
+        MulAdds.push_back(II);
+    for (IntrinsicInst *II : MulAdds) {
+      IRBuilder<> B(II);
+      B.setFastMathFlags(II->getFastMathFlags());
+      Value *R = B.CreateFAdd(
+          B.CreateFMul(II->getArgOperand(0), II->getArgOperand(1)),
+          II->getArgOperand(2));
+      R->takeName(II);
+      II->replaceAllUsesWith(R);
+      II->eraseFromParent();
+    }
+  }
   // powi of a double (SelectionDAG cannot soften it): compiler-rt's
   // __powidf2 in double operations, which the lowering below takes.
   SmallVector<IntrinsicInst *, 2> PowIs;
