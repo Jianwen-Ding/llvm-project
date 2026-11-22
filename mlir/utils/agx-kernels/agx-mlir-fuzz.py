@@ -9,7 +9,7 @@ Each seed generates a gpu.func whose threads each update their row of a 1024x256
 
 c a second memref at the thread's row (column) or at j + o'' alone (every thread's same elements), or b itself
 passed twice; the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16 or f32 (small integers,
-exact sums and products); f an add, sub, xor, a multiply by a constant or a max, g an unsigned or ordered compare,
+exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
 and a guarded statement's c load inside its scf.if (speculate-guarded-loads). Lowered as bench.py does
 (convert-gpu-to-air, mlir-translate, the AIR target's portable passes, opt -O3, llc -O3, the constants in
 uniforms on every other seed), run with agx_run on 1024 threads and compared element for element with the model
@@ -51,12 +51,13 @@ def gen(seed):
     # a running value carried by the loop (iter_args), f(acc, c[...]) each
     # iteration, stored after the loop at the row's last element
     k['red'] = R.random() < 0.35
-    k['rop'] = R.choice(['add', 'sub', 'mul', 'max'] + (['xor'] if k['ty'] != 'f32' else []))
+    k['rop'] = R.choice(['add', 'sub', 'mul', 'max', 'min'] +
+                        (['xor'] if k['ty'] != 'f32' else ['maxnum', 'minnum']))
     k['rlc'] = R.randrange(0, 64)
     k['rinit'] = R.choice([0, 1, 5])
     # c at the thread's row (column) or at j + o alone, for every statement
     cw = 'own' if k['alias'] or R.random() < 0.7 else 'shared'
-    ops = ['add', 'sub', 'mul', 'max'] + (['xor'] if k['ty'] != 'f32' else [])
+    ops = ['add', 'sub', 'mul', 'max', 'min'] + (['xor'] if k['ty'] != 'f32' else ['maxnum', 'minnum'])
     for _ in range(R.randint(1, 3)):
         k['stmts'].append(dict(
             st=R.randrange(0, 64), lb=R.choice([None, R.randrange(0, 64)]),
@@ -120,8 +121,10 @@ def emit(k):
             m = nv()
             L.append('      %s = arith.%s %s, %s : %s' % (m, 'mulf' if flt else 'muli', b, const(kc), T))
             L.append('      %s = arith.%s %s, %s : %s' % (r, 'addf' if flt else 'addi', a, m, T))
-        elif o == 'max':
-            L.append('      %s = arith.%s %s, %s : %s' % (r, 'maximumf' if flt else 'maxui', a, b, T))
+        elif o in ('max', 'min', 'maxnum', 'minnum'):
+            name = {'max': 'maximumf', 'min': 'minimumf', 'maxnum': 'maxnumf', 'minnum': 'minnumf'}[o] if flt \
+                else {'max': 'maxui', 'min': 'minui'}[o]
+            L.append('      %s = arith.%s %s, %s : %s' % (r, name, a, b, T))
         else:
             name = {'add': 'addf', 'sub': 'subf'}[o] if flt else {'add': 'addi', 'sub': 'subi', 'xor': 'xori'}[o]
             L.append('      %s = arith.%s %s, %s : %s' % (r, name, a, b, T))
@@ -195,7 +198,8 @@ def model(k, t, c, b):
                     return (a - x).astype(np.float32)
                 if o == 'mul':
                     return (a + (x * np.float32(kc)).astype(np.float32)).astype(np.float32)
-                return np.where(np.isnan(a) | np.isnan(x), np.float32('nan'), np.maximum(a, x)).astype(np.float32)
+                # (no NaN arises: the values are small integers)
+                return (np.maximum if o in ('max', 'maxnum') else np.minimum)(a, x).astype(np.float32)
         a64, x64 = a.astype(np.int64), x.astype(np.int64)
         if o == 'add':
             r = a64 + x64
@@ -205,6 +209,8 @@ def model(k, t, c, b):
             r = a64 ^ x64
         elif o == 'mul':
             r = a64 + x64 * kc
+        elif o == 'min':
+            r = np.minimum(a64, x64)
         else:
             r = np.maximum(a64, x64)
         return (r & MW).astype(DT[T])
