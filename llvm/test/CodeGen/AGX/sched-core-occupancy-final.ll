@@ -1,12 +1,15 @@
 ; REQUIRES: asserts
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-uniform-constants -debug-only=agx-target-machine -o /dev/null < %s 2>&1 | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-uniform-constants -debug-only=agx-target-machine -agx-sched-core-occupancy-final=0 -o /dev/null < %s 2>&1 | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-uniform-constants -agx-sched-core-occupancy-short=0 -debug-only=agx-target-machine -o /dev/null < %s 2>&1 | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-uniform-constants -debug-only=agx-target-machine -o /dev/null < %s 2>&1 | FileCheck %s --check-prefix=SHORT
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-uniform-constants -agx-sched-core-occupancy-short=0 -debug-only=agx-target-machine -agx-sched-core-occupancy-final=0 -o /dev/null < %s 2>&1 | FileCheck %s --check-prefix=OFF
 
 ; where_rows (MLIR corpus): its first region's free order would leave the core
 ; 82 SIMD-groups of 96, so E799 put it back in its original order; another
 ; block's pressure leaves the function 46 anyway. At the function's end the
 ; region is scheduled freely again: no fewer groups, its latency hidden
-; (L15-E804).
+; (L15-E804). (Its 23 instructions take E806's short cut by default: not reverted.)
+; SHORT: agx-occupancy decide: loads 0 instrs 23 groups 96 -> 82 threads 0 core 0
+; SHORT-NOT: agx-occupancy reverted
 ; CHECK: agx-occupancy reverted
 ; CHECK: agx-occupancy final: free again, halves {{[0-9]+}} beside {{[0-9]+}}
 ; OFF: agx-occupancy reverted

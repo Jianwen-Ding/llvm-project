@@ -314,6 +314,17 @@ static cl::opt<unsigned> AGXSchedCoreOccupancyCut(
              "tenths: 10, any (1.8 times until L15-E761, 1.2 until "
              "L15-E799)"));
 
+static cl::opt<unsigned> AGXSchedCoreShortInstrs(
+    "agx-sched-core-occupancy-short", cl::init(32), cl::Hidden,
+    cl::desc("Regions of fewer instructions take "
+             "-agx-sched-core-occupancy-short-cut, not "
+             "-agx-sched-core-occupancy-cut"));
+
+static cl::opt<unsigned> AGXSchedCoreShortCut(
+    "agx-sched-core-occupancy-short-cut", cl::init(12), cl::Hidden,
+    cl::desc("agx-sched-core-occupancy's cut, in tenths, for regions of "
+             "fewer than -agx-sched-core-occupancy-short instructions"));
+
 static cl::opt<unsigned> AGXSchedLoadsFirstCut(
     "agx-sched-loads-first-cut", cl::init(18), cl::Hidden,
     cl::desc("agx-sched-original-order-loads-first's order dropped where it "
@@ -554,9 +565,15 @@ public:
                     10 * CoreGroups(Before) ||
                 AGXSubtarget::maxThreadsForHalves(After + 16) < Need;
     }
+    // (a short region at E761's 1.2 times: swiglu's and permute4d's 28
+    // instructions, 96 -> 82 groups, hide more of their loads' latency in
+    // the free order than the 14 groups do, +4.3% / +2.0% at 1.0; the
+    // longer softmax, log and sincos rows' gain at 1.0, L15-E806)
+    unsigned CoreCut = Index.size() < AGXSchedCoreShortInstrs
+                           ? AGXSchedCoreShortCut
+                           : AGXSchedCoreOccupancyCut;
     bool Core = AGXSchedCoreOccupancy && FewLoads &&
-                AGXSchedCoreOccupancyCut * CoreGroups(After) <
-                    10 * CoreGroups(Before);
+                CoreCut * CoreGroups(After) < 10 * CoreGroups(Before);
     // (and a region of little but word loads, at a cut of 2 times: a naive
     // matrix product's A and B columns, all issued ahead of their fmas by the
     // free order, 96 -> 40 groups; in order, 55 groups hide them,
