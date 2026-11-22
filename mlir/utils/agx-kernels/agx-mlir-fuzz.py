@@ -11,7 +11,10 @@ c a second memref at the thread's row (column) or at j + o'' alone (every thread
 passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
 vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16, f32 or f16 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
-and a guarded statement's c load inside its scf.if (speculate-guarded-loads). An eighth of the seeds instead share a threadgroup tile: each of rounds tile[l] = f(c[g, l + 16 r]), a
+and a guarded statement's c load inside its scf.if (speculate-guarded-loads). A sixteenth of the seeds instead divide: b[t, j] = op(x, d) + k, op divui / divsi / remui / remsi / floordivsi /
+ceildivsi / ceildivui, x the element (or its low bits), d a constant (powers of two, odd, negative), the kernel's
+argument, an element or j + 1 (the division expansions; division by zero and INT_MIN / -1 left out). An eighth
+share a threadgroup tile: each of rounds tile[l] = f(c[g, l + 16 r]), a
 gpu.barrier, another thread's place (l + sh mod 128 or 256) combined with the thread's own value, a barrier, and
 the result stored (threadgroup accesses, barriers, block barriers of 128 threads). An eighth compute float math over a row (exp, e^(x - k), x > k ? e^(x - k) : x, tanh, the
 sigmoid, log(abs(x) + 1), e^x k + 1, and e^(x - m) of the row's maximum m from a loop before: E731 / E732 / E743's
@@ -727,7 +730,152 @@ def run_tg(seed, a, tmp):
     return src, None
 
 
+IDIV = ['divui', 'divsi', 'remui', 'remsi', 'floordivsi', 'ceildivsi', 'ceildivui']
+
+
+def gen_idiv(seed):
+    R = random.Random(seed)
+    k = dict(ty=R.choice(['i32', 'i32', 'i16']), op=R.choice(IDIV),
+             den=R.choice(['const', 'const', 'arg', 'elem', 'index']),
+             d=R.choice([1, 2, 3, 7, 10, 16, 255, 256, 1000, -1, -3, -16, 65535]),
+             narrow=R.random() < 0.4, add=R.choice([0, 1, 100]))
+    if k['ty'] == 'i16' and abs(k['d']) > 30000:
+        k['d'] = 7
+    return k
+
+
+def emit_idiv(k):
+    """b[t, j] = op(c[t, j] (or narrowed to 0..65535 by an and), the divisor) + add over a thread's row: the
+    divisor a constant, the kernel's argument n, an element c[t, 255], or the index j + 1."""
+    T = k['ty']
+    M = 'memref<1024x256x%s, 1>' % T
+    L = ['gpu.module @k {',
+         '  gpu.func @k(%%c: %s, %%b: %s, %%n: i32) kernel' % (M, M),
+         '      attributes {known_block_size = array<i32: 256, 1, 1>} {',
+         '    %c0 = arith.constant 0 : index', '    %c1 = arith.constant 1 : index',
+         '    %c255 = arith.constant 255 : index',
+         '    %t = gpu.global_id x upper_bound 1024',
+         '    %%add = arith.constant %d : %s' % (k['add'], T)]
+    if k['den'] == 'const':
+        L.append('    %%d = arith.constant %d : %s' % (k['d'], T))
+    elif k['den'] == 'arg':
+        L.append('    %%d = arith.%s %%n : i32 to %s' % ('trunci', T) if T != 'i32' else '    %d = arith.addi %n, %add : i32')
+        if T == 'i32':
+            L[-1] = '    %d = arith.addi %n, %c0i : i32'
+            L.insert(-1, '    %c0i = arith.constant 0 : i32')
+    elif k['den'] == 'elem':
+        L.append('    %%d = memref.load %%c[%%t, %%c255] : %s' % M)
+    L += ['    scf.for %j = %c0 to %c255 step %c1 {',
+          '      %%x0 = memref.load %%c[%%t, %%j] : %s' % M]
+    if k['narrow']:
+        L += ['      %%m = arith.constant %d : %s' % (65535 if T == 'i32' else 255, T),
+              '      %%x = arith.andi %%x0, %%m : %s' % T]
+    else:
+        L += ['      %%x = arith.addi %%x0, %%add : %s' % T]
+    if k['den'] == 'index':
+        L += ['      %j1 = arith.addi %j, %c1 : index',
+              '      %%d = arith.index_cast %%j1 : index to %s' % T]
+    L += ['      %%q = arith.%s %%x, %%d : %s' % (k['op'], T),
+          '      %%y = arith.addi %%q, %%add : %s' % T,
+          '      memref.store %%y, %%b[%%t, %%j] : %s' % M,
+          '    }', '    gpu.return', '  }', '}']
+    return '\n'.join(L) + '\n'
+
+
+def model_idiv(k, c, n, b):
+    T = k['ty']
+    W = 32 if T == 'i32' else 16
+    MW = (1 << W) - 1
+
+    def s(v):   # signed
+        v = v.astype(np.int64) & MW
+        return np.where(v >= 1 << (W - 1), v - (1 << W), v)
+
+    def u(v):
+        return v.astype(np.int64) & MW
+    x = c[:, :255]
+    x = (u(x) & (65535 if T == 'i32' else 255)) if k['narrow'] else u(u(x) + k['add'])
+    if k['den'] == 'const':
+        d = np.full(x.shape, k['d'] & MW, np.int64)
+    elif k['den'] == 'arg':
+        d = np.full(x.shape, n & MW, np.int64)
+    elif k['den'] == 'elem':
+        d = np.broadcast_to(u(c[:, 255:256]), x.shape)
+    else:
+        d = np.broadcast_to(np.arange(1, 256, dtype=np.int64)[None, :], x.shape)
+    op = k['op']
+    ok = d != 0
+    dd = np.where(ok, d, 1)
+    if op in ('divui', 'remui', 'ceildivui'):
+        q = {'divui': x // dd, 'remui': x % dd, 'ceildivui': -(-x // dd)}[op]
+    else:
+        xs, ds = s(x), s(dd)
+        # (signed overflow: INT_MIN / -1 is undefined, as division by zero)
+        ok &= ~((xs == -(1 << (W - 1))) & (ds == -1))
+        ds = np.where(ok, ds, 1)
+        tq = np.trunc(xs / ds).astype(np.int64)
+        tq = np.where(np.abs(xs) < 2 ** 52, tq, xs // ds)   # (exact for these widths)
+        tr = xs - tq * ds
+        if op == 'divsi':
+            q = tq
+        elif op == 'remsi':
+            q = tr
+        elif op == 'floordivsi':
+            q = np.where((tr != 0) & ((tr < 0) != (ds < 0)), tq - 1, tq)
+        else:
+            q = np.where((tr != 0) & ((tr < 0) == (ds < 0)), tq + 1, tq)
+    y = (q + k['add']) & MW
+    return y.astype(DT[T]), ok
+
+
+def run_idiv(seed, a, tmp):
+    k = gen_idiv(seed)
+    src = emit_idiv(k)
+    sp = os.path.join(tmp, 'k.mlir.src')
+    open(sp, 'w').write(src)
+    try:
+        code, consts = compile_kernel(a, sp, tmp, seed % 2 == 1)
+    except subprocess.CalledProcessError as e:
+        return src, 'compile failure: ' + ((e.stderr or '').strip().splitlines() or [''])[-1][:200]
+    rng = np.random.default_rng(seed)
+    T = k['ty']
+    W = 32 if T == 'i32' else 16
+    c = rng.integers(0, 1 << W, (1024, 256), dtype=np.uint64).astype(DT[T])
+    m = rng.random(c.shape) < 0.2
+    edge = np.array([0, 1, 2, 3, 7, (1 << W) - 1, (1 << W) - 2, 1 << (W - 1), (1 << (W - 1)) - 1, 100, 1000], np.uint64)
+    c[m] = rng.choice(edge, m.sum()).astype(DT[T])
+    # (an element divisor never zero)
+    c[:, 255] = np.where(c[:, 255] == 0, 3, c[:, 255])
+    n = int(rng.choice([1, 3, 7, 16, 100, 1000, (1 << W) - 1, (1 << W) - 3]))
+    b = np.zeros((1024, 256), DT[T])
+    fb, fc, fo = (os.path.join(tmp, x) for x in ('b.bin', 'c.bin', 'o.bin'))
+    b.tofile(fb)
+    c.tofile(fc)
+    vb, vc = BASE, BASE + 0x1000000
+    cmd = [a.run, code, '--grid', '1024,1,1', '--wg', '256,1,1',
+           '--map', '%#x=%s' % (vb, fb), '--map', '%#x=%s' % (vc, fc), '--dump', '%#x=%d:%s' % (vb, b.nbytes, fo),
+           '--uniform', '0=%d' % (vc & 0xffffffff), '--uniform', '1=%d' % (vc >> 32),
+           '--uniform', '2=%d' % (vb & 0xffffffff), '--uniform', '3=%d' % (vb >> 32),
+           '--uniform', '4=%d' % n] + consts
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return src, 'agx_run timed out'
+    if r.returncode:
+        return src, 'agx_run failed: ' + ((r.stderr + r.stdout).strip().splitlines() or [''])[-1][:200]
+    got = np.fromfile(fo, DT[T]).reshape(b.shape)[:, :255]
+    ref, ok = model_idiv(k, c, n, b)
+    bad = np.argwhere(ok & (got != ref))
+    if bad.size:
+        e = tuple(bad[0])
+        return src, 'idiv %s: element %s of c %#x: %#x, the model %#x (%d elements differ)' % (
+            k['op'], e, int(c[e]), int(got[e]), int(ref[e]), len(bad))
+    return src, None
+
+
 def run_seed(seed, a, tmp):
+    if seed % 16 == 0:
+        return run_idiv(seed, a, tmp)
     if seed % 8 == 5:
         return run_tg(seed, a, tmp)
     # (a quarter of the seeds: a SIMD-group a row; an eighth: float math)
