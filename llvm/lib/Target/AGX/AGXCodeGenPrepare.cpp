@@ -509,6 +509,8 @@ bool AGXGlobalDataArgs::runOnModule(Module &M) {
 // AGXCodeGenPrepare
 //===----------------------------------------------------------------------===//
 
+static bool tanhPlusOnes(Function &F);
+
 namespace {
 
 class AGXCodeGenPrepare : public FunctionPass {
@@ -8984,6 +8986,8 @@ bool AGXCodeGenPrepare::runOnFunction(Function &F) {
     Changed |= lowerDivergentShuffles(F, TTI);
   Changed |= combineUniformAtomics(F, TTI);
   Changed |= lowerConstrainedFP(F);
+  if (!ST.hasIEEEFP32())
+    Changed |= tanhPlusOnes(F);
   Changed |= expandMath(F, ST);
   Changed |= bfloatSqrts(F, ST);
   Changed |= flushHalfDenormals(F);
@@ -9828,6 +9832,62 @@ static cl::opt<bool> AGXReciprocalSqrt(
 /// normal float in [2^-75, 2^64], whose reciprocal is normal; at +-0 and +inf
 /// the step's residual 1 - d y0 is a NaN, and rcp's own +-inf and +0 are the
 /// quotient (as for a NaN d): rcp, two fmas and a select (L15-E283).
+static cl::opt<bool> AGXTanhPlusOne(
+    "agx-tanh-plus-one", cl::init(true), cl::Hidden,
+    cl::desc("1 + tanh(t) as 2 / (1 + e^-2t), 1 - tanh(t) as 2 / (1 + e^2t)"));
+
+/// 1 + tanh(t) (GELU's tanh form, 0.5 a (1 + tanh(t)); a sigmoid through
+/// tanh) is 2 / (1 + e^-2t), and 1 - tanh(t) is 2 / (1 + e^2t): one
+/// exponential and the reciprocal of e^x + 1 (reciprocalsAboveOne's,
+/// times 2 exactly), not tanh's exponential, reciprocal, small-argument
+/// polynomial and selects and the add. Nor does it cancel: 1 + tanh(t) for
+/// t well below 0 is 1 less a tanh within an ulp of -1, whose error is the
+/// whole result (at t = -5, 1 + tanh(t) = 9.1e-5: thousands of ulps), where
+/// the quotient keeps the exponential's accuracy. At t = +-inf and NaN the
+/// same values (2, +0, NaN); -2t is exact. Only for a float tanh whose one
+/// use is the add (L15-E788).
+static bool tanhPlusOnes(Function &F) {
+  if (!AGXTanhPlusOne)
+    return false;
+  using namespace PatternMatch;
+  SmallVector<std::tuple<Instruction *, IntrinsicInst *, bool>, 4> Work;
+  for (Instruction &I : instructions(F)) {
+    Value *H;
+    bool Minus;
+    if (!I.getType()->isFloatTy() ||
+        (I.getOpcode() != Instruction::FAdd &&
+         I.getOpcode() != Instruction::FSub) ||
+        cast<FPMathOperator>(I).getFastMathFlags().any())
+      continue;
+    if (match(&I, m_c_FAdd(m_Value(H), m_FPOne())))
+      Minus = false;
+    else if (match(&I, m_FSub(m_FPOne(), m_Value(H))))
+      Minus = true;
+    else
+      continue;
+    auto *T = dyn_cast<IntrinsicInst>(H);
+    if (!T || T->getIntrinsicID() != Intrinsic::tanh || !T->hasOneUse() ||
+        T->getFastMathFlags().any())
+      continue;
+    Work.push_back({&I, T, Minus});
+  }
+  for (auto [I, T, Minus] : Work) {
+    IRBuilder<> B(I);
+    Type *Ty = I->getType();
+    Value *N = B.CreateFMul(T->getArgOperand(0),
+                            ConstantFP::get(Ty, Minus ? 2.0 : -2.0));
+    Value *E = B.CreateUnaryIntrinsic(Intrinsic::exp, N);
+    Value *D = B.CreateFAdd(E, ConstantFP::get(Ty, 1.0));
+    Value *R = B.CreateFDiv(ConstantFP::get(Ty, 1.0), D);
+    Value *U = B.CreateFMul(R, ConstantFP::get(Ty, 2.0));
+    U->takeName(I);
+    I->replaceAllUsesWith(U);
+    I->eraseFromParent();
+    T->eraseFromParent();
+  }
+  return !Work.empty();
+}
+
 static bool reciprocalsAboveOne(Function &F) {
   if (!AGXReciprocalAboveOne)
     return false;

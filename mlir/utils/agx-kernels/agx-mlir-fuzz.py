@@ -475,7 +475,8 @@ def run_lanes(seed, a, tmp):
     return src, None
 
 
-MATH = ['exp', 'expk', 'condexp', 'tanh', 'sigmoid', 'log1', 'expscale', 'maxexp', 'online', 'online']
+MATH = ['exp', 'expk', 'condexp', 'tanh', 'sigmoid', 'log1', 'expscale', 'maxexp', 'online', 'online', 'tanh1',
+        'gelu']
 
 
 def gen_math(seed):
@@ -542,6 +543,17 @@ def emit_math(k):
               '      %d = arith.addf %e, %one : f32', '      %y = arith.divf %one, %d : f32']
     elif f == 'log1':
         L += ['      %a = math.absf %x : f32', '      %d = arith.addf %a, %one : f32', '      %y = math.log %d : f32']
+    elif f == 'tanh1':
+        L += ['      %h = math.tanh %x : f32', '      %y = arith.addf %h, %one : f32']
+    elif f == 'gelu':
+        # 0.5 x (1 + tanh(0.79788 (x + 0.044715 x^3)))
+        L += ['      %x2 = arith.mulf %x, %x : f32', '      %x3 = arith.mulf %x2, %x : f32',
+              '      %ca = arith.constant 0.044715 : f32', '      %cb = arith.constant 0.7978845608 : f32',
+              '      %half = arith.constant 0.5 : f32',
+              '      %q = arith.mulf %x3, %ca : f32', '      %s = arith.addf %x, %q : f32',
+              '      %tt = arith.mulf %s, %cb : f32', '      %h = math.tanh %tt : f32',
+              '      %u = arith.addf %h, %one : f32', '      %hx = arith.mulf %x, %half : f32',
+              '      %y = arith.mulf %hx, %u : f32']
     elif f == 'expscale':
         L += ['      %e = math.exp %x : f32', '      %h = arith.mulf %e, %kk : f32', '      %y = arith.addf %h, %one : f32']
     else:
@@ -594,6 +606,16 @@ def model_math(k, c):
         elif f == 'log1':
             d = (np.abs(x) + one).astype(f32)
             y = np.log(F(d)); e = 16 * ulp(y) + ulp(d)
+        elif f == 'tanh1':
+            # (1 + tanh in double cancels too: the quotient form; results near the smallest normal may flush)
+            y = F(2 / (1 + np.exp(-2 * F(x)))); e = 16 * ulp(y) + 2.0 ** -124
+        elif f == 'gelu':
+            s = (x + ((x * x).astype(f32) * x).astype(f32) * f32(0.044715)).astype(f32)
+            tt = (s * f32(0.7978845608)).astype(f32)
+            u = 2 / (1 + np.exp(-2 * F(tt)))
+            y = F(F((x * f32(0.5)).astype(f32)) * u); e = 16 * ulp(y) + 2.0 ** -124
+            # (1 + tanh below 2^-125 flushes in its reciprocal, as tanh's -1 did: a zero result there)
+            e = np.where(u < 2.0 ** -125, np.abs(y) + 2.0 ** -124, e)
         else:
             ex = F(np.exp(F(x)))
             h = (ex.astype(f32) * K).astype(f32)
