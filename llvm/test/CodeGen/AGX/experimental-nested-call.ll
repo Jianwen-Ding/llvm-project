@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-inline-single-call-max-instrs=0 -verify-machineinstrs < %s | FileCheck %s
 ; Three disjoint stack frames and a saved link permit a direct nested call.
 ; CHECK-LABEL: kernel:
 ; CHECK: stack_adjust 3084

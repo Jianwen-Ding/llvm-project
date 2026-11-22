@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -verify-machineinstrs < %s | FileCheck %s --check-prefix=CALL
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -agx-experimental-leaf-calls -agx-inline-single-call-max-instrs=0 -verify-machineinstrs < %s | FileCheck %s --check-prefix=CALL
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s --check-prefix=INLINE
 ;
 ; Opt-in codegen keeps a safe leaf separate even without an explicit noinline

@@ -15,6 +15,13 @@
 // into the block of each access that can fold them; the copies cost
 // nothing, and the shared 64-bit additions they replace disappear.
 //
+// A row + column address, base + ((X + ext(i32 y)) << s), becomes the base
+// base + (X << s) and the index y: the 64-bit addition and the extension
+// disappear, and the hardware stores far faster through a base and a 32-bit
+// index than through a whole 64-bit register address (llama.cpp's
+// k_bin_bcast: 33 -> 22 us, apple-documentation-playground
+// 2026-11-10-store-address-form).
+//
 // Threadgroup and private pointers are 32 bits, but PTX computes their
 // addresses in 64-bit integers. 64-bit arithmetic whose results only reach
 // such pointers or truncations (InstCombine narrows it only where each step
@@ -34,6 +41,7 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
@@ -102,6 +110,99 @@ static bool foldableOffset(Value *Off, unsigned ElemLog2, unsigned Extra,
   if (I)
     Chain.push_back(I);
   return true;
+}
+
+static cl::opt<bool> SplitRowIndex(
+    "agx-split-row-index", cl::init(true), cl::Hidden,
+    cl::desc("Address base + ((X + ext(i32 y)) << s) as the base "
+             "base + (X << s) and the 32-bit index y"));
+
+/// V = X + ext(i32 y), X not a constant (constant offsets fold as they are).
+static bool matchRowColumn(Value *V, Value *&X, Value *&E) {
+  auto *Add = dyn_cast<BinaryOperator>(V);
+  if (!Add || Add->getOpcode() != Instruction::Add ||
+      !Add->getType()->isIntegerTy(64))
+    return false;
+  for (unsigned K = 0; K < 2; ++K)
+    if (isIndexExtension(Add->getOperand(K)) &&
+        !isa<Constant>(Add->getOperand(1 - K))) {
+      E = Add->getOperand(K);
+      X = Add->getOperand(1 - K);
+      return true;
+    }
+  return false;
+}
+
+/// Rewrites the row + column device addresses of F's loads and stores (see
+/// the file comment), in place of the address instruction.
+static bool splitRowIndices(Function &F) {
+  if (!SplitRowIndex)
+    return false;
+  SmallVector<Instruction *, 16> Ptrs;
+  SmallPtrSet<Value *, 16> Seen;
+  for (Instruction &I : instructions(F)) {
+    Value *Ptr = getLoadStorePointerOperand(&I);
+    if (!Ptr || Ptr->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+      continue;
+    if ((isa<GetElementPtrInst>(Ptr) || isa<IntToPtrInst>(Ptr)) &&
+        Seen.insert(Ptr).second)
+      Ptrs.push_back(cast<Instruction>(Ptr));
+  }
+  bool Changed = false;
+  SmallVector<WeakTrackingVH, 16> Dead;
+  for (Instruction *P : Ptrs) {
+    Value *X, *E;
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(P)) {
+      // gep T, base, X + ext(y) -> gep T, (gep T, base, X), ext(y)
+      if (GEP->getNumIndices() != 1 ||
+          !matchRowColumn(GEP->getOperand(1), X, E))
+        continue;
+      IRBuilder<> B(GEP);
+      Type *T = GEP->getSourceElementType();
+      Value *Row = B.CreateGEP(T, GEP->getPointerOperand(), X,
+                               GEP->getName() + ".row");
+      Value *New = B.CreateGEP(T, Row, E, GEP->getName());
+      Dead.push_back(GEP->getOperand(1));
+      GEP->replaceAllUsesWith(New);
+      GEP->eraseFromParent();
+      Changed = true;
+      continue;
+    }
+    // inttoptr (base + ((X + ext(y)) << s)), the shift also as a multiply
+    // by 2^s or absent.
+    auto *ITP = cast<IntToPtrInst>(P);
+    auto *Add = dyn_cast<BinaryOperator>(ITP->getOperand(0));
+    if (!Add || Add->getOpcode() != Instruction::Add ||
+        !Add->getType()->isIntegerTy(64))
+      continue;
+    for (unsigned K = 0; K < 2; ++K) {
+      Value *Off = Add->getOperand(K), *Base = Add->getOperand(1 - K);
+      Value *Idx = Off;
+      const APInt *C;
+      unsigned Shift = 0;
+      if (match(Off, m_Shl(m_Value(Idx), m_APInt(C))) && C->ult(8))
+        Shift = C->getZExtValue();
+      else if (match(Off, m_Mul(m_Value(Idx), m_APInt(C))) && C->isPowerOf2())
+        Shift = C->logBase2();
+      else
+        Idx = Off;
+      if (!matchRowColumn(Idx, X, E))
+        continue;
+      IRBuilder<> B(ITP);
+      Value *Row = B.CreateAdd(Base, Shift ? B.CreateShl(X, Shift) : X,
+                               Add->getName() + ".row");
+      Value *Col = Shift ? B.CreateShl(E, Shift) : E;
+      Value *New = B.CreateIntToPtr(B.CreateAdd(Row, Col), ITP->getType(),
+                                    ITP->getName());
+      Dead.push_back(Add);
+      ITP->replaceAllUsesWith(New);
+      ITP->eraseFromParent();
+      Changed = true;
+      break;
+    }
+  }
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+  return Changed;
 }
 
 namespace {
@@ -374,6 +475,7 @@ bool AGXSinkAddresses::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
   bool Changed = narrowLocalAddresses(F);
+  Changed |= splitRowIndices(F);
   SmallVector<WeakTrackingVH, 16> Originals;
   for (BasicBlock &BB : F) {
     // The copy of each address in this block.

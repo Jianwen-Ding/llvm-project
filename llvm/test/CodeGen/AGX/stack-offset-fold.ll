@@ -1,5 +1,5 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -verify-machineinstrs < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-stack-offset-fold=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -O3 -agx-stack-offset-fold=0 -agx-fold-frame-offsets=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; A stack access at a frame index plus a constant (a private array's element)
 ; is an immediate offset, the object's offset plus the constant (b, at 32: b[5]

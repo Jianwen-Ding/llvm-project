@@ -96,6 +96,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAGXTarget() {
   initializeAGXInvariantHalvesPassPass(PR);
   initializeAGXPairedHalfBitopsPassPass(PR);
   initializeAGXAdvancePointersPassPass(PR);
+  initializeAGXHoistReloadsPassPass(PR);
   initializeAGXUniformConstantsPassPass(PR);
   initializeAGXHoistFromElseFlowPass(PR);
   initializeAGXSinkRematPass(PR);
@@ -215,6 +216,7 @@ public:
   bool addPreISel() override;
   bool addInstSelector() override;
   void addMachineSSAOptimization() override;
+  void addPostRegAlloc() override;
   void addPreEmitPass() override;
 };
 
@@ -997,6 +999,12 @@ void AGXPassConfig::addIRPasses() {
   addPass(createAGXCheckedAccessesPass(&getAGXTargetMachine()));
   // Generic pointers that may name threadgroup memory become tagged integers.
   addPass(createAGXLowerGenericAddressesPass());
+  // Atomics these made threadgroup ones (a generic float add's threadgroup
+  // branch, an address InferAddressSpaces resolved), which the first
+  // expansion saw as generic or device ones: threadgroup memory has no float
+  // atomics (Cycles with a __shared__ BVH stack: AtomicLoadFAdd on
+  // addrspace 3 could not be selected).
+  addPass(createAtomicExpandLegacyPass());
   // By-reference kernel arguments become uniform register values.
   addPass(createAGXPromoteKernelArgsPass());
   // Neighbouring 32-bit accesses become one vector access (after checked
@@ -1042,6 +1050,10 @@ void AGXPassConfig::addIRPasses() {
   TargetPassConfig::addIRPasses();
 }
 
+static cl::opt<bool> AGXUnifyExitsAfterSimplifyCFG(
+    "agx-unify-exits-after-simplifycfg", cl::init(true), cl::Hidden,
+    cl::desc("Unify the exits again after the pre-ISel SimplifyCFG"));
+
 static cl::opt<unsigned> AGXPreISelSimplifyCFG(
     "agx-preisel-simplifycfg", cl::init(2), cl::Hidden,
     cl::desc("SimplifyCFG before structurization with this bonus instruction "
@@ -1078,6 +1090,12 @@ bool AGXPassConfig::addPreISel() {
         SimplifyCFGOptions()
             .bonusInstThreshold(AGXPreISelSimplifyCFG)
             .setSimplifyCondBranch(false)));
+  // (SimplifyCFG ends the blocks of a llvm.trap, noreturn, with unreachable
+  // again: back to branches to the single return, as AGXCodeGenPrepare left
+  // them)
+  if (getOptLevel() != CodeGenOptLevel::None && AGXPreISelSimplifyCFG &&
+      AGXUnifyExitsAfterSimplifyCFG)
+    addPass(createAGXUnifyExitsPass());
   // After that SimplifyCFG, which would speculate the fallbacks again.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createAGXRareFallbacksPass());
@@ -1124,6 +1142,12 @@ void AGXPassConfig::addMachineSSAOptimization() {
   addPass(createAGXInvariantHalvesPass());
   // (last in SSA form: a load's lanes allocated until its first use)
   addPass(createAGXLoadLanesLivePass());
+}
+
+void AGXPassConfig::addPostRegAlloc() {
+  // (before frame lowering: a callee-saved register it gives a reload is saved)
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAGXHoistReloadsPass());
 }
 
 void AGXPassConfig::addPreEmitPass() {

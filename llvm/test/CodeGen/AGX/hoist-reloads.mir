@@ -1,0 +1,274 @@
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=agx-hoist-spill-reloads -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=agx-hoist-spill-reloads -agx-hoist-reloads-verify %s -o /dev/null
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=agx-hoist-spill-reloads -agx-hoist-reloads=0 %s -o - | FileCheck %s --check-prefix=OFF
+
+# Twenty values live across a chain of multiplies, under a 16-register cap
+# (llc -agx-default-max-gprs=16 -stop-before=agx-hoist-spill-reloads). The
+# allocator reloaded each spilled vector into the registers the multiplies had
+# just read, right before its first use. The reloads move up past the device
+# loads and multiplies, into registers free from there to their last reads
+# (r15-r18, r19-r22), and their reads are renamed.
+# CHECK-LABEL: name: spill
+# CHECK:       STACK_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, %stack.1
+# CHECK-NEXT:  $r15_r16_r17_r18 = STACK_LOAD_128 0, 2, 15, %stack.1
+# CHECK:       FMUL32_F32 0, killed renamable $r13, 0, $r15, implicit $r15_r16_r17_r18
+# OFF-LABEL:   name: spill
+# OFF:         STACK_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, %stack.1
+# OFF-NEXT:    renamable $r9_r10_r11_r12 = DEVICE_LOAD_128
+# OFF:         renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.1
+# OFF-NEXT:    FMUL32_F32 0, killed renamable $r13, 0, renamable $r1, implicit renamable $r1_r2_r3_r4
+
+--- |
+  ; ModuleID = 'spill.ll'
+  source_filename = "spill.ll"
+  target datalayout = "e-m:e-p:64:64-p1:64:64-p3:32:32-p4:64:64-p5:32:32-i1:8-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-v16:16-v32:32-v64:64-v96:32-v128:128-n16:32:64-S32-A5-G1"
+  target triple = "agx"
+  
+  define agx_kernel void @spill(ptr addrspace(1) %in, ptr addrspace(1) %out) #0 {
+    %1 = load <4 x float>, ptr addrspace(1) %in, align 4
+    %.i3 = extractelement <4 x float> %1, i64 3
+    %.i2 = extractelement <4 x float> %1, i64 2
+    %.i1 = extractelement <4 x float> %1, i64 1
+    %.i0 = extractelement <4 x float> %1, i64 0
+    %p4 = getelementptr inbounds float, ptr addrspace(1) %in, i64 4
+    %2 = load <4 x float>, ptr addrspace(1) %p4, align 4
+    %.i332 = extractelement <4 x float> %2, i64 3
+    %.i231 = extractelement <4 x float> %2, i64 2
+    %.i130 = extractelement <4 x float> %2, i64 1
+    %.i029 = extractelement <4 x float> %2, i64 0
+    %p8 = getelementptr inbounds float, ptr addrspace(1) %in, i64 8
+    %3 = load <4 x float>, ptr addrspace(1) %p8, align 4
+    %.i336 = extractelement <4 x float> %3, i64 3
+    %.i235 = extractelement <4 x float> %3, i64 2
+    %.i134 = extractelement <4 x float> %3, i64 1
+    %.i033 = extractelement <4 x float> %3, i64 0
+    %p12 = getelementptr inbounds float, ptr addrspace(1) %in, i64 12
+    %4 = load <4 x float>, ptr addrspace(1) %p12, align 4
+    %.i340 = extractelement <4 x float> %4, i64 3
+    %.i239 = extractelement <4 x float> %4, i64 2
+    %.i138 = extractelement <4 x float> %4, i64 1
+    %.i037 = extractelement <4 x float> %4, i64 0
+    %p16 = getelementptr inbounds float, ptr addrspace(1) %in, i64 16
+    %5 = load <4 x float>, ptr addrspace(1) %p16, align 4
+    %.i344 = extractelement <4 x float> %5, i64 3
+    %.i243 = extractelement <4 x float> %5, i64 2
+    %.i142 = extractelement <4 x float> %5, i64 1
+    %.i041 = extractelement <4 x float> %5, i64 0
+    %a0 = fadd float %.i0, %.i1
+    %a1 = fmul float %a0, %.i1
+    %a2 = fmul float %a1, %.i2
+    %a3 = fmul float %a2, %.i3
+    %a4 = fmul float %a3, %.i029
+    %a5 = fmul float %a4, %.i130
+    %a6 = fmul float %a5, %.i231
+    %a7 = fmul float %a6, %.i332
+    %a8 = fmul float %a7, %.i033
+    %a9 = fmul float %a8, %.i134
+    %a10 = fmul float %a9, %.i235
+    %a11 = fmul float %a10, %.i336
+    %a12 = fmul float %a11, %.i037
+    %a13 = fmul float %a12, %.i138
+    %a14 = fmul float %a13, %.i239
+    %a15 = fmul float %a14, %.i340
+    %a16 = fmul float %a15, %.i041
+    %a17 = fmul float %a16, %.i142
+    %a18 = fmul float %a17, %.i243
+    %a19 = fmul float %a18, %.i344
+    %b0 = fadd float %a19, %.i0
+    %b1 = fadd float %a19, %.i1
+    %b2 = fadd float %a19, %.i2
+    %b3 = fadd float %a19, %.i3
+    %.upto051 = insertelement <4 x float> poison, float %b0, i64 0
+    %.upto152 = insertelement <4 x float> %.upto051, float %b1, i64 1
+    %.upto253 = insertelement <4 x float> %.upto152, float %b2, i64 2
+    %6 = insertelement <4 x float> %.upto253, float %b3, i64 3
+    store <4 x float> %6, ptr addrspace(1) %out, align 4
+    %b4 = fadd float %a19, %.i029
+    %q4 = getelementptr inbounds float, ptr addrspace(1) %out, i64 4
+    %b5 = fadd float %a19, %.i130
+    %b6 = fadd float %a19, %.i231
+    %b7 = fadd float %a19, %.i332
+    %.upto063 = insertelement <4 x float> poison, float %b4, i64 0
+    %.upto164 = insertelement <4 x float> %.upto063, float %b5, i64 1
+    %.upto265 = insertelement <4 x float> %.upto164, float %b6, i64 2
+    %7 = insertelement <4 x float> %.upto265, float %b7, i64 3
+    store <4 x float> %7, ptr addrspace(1) %q4, align 4
+    %b8 = fadd float %a19, %.i033
+    %q8 = getelementptr inbounds float, ptr addrspace(1) %out, i64 8
+    %b9 = fadd float %a19, %.i134
+    %b10 = fadd float %a19, %.i235
+    %b11 = fadd float %a19, %.i336
+    %.upto075 = insertelement <4 x float> poison, float %b8, i64 0
+    %.upto176 = insertelement <4 x float> %.upto075, float %b9, i64 1
+    %.upto277 = insertelement <4 x float> %.upto176, float %b10, i64 2
+    %8 = insertelement <4 x float> %.upto277, float %b11, i64 3
+    store <4 x float> %8, ptr addrspace(1) %q8, align 4
+    %b12 = fadd float %a19, %.i037
+    %q12 = getelementptr inbounds float, ptr addrspace(1) %out, i64 12
+    %b13 = fadd float %a19, %.i138
+    %b14 = fadd float %a19, %.i239
+    %b15 = fadd float %a19, %.i340
+    %.upto087 = insertelement <4 x float> poison, float %b12, i64 0
+    %.upto188 = insertelement <4 x float> %.upto087, float %b13, i64 1
+    %.upto289 = insertelement <4 x float> %.upto188, float %b14, i64 2
+    %9 = insertelement <4 x float> %.upto289, float %b15, i64 3
+    store <4 x float> %9, ptr addrspace(1) %q12, align 4
+    %b16 = fadd float %a19, %.i041
+    %q16 = getelementptr inbounds float, ptr addrspace(1) %out, i64 16
+    %b17 = fadd float %a19, %.i142
+    %b18 = fadd float %a19, %.i243
+    %b19 = fadd float %a19, %.i344
+    %.upto099 = insertelement <4 x float> poison, float %b16, i64 0
+    %.upto1100 = insertelement <4 x float> %.upto099, float %b17, i64 1
+    %.upto2101 = insertelement <4 x float> %.upto1100, float %b18, i64 2
+    %10 = insertelement <4 x float> %.upto2101, float %b19, i64 3
+    store <4 x float> %10, ptr addrspace(1) %q16, align 4
+    ret void
+  }
+  
+  attributes #0 = { "target-cpu"="agx-g14c" }
+...
+---
+name:            spill
+alignment:       2
+exposesReturnsTwice: false
+legalized:       false
+regBankSelected: false
+selected:        false
+failedISel:      false
+tracksRegLiveness: true
+hasWinCFI:       false
+noPhis:          true
+isSSA:           false
+noVRegs:         true
+hasFakeUses:     false
+callsEHReturn:   false
+callsUnwindInit: false
+hasEHContTarget: false
+hasEHScopes:     false
+hasEHFunclets:   false
+isOutlined:      false
+debugInstrRef:   false
+failsVerification: false
+tracksDebugUserValues: true
+registers:       []
+liveins:
+  - { reg: '$u0_u1', virtual-reg: '' }
+  - { reg: '$u2_u3', virtual-reg: '' }
+frameInfo:
+  isFrameAddressTaken: false
+  isReturnAddressTaken: false
+  hasStackMap:     false
+  hasPatchPoint:   false
+  stackSize:       0
+  offsetAdjustment: 0
+  maxAlignment:    4
+  adjustsStack:    false
+  hasCalls:        false
+  framePointerPolicy: none
+  stackProtector:  ''
+  functionContext: ''
+  maxCallFrameSize: 4294967295
+  cvBytesOfCalleeSavedRegisters: 0
+  hasOpaqueSPAdjustment: false
+  hasVAStart:      false
+  hasMustTailInVarArgFunc: false
+  hasTailCall:     false
+  isCalleeSavedInfoValid: false
+  localFrameSize:  0
+fixedStack:      []
+stack:
+  - { id: 0, name: '', type: spill-slot, offset: 0, size: 16, alignment: 4, 
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true, 
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+  - { id: 1, name: '', type: spill-slot, offset: 0, size: 16, alignment: 4, 
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true, 
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+  - { id: 2, name: '', type: spill-slot, offset: 0, size: 16, alignment: 4, 
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true, 
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+  - { id: 3, name: '', type: spill-slot, offset: 0, size: 16, alignment: 4, 
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true, 
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+  - { id: 4, name: '', type: spill-slot, offset: 0, size: 16, alignment: 4, 
+      stack-id: default, callee-saved-register: '', callee-saved-restored: true, 
+      debug-info-variable: '', debug-info-expression: '', debug-info-location: '' }
+entry_values:    []
+callSites:       []
+debugValueSubstitutions: []
+constants:       []
+machineFunctionInfo: {}
+body:             |
+  bb.0 (%ir-block.0):
+    liveins: $u0_u1, $u2_u3
+  
+    renamable $r5_r6_r7_r8 = DEVICE_LOAD_128 0, 2, 15, $u0_u1, 0, 0, 0 :: (load (s128) from %ir.in, align 4, addrspace 1)
+    renamable $r1_r2_r3_r4 = DEVICE_LOAD_128 0, 2, 15, $u0_u1, 4, 0, 0 :: (load (s128) from %ir.p4, align 4, addrspace 1)
+    renamable $r9_r10_r11_r12 = DEVICE_LOAD_128 0, 2, 15, $u0_u1, 8, 0, 0 :: (load (s128) from %ir.p8, align 4, addrspace 1)
+    STACK_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, %stack.1 :: (store (s128) into %stack.1, align 4, addrspace 5)
+    renamable $r9_r10_r11_r12 = DEVICE_LOAD_128 0, 2, 15, $u0_u1, 12, 0, 0 :: (load (s128) from %ir.p12, align 4, addrspace 1)
+    STACK_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, %stack.0 :: (store (s128) into %stack.0, align 4, addrspace 5)
+    renamable $r9_r10_r11_r12 = DEVICE_LOAD_128 0, 2, 15, $u0_u1, 16, 0, 0 :: (load (s128) from %ir.p16, align 4, addrspace 1)
+    STACK_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, %stack.4 :: (store (s128) into %stack.4, align 4, addrspace 5)
+    renamable $r13 = FADD32_F32 0, renamable $r5, 0, renamable $r6, implicit renamable $r5_r6_r7_r8
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r6
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r7
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r8
+    STACK_STORE_128 0, 2, 15, renamable $r1_r2_r3_r4, %stack.3 :: (store (s128) into %stack.3, align 4, addrspace 5)
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r1, implicit renamable $r1_r2_r3_r4
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r2
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r3
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, killed renamable $r4
+    renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.1 :: (load (s128) from %stack.1, align 4, addrspace 5)
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r1, implicit renamable $r1_r2_r3_r4
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r2
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r3
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, killed renamable $r4
+    renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.0 :: (load (s128) from %stack.0, align 4, addrspace 5)
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r1, implicit renamable $r1_r2_r3_r4
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r2
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r3
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, killed renamable $r4
+    renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.4 :: (load (s128) from %stack.4, align 4, addrspace 5)
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r1, implicit renamable $r1_r2_r3_r4
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r2
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r3
+    renamable $r13 = FMUL32_F32 0, killed renamable $r13, 0, renamable $r4
+    renamable $r9_r10_r11_r12 = lr-split COPY killed renamable $r1_r2_r3_r4
+    renamable $r1 = FADD32_F32 0, renamable $r13, 0, renamable $r5
+    renamable $r2 = FADD32_F32 0, renamable $r13, 0, renamable $r6
+    renamable $r3 = FADD32_F32 0, renamable $r13, 0, renamable $r7
+    renamable $r4 = FADD32_F32 0, renamable $r13, 0, killed renamable $r8
+    STACK_STORE_128 0, 2, 15, killed renamable $r1_r2_r3_r4, %stack.2 :: (store (s128) into %stack.2, align 4, addrspace 5)
+    renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.3 :: (load (s128) from %stack.3, align 4, addrspace 5)
+    renamable $r1 = FADD32_F32 0, renamable $r13, 0, renamable $r1
+    renamable $r2 = FADD32_F32 0, renamable $r13, 0, renamable $r2
+    renamable $r3 = FADD32_F32 0, renamable $r13, 0, renamable $r3
+    renamable $r4 = FADD32_F32 0, renamable $r13, 0, killed renamable $r4
+    STACK_STORE_128 0, 2, 15, killed renamable $r1_r2_r3_r4, %stack.3 :: (store (s128) into %stack.3, align 4, addrspace 5)
+    renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.1 :: (load (s128) from %stack.1, align 4, addrspace 5)
+    renamable $r1 = FADD32_F32 0, renamable $r13, 0, renamable $r1
+    renamable $r2 = FADD32_F32 0, renamable $r13, 0, renamable $r2
+    renamable $r3 = FADD32_F32 0, renamable $r13, 0, renamable $r3
+    renamable $r4 = FADD32_F32 0, renamable $r13, 0, killed renamable $r4
+    STACK_STORE_128 0, 2, 15, killed renamable $r1_r2_r3_r4, %stack.1 :: (store (s128) into %stack.1, align 4, addrspace 5)
+    renamable $r1_r2_r3_r4 = STACK_LOAD_128 0, 2, 15, %stack.0 :: (load (s128) from %stack.0, align 4, addrspace 5)
+    renamable $r5 = FADD32_F32 0, renamable $r13, 0, renamable $r1
+    renamable $r6 = FADD32_F32 0, renamable $r13, 0, renamable $r2
+    renamable $r7 = FADD32_F32 0, renamable $r13, 0, renamable $r3
+    renamable $r8 = FADD32_F32 0, renamable $r13, 0, killed renamable $r4
+    renamable $r1_r2_r3_r4 = lr-split COPY killed renamable $r9_r10_r11_r12
+    renamable $r1 = FADD32_F32 0, renamable $r13, 0, renamable $r1
+    renamable $r2 = FADD32_F32 0, renamable $r13, 0, renamable $r2
+    renamable $r3 = FADD32_F32 0, renamable $r13, 0, renamable $r3
+    renamable $r4 = FADD32_F32 0, killed renamable $r13, 0, killed renamable $r4
+    renamable $r9_r10_r11_r12 = STACK_LOAD_128 0, 2, 15, %stack.2 :: (load (s128) from %stack.2, align 4, addrspace 5)
+    DEVICE_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, $u2_u3, 0, 0, 0 :: (store (s128) into %ir.out, align 4, addrspace 1)
+    renamable $r9_r10_r11_r12 = STACK_LOAD_128 0, 2, 15, %stack.3 :: (load (s128) from %stack.3, align 4, addrspace 5)
+    DEVICE_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, $u2_u3, 4, 0, 0 :: (store (s128) into %ir.q4, align 4, addrspace 1)
+    renamable $r9_r10_r11_r12 = STACK_LOAD_128 0, 2, 15, %stack.1 :: (load (s128) from %stack.1, align 4, addrspace 5)
+    DEVICE_STORE_128 0, 2, 15, killed renamable $r9_r10_r11_r12, $u2_u3, 8, 0, 0 :: (store (s128) into %ir.q8, align 4, addrspace 1)
+    DEVICE_STORE_128 0, 2, 15, killed renamable $r5_r6_r7_r8, $u2_u3, 12, 0, 0 :: (store (s128) into %ir.q12, align 4, addrspace 1)
+    DEVICE_STORE_128 0, 2, 15, killed renamable $r1_r2_r3_r4, $u2_u3, 16, 0, 0 :: (store (s128) into %ir.q16, align 4, addrspace 1)
+    AGX_STOP
+...

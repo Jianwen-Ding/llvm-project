@@ -1,5 +1,5 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs -agx-atomic-optimizer < %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -agx-aggregate-atomics=0 -mcpu=agx-g14c -verify-machineinstrs -agx-atomic-optimizer < %s | FileCheck %s
+; RUN: llc -mtriple=agx -agx-aggregate-atomics=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s --check-prefix=OFF
 
 ; With -agx-atomic-optimizer, atomics of a SIMD-group's threads to one uniform
 ; address are one atomic by the first active thread: of the active count times

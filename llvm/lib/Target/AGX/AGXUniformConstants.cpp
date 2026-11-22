@@ -30,13 +30,15 @@
 #include "MCTargetDesc/AGXMCTargetDesc.h"
 #include "Utils/AGXBaseInfo.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
-#include "llvm/InitializePasses.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/IR/CallingConv.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
+#include <optional>
 
 using namespace llvm;
 
@@ -102,7 +104,7 @@ static cl::opt<bool> AGXUniformConstants16(
 /// The uniform file is 256 32-bit registers (512 halves).
 static constexpr unsigned UniformHalves = 512;
 /// At most this many constants per kernel.
-static constexpr unsigned MaxConstants = 64;
+static constexpr unsigned MaxConstants = 128;
 
 namespace {
 
@@ -147,44 +149,80 @@ bool AGXUniformConstantsPass::runOnMachineFunction(MachineFunction &MF) {
   MachineLoopInfo &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
   unsigned Half = alignTo(MFI->getUniformHalfCount(), 2);
+  // The value a move puts in a uniform slot: a 32-bit constant, or a 16-bit
+  // one as the low half of a slot holding it zero-extended (L15-E644;
+  // swiglu_f16's exponential bounds in half were two mov_imm a thread).
+  // (not 0, 1 and the like in 16 bits: a flag's or an index's start, a
+  // register's value whose copy from a uniform costs the move it replaces;
+  // nor, by default, a 16-bit constant a loop reads: its fadd16s and xors
+  // read the uniform half every iteration, gemv_q8f +1.0% on average over
+  // prologue paddings)
+  auto Candidate = [&](const MachineInstr &MI) -> std::optional<uint32_t> {
+    if ((MI.getOpcode() != AGX::MOV_IMM32 &&
+         MI.getOpcode() != AGX::MOV_IMM16) ||
+        !MI.getOperand(1).isImm())
+      return std::nullopt;
+    uint32_t Imm = uint32_t(MI.getOperand(1).getImm());
+    if (MI.getOpcode() == AGX::MOV_IMM32)
+      return Imm;
+    if (MI.getOpcode() == AGX::MOV_IMM16 && AGXUniformConstants16 &&
+        MI.getOperand(0).getReg().isVirtual() && (Imm & 0xffff) > 255 &&
+        (AGXUniformConstants16Loops ||
+         none_of(MRI.use_nodbg_instructions(MI.getOperand(0).getReg()),
+                 [&](const MachineInstr &U) {
+                   return MLI.getLoopFor(U.getParent());
+                 })))
+      return Imm & 0xffff;
+    return std::nullopt;
+  };
+  // The constants that take the slots are the ones read most, a use in a loop
+  // weighing 8 per level of depth (not the first ones in program order: a
+  // kernel with hundreds of distinct constants, as Cycles', would give the
+  // slots to the code before its loops).
+  struct Use {
+    uint64_t Weight = 0;
+    unsigned First = 0; // order of first appearance: ties keep program order
+  };
+  DenseMap<uint32_t, Use> Uses;
+  unsigned Order = 0;
+  for (MachineBasicBlock &MBB : MF) {
+    unsigned Depth = std::min(MLI.getLoopDepth(&MBB), 6u);
+    for (MachineInstr &MI : MBB)
+      if (std::optional<uint32_t> Value = Candidate(MI)) {
+        auto [It, New] = Uses.try_emplace(*Value);
+        if (New)
+          It->second.First = Order++;
+        It->second.Weight += uint64_t(1) << (3 * Depth);
+      }
+  }
+  SmallVector<std::tuple<uint64_t, unsigned, uint32_t>, 0> Ranked;
+  for (auto [Value, U] : Uses)
+    Ranked.push_back({U.Weight, U.First, Value});
+  llvm::sort(Ranked, [](const auto &A, const auto &B) {
+    return std::get<0>(A) != std::get<0>(B) ? std::get<0>(A) > std::get<0>(B)
+                                            : std::get<1>(A) < std::get<1>(B);
+  });
   DenseMap<uint32_t, MCRegister> Slots;
+  for (auto [W, First, Value] : Ranked) {
+    if (Slots.size() >= MaxConstants || Half + 2 > UniformHalves)
+      break;
+    MCRegister Reg = AGX::getRegister(AGX::RegKind::UGPR32, Half, *TRI);
+    if (!Reg)
+      break;
+    Slots[Value] = Reg;
+    MFI->UniformConstants.push_back({Half, Value});
+    Half += 2;
+  }
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
-      // (a 16-bit constant: the low half of a 32-bit slot holding it
-      // zero-extended, L15-E644; swiglu_f16's exponential bounds in half
-      // were two mov_imm a thread)
-      // (not 0, 1 and the like: a flag's or an index's start, a register's
-      // value whose copy from a uniform costs the move it replaces)
-      bool Narrow = MI.getOpcode() == AGX::MOV_IMM16 && AGXUniformConstants16 &&
-                    MI.getOperand(0).getReg().isVirtual() &&
-                    MI.getOperand(1).isImm() &&
-                    (uint32_t(MI.getOperand(1).getImm()) & 0xffff) > 255 &&
-                    (AGXUniformConstants16Loops ||
-                     none_of(MRI.use_nodbg_instructions(
-                                 MI.getOperand(0).getReg()),
-                             [&](const MachineInstr &U) {
-                               return MLI.getLoopFor(U.getParent());
-                             }));
-      // (a loop's: its fadd16s and xors read the uniform half every
-      // iteration, gemv_q8f +1.0% on average over prologue paddings)
-      if ((MI.getOpcode() != AGX::MOV_IMM32 && !Narrow) ||
-          !MI.getOperand(1).isImm())
+      std::optional<uint32_t> Value = Candidate(MI);
+      if (!Value)
         continue;
-      uint32_t Value = Narrow ? uint32_t(MI.getOperand(1).getImm()) & 0xffff
-                              : uint32_t(MI.getOperand(1).getImm());
-      MCRegister Reg = Slots.lookup(Value);
-      if (!Reg) {
-        if (Slots.size() >= MaxConstants || Half + 2 > UniformHalves)
-          continue;
-        Reg = AGX::getRegister(AGX::RegKind::UGPR32, Half, *TRI);
-        if (!Reg)
-          continue;
-        Slots[Value] = Reg;
-        MFI->UniformConstants.push_back({Half, Value});
-        Half += 2;
-      }
-      if (Narrow) {
+      MCRegister Reg = Slots.lookup(*Value);
+      if (!Reg)
+        continue;
+      if (MI.getOpcode() == AGX::MOV_IMM16) {
         Register Lo = TRI->getSubReg(Reg, AGX::lo16);
         if (!Lo)
           continue;
