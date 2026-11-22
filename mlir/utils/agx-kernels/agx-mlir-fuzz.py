@@ -11,7 +11,10 @@ c a second memref at the thread's row (column) or at j + o'' alone (every thread
 passed twice; on rows, a third of the seeds by vector<4> loads and stores in steps of 4 or 8 (the reduction a
 vector, then vector.reduction); the trip a constant or a runtime i32, steps of 1 or 2; the elements i32, i16 or f32 (small integers,
 exact sums and products); f an add, sub, xor, a multiply by a constant, a max or min (maximumf / minimumf / maxnumf / minnumf), g an unsigned or ordered compare,
-and a guarded statement's c load inside its scf.if (speculate-guarded-loads). A quarter of the seeds instead run a SIMD-group a row: each lane's running value
+and a guarded statement's c load inside its scf.if (speculate-guarded-loads). An eighth of the seeds instead compute float math over a row (exp, e^(x - k), x > k ? e^(x - k) : x, tanh, the
+sigmoid, log(abs(x) + 1), e^x k + 1, and e^(x - m) of the row's maximum m from a loop before: E731 / E732 / E743's
+range analyses), against double with each arithmetic step rounded to float and 16 ulps of each function's value,
+over inputs up to 100 in magnitude (overflows and flushes). A quarter of the seeds instead run a SIMD-group a row: each lane's running value
 over j = lane, lane + 32, ... (scf.for from the lane id), gpu.subgroup_reduce of them, and the row rewritten with
 the result (the online softmax's shape, exact ops). Lowered as bench.py does
 (convert-gpu-to-air, mlir-translate, the AIR target's portable passes, opt -O3, llc -O3, the constants in
@@ -440,10 +443,153 @@ def run_lanes(seed, a, tmp):
     return src, None
 
 
+MATH = ['exp', 'expk', 'condexp', 'tanh', 'sigmoid', 'log1', 'expscale', 'maxexp']
+
+
+def gen_math(seed):
+    R = random.Random(seed)
+    return dict(f=R.choice(MATH), k=R.choice([0.5, 3.0, -2.0, 10.0]), trip=R.choice([16, 64, 100, 256]),
+                lo=R.choice([-100.0, -30.0, -10.0, -1.0]), hi=R.choice([1.0, 10.0, 30.0, 100.0]))
+
+
+def emit_math(k):
+    """b[t, j] = g(c[t, j]) over a thread's row of floats; for maxexp the row's maximum m first (a loop of
+    maximumf), then e^(c - m) (E731 / E743's exponent below a loop's maximum)."""
+    M = 'memref<1024x256xf32, 1>'
+    K = '%r' % float(k['k'])
+    L = ['gpu.module @k {',
+         '  gpu.func @k(%%c: %s, %%b: %s, %%n: i32) kernel' % (M, M),
+         '      attributes {known_block_size = array<i32: 256, 1, 1>} {',
+         '    %c0 = arith.constant 0 : index',
+         '    %c1 = arith.constant 1 : index',
+         '    %%T = arith.constant %d : index' % k['trip'],
+         '    %one = arith.constant 1.0 : f32',
+         '    %%kk = arith.constant %s : f32' % K,
+         '    %t = gpu.global_id x upper_bound 1024']
+    if k['f'] == 'maxexp':
+        L += ['    %ninf = arith.constant 0xFF800000 : f32',
+              '    %m = scf.for %j = %c0 to %T step %c1 iter_args(%a = %ninf) -> (f32) {',
+              '      %%v = memref.load %%c[%%t, %%j] : %s' % M,
+              '      %a2 = arith.maximumf %a, %v : f32',
+              '      scf.yield %a2 : f32',
+              '    }']
+    L += ['    scf.for %j = %c0 to %T step %c1 {',
+          '      %%x = memref.load %%c[%%t, %%j] : %s' % M]
+    f = k['f']
+    if f == 'exp':
+        L += ['      %y = math.exp %x : f32']
+    elif f == 'expk':
+        L += ['      %d = arith.subf %x, %kk : f32', '      %y = math.exp %d : f32']
+    elif f == 'condexp':
+        L += ['      %g = arith.cmpf ogt, %x, %kk : f32',
+              '      %y = scf.if %g -> (f32) {',
+              '        %d = arith.subf %x, %kk : f32', '        %e = math.exp %d : f32', '        scf.yield %e : f32',
+              '      } else {', '        scf.yield %x : f32', '      }']
+    elif f == 'tanh':
+        L += ['      %y = math.tanh %x : f32']
+    elif f == 'sigmoid':
+        L += ['      %ng = arith.negf %x : f32', '      %e = math.exp %ng : f32',
+              '      %d = arith.addf %e, %one : f32', '      %y = arith.divf %one, %d : f32']
+    elif f == 'log1':
+        L += ['      %a = math.absf %x : f32', '      %d = arith.addf %a, %one : f32', '      %y = math.log %d : f32']
+    elif f == 'expscale':
+        L += ['      %e = math.exp %x : f32', '      %h = arith.mulf %e, %kk : f32', '      %y = arith.addf %h, %one : f32']
+    else:
+        L += ['      %d = arith.subf %x, %m : f32', '      %y = math.exp %d : f32']
+    L += ['      memref.store %%y, %%b[%%t, %%j] : %s' % M, '    }', '    gpu.return', '  }', '}']
+    return '\n'.join(L) + '\n'
+
+
+def model_math(k, c):
+    """The reference and its tolerance: each arithmetic step rounded to float as the kernel does, the functions
+    in double; 16 ulps of the function's own value carried through the steps after it (a sum that cancels keeps
+    the error of its larger term)."""
+    f32 = np.float32
+    x = c[:, :k['trip']]
+    K = f32(k['k'])
+    one = f32(1)
+
+    def F(v):
+        # (a double's value as the float the kernel has: past the float range, an infinity)
+        return v.astype(np.float32).astype(np.float64)
+
+    def ulp(v):
+        u = np.spacing(np.abs(v.astype(np.float32))).astype(np.float64)
+        return np.where(np.isfinite(u), u, 0)
+    with np.errstate(all='ignore'):
+        f = k['f']
+        if f == 'exp':
+            y = F(np.exp(F(x))); e = 16 * ulp(y)
+        elif f in ('expk', 'maxexp'):
+            m = K if f == 'expk' else x.max(axis=1, keepdims=True)
+            d = (x - m).astype(f32)
+            y = F(np.exp(F(d))); e = 16 * ulp(y)
+        elif f == 'condexp':
+            d = (x - K).astype(f32)
+            y = F(np.where(x > K, np.exp(F(d)), F(x))); e = np.where(x > K, 16 * ulp(y), 0)
+        elif f == 'tanh':
+            y = np.tanh(F(x)); e = 16 * ulp(y)
+        elif f == 'sigmoid':
+            ex = F(np.exp(F((-x).astype(f32))))
+            d = (ex.astype(f32) + one).astype(f32)
+            y = 1 / F(d); e = 16 * ulp(ex) / np.maximum(F(d), 1) ** 2 + 4 * ulp(y)
+        elif f == 'log1':
+            d = (np.abs(x) + one).astype(f32)
+            y = np.log(F(d)); e = 16 * ulp(y) + ulp(d)
+        else:
+            ex = F(np.exp(F(x)))
+            h = (ex.astype(f32) * K).astype(f32)
+            y = F((h + one).astype(f32)); e = 16 * ulp(ex) * abs(float(K)) + ulp(h) + ulp(y)
+    return y, e + 2.0 ** -126
+
+
+def run_math(seed, a, tmp):
+    k = gen_math(seed)
+    src = emit_math(k)
+    sp = os.path.join(tmp, 'k.mlir.src')
+    open(sp, 'w').write(src)
+    try:
+        code, consts = compile_kernel(a, sp, tmp, seed % 2 == 1)
+    except subprocess.CalledProcessError as e:
+        return src, 'compile failure: ' + ((e.stderr or '').strip().splitlines() or [''])[-1][:200]
+    rng = np.random.default_rng(seed)
+    c = rng.uniform(k['lo'], k['hi'], (1024, 256)).astype(np.float32)
+    m = rng.random(c.shape) < 0.05
+    c[m] = rng.choice(np.array([0.0, -0.0, 1.0, -1.0, k['k']], np.float32), m.sum())
+    b = np.zeros((1024, 256), np.float32)
+    fb, fc, fo = (os.path.join(tmp, x) for x in ('b.bin', 'c.bin', 'o.bin'))
+    b.tofile(fb)
+    c.tofile(fc)
+    vb, vc = BASE, BASE + 0x1000000
+    cmd = [a.run, code, '--grid', '1024,1,1', '--wg', '256,1,1',
+           '--map', '%#x=%s' % (vb, fb), '--map', '%#x=%s' % (vc, fc), '--dump', '%#x=%d:%s' % (vb, b.nbytes, fo),
+           '--uniform', '0=%d' % (vc & 0xffffffff), '--uniform', '1=%d' % (vc >> 32),
+           '--uniform', '2=%d' % (vb & 0xffffffff), '--uniform', '3=%d' % (vb >> 32),
+           '--uniform', '4=0'] + consts
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return src, 'agx_run timed out'
+    if r.returncode:
+        return src, 'agx_run failed: ' + ((r.stderr + r.stdout).strip().splitlines() or [''])[-1][:200]
+    got = np.fromfile(fo, np.float32).reshape(b.shape)[:, :k['trip']].astype(np.float64)
+    ref, tol = model_math(k, c)
+    with np.errstate(invalid='ignore'):
+        ok = (np.abs(got - ref) <= tol) | (np.isinf(got) & np.isinf(ref) & (np.sign(got) == np.sign(ref)))
+    bad = np.argwhere(~ok)
+    if bad.size:
+        e = tuple(bad[0])
+        return src, 'math %s: element %s of c %r: %r, the reference %r (%d elements off)' % (
+            k['f'], e, float(c[e]), got[e], ref[e], len(bad))
+    return src, None
+
+
 def run_seed(seed, a, tmp):
-    # (a quarter of the seeds: a SIMD-group a row)
+    # (a quarter of the seeds: a SIMD-group a row; an eighth: float math)
     if seed % 4 == 3:
         return run_lanes(seed, a, tmp)
+    if seed % 8 == 1:
+        return run_math(seed, a, tmp)
     k = gen(seed)
     src = emit(k)
     sp = os.path.join(tmp, 'k.mlir.src')
