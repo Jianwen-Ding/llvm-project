@@ -3201,6 +3201,83 @@ static LogicalResult rewriteSmallFloatTruncF(arith::TruncFOp op,
                               x);
     srcEt = b.getF32Type();
   }
+  // (L15-E848) from f32 to a format of at most 4 exponent bits (or
+  // f8E5M2, a half's top byte): the value scaled by 2^(bias - 15) rounded to
+  // a half by the hardware's conversion, made round-to-odd (an inexact half
+  // one ulp toward zero with its lowest bit set: the first of two roundings
+  // to odd keeps the second, to nearest even at the code's precision, as if
+  // done once; a half has more than m + 2 bits), then rounded by the bias
+  // and shift of its bits as the codes are the half's top bits (E846)
+  unsigned fe = s->w - 1 - s->m;
+  int fbias = 1 - s->emin;
+  if (smallFloatExtViaHalf && srcEt.isF32() &&
+      (fe <= 4 || (fe == 5 && fbias == 15 && s->hasInf))) {
+    auto cmp = [&](arith::CmpIPredicate p, Value l, Value r) {
+      return arith::CmpIOp::create(b, p, l, r);
+    };
+    auto sel = [&](Value cnd, Value t, Value f) {
+      return arith::SelectOp::create(b, cnd, t, f);
+    };
+    using P = arith::CmpIPredicate;
+    using FP = arith::CmpFPredicate;
+    Type f32t = x.getType();
+    Type f16t = smallFloatShaped(f32t, b.getF16Type());
+    Type i16 = smallFloatShaped(f32t, b.getI16Type());
+    auto c16 = [&](uint64_t v) { return smallFloatConst(b, i16, v); };
+    unsigned up = 10 - s->m;
+    Value xs = x;
+    if (fbias != 15) {
+      TypedAttr sa = b.getF32FloatAttr(std::ldexp(1.0f, fbias - 15));
+      if (auto vt = dyn_cast<VectorType>(f32t))
+        sa = DenseElementsAttr::get(vt, sa);
+      xs = arith::MulFOp::create(b, x, arith::ConstantOp::create(b, f32t, sa));
+    }
+    Value h = arith::TruncFOp::create(b, f16t, xs);
+    Value he = arith::ExtFOp::create(b, f32t, h);
+    Value inexact = arith::CmpFOp::create(b, FP::UNE, he, xs);
+    Value over = arith::CmpFOp::create(b, FP::OGT, math::AbsFOp::create(b, he),
+                                       math::AbsFOp::create(b, xs));
+    Value hb = arith::BitcastOp::create(b, i16, h);
+    Value odd = arith::OrIOp::create(
+        b, arith::SubIOp::create(b, hb, arith::ExtUIOp::create(b, i16, over)),
+        arith::ExtUIOp::create(b, i16, inexact));
+    Value magp = arith::AndIOp::create(b, odd, c16(0x7fff));
+    Value lsb = arith::AndIOp::create(
+        b, arith::ShRUIOp::create(b, magp, c16(up)), c16(1));
+    Value mag = arith::ShRUIOp::create(
+        b,
+        arith::AddIOp::create(
+            b, arith::AddIOp::create(b, magp, c16((1u << (up - 1)) - 1)), lsb),
+        c16(up));
+    uint64_t ovf = s->hasInf ? s->infMag : s->hasNaN ? s->nanMag : s->maxMag;
+    mag = sel(cmp(P::ugt, mag, c16(s->maxMag)), c16(ovf), mag);
+    uint64_t nanV;
+    if (s->hasInf)
+      nanV = s->infMag | (1u << (s->m - 1));
+    else
+      nanV = s->hasNaN ? s->nanMag : s->maxMag;
+    // a NaN: the format's (an IEEE-like format's payload is not kept); the
+    // sign the input's, its high half's top bit (the half's conversion
+    // gives a NaN its own sign)
+    mag = sel(arith::CmpFOp::create(b, FP::UNO, x, x), c16(nanV), mag);
+    Type i32t = smallFloatShaped(f32t, b.getI32Type());
+    Value xhi = arith::TruncIOp::create(
+        b, i16,
+        arith::ShRUIOp::create(b, arith::BitcastOp::create(b, i32t, x),
+                               smallFloatConst(b, i32t, 16)));
+    Value code = arith::OrIOp::create(
+        b, mag,
+        arith::ShLIOp::create(b, arith::ShRUIOp::create(b, xhi, c16(15)),
+                              c16(s->w - 1)));
+    if (s->nanNegZero) {
+      code = sel(cmp(P::eq, mag, c16(0)), c16(0), code);
+      code = sel(cmp(P::eq, mag, c16(s->nanMag)), c16(s->nanMag), code);
+    }
+    Value narrow = arith::TruncIOp::create(
+        b, smallFloatShaped(f32t, b.getIntegerType(s->w)), code);
+    rewriter.replaceOp(op, arith::BitcastOp::create(b, dstTy, narrow));
+    return success();
+  }
   bool d64 = srcEt.isF64();
   unsigned S = d64 ? 64 : 32, F = d64 ? 52 : 23;
   int64_t srcBias = d64 ? 1023 : 127;

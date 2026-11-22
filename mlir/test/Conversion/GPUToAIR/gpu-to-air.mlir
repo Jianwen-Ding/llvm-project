@@ -1859,9 +1859,9 @@ gpu.module @assert_transfer {
 // as the half its fields make (the sign moved up by a multiply-add), scaled
 // by 2^8, its NaN codes selected
 // (L15-E846; with small-float-ext-via-half=0 in integer operations, its
-// denormals by uitofp and a scale), f32 rounded to f8E5M2 and f64 to
-// f4E2M1FN on their own bits (no double rounding), the codes stored as
-// integers.
+// denormals by uitofp and a scale), f32 rounded to f8E5M2 through the
+// hardware's half made round-to-odd (L15-E848) and f64 to f4E2M1FN on its
+// own bits (no double rounding either way), the codes stored as integers.
 gpu.module @small_floats {
   // CHECK-LABEL: gpu.module @small_floats
   // CHECK: llvm.func @k(
@@ -1879,7 +1879,10 @@ gpu.module @small_floats {
   // SFINT-NOT: llvm.fpext {{.*}} : f16 to f32
   // SFINT: llvm.uitofp {{.*}} : i32 to f32
   // SFINT: llvm.store {{.*}} : f32, !llvm.ptr<1>
-  // CHECK: llvm.trunc {{.*}} : i32 to i8
+  // CHECK: llvm.fptrunc {{.*}} : f32 to f16
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.fcmp "une"
+  // CHECK: llvm.trunc {{.*}} : i16 to i8
   // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
   // CHECK: llvm.load {{.*}} -> f64
   // CHECK-NOT: llvm.fptrunc
