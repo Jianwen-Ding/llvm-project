@@ -53,6 +53,9 @@ class AGXTargetLowering final : public TargetLowering {
   SDValue performBRCONDCombine(SDNode *N, DAGCombinerInfo &DCI) const;
 
 public:
+  /// Stack accesses at a constant offset from a frame index: the offset in
+  /// the frame-index operand's target flags (L15-E288).
+  void finalizeLowering(MachineFunction &MF) const override;
   // Negation and absolute value are source modifiers of the float operations
   // (.neg, .abs): free, so the DAG combiner keeps fneg / fabs of a bitcast
   // rather than making them integer xor / and on the bits (which a strict
@@ -76,6 +79,9 @@ public:
   bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM, Type *Ty,
                              unsigned AS,
                              Instruction *I = nullptr) const override;
+  bool isLoadBitCastBeneficial(EVT LoadVT, EVT BitcastVT,
+                               const SelectionDAG &DAG,
+                               const MachineMemOperand &MMO) const override;
   bool allowsMisalignedMemoryAccesses(EVT VT, unsigned AS, Align Alignment,
                                       MachineMemOperand::Flags Flags,
                                       unsigned *Fast) const override;

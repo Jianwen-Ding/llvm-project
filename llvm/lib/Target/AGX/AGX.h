@@ -14,6 +14,7 @@
 #define LLVM_LIB_TARGET_AGX_AGX_H
 
 #include <optional>
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Intrinsics.h"
@@ -22,7 +23,10 @@
 #include "llvm/Pass.h"
 
 namespace llvm {
+class BasicBlock;
 class Function;
+class SCEV;
+class ScalarEvolution;
 /// The most 32-bit registers that F's IR values hold at once (SSA liveness,
 /// each value by its size): an estimate of its register pressure before
 /// instruction selection.
@@ -54,19 +58,66 @@ FunctionPass *createAGXSoftF64Pass();
 FunctionPass *createAGXExpandWideAtomicsPass(const AGXTargetMachine *TM = nullptr);
 FunctionPass *createAGXAnnotateControlFlowPass();
 FunctionPass *createAGXSinkAddressesPass();
+FunctionPass *createAGXRareFallbacksPass();
 FunctionPass *createAGXThreadgroupAddressesPass();
 FunctionPass *createAGXHoistGuardedLoadsPass();
+FunctionPass *createAGXAliasVersioningPass();
+FunctionPass *createAGXWideIndexVersioningPass();
 FunctionPass *createAGXAlignmentVersioningPass();
 FunctionPass *createAGXNarrowInductionsPass();
+FunctionPass *createAGXSplitWideAccumulatorsPass();
+FunctionPass *createAGXWordCounterVersioningPass();
+FunctionPass *createAGXWordIndicesPass();
 FunctionPass *createAGXSpecialRegisterRangesPass();
 namespace AGX {
+/// Whether wide constants go to preloaded uniforms (-agx-uniform-constants):
+/// then they hold no general purpose registers.
+bool uniformConstantsEnabled();
+/// Whether x & (2^k - 1) is an and with the mask in a uniform where the
+/// constants are (-agx-low-mask-and-uniform), not a bfeil.
+bool lowMaskAndInUniforms();
+/// Whether a 16-bit field under the clear bits of a constant is one bfeil
+/// with that base (-agx-field-base-16).
+bool fieldBase16();
+/// Whether x & m under the clear bits of a constant is one bfeil as well.
+bool fieldBaseAnd();
+/// Whether x >> 31 (logical) is a compare-select of x < 0, not a bfeil
+/// (-agx-sign-bit-compares).
+bool signBitCompares();
+/// Whether x << 16 is x's low half under a zero half, not a bfi
+/// (-agx-shl16-halves).
+bool shl16Halves();
+/// Whether x >> 31 (arithmetic) is a compare-select of x < 0 with a uniform
+/// -1, with -agx-uniform-constants (-agx-sign-splat-compares).
+bool signSplatCompares();
 /// Gives the special register reads of F their range return attributes (see
 /// AGXSpecialRegisterRanges.cpp), and lists the calls it gave one in Added.
+/// With ForAnalysis (ranges the caller takes off again), also the kernel's
+/// upper bounds and the known grid's, which codegen itself leaves out.
 bool addSpecialRegisterRanges(Function &F,
-                              SmallVectorImpl<WeakVH> *Added = nullptr);
+                              SmallVectorImpl<WeakVH> *Added = nullptr,
+                              bool ForAnalysis = false);
+/// Whether no use of \p I's value depends on the sign of a zero
+/// (AGXCodeGenPrepare's ZeroSignFree, which makes a float min / max nsz,
+/// one instruction: L15-E389), without the special registers' ranges.
+bool zeroSignFreeValue(Instruction &I);
 /// The extent of the grid position an intrinsic reads that the kernel's known
 /// grid gives (agx-threads-per-grid, agx-threadgroups-per-grid), if any.
 std::optional<uint64_t> knownGridExtent(const Function &F, unsigned IntrinsicID);
+/// The extent a position read is below: the known grid's or the kernel's
+/// agx-upper-bounds (AGXSpecialRegisterRanges, L15-E391).
+std::optional<uint64_t> knownUpperBound(const Function &F, unsigned IntrinsicID);
+/// An upper bound on an integer SCEV's value from constants, positions, sums,
+/// products, extensions, truncations, minimums and bounded recurrences
+/// (AGXNarrowInductions' upperBound), as a 128-bit APInt.
+/// AGXCodeGenPrepare's narrowing of 64-bit trees below 2^32 to 32 bits
+/// (L15-E405), which AGXNarrowInductions runs again once the counters are
+/// narrowed (L15-E426).
+bool narrowBoundedI64(Function &F);
+/// nuw / nsw on shifts and multiplies of bounded positions (-agx-bounded-position-flags).
+bool boundedPositionFlags(Function &F);
+std::optional<APInt> scevUpperBound(const SCEV *S, ScalarEvolution &SE,
+                                    const Function &F);
 } // namespace AGX
 FunctionPass *createAGXVectorAccessesPass(bool BeforeVectorizer);
 FunctionPass *createAGXLowerGenericAddressesPass();
@@ -81,6 +132,9 @@ FunctionPass *createAGXISelDag(AGXTargetMachine &TM);
 // Machine passes.
 FunctionPass *createAGXFoldOperandsPass();
 FunctionPass *createAGXLoadLanesLivePass();
+FunctionPass *createAGXInvariantHalvesPass();
+FunctionPass *createAGXPairedHalfBitopsPass();
+FunctionPass *createAGXAdvancePointersPass();
 FunctionPass *createAGXHoistReloadsPass();
 FunctionPass *createAGXUniformConstantsPass();
 FunctionPass *createAGXHoistFromElseFlowPass();
@@ -91,6 +145,14 @@ FunctionPass *createAGXColdRegionsPass();
 
 // Machine scheduler: keeps runs of memory accesses of one kind together.
 std::unique_ptr<ScheduleDAGMutation> createAGXMemClusterMutation();
+/// Whether MI is a device load (one of AGXMemCluster's kinds).
+bool isAGXDeviceLoad(const MachineInstr &MI);
+/// Whether a 4-byte aligned <8 x half> / <8 x i16> device load in BB is one
+/// 16-byte access (L15-E585, E590), and such a store (L15-E591).
+bool agxWideHalfLoadBlock(const BasicBlock &BB);
+/// And a 4-byte aligned <16 x i8> (L15-E596).
+bool agxWideByteLoadBlock(const BasicBlock &BB);
+bool agxWideHalfStores();
 /// The post-RA machine scheduler: AGXMemClusterMutation, and cluster members
 /// kept together ahead of latency stalls.
 ScheduleDAGMI *createAGXPostRAScheduler(MachineSchedContext *C);
@@ -106,16 +168,25 @@ void initializeAGXSoftF64Pass(PassRegistry &);
 void initializeAGXExpandWideAtomicsPass(PassRegistry &);
 void initializeAGXAnnotateControlFlowPass(PassRegistry &);
 void initializeAGXSinkAddressesPass(PassRegistry &);
+void initializeAGXRareFallbacksPass(PassRegistry &);
 void initializeAGXThreadgroupAddressesPass(PassRegistry &);
 void initializeAGXHoistGuardedLoadsPass(PassRegistry &);
+void initializeAGXAliasVersioningPass(PassRegistry &);
+void initializeAGXWideIndexVersioningPass(PassRegistry &);
 void initializeAGXAlignmentVersioningPass(PassRegistry &);
 void initializeAGXNarrowInductionsPass(PassRegistry &);
+void initializeAGXSplitWideAccumulatorsPass(PassRegistry &);
+void initializeAGXWordCounterVersioningPass(PassRegistry &);
+void initializeAGXWordIndicesPass(PassRegistry &);
 void initializeAGXSpecialRegisterRangesPassPass(PassRegistry &);
 void initializeAGXVectorAccessesPass(PassRegistry &);
 void initializeAGXLowerGenericAddressesPass(PassRegistry &);
 void initializeAGXDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeAGXFoldOperandsPass(PassRegistry &);
 void initializeAGXLoadLanesPass(PassRegistry &);
+void initializeAGXInvariantHalvesPassPass(PassRegistry &);
+void initializeAGXPairedHalfBitopsPassPass(PassRegistry &);
+void initializeAGXAdvancePointersPassPass(PassRegistry &);
 void initializeAGXHoistReloadsPassPass(PassRegistry &);
 void initializeAGXUniformConstantsPassPass(PassRegistry &);
 void initializeAGXHoistFromElseFlowPass(PassRegistry &);
@@ -128,6 +199,23 @@ void initializeAGXAsmPrinterPass(PassRegistry &);
 class TargetMachine;
 
 /// Compiles a module described by !air.kernel (AIR) as AGX kernels.
+/// Straight-line runs of device accesses versioned on their buffers not
+/// overlapping, in opt after unrolling (L15-E528).
+class AGXAliasVersioningPass
+    : public OptionalPassInfoMixin<AGXAliasVersioningPass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
+/// The exps below a maximum another loop takes of the same loads
+/// (AGXCodeGenPrepare's expBelowLoopMax) marked !agx.exp.below.max, in opt
+/// before the loop unroller, whose copies keep the mark (L15-E731).
+class AGXMarkExpsBelowMaxPass
+    : public OptionalPassInfoMixin<AGXMarkExpsBelowMaxPass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 class AGXLowerAIRPass : public RequiredPassInfoMixin<AGXLowerAIRPass> {
   const TargetMachine &TM;
 
@@ -153,8 +241,19 @@ bool canExpandMath(Intrinsic::ID ID, Type *Ty, bool Approx);
 /// (asinh, acosh, atanh, sinpi, cospi, tanpi) of \p X; nullptr for another.
 /// \p FlushF32: f32 arithmetic flushes denormals (no ieee-fp32), so the
 /// expansion need not keep denormal operands.
+/// \p ExpNoOverflow: exp's argument is known not to reach its overflow
+/// (a softmax's x - max), so no clamp above and no +inf select.
+/// \p NativeNaN: f32 arithmetic's NaN is 0x7fc00000 (no canonical-nan).
+/// \p ExpResultFlushed: exp's result only reaches f32 arithmetic, which
+/// flushes a denormal operand.
+/// \p ExpOverflowFinite: an exponential's value past its overflow bound is
+/// 2^127, not +inf (its only use a reciprocal's sum, which then flushes).
+/// \p ExpNonNegative: exp's argument is at least 0 (or +0 by a flush)
+/// wherever its value is used, so no underflow clamp and no +0 select.
 Value *expandMath(IRBuilderBase &B, Intrinsic::ID ID, ArrayRef<Value *> Args,
-                  bool FlushF32 = false);
+                  bool FlushF32 = false, bool ExpNoOverflow = false,
+                  bool NativeNaN = false, bool ExpResultFlushed = false,
+                  bool ExpOverflowFinite = false, bool ExpNonNegative = false);
 Value *expandMath(IRBuilderBase &B, StringRef Fn, Value *X);
 
 /// Whether a device memory access must reach memory shared with the host while

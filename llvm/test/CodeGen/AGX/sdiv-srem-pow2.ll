@@ -13,7 +13,7 @@ define agx_kernel void @sdiv2(ptr addrspace(1) %p, i32 %a) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bfeil r1, 0, u2, 31
+; CHECK-NEXT:    icmpsel slt, r1, u2, 0, 1, 0
 ; CHECK-NEXT:    iadd r1, u2, r1
 ; CHECK-NEXT:    asr r1, r1, 1
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
@@ -134,7 +134,7 @@ define agx_kernel void @srem2(ptr addrspace(1) %p, i32 %a) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    bfeil r1, 0, u2, 31
+; CHECK-NEXT:    icmpsel slt, r1, u2, 0, 1, 0
 ; CHECK-NEXT:    iadd r2, u2, r1
 ; CHECK-NEXT:    and r2, r2, 1
 ; CHECK-NEXT:    isub r1, r2, r1

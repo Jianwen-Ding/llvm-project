@@ -12,7 +12,8 @@ python3 mlir/utils/agx-kernels/bench/bench.py --bin build/bin \
 Each file holds a `gpu.module @k` with one kernel, static memref shapes (the bare-pointer convention),
 `known_block_size` and, where loops or bounds depend on arguments, a `// agx-cost:` line with the launch agx_cost
 traces (`--uniform I=V` sets 32-bit uniform I: a pointer takes two, an `index` two, an `f32` one, in argument order;
-the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
+the `threadgroups_per_grid` uniform is named in llc's kernel header comment; `--map VA=@FILE` maps a file, relative to
+the kernel's, as memory at VA).
 
 | Kernel | What it models |
 | --- | --- |
@@ -27,6 +28,7 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `softmax_rows` | row softmax, a SIMD-group per row: strided loops with `gpu.subgroup_reduce maxnumf` / `add` and `math.exp` |
 | `layernorm_rows` | LayerNorm of 1024-float rows by a 256-thread threadgroup: `gpu.all_reduce` (the dialect's lowering), `math.rsqrt` |
 | `silu_f16x4` | f16 bias + SiLU on `vector<4xf16>` loads and stores, computed in f32 |
+| `gelu_erf` | exact GELU, 0.5 x (1 + erf(x / sqrt 2)), elementwise f32 (erf by the rational approximation) |
 | `saxpy_vec4` | grid-stride `y = a x + y` on `vector<4xf32>` loads and stores |
 | `stencil5_2d` | 5-point Jacobi step on a 2-D memref with a halo |
 | `histogram_atomic` | 256-bin byte histogram: `memref.atomic_rmw` into workgroup bins, then into device memory |
@@ -39,11 +41,87 @@ the `threadgroups_per_grid` uniform is named in llc's kernel header comment).
 | `conv1d` | a 3-tap filter of x[i], x[i + 1], x[i + 2] |
 | `hist` | a 256-bin histogram of low bytes by device atomics |
 | `dot_vec4` | row dot products by `vector<4xf32>` fma and a `vector.reduction` of the lanes |
+| `dot_i8` | int8 GEMV: a thread per row, `vector<4xi8>` loads sign-extended to i32 products summed in a vector<4xi32> |
+| `gemv_q8f` | int8-weight GEMV with float activations: `vector<4xi8>` weights converted to f32, fma into a vector<4xf32>, a per-row scale |
 | `shfl_sum` | SIMD-group sums by an xor shuffle tree, one store per group |
 | `hash` | a 32-bit hash mix: multiplies, rotates of products, an xor shift |
 | `h2` | `vector<2xf16>` accesses split into halves (2-byte alignment) and f16 arithmetic |
 | `conv3x3` | a 3 x 3 convolution, its loops fully unrolled (known grid, no loops left) |
 | `cluster_reduce` | `gpu.subgroup_reduce` over clusters of 8 and 4 lanes |
 | `reduce_f16_i64` | `gpu.subgroup_reduce` of f16 (whole SIMD-group and clusters of 8) and of i64 |
+| `relu6_vec4` | ReLU6 of `vector<4xf32>` by `arith.maximumf` / `arith.minimumf` |
+| `box3_u8f` | a 3-tap box filter of bytes to floats (an exact float sum, then x 1/3) |
+| `fir_taps` | an FIR filter with a runtime tap count: x[i + k] and w[k] in a loop over k |
+| `spmv_csr` | CSR sparse y = A x, a thread per row: an `scf.for` between i32 row offsets from memory (`--map VA=@FILE`) and a gather of x |
+| `causal_rowmax` | a causally masked row (j <= i) by a SIMD-group: running maximum, then the sum of exponentials, the mask on the 64-bit index |
+| `window_rowmax` | causal_rowmax with a sliding window of 128 (j in [row - 128, row]): the maximum and the sum of e^(x - max) with the two-sided mask |
+| `conv3x3_pad` | a zero-padded 3 x 3 convolution of a 1024 x 1024 image: nine bounds-guarded loads in flight across their ifs |
+| `argmax_rows` | a thread's argmax over a row of 256 floats: the narrowed load index and the i32 index are one counter |
+| `xent_rows` | cross-entropy per row of 1000 logits by a SIMD-group: maximumf, the sum of exponentials, lane 0's log and label |
+| `colsum` | a thread per column of a 512 x 1024 matrix: a strided loop of a constant trip, unrolled by 8 |
+| `rowmax_vec4` | a thread's maximumf over a row of 256 floats in vector<4xf32> steps: NaN and zero signs deferred to the loop's exit |
+| `softmax_f16` | row softmax of f16 logits in f32 by a SIMD-group: extended loads, maximumf, the sum of exponentials and the f16 normalized write |
+| `online_softmax` | one-pass softmax normalizer (log-sum-exp) of 1024-float rows by a SIMD-group: a running maximumf whose old and new values rescale the running sum, merged across lanes |
+| `online_softmax_vec4` | the same by a thread per row in vector<4xf32> steps: four running maximumf / sums combined by vector reductions |
+| `online_softmax_maxnum` | online_softmax with `arith.maxnumf` (C's fmaxf) for the running maximum and its subgroup reduction |
+| `online_softmax_exp2` | online_softmax with `math.exp2` (base-2 exponentials, as attention kernels with log2(e) in their scale) |
+| `attn_decode_f16` | one query per head attending over 512 cached f16 keys and values (128 dims, four per lane): vector<4xf16> loads, the score by gpu.subgroup_reduce add, an online maximumf softmax rescaling the weighted sum of values |
+| `rope_f32` | rotary position embedding (1024 tokens x 64 pairs): a thread per pair, the angle position * inv_freq through precise math.cos and math.sin |
+| `rmsnorm_f16` | RMSNorm of f16 rows by a SIMD-group: vector<4xf16> loads, the sum of squares in f32, rsqrt, the f16 weighted write |
+| `layernorm_thread` | LayerNorm of 256-float rows, a thread per row: two passes for the mean and variance, then a loop that loads the row, gamma and beta and stores the normalized row |
+| `softmax_f32v` | Row softmax of 1024-float rows by a SIMD-group, a lane per 32 elements: max, sum of exponentials, then the normalized store, three passes over the same row |
+| `softmax_thread` | Softmax of 64-float rows, a thread per row: max, sum of exponentials, then the normalized store |
+| `quant_rows` | Row quantization of 256-float rows to int8, a thread per row: scale, round, clamp to [-127, 127], byte stores |
+| `to_f16` | Scaled f32 rows to f16, a thread per row of 256: 2-byte stores |
+| `mask_rows` | Row masks of 256-float rows against a per-row threshold, a thread per row: one byte per element |
+| `where_rows` | Per-element select between two f32 rows on a byte mask, a thread per row of 256: byte loads |
+| `widen_f16` | f16 rows widened to f32 with a scale and bias, a thread per row of 256: 2-byte loads |
+| `stencil_row` | A 3-point stencil over each 258-float row, a thread per row: loads at three offsets of the row, 256 stores |
+| `i16_rows` | int16 rows scaled, biased by an int16 vector and clamped back to int16, a thread per row of 256 |
+| `bswap_rows` | A byte swap of every 32-bit word of the rows, a thread per row of 256 (shifts, masks and ors, matched as a byte swap) |
+| `dot_i8_scalar` | int8 row dot products with an int8 vector in i32, a thread per row of 512: scalar byte loads, sign-extended products |
+| `row_scale_dyn` | Rows scaled by a vector over a runtime length n (512 in the cost run), a thread per row |
+| `row_axpy_dyn` | a x + y over rows of a runtime length n (512 in the cost run), a thread per row |
+| `row_sum_dyn` | Row sums over a runtime length n (512 in the cost run), a thread per row |
+| `row_dot_dyn` | Row dot products with a vector over a runtime length n (512 in the cost run), a thread per row |
+| `quant_dyn` | Row quantization to int8 over a runtime length n (256 in the cost run), a thread per row: byte stores |
+| `widen_dyn` | f16 rows widened to f32 with a scale over a runtime length n (256 in the cost run), a thread per row: 2-byte loads |
+| `softmax_dyn` | Softmax of rows of a runtime length n (64 in the cost run), a thread per row: max, sum of exponentials, normalized store |
+| `layernorm_dyn` | LayerNorm over rows of a runtime length n (256 in the cost run), a thread per row: mean, variance, normalize with gamma / beta |
+| `cond_store` | A thread's row of 256 copied where above a threshold: a conditional store in the loop |
+| `col_scale_dyn` | Columns scaled by a vector down a runtime length n (256 in the cost run), a thread per column |
+| `gelu_dyn` | tanh-GELU over rows of a runtime length n (512 in the cost run), a thread per row |
+| `silu_dyn` | SiLU, x / (1 + exp(-x)), over rows of a runtime length n (512 in the cost run), a thread per row |
+| `log_dyn` | log(x) + x over rows of a runtime length n (512 in the cost run), a thread per row |
+| `sin_dyn` | sin(x) + x over rows of a runtime length n (512 in the cost run), a thread per row |
+| `sincos_rows` | sin(x) cos(2x) over rows of 256, a thread per row |
+| `logpow_rows` | log(x) + pow(x, 0.75) over rows of 256 positive floats, a thread per row |
+| `rowmax_dyn` | maxnum over rows of a runtime length (512 here), a thread per row |
+| `bsum_dyn` | sums of sign-extended bytes over rows of a runtime length (512 here), a thread per row |
+| `hdot_dyn` | dots of half rows with a half vector, in floats, over a runtime length (512 here), a thread per row |
+| `hscale_dyn` | half rows scaled by a half per row, a runtime length (512 here), a thread per row |
+| `col_axpy_dyn` | y = x * w[i] + y down columns of a runtime length (256 here), a thread per column |
+| `col_relu_dyn` | max(x * w[i], 0) down columns of a runtime length (256 here), a thread per column |
+| `col_sum2_dyn` | column sums down a runtime length (256 here), a thread per column (no known grid) |
+| `col_max_dyn` | column maxima (maxnum) down a runtime length (256 here), a thread per column |
+| `deq_i8_f16_dyn` | int8 rows dequantized to halves (x * s), a runtime length (512 here), a thread per row |
+| `q_f16_i8_dyn` | half rows quantized to int8, a runtime length (512 here), a thread per row |
+| `iadd_i32_dyn` | int32 rows plus a constant, a runtime length (512 here), a thread per row |
+| `split_dyn` | sums and differences of two rows into two outputs, a runtime length (512 here), a thread per row |
+| `axpy_c64` | y = 2x + z over rows of 64, a thread per row |
+| `axpy_c32` | y = 2x + z over rows of 32, a thread per row |
+| `copy_c64` | y = 2x over rows of 64, a thread per row |
+| `hscale_c64` | half rows of 64 halved, a thread per row |
+| `row_scale` | y = x * w[j] over rows of 512 floats, a thread per row |
+| `row_norm_apply` | y = (x - s) * w[j] + z over rows of 512 floats, a thread per row |
+| `cumsum_dyn` | row prefix sums over a runtime length n (512 in the cost run), a thread per row |
+| `entropy_dyn` | row entropies -sum p log p over a runtime length n (512 in the cost run), a thread per row |
+| `fp8_dot_e4m3` | a row of f8E4M3FN weights times an f32 vector (vector<4xf8E4M3FN> loads extended through the half their fields make), a thread per row of 256 |
+| `fp8_dot_e5m2` | the same with f8E5M2 weights (a half's top byte) |
+| `fp8_quant_e4m3` | f32 rows times a scale rounded to f8E4M3FN (through a round-to-odd half), a thread per row of 256 |
+| `gemm_mma16` | C = A B, 32x32x32 with f16 inputs and f32 accumulators, as gpu.subgroup_mma 16x16 tiles on one SIMD-group (each four 8x8 AIR matrices) |
+| `int4_dot` | a row of int4 weights (a vector.bitcast of bytes to i4) times an f32 vector, each nibble through a half's 0x6400, a thread per row of 128 bytes |
+
+The bench compiles as agx-build-fatbin.py does, with wide constants in the uniforms the runtime preloads (`-agx-uniform-constants`, .agx.kernels extension 6), and costs with those values and separate buffers; `AGX_BENCH_UNIFORM_CONSTANTS=0` measures the mov_imm form (agx-build-fatbin.py `--no-uniform-constants`).
 
 The kernels from `gemm_smem_tile` down were checked on the simulator's functional runner (`agx_run`) against NumPy.

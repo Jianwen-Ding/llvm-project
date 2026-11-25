@@ -1,0 +1,43 @@
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=postmisched -verify-machineinstrs %s -o - | FileCheck %s
+# RUN: llc -mtriple=agx -mcpu=agx-g14c -run-pass=postmisched -agx-tg-load-reader-operands-first=0 %s -o - | FileCheck %s --check-prefix=OFF
+
+# A transpose: four threadgroup loads (one cluster), then four device stores of
+# their values. The stores' addresses do not depend on the loads: they are
+# computed before the loads, not between the loads and the stores (an ALU
+# instruction there delays the loads).
+# CHECK-LABEL: name: transpose
+# CHECK:       $r4 = IADD_I32
+# CHECK:       LOCAL_LOAD_32
+# CHECK-NEXT:  LOCAL_LOAD_32
+# CHECK-NEXT:  LOCAL_LOAD_32
+# CHECK-NEXT:  LOCAL_LOAD_32
+# CHECK-NEXT:  DEVICE_STORE_32
+# OFF-LABEL:   name: transpose
+# OFF:         LOCAL_LOAD_32
+# OFF:         $r4 = IADD_I32
+# OFF:         DEVICE_STORE_32
+
+---
+name:            transpose
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $r1, $r2, $r3, $r4, $r5, $r6, $r8, $r10, $u2_u3
+
+    renamable $r7 = LOCAL_LOAD_32 2, 1, renamable $r5l, 0 :: (load (s32), addrspace 3)
+    renamable $r9 = LOCAL_LOAD_32 2, 1, renamable $r5l, 2 :: (load (s32), addrspace 3)
+    renamable $r11 = LOCAL_LOAD_32 2, 1, renamable $r5l, 4 :: (load (s32), addrspace 3)
+    renamable $r5 = LOCAL_LOAD_32 2, 1, killed renamable $r5l, 6 :: (load (s32), addrspace 3)
+    renamable $r2 = disjoint BITOP_I32 14, 0, killed renamable $r2, 0, killed renamable $r3
+    renamable $r2 = BFI_I32 0, 0, 0, killed renamable $r2, 0, 10, 0
+    renamable $r1 = disjoint BITOP_I32 14, 0, killed renamable $r4, 0, killed renamable $r1
+    renamable $r1 = IADD_I32 0, killed renamable $r1, 0, killed renamable $r2, 0
+    renamable $r2 = IADD_I32 0, renamable $r1, 0, killed renamable $r6, 0
+    renamable $r3 = IADD_I32 0, renamable $r1, 0, killed renamable $r8, 0
+    renamable $r4 = IADD_I32 0, renamable $r1, 0, killed renamable $r10, 0
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r7, $u2_u3, killed renamable $r1, 1, 0 :: (store (s32), addrspace 1)
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r9, $u2_u3, killed renamable $r2, 1, 0 :: (store (s32), addrspace 1)
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r11, $u2_u3, killed renamable $r3, 1, 0 :: (store (s32), addrspace 1)
+    DEVICE_STORE_32 0, 2, 1, killed renamable $r5, $u2_u3, killed renamable $r4, 1, 0 :: (store (s32), addrspace 1)
+    AGX_STOP
+...

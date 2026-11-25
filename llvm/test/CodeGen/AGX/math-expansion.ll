@@ -8,7 +8,7 @@
 
 ; CHECK-LABEL: @f(
 ; CHECK-NOT: call float @llvm.{{tan|asin|acos|atan|atan2|sinh|cosh|tanh|sin|cos|exp|log}}.f32
-; CHECK: call float @llvm.roundeven.f32
+; CHECK: fadd float {{.*}}, f0x4B400000
 ; CHECK: call afn float @llvm.sin.f32
 ; CHECK: call afn float @llvm.cos.f32
 ; CHECK-NOT: call float @llvm.{{tan|asin|acos|atan|atan2|sinh|cosh|tanh|sin|cos|exp|log}}.f32
@@ -21,7 +21,7 @@
 ; CHECK: call afn float @llvm.log.f32
 ; CHECK-LABEL: @sc(
 ; CHECK-NOT: call {{.*}}@llvm.sincos
-; CHECK: call float @llvm.roundeven.f32
+; CHECK: fadd float {{.*}}, f0x4B400000
 ; ASM-LABEL: f:
 ; ASM-NOT: {{tanf|atanf|call}}
 

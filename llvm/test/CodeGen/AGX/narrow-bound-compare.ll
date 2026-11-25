@@ -27,24 +27,26 @@ define agx_kernel void @stride_loop(ptr addrspace(1) nofree readonly captures(no
 ; CHECK-NEXT:  // %bb.1: // %.lr.ph.preheader
 ; CHECK-NEXT:    isub r2_r3, r2_r3, r1
 ; CHECK-NEXT:    mov_imm r4, 65536
-; CHECK-NEXT:    if_fcmp r0l, eq, 0.0, 0.0, 1
 ; CHECK-NEXT:    icmpsel ult, r5, r2, r4, 1, 0
 ; CHECK-NEXT:    icmpsel ueq, r3, r3, 0, r5, 0
 ; CHECK-NEXT:    icmpsel ueq, r2, r3, 0, r4, r2
-; CHECK-NEXT:    mov_imm r3, 0
-; CHECK-NEXT:    mov_imm r4, 1024
+; CHECK-NEXT:    mov_imm r3, 1023
+; CHECK-NEXT:    icmpsel ugt, r2, r2, 1, r2, 1
+; CHECK-NEXT:    iadd r2, r2, r3
+; CHECK-NEXT:    mov_imm r3, -1024
+; CHECK-NEXT:    and r2, r2, r3
+; CHECK-NEXT:    mov_imm r3, 1024
+; CHECK-NEXT:    iadd r2, r1, r2
 ; CHECK-NEXT:  .LBB0_2: // %.lr.ph
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
-; CHECK-NEXT:    device_load 0, i32, x, r5, u0_u1, r1, unsigned
-; CHECK-NEXT:    iadd r3, r3, r4
+; CHECK-NEXT:    device_load 0, i32, x, r4, u0_u1, r1, unsigned
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    fmul32 r5, r5, r5
-; CHECK-NEXT:    device_store 0, i32, x, r5, u2_u3, r1, unsigned
-; CHECK-NEXT:    iadd r1, r1, r4
-; CHECK-NEXT:    while_icmp r0l, ult, r3, r2, 1
+; CHECK-NEXT:    fmul32 r4, r4, r4
+; CHECK-NEXT:    device_store 0, i32, x, r4, u2_u3, r1, unsigned
+; CHECK-NEXT:    iadd r1, r1, r3
+; CHECK-NEXT:    while_icmp r0l, nueq, r1, r2, 1
 ; CHECK-NEXT:    jmp_exec_any .LBB0_2
 ; CHECK-NEXT:  // %bb.3: // %Flow
-; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:  .LBB0_4: // %Flow3
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    stop

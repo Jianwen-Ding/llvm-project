@@ -19,7 +19,7 @@ define agx_kernel void @butterfly(ptr addrspace(1) %p, i32 %n) {
 ; CHECK-NEXT:    get_sr r2, sr52 (thread_index_in_simdgroup)
 ; CHECK-NEXT:    xor r2, r2, 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    simd_shuffle_xor r3, r1, 2
+; CHECK-NEXT:    quad_shuffle_xor r3, r1, 2
 ; CHECK-NEXT:    icmpsel slt, r1, r2, u2, r3, r1
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop
@@ -66,9 +66,9 @@ define agx_kernel void @other(ptr addrspace(1) %p, i32 %n, i32 %d) {
 ; CHECK-NEXT:    or r0h, r3l, 3
 ; CHECK-NEXT:    simd_shuffle r3, r1, r0h
 ; CHECK-NEXT:    mov_imm r0h, 0
-; CHECK-NEXT:    icmpsel ueq, r4, r7, 1, r5, r4
-; CHECK-NEXT:    icmpsel ueq, r4, r7, 2, r6, r4
-; CHECK-NEXT:    icmpsel ueq, r3, r7, 3, r3, r4
+; CHECK-NEXT:    icmpsel ueq, r4, r7l, 1, r5, r4
+; CHECK-NEXT:    icmpsel ueq, r4, r7l, 2, r6, r4
+; CHECK-NEXT:    icmpsel ueq, r3, r7l, 3, r3, r4
 ; CHECK-NEXT:    icmpsel ult, r1, r2, 32, r1, r3
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

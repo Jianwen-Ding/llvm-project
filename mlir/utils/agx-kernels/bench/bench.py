@@ -20,6 +20,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# As agx-build-fatbin.py (its --no-uniform-constants: AGX_BENCH_UNIFORM_CONSTANTS=0)
+UNIFORM_CONSTANTS = os.environ.get('AGX_BENCH_UNIFORM_CONSTANTS', '1') != '0'
 PIPELINE = ('builtin.module(gpu.module(canonicalize,'
             'convert-gpu-to-air{use-bare-ptr-memref-call-conv=1},canonicalize))')
 
@@ -48,28 +50,59 @@ def cost(bindir, costbin, ll, tmp, cpu, args, optimize=True):
   llc, opt = os.path.join(bindir, 'llc'), os.path.join(bindir, 'opt')
   air, agx = os.path.join(tmp, 'air.ll'), os.path.join(tmp, 'agx.ll')
   run([llc, '-mtriple=air', '-air-portable', ll, '-o', air])
-  passes = ['-O3'] if optimize else ['-passes=agx-lower-air']
+  passes = (['-O3'] if optimize else ['-passes=agx-lower-air']) + \
+      (['-agx-uniform-constants'] if UNIFORM_CONSTANTS else [])
   run([opt, '-mtriple=agx', '-mcpu=' + cpu] + passes + ['-S', air, '-o', agx])
-  level = ['-O3'] if optimize else []
+  # (agx-build-fatbin.py's wide constants in uniforms, which the runtime
+  # preloads: L15-E540)
+  level = (['-O3'] if optimize else []) + (['-agx-uniform-constants'] if UNIFORM_CONSTANTS else [])
   asm = run([llc, '-mtriple=agx', '-mcpu=' + cpu] + level + [agx, '-o', '-'])
   obj, binf = os.path.join(tmp, 'k.o'), os.path.join(tmp, 'k.bin')
   run([llc, '-mtriple=agx', '-mcpu=' + cpu] + level +
       ['-filetype=obj', agx, '-o', obj])
   run([os.path.join(bindir, 'llvm-objcopy'), '-O', 'binary',
        '--only-section=.text', obj, binf])
+  # separate buffers (agx-bench's pointer_uniforms), as a launch binds them,
+  # and the preloaded constants
+  ab = _agx_bench()
+  args = list(args) + ab.pointer_uniforms(open(agx).read(), _kernel_name(agx), args)
+  if UNIFORM_CONSTANTS:
+    args += ab.constant_uniforms(obj, _kernel_name(agx),
+                                 os.path.join(bindir, 'llvm-objcopy'))
   j = json.loads(run([costbin, binf, '--allow-unknown'] + args)
                  .strip().splitlines()[-1])
   insts = [l for l in asm.splitlines()
            if re.match(r'^\t[a-z]', l) and not l.strip().startswith('trap')]
   gprs = re.search(r'general purpose registers: (\d+)', asm)
   return {'cycles': j['cycles'], 'instructions': len(insts),
-          'gprs': int(gprs.group(1)) if gprs else 0, 'asm': asm}
+          'gprs': int(gprs.group(1)) if gprs else 0, 'asm': asm, 'args': args}
+
+
+def _agx_bench():
+  """llvm/utils/agx-bench/agx-bench.py as a module."""
+  import importlib.util
+  spec = importlib.util.spec_from_file_location(
+      'agx_bench', os.path.join(HERE, '..', '..', '..', '..', 'llvm', 'utils',
+                                'agx-bench', 'agx-bench.py'))
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+def _kernel_name(ll):
+  m = re.search(r'^define agx_kernel [^@]*@"?([\w.$]+)', open(ll).read(), re.M)
+  return m.group(1) if m else ''
+
 
 
 def launch_args(src):
+  # --map VA=@FILE: FILE relative to the kernel file (memory contents, e.g.
+  # CSR row offsets).
   for l in open(src):
     if l.startswith('// agx-cost:'):
-      return l.split(':', 1)[1].split()
+      return [re.sub(r'=@(.*)$', lambda m: '=' + os.path.join(
+                  os.path.dirname(os.path.abspath(src)), m.group(1)), x)
+              for x in l.split(':', 1)[1].split()]
   return []
 
 

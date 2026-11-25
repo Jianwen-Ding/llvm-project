@@ -45,16 +45,122 @@
 
 using namespace llvm;
 
+static cl::opt<bool> AGXAddHighWords(
+    "agx-add-high-words", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit add or subtract of a value with a zero low word as a "
+             "32-bit add of the high words"));
+
+static cl::opt<bool> FieldMaskAnyLow(
+    "agx-field-mask-any-low", cl::init(true), cl::Hidden,
+    cl::desc("(x & m) >> s as one bfeil for every m whose bits from s are "
+             "low bits, and also where the and has other users"));
+
 static cl::opt<bool> ExperimentalLeafCalls(
     "agx-experimental-leaf-calls", cl::Hidden, cl::init(false),
     cl::desc("Emit direct calls to argument-free void AGX leaf functions"));
 
 bool llvm::agxExperimentalLeafCallsEnabled() { return ExperimentalLeafCalls; }
 
+static cl::opt<bool> AGXWideHalfLoads(
+    "agx-wide-half-loads", cl::init(true), cl::Hidden,
+    cl::desc("Load 4-byte aligned vectors of 8 16-bit elements as one "
+             "16-byte access"));
+
+static cl::opt<bool> AGXWideHalfLoadsHalfStores(
+    "agx-wide-half-loads-half-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-wide-half-loads-divergent's block may store 16-bit "
+             "elements"));
+
+static cl::opt<bool> AGXWideByteVectors(
+    "agx-wide-byte-vectors", cl::init(true), cl::Hidden,
+    cl::desc("Load a thread's row of 16 4-byte aligned bytes as one 16-byte "
+             "access of words, under -agx-wide-half-loads-divergent's terms"));
+
+static cl::opt<bool> AGXWideHalfLoadsDivergent(
+    "agx-wide-half-loads-divergent", cl::init(true), cl::Hidden,
+    cl::desc("-agx-wide-half-loads only for a thread's own row, in a block "
+             "that stores nothing"));
+
+/// Whether a 16-byte load of 8 16-bit elements gains on two 8-byte ones: in
+/// a block that stores nothing to device memory and whose device loads are
+/// all of the thread's own (their addresses the thread's position's), a row
+/// sum's. Rows that store as they load (widen_f16, rowcopy_f16) and blocks
+/// that also read a vector every lane reads alike (gemv_f16's x, hdot_dyn's
+/// w; its row alone 16 bytes wide lost more) lost 1-4% with many groups
+/// resident (L15-E585).
+/// (the block's terms, for AGXWordIndices too)
+bool llvm::agxWideHalfLoadBlock(const BasicBlock &BB) {
+  if (!AGXWideHalfLoads)
+    return false;
+  if (!AGXWideHalfLoadsDivergent)
+    return true;
+  auto ThreadDependent = [](const Value *P) {
+    SmallPtrSet<const Value *, 32> Seen;
+    SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
+    while (!Work.empty()) {
+      auto [V, Depth] = Work.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      if (auto *C = dyn_cast<CallBase>(V)) {
+        if (const Function *F = C->getCalledFunction();
+            F && F->getName().starts_with("llvm.agx.thread."))
+          return true;
+        continue;
+      }
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || Depth >= 12)
+        continue;
+      for (const Value *Op : I->operands())
+        Work.push_back({Op, Depth + 1});
+    }
+    return false;
+  };
+  bool Loads = false;
+  for (const Instruction &I : BB) {
+    // (a row of halves stored as it is loaded, rowcopy_f16, once E589 kept
+    // its loads after its stores: L15-E590)
+    if (auto *S = dyn_cast<StoreInst>(&I);
+        S && S->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+        !(AGXWideHalfLoadsHalfStores &&
+          S->getValueOperand()->getType()->getScalarSizeInBits() == 16))
+      return false;
+    if (auto *LI = dyn_cast<LoadInst>(&I);
+        LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
+      if (!ThreadDependent(LI->getPointerOperand()))
+        return false;
+      Loads = true;
+    }
+  }
+  return Loads;
+}
+
+bool llvm::agxWideByteLoadBlock(const BasicBlock &BB) {
+  return AGXWideByteVectors && agxWideHalfLoadBlock(BB);
+}
+
+static bool wideByteLoad(const LoadSDNode *L) {
+  auto *PI = dyn_cast_or_null<Instruction>(L->getMemOperand()->getValue());
+  return PI && agxWideByteLoadBlock(*PI->getParent());
+}
+
+static bool wideHalfLoad(const LoadSDNode *L) {
+  auto *PI = dyn_cast_or_null<Instruction>(L->getMemOperand()->getValue());
+  return PI && agxWideHalfLoadBlock(*PI->getParent());
+}
+
+static cl::opt<bool> AGXWideHalfStores(
+    "agx-wide-half-stores", cl::init(true), cl::Hidden,
+    cl::desc("Store 4-byte aligned vectors of 8 16-bit elements as one "
+             "16-byte store of words"));
+
 static cl::opt<bool> AGXPairedHalfStores(
     "agx-paired-half-stores", cl::Hidden, cl::init(true),
     cl::desc("Store 4-byte aligned pairs of 16-bit elements as one 32-bit "
              "word each"));
+
+bool llvm::agxWideHalfStores() {
+  return AGXPairedHalfStores && AGXWideHalfStores;
+}
 
 #define DEBUG_TYPE "agx-lower"
 
@@ -67,6 +173,16 @@ static void diagnose(SelectionDAG &DAG, const SDLoc &DL, const Twine &Msg) {
 static cl::opt<bool> AGXWordShifts128(
     "agx-word-shifts-128", cl::init(true), cl::Hidden,
     cl::desc("Variable 128-bit shifts on the 32-bit words"));
+
+static cl::opt<bool> CttzHalfPopcount(
+    "agx-cttz16-popcount",
+    cl::desc("16-bit cttz as the popcount of (x - 1) & ~x"), cl::init(true),
+    cl::Hidden);
+
+static cl::opt<bool> AGXBswapRotates(
+    "agx-bswap-rotates", cl::init(true), cl::Hidden,
+    cl::desc("A 32-bit byte swap as two rotates, two ands and an or (a 64-bit "
+             "one as two of its words)"));
 
 AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
                                      const AGXSubtarget &ST)
@@ -110,11 +226,12 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ATOMIC_LOAD_SUB, MVT::i32, Custom);
   // llvm.agx.simd.ballot takes an i1, which is promoted by custom lowering.
   setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i1, Custom);
-  setTargetDAGCombine({ISD::SHL, ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
+  setTargetDAGCombine({ISD::SHL, ISD::SUB, ISD::FP_TO_SINT, ISD::FP_TO_UINT, ISD::FP_TO_SINT_SAT,
                        ISD::FP_TO_UINT_SAT, ISD::SETCC, ISD::SELECT, ISD::BRCOND, ISD::TRUNCATE, ISD::BUILD_PAIR, ISD::SRL,
                        ISD::ZERO_EXTEND, ISD::FMINIMUMNUM, ISD::SRA,
                        ISD::SIGN_EXTEND_INREG, ISD::OR, ISD::AND, ISD::MULHU,
-                       ISD::MULHS, ISD::ADD});
+                       ISD::MULHS, ISD::ADD, ISD::FREEZE, ISD::SINT_TO_FP,
+                       ISD::UINT_TO_FP, ISD::BITCAST});
   // Vectors are not legal types; 4-byte aligned loads and stores of 2 to 4
   // 32-bit elements still become one access (lowerVectorLoad/Store).
   for (MVT VT : {MVT::v2i32, MVT::v3i32, MVT::v4i32, MVT::v2f32, MVT::v3f32,
@@ -127,11 +244,21 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // pair, whose halves are the elements (ReplaceNodeResults)
   setOperationAction(ISD::LOAD, {MVT::v2i16, MVT::v4i16, MVT::v2f16, MVT::v4f16},
                      Custom);
+  // (and 8: one 16-byte access, not an 8-byte access of the i16 format and a
+  // second through a pointer of its own, L15-E585)
+  if (AGXWideHalfLoads)
+    setOperationAction(ISD::LOAD, {MVT::v8i16, MVT::v8f16}, Custom);
+  // (and 16 bytes, L15-E596)
+  if (AGXWideByteVectors)
+    setOperationAction(ISD::LOAD, MVT::v16i8, Custom);
   // and stores: one 32-bit store per pair, its halves the elements
   // (lowerVectorStore), not a 16-bit store each
   if (AGXPairedHalfStores)
     setOperationAction(ISD::STORE,
                        {MVT::v2i16, MVT::v4i16, MVT::v2f16, MVT::v4f16}, Custom);
+  // (and 8: one 16-byte store of words, L15-E591)
+  if (AGXPairedHalfStores && AGXWideHalfStores)
+    setOperationAction(ISD::STORE, {MVT::v8i16, MVT::v8f16}, Custom);
 
   //===--------------------------------------------------------------------===//
   // Integer operations
@@ -166,6 +293,8 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::FSHR, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i32, Legal);
   setOperationAction(ISD::BITREVERSE, MVT::i64, Custom);
+  if (AGXBswapRotates)
+    setOperationAction(ISD::BSWAP, {MVT::i32, MVT::i64}, Custom);
   setOperationAction(ISD::BITREVERSE, MVT::i16, Promote);
   // (ctlz_zero_poison too: expanded it takes 10 instructions of shifts, ors
   // and a popcount, promoted 4. cttz_zero_poison's expansion, a popcount of
@@ -173,6 +302,11 @@ AGXTargetLowering::AGXTargetLowering(const TargetMachine &TM,
   // once instead of twice.)
   setOperationAction({ISD::CTPOP, ISD::CTLZ, ISD::CTTZ, ISD::CTLZ_ZERO_POISON},
                      MVT::i16, Promote);
+  // cttz of 16 bits as popcount((x - 1) & ~x) in 16 bits (16 for 0), the
+  // popcount reading the 16-bit register (L15-E361), instead of the
+  // promotion's or of 2^16, bitrev, ffs and subtraction.
+  if (CttzHalfPopcount)
+    setOperationAction(ISD::CTTZ, MVT::i16, Custom);
   setOperationAction({ISD::CTLZ, ISD::CTTZ}, MVT::i64, Custom);
   // Averages without the widened addition (a 64-bit add on the wide issue
   // slot): (a & b) + ((a ^ b) >> 1), and (a | b) - ((a ^ b) >> 1) rounding
@@ -345,8 +479,12 @@ static cl::opt<unsigned> AGXSignedBytesALU(
              "2 every byte, 3 every byte in functions with register headroom "
              "(-agx-headroom-gprs), else the low byte"));
 
+// 64 since L15-E757 (24 before): the soft doubles' 64-bit counts of
+// leading zeros at a half (cosh_f64, expm1_f64, sinh_f64, tanh_f64 -3%,
+// agx-bench ddot -3.1%, their registers the same or two more at the same
+// threads per threadgroup).
 static cl::opt<unsigned> AGXHeadroomGPRs(
-    "agx-headroom-gprs", cl::Hidden, cl::init(24),
+    "agx-headroom-gprs", cl::Hidden, cl::init(64),
     cl::desc(
         "Functions whose estimated register pressure (agxEstimatePressure, "
         "32-bit registers) is at most this take the forms that trade "
@@ -357,14 +495,25 @@ static cl::opt<bool> AGXDecomposeMul(
     "agx-decompose-mul", cl::Hidden, cl::init(true),
     cl::desc("Multiply 32-bit values by 3, 5, 9 or 17 with a shifted iadd"));
 
+static cl::opt<bool> AGXDecomposeMulMore(
+    "agx-decompose-mul-more",
+    cl::desc("16-bit multiplications by 2^k + 1, and multiplications by "
+             "1 - 2^k, as a shifted add / sub"),
+    cl::init(true), cl::Hidden);
+
 bool AGXTargetLowering::decomposeMulByConstant(LLVMContext &Context, EVT VT,
                                                SDValue C) const {
   // x * (2^k + 1), k <= 4: iadd x, x << k (an ALU instruction) instead of
   // imadd (SFU).
   auto *N = dyn_cast<ConstantSDNode>(C);
-  if (!AGXDecomposeMul || VT != MVT::i32 || !N)
+  if (!AGXDecomposeMul || !N || (VT != MVT::i32 && !(AGXDecomposeMulMore && VT == MVT::i16)))
     return false;
-  const APInt &V = N->getAPIntValue();
+  int64_t V = N->getAPIntValue().getSExtValue();
+  // and x * (1 - 2^k) for k = 3, 4: isub x, x << k (the combiner's
+  // -((x << k) - x); -3 it takes as -(x + (x << 1)), two instructions, so
+  // not); 16-bit likewise (L15-E356)
+  if (AGXDecomposeMulMore && (V == -7 || V == -15))
+    return true;
   return V == 3 || V == 5 || V == 9 || V == 17;
 }
 
@@ -788,6 +937,30 @@ static cl::opt<bool> SatConvertClamp(
 SDValue AGXTargetLowering::LowerOperation(SDValue Op,
                                           SelectionDAG &DAG) const {
   switch (Op.getOpcode()) {
+  case ISD::BSWAP: {
+    // The bytes [b3 b2 b1 b0] reversed: rotated right by 8, [b0 b3 b2 b1],
+    // has b0 and b2 in place, rotated left, [b2 b1 b0 b3], b1 and b3: two
+    // rotates (extr, the shared unit's) and three ALU operations, not the
+    // expansion's three of the shared unit (two rotates and a shift,
+    // L15-E556)
+    SDLoc DL(Op);
+    SDValue X = Op.getOperand(0);
+    if (Op.getValueType() == MVT::i64) {
+      auto [Lo, Hi] = DAG.SplitScalar(X, DL, MVT::i32, MVT::i32);
+      return DAG.getNode(ISD::BUILD_PAIR, DL, MVT::i64,
+                         DAG.getNode(ISD::BSWAP, DL, MVT::i32, Hi),
+                         DAG.getNode(ISD::BSWAP, DL, MVT::i32, Lo));
+    }
+    auto Rot = [&](unsigned S) {
+      return DAG.getNode(ISD::ROTL, DL, MVT::i32, X,
+                         DAG.getConstant(S, DL, MVT::i32));
+    };
+    SDValue Hi = DAG.getNode(ISD::AND, DL, MVT::i32, Rot(24),
+                             DAG.getConstant(0xFF00FF00u, DL, MVT::i32));
+    SDValue Lo = DAG.getNode(ISD::AND, DL, MVT::i32, Rot(8),
+                             DAG.getConstant(0x00FF00FFu, DL, MVT::i32));
+    return DAG.getNode(ISD::OR, DL, MVT::i32, Hi, Lo, SDNodeFlags::Disjoint);
+  }
   case ISD::STORE:
     return lowerVectorStore(Op, DAG);
   case ISD::LOAD:
@@ -819,7 +992,22 @@ SDValue AGXTargetLowering::LowerOperation(SDValue Op,
   case ISD::MUL:
     return lowerMUL64(Op, DAG);
   case ISD::CTLZ:
+    return lowerCTLZ_CTTZ64(Op, DAG);
   case ISD::CTTZ:
+    if (Op.getValueType() == MVT::i16) {
+      SDLoc DL(Op);
+      SDValue X = Op.getOperand(0);
+      SDValue Low = DAG.getNode(
+          ISD::AND, DL, MVT::i16,
+          DAG.getNode(ISD::XOR, DL, MVT::i16, X,
+                      DAG.getAllOnesConstant(DL, MVT::i16)),
+          DAG.getNode(ISD::SUB, DL, MVT::i16, X,
+                      DAG.getConstant(1, DL, MVT::i16)));
+      return DAG.getNode(
+          ISD::TRUNCATE, DL, MVT::i16,
+          DAG.getNode(ISD::CTPOP, DL, MVT::i32,
+                      DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i32, Low)));
+    }
     return lowerCTLZ_CTTZ64(Op, DAG);
   case ISD::AVGFLOORU:
   case ISD::AVGCEILU:
@@ -1146,6 +1334,33 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
     Results.push_back(Load.getValue(NumElts));
     return;
   }
+  // 16 bytes of a thread's own row, 4-byte aligned, under E585's terms
+  // (L15-E596, once E594 indexes them by words): one 16-byte access of
+  // words, its bytes shifted out (an int8 row sum's, folded into the
+  // extensions), not four 4-byte accesses of the byte format.
+  if (auto *L = dyn_cast<LoadSDNode>(N);
+      L && L->getValueType(0) == MVT::v16i8 &&
+      L->getExtensionType() == ISD::NON_EXTLOAD && !L->isIndexed() &&
+      L->isSimple() && L->getAlign() >= Align(4) &&
+      L->getAddressSpace() == AGX::DEVICE_ADDRESS && wideByteLoad(L)) {
+    SDLoc DL(N);
+    SDValue Load = DAG.getLoad(MVT::v4i32, DL, L->getChain(), L->getBasePtr(),
+                               L->getMemOperand());
+    SmallVector<SDValue, 16> Elts;
+    for (unsigned W = 0; W < 4; ++W) {
+      SDValue Word = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL, MVT::i32, Load,
+                                 DAG.getVectorIdxConstant(W, DL));
+      for (unsigned B = 0; B < 4; ++B)
+        Elts.push_back(DAG.getNode(
+            ISD::TRUNCATE, DL, MVT::i8,
+            B ? DAG.getNode(ISD::SRL, DL, MVT::i32, Word,
+                            DAG.getConstant(8 * B, DL, MVT::i32))
+              : Word));
+    }
+    Results.push_back(DAG.getBuildVector(MVT::v16i8, DL, Elts));
+    Results.push_back(Load.getValue(1));
+    return;
+  }
   // Pairs of 16-bit elements: a 32-bit access each, its low half the first
   // element (a 16-bit half register, no instruction to split it).
   if (auto *L = dyn_cast<LoadSDNode>(N);
@@ -1154,11 +1369,15 @@ void AGXTargetLowering::ReplaceNodeResults(SDNode *N,
       (L->getAddressSpace() == AGX::DEVICE_ADDRESS ||
        L->getAddressSpace() == AGX::THREADGROUP_ADDRESS) &&
       (L->getValueType(0) == MVT::v2i16 || L->getValueType(0) == MVT::v4i16 ||
-       L->getValueType(0) == MVT::v2f16 || L->getValueType(0) == MVT::v4f16)) {
+       L->getValueType(0) == MVT::v2f16 || L->getValueType(0) == MVT::v4f16 ||
+       (AGXWideHalfLoads && (L->getValueType(0) == MVT::v8i16 ||
+                             L->getValueType(0) == MVT::v8f16) &&
+        wideHalfLoad(L)))) {
     SDLoc DL(N);
     EVT VT = L->getValueType(0);
     unsigned Words = VT.getVectorNumElements() / 2;
-    EVT WordsVT = Words == 1 ? EVT(MVT::i32) : EVT(MVT::v2i32);
+    EVT WordsVT = Words == 1 ? EVT(MVT::i32)
+                             : EVT(MVT::getVectorVT(MVT::i32, Words));
     SDValue Load = DAG.getLoad(WordsVT, DL, L->getChain(), L->getBasePtr(),
                                L->getMemOperand());
     SmallVector<SDValue, 4> Elts;
@@ -1259,7 +1478,8 @@ SDValue AGXTargetLowering::lowerVectorStore(SDValue Op,
   // Pairs of 16-bit elements, 4-byte aligned: a 32-bit word each, whose
   // halves are the elements (a register's halves, no instruction to pack).
   if ((VT == MVT::v2i16 || VT == MVT::v4i16 || VT == MVT::v2f16 ||
-       VT == MVT::v4f16) &&
+       VT == MVT::v4f16 ||
+       (AGXWideHalfStores && (VT == MVT::v8i16 || VT == MVT::v8f16))) &&
       !S->isTruncatingStore() && !S->isIndexed() && S->isSimple() &&
       S->getAlign() >= Align(4) &&
       (S->getAddressSpace() == AGX::DEVICE_ADDRESS ||
@@ -1280,9 +1500,11 @@ SDValue AGXTargetLowering::lowerVectorStore(SDValue Op,
     if (Words == 1)
       return DAG.getStore(S->getChain(), DL, W[0], S->getBasePtr(),
                           S->getMemOperand());
-    return DAG.getMemIntrinsicNode(vectorNode(false, 2), DL,
-                                   DAG.getVTList(MVT::Other),
-                                   {S->getChain(), W[0], W[1], S->getBasePtr()},
+    SmallVector<SDValue, 6> Ops{S->getChain()};
+    Ops.append(W.begin(), W.end());
+    Ops.push_back(S->getBasePtr());
+    return DAG.getMemIntrinsicNode(vectorNode(false, Words), DL,
+                                   DAG.getVTList(MVT::Other), Ops,
                                    S->getMemoryVT(), S->getMemOperand());
   }
   if (S->isTruncatingStore() || S->isIndexed() || !isVectorAccess(VT, S))
@@ -1783,6 +2005,152 @@ static SDValue signedByteALU(SelectionDAG &DAG, const SDLoc &DL, SDValue X,
   return DAG.getNode(ISD::SUB, DL, MVT::i32, F, C(128));
 }
 
+static cl::opt<bool> AGXSignedBytesALU16(
+    "agx-signed-bytes-alu16", cl::init(true), cl::Hidden,
+    cl::desc("A byte with a zero high byte sign-extended in a 16-bit "
+             "register as (x ^ 128) - 128 on the ALU"));
+
+static cl::opt<bool> AGXSignedBytesHalfLanes(
+    "agx-signed-bytes-half-lanes", cl::init(true), cl::Hidden,
+    cl::desc("A byte in an extended 16-bit lane sign-extended in the 16-bit "
+             "register, for 32-bit users' 16-bit sources"));
+
+static cl::opt<bool> AGXSignedBytePairs(
+    "agx-signed-byte-pairs", cl::init(true), cl::Hidden,
+    cl::desc("Two byte lanes of a vector load biased by one 32-bit xor"));
+
+static cl::opt<bool> AGXShiftedFieldInsert(
+    "agx-shifted-field-insert", cl::init(true), cl::Hidden,
+    cl::desc("(x << s) | q, s above 4 and q zero in x's field, as one bfi "
+             "of x into q"));
+
+static cl::opt<bool> AGXBoundedFieldInsert(
+    "agx-bounded-field-insert", cl::init(true), cl::Hidden,
+    cl::desc("(x << s) + p or (x << s) | p, p a thread or threadgroup "
+             "position whose upper_bound is at most 2^s, as one bfi"));
+
+/// Whether Q is a thread or threadgroup position (perhaps extended or
+/// truncated) below Limit by the kernel's upper_bound or known grid
+/// (AGX::knownUpperBound), which the DAG's known bits do not see.
+static bool positionBelow(SDValue Q, uint64_t Limit, SelectionDAG &DAG) {
+  while (Q.getOpcode() == ISD::TRUNCATE || Q.getOpcode() == ISD::ZERO_EXTEND ||
+         Q.getOpcode() == ISD::AssertZext)
+    Q = Q.getOperand(0);
+  if (Q.getOpcode() != ISD::INTRINSIC_WO_CHAIN ||
+      !isa<ConstantSDNode>(Q.getOperand(0)))
+    return false;
+  std::optional<uint64_t> B = AGX::knownUpperBound(
+      DAG.getMachineFunction().getFunction(), Q.getConstantOperandVal(0));
+  return B && *B <= Limit;
+}
+
+/// (x << s) + p or | p, p below 2^s by its upper_bound, s above 4: one bfi of
+/// x into p (a 2-D index i * 1024 + j), not the shift's bfi and an add
+/// (L15-E864).
+static SDValue performBoundedFieldInsert(SDNode *N,
+                                         TargetLowering::DAGCombinerInfo &DCI) {
+  if (!AGXBoundedFieldInsert || !DCI.isAfterLegalizeDAG() ||
+      N->getValueType(0) != MVT::i32)
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue P = N->getOperand(I), Q = N->getOperand(1 - I);
+    if (P.getOpcode() != ISD::SHL || !isa<ConstantSDNode>(P.getOperand(1)) ||
+        !P.hasOneUse())
+      continue;
+    uint64_t S = P.getConstantOperandVal(1);
+    if (S <= 4 || S >= 32 || !positionBelow(Q, uint64_t(1) << S, DAG))
+      continue;
+    SDLoc DL(N);
+    return DAG.getNode(AGXISD::BFI_FIELD, DL, MVT::i32, Q, P.getOperand(0),
+                       DAG.getConstant(S, DL, MVT::i32),
+                       DAG.getTargetConstant(32 - S, DL, MVT::i32));
+  }
+  return SDValue();
+}
+
+static cl::opt<bool> BranchLowBitXor(
+    "agx-branch-low-bit-xor",
+    cl::desc("a branch on (a ^ x) & 1, a boolean, as a != (x & 1)"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> FreezeTruthLogic(
+    "agx-freeze-truth-logic",
+    cl::desc("push a freeze of an and / or / xor / select of truth values "
+             "into its operands"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> HalfCompares(
+    "agx-half-compares", cl::init(true), cl::Hidden,
+    cl::desc("a select between two registers on a comparison of values with "
+             "a half known zero compares the other halves"));
+
+static cl::opt<bool> IntToHalfSources(
+    "agx-int-to-half-sources", cl::init(true), cl::Hidden,
+    cl::desc("a float of a small integer that float arithmetic uses, as a "
+             "half that its 16-bit sources widen"));
+
+static cl::opt<bool> NarrowTruthSelects(
+    "agx-narrow-truth-selects", cl::init(true), cl::Hidden,
+    cl::desc("a truth value of selects between compares and 0 / 1 that only "
+             "selects test, in 16 bits"));
+
+static cl::opt<bool> TruncatedCompares(
+    "agx-truncated-compares", cl::init(true), cl::Hidden,
+    cl::desc("a comparison's truth value truncated to 16 bits written as a "
+             "half by the compare-select"));
+
+static cl::opt<bool> SelectImpliedArms(
+    "agx-select-implied-arms",
+    cl::desc("a select's arm that compares the select condition's operands "
+             "again, as the constant the condition decides it to be"),
+    cl::init(true), cl::Hidden);
+
+/// Whether integer condition Q holds for operands of which Known is true:
+/// true, false, or unknown. Each condition is the set of orderings (less,
+/// equal, greater) it accepts, signed or unsigned; an unsigned compare with
+/// a zero right operand cannot be less.
+static std::optional<bool> impliedIntCond(ISD::CondCode Known,
+                                          ISD::CondCode Q, bool RHSZero) {
+  enum { Lt = 1, Eq = 2, Gt = 4 };
+  // (domain: 0 either, 1 unsigned, 2 signed; the orderings)
+  auto Set = [&](ISD::CondCode C) -> std::pair<int, unsigned> {
+    switch (C) {
+    case ISD::SETEQ: return {0, Eq};
+    case ISD::SETNE: return {0, Lt | Gt};
+    case ISD::SETULT: return {1, Lt};
+    case ISD::SETULE: return {1, Lt | Eq};
+    case ISD::SETUGT: return {1, Gt};
+    case ISD::SETUGE: return {1, Gt | Eq};
+    case ISD::SETLT: return {2, Lt};
+    case ISD::SETLE: return {2, Lt | Eq};
+    case ISD::SETGT: return {2, Gt};
+    case ISD::SETGE: return {2, Gt | Eq};
+    default: return {-1, 0};
+    }
+  };
+  auto [DK, K] = Set(Known);
+  auto [DQ, M] = Set(Q);
+  if (DK < 0 || DQ < 0)
+    return std::nullopt;
+  // (EQ and NE in either domain; with a zero right operand unsigned, the
+  // unsigned domain's "less" is impossible)
+  int D = DK ? DK : DQ;
+  if (DK && DQ && DK != DQ)
+    return std::nullopt;
+  if (D == 1 && RHSZero) {
+    K &= ~unsigned(Lt);
+    M &= ~unsigned(Lt);
+  }
+  if (!K)
+    return std::nullopt;
+  if ((K & M) == K)
+    return true;
+  if (!(K & M))
+    return false;
+  return std::nullopt;
+}
+
 static cl::opt<bool> SelectOfSelect(
     "agx-select-of-select",
     cl::desc("a select on an or / and of truth values as two nested "
@@ -1997,8 +2365,21 @@ static SDValue performOffsetIndexCombine(SDNode *N,
   return SDValue();
 }
 
+/// A load or store of 32-bit lanes (one access up to 16 bytes, see
+/// lowerVectorLoad) stays one: not a vector of other lanes, which type
+/// legalization would split (AGXVectorAccesses made <8 x half> and <2 x i64>
+/// accesses <4 x i32> for that).
+bool AGXTargetLowering::isLoadBitCastBeneficial(
+    EVT LoadVT, EVT BitcastVT, const SelectionDAG &DAG,
+    const MachineMemOperand &MMO) const {
+  if (LoadVT.isVector() && LoadVT.getScalarSizeInBits() == 32 &&
+      BitcastVT.isVector() && BitcastVT.getScalarSizeInBits() != 32)
+    return false;
+  return TargetLowering::isLoadBitCastBeneficial(LoadVT, BitcastVT, DAG, MMO);
+}
+
 static cl::opt<bool> NarrowTruncatedOps(
-    "agx-narrow-truncated-ops", cl::init(true), cl::Hidden,
+    "agx-narrow-truncated-dag-ops", cl::init(true), cl::Hidden,
     cl::desc("The low half of a 64-bit add, sub, mul or shift left by a "
              "constant, used only truncated, as a 32-bit operation"));
 
@@ -2047,8 +2428,67 @@ static SDValue narrowTruncatedOp(SDNode *N,
 SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                                              DAGCombinerInfo &DCI) const {
   switch (N->getOpcode()) {
+  case AGXISD::TRUTH_SELECT: {
+    // Its patterns take a comparison of two 32-bit values; a condition that
+    // later combines made something else (a compare folded to a constant)
+    // goes back to an ordinary 16-bit select, which takes any condition.
+    SDValue C = N->getOperand(0);
+    if (C.getOpcode() == ISD::SETCC &&
+        C.getOperand(0).getValueSizeInBits() == 32)
+      return SDValue();
+    return DCI.DAG.getSelect(SDLoc(N), MVT::i16, C, N->getOperand(1),
+                             N->getOperand(2));
+  }
   case ISD::ADD:
+  case ISD::SUB: {
+    if (N->getOpcode() == ISD::ADD)
+      if (SDValue V = performBoundedFieldInsert(N, DCI))
+        return V;
+    // a 64-bit value plus (or minus) one with a zero low word: the high
+    // words only (L15-E660)
+    if (AGXAddHighWords && N->getValueType(0) == MVT::i64 &&
+        DCI.isAfterLegalizeDAG()) {
+      SelectionDAG &DAG = DCI.DAG;
+      for (unsigned K = 0; K < 2; ++K) {
+        if (K && N->getOpcode() == ISD::SUB)
+          break;
+        SDValue A = N->getOperand(K), Bv = N->getOperand(1 - K);
+        if (DAG.computeKnownBits(Bv).countMinTrailingZeros() < 32)
+          continue;
+        SDLoc DL(N);
+        SDValue Hi = DAG.getNode(
+            ISD::TRUNCATE, DL, MVT::i32,
+            DAG.getNode(ISD::SRL, DL, MVT::i64, Bv,
+                        DAG.getShiftAmountConstant(32, MVT::i64, DL)));
+        return DAG.getNode(N->getOpcode() == ISD::ADD ? AGXISD::ADD_HI
+                                                       : AGXISD::SUB_HI,
+                           DL, MVT::i64, A, Hi);
+      }
+    }
+    if (N->getOpcode() == ISD::SUB)
+      return SDValue();
     return performOffsetIndexCombine(N, DCI);
+  }
+  case ISD::BITCAST: {
+    // The bits of |x| that only integer ands and right shifts read (a log's
+    // exponent and mantissa of |x|): x's bits under a mask, which those fold
+    // into (no and of the sign bit: L15-E613). DAGCombiner leaves the fabs,
+    // a source modifier here.
+    SDValue A = N->getOperand(0);
+    if (!FieldMaskAnyLow || N->getValueType(0) != MVT::i32 ||
+        A.getOpcode() != ISD::FABS || A.getValueType() != MVT::f32 ||
+        N->use_empty() || !all_of(N->users(), [&](const SDNode *U) {
+          return (U->getOpcode() == ISD::AND || U->getOpcode() == ISD::SRL) &&
+                 U->getOperand(0).getNode() == N &&
+                 isa<ConstantSDNode>(U->getOperand(1));
+        }))
+      return SDValue();
+    SDLoc DL(N);
+    return DCI.DAG.getNode(
+        ISD::AND, DL, MVT::i32,
+        DCI.DAG.getNode(ISD::BITCAST, DL, MVT::i32, A.getOperand(0)),
+        DCI.DAG.getConstant(0x7fffffff, DL, MVT::i32));
+  }
   case ISD::SHL: {
     // (x ^ c) << s -> (x << s) ^ (c << s) for c << s an 8-bit immediate: the
     // shifted x is the one other indices use (tg[t] beside tg[t ^ 1]), so
@@ -2079,6 +2519,34 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     return performRoundClampConvertCombine(N, DCI);
   case ISD::SELECT: {
     SDValue C = N->getOperand(0);
+    // select (setcc a, b, cc), x, (setcc a, b, cc2): the false arm's compare
+    // as what !cc decides it (and the true arm's under cc): an i64 a >u K
+    // (K < 2^32) after expansion is select (hi == 0, lo >u K, hi != 0),
+    // whose hi != 0 is 1 there, one compare-select fewer (L15-E639).
+    if (SelectImpliedArms && C.getOpcode() == ISD::SETCC &&
+        C.getOperand(0).getValueType().isScalarInteger() &&
+        !N->getValueType(0).isVector()) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDValue A = C.getOperand(0), B = C.getOperand(1);
+      ISD::CondCode CC = cast<CondCodeSDNode>(C.getOperand(2))->get();
+      bool RHSZero = isNullConstant(B);
+      auto Fold = [&](SDValue Arm, ISD::CondCode Known) -> SDValue {
+        if (Arm.getOpcode() != ISD::SETCC || Arm.getOperand(0) != A ||
+            Arm.getOperand(1) != B)
+          return SDValue();
+        std::optional<bool> V = impliedIntCond(
+            Known, cast<CondCodeSDNode>(Arm.getOperand(2))->get(), RHSZero);
+        if (!V)
+          return SDValue();
+        return DAG.getConstant(*V, SDLoc(Arm), Arm.getValueType());
+      };
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      SDValue NX = Fold(X, CC);
+      SDValue NY = Fold(Y, ISD::getSetCCInverse(CC, A.getValueType()));
+      if (NX || NY)
+        return DAG.getSelect(SDLoc(N), N->getValueType(0), C, NX ? NX : X,
+                             NY ? NY : Y);
+    }
     // select (select (c, 1, d)), x, y -> select c, x, (select d, x, y) and
     // select (select (c, d, 0)), x, y -> select c, (select d, x, y), y: a
     // condition that is a truth value or another (the or / and of two
@@ -2099,6 +2567,121 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                              DAG.getSelect(DL, N->getValueType(0), T, X, Y),
                              Y);
     }
+    // A truth value made by selects between comparisons and 0 / 1 (the and
+    // / or of compares, e.g. an argmax's "greater, or equal with a lower
+    // index") that only selects test: computed in 16 bits, so that each
+    // compare-select of the chain and each select on it reads one 32-bit
+    // register fewer (two at most: the one-cycle issue, agx_cost
+    // PORT_BOUND; L15-E369). The arms become 16-bit (a compare's truth value
+    // through its low half; an inner such select is narrowed in turn, its
+    // only user then this truncation).
+    if (NarrowTruthSelects && DCI.isAfterLegalizeDAG() &&
+        N->getValueType(0) == MVT::i32) {
+      std::function<bool(SDValue, unsigned)> IsTruth = [&](SDValue V,
+                                                           unsigned Depth) {
+        if (auto *K = dyn_cast<ConstantSDNode>(V))
+          return K->getZExtValue() <= 1;
+        if (V.getValueType() != MVT::i32)
+          return false;
+        if (V.getOpcode() == ISD::SETCC)
+          return true;
+        return V.getOpcode() == ISD::SELECT && Depth < 4 &&
+               IsTruth(V.getOperand(1), Depth + 1) &&
+               IsTruth(V.getOperand(2), Depth + 1);
+      };
+      auto OnlyTested = [&](SDNode *S) {
+        for (SDUse &U : S->uses()) {
+          SDNode *User = U.getUser();
+          if (User->getOpcode() == ISD::SELECT && U.getOperandNo() == 0)
+            continue;
+          if (User->getOpcode() == ISD::TRUNCATE &&
+              User->getValueType(0) == MVT::i16)
+            continue;
+          return false;
+        }
+        return true;
+      };
+      // Only where the select reads three 32-bit registers now: a
+      // comparison of two non-constant 32-bit values and a register arm
+      // (otherwise it issues in one cycle already, and a 16-bit read of a
+      // just-written value is not forwarded: ddot and softmax_rows were
+      // slower).
+      auto Reg32 = [](SDValue V) {
+        return !isa<ConstantSDNode>(V) && !isa<ConstantFPSDNode>(V) &&
+               V.getValueSizeInBits() == 32;
+      };
+      bool ThreeReads = C.getOpcode() == ISD::SETCC &&
+                        Reg32(C.getOperand(0)) && Reg32(C.getOperand(1)) &&
+                        C.getOperand(0) != C.getOperand(1);
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      // (a truth value one select tests is two nested compare-selects
+      // instead, above, where its form allows)
+      bool OneSelect = N->hasOneUse() &&
+                       N->user_begin()->getOpcode() == ISD::SELECT;
+      if (ThreeReads && !OneSelect && IsTruth(X, 0) && IsTruth(Y, 0) &&
+          OnlyTested(N) &&
+          !(isa<ConstantSDNode>(X) && isa<ConstantSDNode>(Y))) {
+        SelectionDAG &DAG = DCI.DAG;
+        SDLoc DL(N);
+        auto Narrow = [&](SDValue V) {
+          if (auto *K = dyn_cast<ConstantSDNode>(V))
+            return DAG.getConstant(K->getZExtValue(), DL, MVT::i16);
+          return DAG.getNode(ISD::TRUNCATE, DL, MVT::i16, V);
+        };
+        SDValue S16 = DAG.getNode(AGXISD::TRUTH_SELECT, DL, MVT::i16, C,
+                                  Narrow(X), Narrow(Y));
+        return DAG.getNode(ISD::ZERO_EXTEND, DL, MVT::i32, S16);
+      }
+    }
+    // A select between two registers on an integer comparison of two values
+    // whose high 16 bits are known zero (or a constant below 2^16): the low
+    // halves compared, unsigned (both are non-negative); of two values whose
+    // low 16 bits are known zero: the high halves, as compared. The select
+    // then reads two 32-bit registers, not three or four (L15-E373).
+    if (HalfCompares && DCI.isAfterLegalizeDAG() &&
+        C.getOpcode() == ISD::SETCC &&
+        C.getOperand(0).getValueType() == MVT::i32 &&
+        N->getValueType(0).getSizeInBits() == 32) {
+      SDValue X = N->getOperand(1), Y = N->getOperand(2);
+      auto IsConst = [](SDValue V) {
+        return isa<ConstantSDNode>(V) || isa<ConstantFPSDNode>(V);
+      };
+      SDValue A = C.getOperand(0), B = C.getOperand(1);
+      ISD::CondCode CC = cast<CondCodeSDNode>(C.getOperand(2))->get();
+      SelectionDAG &DAG = DCI.DAG;
+      if (!IsConst(X) && !IsConst(Y) && X != Y && !IsConst(A) &&
+          A.getOpcode() != ISD::ZERO_EXTEND && B.getOpcode() != ISD::ZERO_EXTEND &&
+          // (the sign and zero tests of E372 are patterns)
+          !(isNullConstant(B) && (CC == ISD::SETLT || CC == ISD::SETEQ ||
+                                  CC == ISD::SETNE))) {
+        KnownBits KA = DAG.computeKnownBits(A), KB = DAG.computeKnownBits(B);
+        SDLoc DL(N);
+        auto Lo = [&](SDValue V) {
+          return DAG.getNode(ISD::TRUNCATE, DL, MVT::i16, V);
+        };
+        auto Hi = [&](SDValue V) {
+          return DAG.getNode(ISD::TRUNCATE, DL, MVT::i16,
+                             DAG.getNode(ISD::SRL, DL, MVT::i32, V,
+                                         DAG.getConstant(16, DL, MVT::i32)));
+        };
+        SDValue NewC;
+        if (KA.Zero.countl_one() >= 16 && KB.Zero.countl_one() >= 16) {
+          ISD::CondCode U = CC;
+          switch (CC) {
+          case ISD::SETLT: U = ISD::SETULT; break;
+          case ISD::SETLE: U = ISD::SETULE; break;
+          case ISD::SETGT: U = ISD::SETUGT; break;
+          case ISD::SETGE: U = ISD::SETUGE; break;
+          default: break;
+          }
+          NewC = DAG.getSetCC(DL, C.getValueType(), Lo(A), Lo(B), U);
+        } else if (KA.Zero.countr_one() >= 16 && KB.Zero.countr_one() >= 16) {
+          NewC = DAG.getSetCC(DL, C.getValueType(), Hi(A), Hi(B), CC);
+        }
+        if (NewC)
+          return DAG.getSelect(DL, N->getValueType(0), NewC, X, Y);
+      }
+    }
     // select (x > -1), a, b -> select (x < 0), b, a: icmpsel compares with
     // an immediate 0 but needs -1 in a register (a mov_imm). x >= 0 is
     // canonicalized to x > -1.
@@ -2116,6 +2699,63 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     return DAG.getSelect(DL, N->getValueType(0), Lt, N->getOperand(2),
                          N->getOperand(1));
   }
+  case ISD::SINT_TO_FP:
+  case ISD::UINT_TO_FP: {
+    // A float of a small integer (an int8 weight, at most 11 significant
+    // bits) that only fused multiply-adds use: converted to half, which
+    // holds it exactly, and widened by their 16-bit sources (recorded:
+    // fmadd32 r6l, r7h, and fadd32 / fmul32 r6l), so that each reads one
+    // 32-bit register fewer (an fmadd32 of two 32-bit registers issues in
+    // one cycle, of three in two; L15-E370).
+    SDValue I = N->getOperand(0);
+    EVT IVT = I.getValueType();
+    if (!IntToHalfSources || N->getValueType(0) != MVT::f32 ||
+        (IVT != MVT::i32 && IVT != MVT::i16) || N->use_empty())
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    bool Signed = N->getOpcode() == ISD::SINT_TO_FP;
+    unsigned Bits =
+        Signed ? IVT.getSizeInBits() - DAG.ComputeNumSignBits(I) + 1
+               : DAG.computeKnownBits(I).countMaxActiveBits();
+    if (Bits > (Signed ? 12u : 11u))
+      return SDValue();
+    // Only fused multiply-adds whose other two operands are registers: the
+    // ones that read three 32-bit registers now (fadd and fmul read two at
+    // most; with a constant operand the change only moves the schedule:
+    // blur_rgba8's weights, 26% slower on one group).
+    for (SDNode *U : N->users()) {
+      if (U->getOpcode() != ISD::FMA)
+        return SDValue();
+      for (const SDValue &Op : U->op_values())
+        if (Op.getNode() != N &&
+            (isa<ConstantFPSDNode>(Op) || Op.getValueType() != MVT::f32))
+          return SDValue();
+    }
+    SDLoc DL(N);
+    SDValue H = DAG.getNode(N->getOpcode(), DL, MVT::f16, I);
+    return DAG.getNode(ISD::FP_EXTEND, DL, MVT::f32, H);
+  }
+  case ISD::FREEZE: {
+    // freeze (and a, b) -> and (freeze a), (freeze b), likewise or, xor and
+    // select, for i1: the generic combine pushes a freeze only into an
+    // operation with one operand that may be poison (or a compare), and
+    // `select c, true, d` -> `or c, freeze d` leaves a frozen and of two
+    // compares, whose known bits (0 or 1) are lost. Each operand is frozen
+    // here, without replacing its other uses; the compares then take the
+    // freezes into their own operands.
+    SDValue V = N->getOperand(0);
+    if (!FreezeTruthLogic || V.getValueType() != MVT::i1 || !V.hasOneUse())
+      return SDValue();
+    unsigned Opc = V.getOpcode();
+    if (Opc != ISD::AND && Opc != ISD::OR && Opc != ISD::XOR &&
+        Opc != ISD::SELECT)
+      return SDValue();
+    SelectionDAG &DAG = DCI.DAG;
+    SmallVector<SDValue, 3> Ops;
+    for (SDValue Op : V->op_values())
+      Ops.push_back(DAG.getFreeze(Op));
+    return DAG.getNode(Opc, SDLoc(N), MVT::i1, Ops);
+  }
   case ISD::BRCOND:
     return performBRCONDCombine(N, DCI);
   case ISD::AND:
@@ -2126,6 +2766,8 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     if (SDValue V = performBooleanLogicCombine(N, DCI))
       return V;
     if (SDValue V = performBfiInsertCombine(N, DCI))
+      return V;
+    if (SDValue V = performBoundedFieldInsert(N, DCI))
       return V;
     // or(Q, P) where P is x << s (with masks around the shift) whose bits
     // that may be set are one field [s, s + w) and Q is known zero there:
@@ -2169,7 +2811,11 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       bool Insert = Q.getOpcode() == ISD::AND &&
                     isa<ConstantSDNode>(Q.getOperand(1)) &&
                     Q.getConstantOperandAPInt(1) == ~Field;
-      if (!Insert && (S % 8 != 0 || Field.popcount() % 8 != 0))
+      // (or a plain shift by more than iadd's 4 places: a bfi on the same
+      // unit already, so the insert saves the or (L15-E317): a 2-D or 3-D
+      // index (y << 6) | x)
+      bool UnitShift = AGXShiftedFieldInsert && P == Sh && S > 4;
+      if (!Insert && !UnitShift && (S % 8 != 0 || Field.popcount() % 8 != 0))
         continue;
       if (Insert)
         Q = Q.getOperand(0);
@@ -2200,10 +2846,102 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
       return SDValue();
     // The low byte signed: ((x & 255) ^ 128) - 128, as below. (16 bits are
     // one addition with a sign-extended 16-bit source.)
-    if (!DCI.isAfterLegalizeDAG() || N->getValueType(0) != MVT::i32 ||
+    if (!DCI.isAfterLegalizeDAG() ||
         cast<VTSDNode>(N->getOperand(1))->getVT() != MVT::i8)
       return SDValue();
+    // In a 16-bit register (an i8 value's, as loaded): the same on the
+    // 16-bit ALU, for the shift left and arithmetic shift right of the
+    // integer-multiply / bit-field unit (bfi and asr: 2 cycles of issue and
+    // latency 2.95 each, against 1.04 and 2 for xor and isub), where the
+    // high byte is known zero (a byte load's): elsewhere the and makes three
+    // and keeps the shifts' other folds from it (L15-E311).
+    // (not where a user extends it to 32 bits, which the 32-bit forms below
+    // fold, several bytes sharing one bias, or converts it, convert's s8
+    // source)
+    // (a byte load's high byte: zero once the and below makes it the
+    // zero-extending load, which costs nothing)
+    auto *Ld = dyn_cast<LoadSDNode>(N->getOperand(0));
+    bool ByteLoad = Ld && Ld->getMemoryVT() == MVT::i8 &&
+                    Ld->getExtensionType() != ISD::SEXTLOAD &&
+                    N->getOperand(0).hasOneUse();
+    if (N->getValueType(0) == MVT::i16 && AGXSignedBytesALU16 &&
+        (ByteLoad ||
+         DCI.DAG.computeKnownBits(N->getOperand(0)).countMinLeadingZeros() >=
+             8) &&
+        none_of(N->users(), [](const SDNode *U) {
+          switch (U->getOpcode()) {
+          case ISD::SIGN_EXTEND:
+          case ISD::ANY_EXTEND:
+          case ISD::ZERO_EXTEND:
+          case ISD::SINT_TO_FP:
+          case ISD::UINT_TO_FP:
+          case ISD::STRICT_SINT_TO_FP:
+          case ISD::STRICT_UINT_TO_FP:
+            return true;
+          default:
+            return false;
+          }
+        })) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDLoc DL(N);
+      auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i16); };
+      SDValue F = N->getOperand(0);
+      if (ByteLoad)
+        F = DAG.getNode(ISD::AND, DL, MVT::i16, F, C(255));
+      F = DAG.getNode(ISD::XOR, DL, MVT::i16, F, C(128));
+      return DAG.getNode(ISD::SUB, DL, MVT::i16, F, C(128));
+    }
+    if (N->getValueType(0) != MVT::i32)
+      return SDValue();
     SDValue X = N->getOperand(0);
+    // An extended 16-bit lane with a zero high byte (a byte of a vector
+    // load): (y ^ 128) - 128 in its 16-bit register and that sign-extended,
+    // which a 32-bit user's 16-bit source folds (imadd, iadd: L15-E487),
+    // instead of a copy to 32 bits first.
+    if (AGXSignedBytesHalfLanes &&
+        (X.getOpcode() == ISD::ANY_EXTEND ||
+         X.getOpcode() == ISD::ZERO_EXTEND) &&
+        X.getOperand(0).getValueType() == MVT::i16 &&
+        DCI.DAG.computeKnownBits(X.getOperand(0)).countMinLeadingZeros() >=
+            8 &&
+        // (only for users with such sources: a shift left folded the
+        // subtraction into its iadd's addend, 26 -> 29 instructions)
+        all_of(N->users(), [](const SDNode *U) {
+          return U->getOpcode() == ISD::MUL || U->getOpcode() == ISD::ADD ||
+                 U->getOpcode() == ISD::SUB;
+        })) {
+      SelectionDAG &DAG = DCI.DAG;
+      SDLoc DL(N);
+      auto C = [&](uint64_t V) { return DAG.getConstant(V, DL, MVT::i16); };
+      SDValue Y = X.getOperand(0);
+      SDValue F;
+      // A lane of a byte vector load: its pair of halves biased by one
+      // 32-bit xor with 0x00800080 (the pair's other lane shares it,
+      // L15-E488), opaque so that the truncations do not narrow it again.
+      if (AGXSignedBytePairs &&
+          (Y.getOpcode() == AGXISD::LOAD_V2_I8 ||
+           Y.getOpcode() == AGXISD::LOAD_V4_I8) &&
+          cast<MemSDNode>(Y)->getMemoryVT().getScalarSizeInBits() == 8) {
+        unsigned K = Y.getResNo();
+        SDValue Lo(Y.getNode(), K & ~1u), Hi(Y.getNode(), K | 1u);
+        SDValue P = DAG.getNode(
+            AGXISD::PACK16, DL, MVT::i32,
+            DAG.getNode(ISD::ANY_EXTEND, DL, MVT::i32, Lo),
+            DAG.getNode(ISD::ANY_EXTEND, DL, MVT::i32, Hi));
+        P = DAG.getNode(ISD::XOR, DL, MVT::i32, P,
+                        DAG.getConstant(0x00800080, DL, MVT::i32,
+                                        /*isTarget=*/false,
+                                        /*isOpaque=*/true));
+        if (K & 1)
+          P = DAG.getNode(ISD::SRL, DL, MVT::i32, P,
+                          DAG.getConstant(16, DL, MVT::i32));
+        F = DAG.getNode(ISD::TRUNCATE, DL, MVT::i16, P);
+      } else {
+        F = DAG.getNode(ISD::XOR, DL, MVT::i16, Y, C(128));
+      }
+      F = DAG.getNode(ISD::SUB, DL, MVT::i16, F, C(128));
+      return DAG.getNode(ISD::SIGN_EXTEND, DL, MVT::i32, F);
+    }
     unsigned P = 0;
     if (X.getOpcode() == ISD::SRL && isa<ConstantSDNode>(X.getOperand(1)) &&
         X.getConstantOperandVal(1) <= 24 && SharedByteBias &&
@@ -2371,11 +3109,20 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
     auto *M = A.getOpcode() == ISD::AND
                   ? dyn_cast<ConstantSDNode>(A.getOperand(1))
                   : nullptr;
-    if (!DCI.isAfterLegalizeDAG() || !S || !M || !A.hasOneUse())
+    if (!DCI.isAfterLegalizeDAG() || !S || !M)
       return SDValue();
     uint64_t Mask = M->getZExtValue(), Shift = S->getZExtValue();
-    if (!isShiftedMask_64(Mask) || llvm::countr_zero(Mask) != Shift)
+    // Any mask whose bits from s on are low bits, the bits below s shifted
+    // out either way ((bits & 0x7fffffff) >> 23 of a log's |x|): one bfeil
+    // for the shift that already is one, also where the and has other users
+    // (L15-E613).
+    if (FieldMaskAnyLow && Shift < 64 && isMask_64(Mask >> Shift)) {
+      if (!A.hasOneUse() && llvm::countr_zero(Mask) == Shift)
+        return SDValue();
+    } else if (!A.hasOneUse() || !isShiftedMask_64(Mask) ||
+               llvm::countr_zero(Mask) != Shift) {
       return SDValue();
+    }
     SDLoc DL(N);
     EVT VT = N->getValueType(0);
     SDValue Shifted = DCI.DAG.getNode(ISD::SRL, DL, VT, A.getOperand(0),
@@ -2384,6 +3131,31 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
                            DCI.DAG.getConstant(Mask >> Shift, DL, VT));
   }
   case ISD::TRUNCATE:
+    // A 16-bit truth value of a comparison of 32-bit values (the bytes of a
+    // mask that one store packs from 16-bit halves): the compare-select
+    // writes the half itself, not a 32-bit register that a move then copies
+    // the low half of (L15-E548).
+    if (TruncatedCompares && DCI.isAfterLegalizeDAG() &&
+        N->getValueType(0) == MVT::i16 &&
+        N->getOperand(0).getOpcode() == ISD::SETCC &&
+        N->getOperand(0).getValueType() == MVT::i32 &&
+        all_of(N->users(), [](const SDNode *U) {
+          // (only where stores take it: a half that other arithmetic
+          // reads is not forwarded, window_rowmax +3.7%)
+          return U->getOpcode() == AGXISD::STORE_V2_I8 ||
+                 U->getOpcode() == AGXISD::STORE_V4_I8 ||
+                 U->getOpcode() == ISD::STORE;
+        })) {
+      SDValue C = N->getOperand(0);
+      EVT OT = C.getOperand(0).getValueType();
+      if (OT == MVT::i32 || OT == MVT::f32) {
+        SelectionDAG &DAG = DCI.DAG;
+        SDLoc DL(N);
+        return DAG.getNode(AGXISD::TRUTH_SELECT, DL, MVT::i16, C,
+                           DAG.getConstant(1, DL, MVT::i16),
+                           DAG.getConstant(0, DL, MVT::i16));
+      }
+    }
     // The low half of a pair.
     if (N->getOperand(0).getOpcode() == ISD::BUILD_PAIR) {
       SDValue Lo = N->getOperand(0).getOperand(0);
@@ -2443,6 +3215,26 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
         return Branch(DAG.getSetCC(DL, MVT::i32, A, B, ISD::SETNE));
       return SDValue();
     }
+    // On (a ^ x) & 1 for a boolean a: on a != (x & 1), a compare the
+    // branch takes, and x & 1 often computed already (bitonic's direction
+    // bit, i1 trunc of the thread index), instead of an xor, an and and a
+    // compare with zero.
+    if (BranchLowBitXor && Cond.getOpcode() == ISD::AND && Cond.hasOneUse() &&
+        isOneConstant(Cond.getOperand(1)) &&
+        Cond.getOperand(0).getOpcode() == ISD::XOR &&
+        Cond.getOperand(0).hasOneUse() && Cond.getValueType() == MVT::i32) {
+      SDValue X = Cond.getOperand(0);
+      for (unsigned I = 0; I < 2; ++I) {
+        SDValue A = X.getOperand(I), B = X.getOperand(1 - I);
+        if (!IsBool(A) || isa<ConstantSDNode>(B))
+          continue;
+        return Branch(DAG.getSetCC(
+            DL, MVT::i32, A,
+            DAG.getNode(ISD::AND, DL, MVT::i32, B,
+                        DAG.getConstant(1, DL, MVT::i32)),
+            ISD::SETNE));
+      }
+    }
     if (Cond.getOpcode() == ISD::SETCC && Cond.hasOneUse() &&
         isNullConstant(Cond.getOperand(1)) &&
         Cond.getOperand(0).getOpcode() == ISD::XOR &&
@@ -2458,6 +3250,7 @@ SDValue AGXTargetLowering::PerformDAGCombine(SDNode *N,
   }
   case AGXISD::BFI7:
   case AGXISD::EXTR7:
+  case AGXISD::SHLHI7:
   case AGXISD::SRA7:
     // Shifts of zero.
     if (all_of(drop_end(N->ops()), [](const SDUse &U) { return isNullConstant(U.get()); }))
@@ -2575,6 +3368,11 @@ SDValue AGXTargetLowering::lowerSETCC64(SDValue Op, SelectionDAG &DAG) const {
   return DAG.getSelect(DL, VT, HiEq, LoCmp, HiCmp);
 }
 
+static cl::opt<bool> AGXShlhiShift(
+    "agx-shlhi-shift", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit left shift by a variable amount takes the bits that "
+             "move into the high word with shlhi"));
+
 SDValue AGXTargetLowering::lowerShift64(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   unsigned Opc = Op.getOpcode();
@@ -2628,11 +3426,25 @@ SDValue AGXTargetLowering::lowerShift64(SDValue Op, SelectionDAG &DAG) const {
     NewHi = DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Hi, Zero, Amt);
   } else if (Opc == ISD::SHL) {
     NewLo = DAG.getNode(AGXISD::BFI7, DL, MVT::i32, Zero, Lo, Amt);
-    SDValue Up = DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Zero, Lo,
-                             DAG.getNode(ISD::SUB, DL, MVT::i32, C32(64), Amt));
+    // (shlhi 0, lo, s: the same bits without the 64 - s, L15-E321; the
+    // coverage recordings of shlhi by registers and 0..127)
+    SDValue Up =
+        AGXShlhiShift
+            ? DAG.getNode(AGXISD::SHLHI7, DL, MVT::i32, Zero, Lo, Amt)
+            : DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Zero, Lo,
+                          DAG.getNode(ISD::SUB, DL, MVT::i32, C32(64), Amt));
     NewHi = DAG.getNode(AGXISD::BFI7, DL, MVT::i32, Up, Hi, Amt);
   } else {
     NewHi = DAG.getNode(AGXISD::SRA7, DL, MVT::i32, Hi, Amt);
+    // asrh hi, s is hi's part of the low word for every s (hi << (32 - s)
+    // below 32, hi >> (s - 32) with its sign from 32), and extr lo, 0, s
+    // lo's (0 from 32): their or, without the select (L15-E321).
+    if (AGXShlhiShift) {
+      NewLo = DAG.getNode(
+          ISD::OR, DL, MVT::i32, DAG.getNode(AGXISD::ASRH7, DL, MVT::i32, Hi, Amt),
+          DAG.getNode(AGXISD::EXTR7, DL, MVT::i32, Lo, Zero, Amt));
+      return join64(DAG, DL, NewLo, NewHi);
+    }
     SDValue Big = DAG.getSetCC(DL, MVT::i32, Amt, C32(31), ISD::SETUGT);
     NewLo = DAG.getSelect(
         DL, MVT::i32, Big,
@@ -2711,7 +3523,8 @@ SDValue AGXTargetLowering::lowerCTLZ_CTTZ64(SDValue Op,
     // 63 - ffs(second) where the first half is zero (64 for x = 0), instead
     // of counting both halves. Both halves stay live up to the select, so
     // only where the function has register headroom (ddot, without it:
-    // 64 -> 66 GPRs, 832 -> 768 threads per threadgroup).
+    // 64 -> 66 GPRs, 832 -> 768 threads per threadgroup; since L15-E757
+    // 62 -> 64 at 832, and faster).
     SDValue V = DAG.getSelect(DL, MVT::i32, FirstZero, Second, First);
     if (!IsCTLZ)
       V = DAG.getNode(ISD::BITREVERSE, DL, MVT::i32, V);
@@ -2760,6 +3573,207 @@ static cl::opt<bool> ConstDivisorFold(
     cl::desc("a constant divisor's significand, reciprocal and exponent "
              "factor at compile time in the correctly rounded division"));
 
+static cl::opt<bool> StackOffsetFold(
+    "agx-stack-offset-fold", cl::init(true), cl::Hidden,
+    cl::desc("a stack access at a frame index plus a constant as an "
+             "immediate offset"));
+
+/// A stack load or store whose offset is FRAME_ADDR fi + c (an iadd of the
+/// frame address and an immediate, no modifiers, shift applied) takes the
+/// frame index itself, c in its target flags, which eliminateFrameIndex
+/// adds: an immediate offset instead of the frame address and the iadd per
+/// access (a private array's elements) (L15-E288).
+void AGXTargetLowering::finalizeLowering(MachineFunction &MF) const {
+  if (StackOffsetFold) {
+    MachineRegisterInfo &MRI = MF.getRegInfo();
+    for (MachineBasicBlock &MBB : MF)
+      for (MachineInstr &MI : MBB) {
+        // An iadd of the frame address (to a private array's element at a
+        // variable index): the frame index as its immediate source, the
+        // object's offset after frame lowering, without the mov_imm.
+        if (MI.getOpcode() == AGX::IADD_I32 && !MI.getOperand(1).getImm() &&
+            MI.getOperand(2).isReg() && MI.getOperand(2).getReg().isVirtual()) {
+          MachineInstr *FA = MRI.getUniqueVRegDef(MI.getOperand(2).getReg());
+          if (FA && FA->getOpcode() == AGX::FRAME_ADDR &&
+              FA->getOperand(1).isFI() && !FA->getOperand(1).getTargetFlags())
+            MI.getOperand(2).ChangeToFrameIndex(FA->getOperand(1).getIndex());
+          continue;
+        }
+        switch (MI.getOpcode()) {
+        case AGX::STACK_LOAD_16:
+        case AGX::STACK_LOAD_32:
+        case AGX::STACK_LOAD_64:
+        case AGX::STACK_LOAD_96:
+        case AGX::STACK_LOAD_128:
+        case AGX::STACK_STORE_16:
+        case AGX::STACK_STORE_32:
+        case AGX::STACK_STORE_64:
+        case AGX::STACK_STORE_96:
+        case AGX::STACK_STORE_128:
+          break;
+        default:
+          continue;
+        }
+        // (the offset: the last operand)
+        MachineOperand *O = &MI.getOperand(MI.getNumExplicitOperands() - 1);
+        if (!O->isReg() || !O->getReg().isVirtual())
+          continue;
+        MachineInstr *Add = MRI.getUniqueVRegDef(O->getReg());
+        // (the frame address plus a constant as one move: FRAME_ADDR_OFF,
+        // which frame lowering turns into the move of the sum; here the
+        // access's immediate offset instead)
+        if (Add && Add->getOpcode() == AGX::FRAME_ADDR_OFF &&
+            Add->getOperand(1).isFI() && !Add->getOperand(1).getTargetFlags() &&
+            Add->getOperand(2).isImm()) {
+          int64_t C = Add->getOperand(2).getImm();
+          if (C >= 0 && C < (1 << 12))
+            O->ChangeToFrameIndex(Add->getOperand(1).getIndex(), unsigned(C));
+          continue;
+        }
+        if (!Add || Add->getOpcode() != AGX::IADD_I32 ||
+            Add->getOperand(1).getImm() || Add->getOperand(3).getImm() ||
+            !Add->getOperand(4).isImm() || !Add->getOperand(5).isImm())
+          continue;
+        // (the frame address, or the frame index the iadd took above)
+        const MachineOperand *FI = &Add->getOperand(2);
+        if (FI->isReg()) {
+          MachineInstr *FA =
+              FI->getReg().isVirtual() ? MRI.getUniqueVRegDef(FI->getReg())
+                                       : nullptr;
+          if (!FA || FA->getOpcode() != AGX::FRAME_ADDR)
+            continue;
+          FI = &FA->getOperand(1);
+        }
+        if (!FI->isFI() || FI->getTargetFlags())
+          continue;
+        int64_t Shift = Add->getOperand(5).getImm();
+        int64_t C = Add->getOperand(4).getImm();
+        if (Shift < 0 || Shift > 4 || C < 0)
+          continue;
+        C <<= Shift;
+        if (C >= (1 << 12))
+          continue;
+        O->ChangeToFrameIndex(FI->getIndex(), unsigned(C));
+      }
+  }
+  TargetLowering::finalizeLowering(MF);
+}
+
+static cl::opt<bool> HalfPow2Numerator(
+    "agx-half-pow2-numerator", cl::init(true), cl::Hidden,
+    cl::desc("a half quotient of a constant +-2^k without the correction "
+             "step"));
+
+/// An upper bound on |v| (as a power of two, log2) where v is finite, from
+/// how v is computed: integer conversions, half extensions, square roots,
+/// constants, and |x|, -x, sums and products of such; v may also be +-0, an
+/// infinity or a NaN. None if unknown. (L15-E344)
+static std::optional<int> magnitudeLog2Bound(SDValue V, unsigned Depth = 0) {
+  if (Depth > 4)
+    return std::nullopt;
+  switch (V.getOpcode()) {
+  case ISD::ConstantFP: {
+    const APFloat &F = cast<ConstantFPSDNode>(V)->getValueAPF();
+    if (!F.isFinite())
+      return 0;
+    return F.isZero() ? 0 : ilogb(F) + 1;
+  }
+  case ISD::SINT_TO_FP:
+  case ISD::UINT_TO_FP:
+    if (V.getOperand(0).getValueType().getScalarSizeInBits() > 64)
+      return std::nullopt;
+    return int(V.getOperand(0).getValueType().getScalarSizeInBits());
+  case ISD::FP_EXTEND:
+    if (V.getOperand(0).getValueType().getScalarType() == MVT::f16)
+      return 16;
+    return std::nullopt;
+  case ISD::FSQRT:
+    return 64;
+  case ISD::INTRINSIC_WO_CHAIN:
+  case ISD::FEXP2: {
+    // 2^x of an x that is <= 0 (or a NaN): at most 1 (L15-E346)
+    if (V.getOpcode() == ISD::INTRINSIC_WO_CHAIN &&
+        V.getConstantOperandVal(0) != Intrinsic::agx_exp2)
+      return std::nullopt;
+    SDValue X = V.getOperand(V.getOpcode() == ISD::FEXP2 ? 0 : 1);
+    auto NonPosConst = [](SDValue C) {
+      auto *F = dyn_cast<ConstantFPSDNode>(C);
+      return F && (F->isNegative() || F->isZero()) && !F->isNaN();
+    };
+    bool NonPos =
+        NonPosConst(X) ||
+        (X.getOpcode() == ISD::FNEG &&
+         X.getOperand(0).getOpcode() == ISD::FABS) ||
+        (X.getOpcode() == ISD::FMUL &&
+         ((X.getOperand(0).getOpcode() == ISD::FABS &&
+           NonPosConst(X.getOperand(1))) ||
+          (X.getOperand(1).getOpcode() == ISD::FABS &&
+           NonPosConst(X.getOperand(0)))));
+    if (NonPos)
+      return 1;
+    return std::nullopt;
+  }
+  case ISD::FABS:
+  case ISD::FNEG:
+    return magnitudeLog2Bound(V.getOperand(0), Depth + 1);
+  case ISD::FADD:
+  case ISD::FSUB:
+  case ISD::FMUL: {
+    auto L = magnitudeLog2Bound(V.getOperand(0), Depth + 1);
+    auto R = L ? magnitudeLog2Bound(V.getOperand(1), Depth + 1) : L;
+    if (!L || !R)
+      return std::nullopt;
+    return V.getOpcode() == ISD::FMUL ? *L + *R : std::max(*L, *R) + 1;
+  }
+  default:
+    return std::nullopt;
+  }
+}
+
+/// Whether v is +-0 or at least 2^-124 in magnitude (or infinite or a NaN):
+/// integer conversions, half extensions (2^-24 at least), square roots of
+/// flushing floats (2^-63) and |x|, -x of such. (L15-E344)
+static bool zeroOrNotTiny(SDValue V, unsigned Depth = 0) {
+  if (Depth > 4)
+    return false;
+  switch (V.getOpcode()) {
+  case ISD::SINT_TO_FP:
+  case ISD::UINT_TO_FP:
+    return true;
+  case ISD::FP_EXTEND:
+    return V.getOperand(0).getValueType().getScalarType() == MVT::f16;
+  case ISD::FABS:
+  case ISD::FNEG:
+    return zeroOrNotTiny(V.getOperand(0), Depth + 1);
+  default:
+    return false;
+  }
+}
+
+static cl::opt<bool> BoundedDivisions(
+    "agx-fdiv-bounded-operands",
+    cl::desc("float division whose divisor is below 2^100 or dividend not "
+             "below 2^-124 by how they are computed: no size test"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> FDivKnownNotNaN(
+    "agx-fdiv-known-not-nan",
+    cl::desc("float division: no NaN select for an operand known not to be "
+             "a NaN"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> IntDivisorScale(
+    "agx-fdiv-int-divisor",
+    cl::desc("float division by an integer converted to float: the "
+             "divisor's scale first, no test of the dividend's size"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> IntQuotient(
+    "agx-fdiv-int-quotient",
+    cl::desc("float division of two converted 32-bit integers as Markstein's "
+             "quotient step without scaling"),
+    cl::init(true), cl::Hidden);
+
 SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   SDLoc DL(Op);
   const MVT VT = MVT::f32;
@@ -2780,6 +3794,35 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   };
   EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
 
+  // Both operands integers of at most 32 bits converted to float: |a| and
+  // |b| are 0 or in [1, 2^34], never -0, an infinity or a NaN. 1 / b is a
+  // normal float and so is every nonzero quotient (at least 2^-34), so with
+  // y the correctly rounded 1 / b, Markstein's q0 = a y, r = a - b q0 (exact)
+  // and q = q0 + r y is the correctly rounded quotient, no exponent scaling.
+  // For b = 0 the refinement is a NaN (-0 * inf + 1): a * rcp(0) = a * +inf
+  // is the quotient (+-inf, or a NaN for 0 / 0) (L15-E465).
+  // (also sums and differences of such, to depth 2: integers of magnitude at
+  // most 2^34, still never -0 (x - x is +0), an infinity or a NaN)
+  std::function<bool(SDValue, unsigned)> IntVal = [&](SDValue V,
+                                                      unsigned Depth) {
+    if (V.getOpcode() == ISD::SINT_TO_FP || V.getOpcode() == ISD::UINT_TO_FP)
+      return V.getOperand(0).getValueType().getScalarSizeInBits() <= 32;
+    if (Depth < 2 &&
+        (V.getOpcode() == ISD::FADD || V.getOpcode() == ISD::FSUB))
+      return IntVal(V.getOperand(0), Depth + 1) &&
+             IntVal(V.getOperand(1), Depth + 1);
+    return false;
+  };
+  auto IntConv = [&](SDValue V) { return IntVal(V, 0); };
+  if (IntQuotient && IntConv(A) && IntConv(B)) {
+    SDValue NegB = DAG.getNode(ISD::FNEG, DL, VT, B);
+    SDValue Y0 = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rcp, VT, B);
+    SDValue Y = Fma(Fma(NegB, Y0, K(1.0f)), Y0, Y0);
+    SDValue Q0 = Mul(A, Y);
+    SDValue Q = Fma(Fma(NegB, Q0, A), Y, Q0);
+    return DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, B, K(0.0f), ISD::SETOEQ),
+                         Mul(A, Y0), Q);
+  }
   SDValue D, NegD, Y, PB;
   SmallVector<SDValue, 2> NaNOperands;
   auto *CB = dyn_cast<ConstantFPSDNode>(B);
@@ -2827,7 +3870,24 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
     }
     SDValue PA = Flt(And(AB, 0x7f800000));
     auto *CPB = dyn_cast<ConstantFPSDNode>(PB);
-    if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {
+    // b converted from an integer of at most 64 bits: +-0 (pb = +inf: q pb
+    // pa is +-inf, or a NaN for a = 0, as the select form gives) or of
+    // magnitude in [1, 2^64], pb in [2^-63, 2]: the same argument as for a
+    // moderate constant (L15-E343)
+    bool IntB = IntDivisorScale &&
+                (B.getOpcode() == ISD::SINT_TO_FP ||
+                 B.getOpcode() == ISD::UINT_TO_FP) &&
+                B.getOperand(0).getValueType().getScalarSizeInBits() <= 64;
+    // More generally a b below 2^100 in magnitude (pb >= 2^-100), and a
+    // dividend that is +-0 or not below 2^-124, whose size test is known
+    // (L15-E344)
+    std::optional<int> BBound =
+        BoundedDivisions && !CB ? magnitudeLog2Bound(B) : std::nullopt;
+    if (IntB || (BBound && *BBound <= 100)) {
+      R = Mul(Mul(Q, PB), PA);
+    } else if (BoundedDivisions && !CPB && zeroOrNotTiny(A)) {
+      R = Mul(Mul(Q, PA), PB);
+    } else if (CPB && CPB->getValueAPF().convertToFloat() >= 0x1p-100f) {
       // A constant b of moderate size: q (in [1/4, 1)) times pb is exact
       // (neither flushed nor infinite), so pb first is right for every a and
       // the product with pa rounds once; no test of a's size.
@@ -2847,9 +3907,13 @@ SDValue AGXTargetLowering::lowerFDIV32(SDValue Op, SelectionDAG &DAG) const {
   // One compare-and-select per operand.
   SDValue NaN =
       DAG.getConstantFP(APFloat::getQNaN(APFloat::IEEEsingle()), DL, VT);
-  for (SDValue X : NaNOperands)
+  for (SDValue X : NaNOperands) {
+    // (none for an operand known not to be a NaN: L15-E345)
+    if (FDivKnownNotNaN && DAG.isKnownNeverNaN(X))
+      continue;
     R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, X, X, ISD::SETUO), NaN,
                       R);
+  }
   return R;
 }
 
@@ -2904,19 +3968,27 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
                       Y0, Y0);
     }
     SDValue Q1 = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y);
-    SDValue Q = DAG.getNode(
-        ISD::FMA, DL, MVT::f32,
-        DAG.getNode(ISD::FMA, DL, MVT::f32, NegB, Q1, A32), Y, Q1);
+    // A constant a = +-2^k: a y, exact (in [2^-40, 2^39]), is already the
+    // correctly rounded float quotient, and never zero (L15-E284).
+    auto *CA = dyn_cast<ConstantFPSDNode>(A);
+    bool Pow2 = HalfPow2Numerator && CA && CA->getValueAPF().isNormal() &&
+                CA->getValueAPF().getExactLog2Abs() != INT_MIN;
+    SDValue Q = Pow2 ? Q1
+                     : DAG.getNode(ISD::FMA, DL, MVT::f32,
+                                   DAG.getNode(ISD::FMA, DL, MVT::f32, NegB,
+                                               Q1, A32),
+                                   Y, Q1);
     SDValue Simple = DAG.getNode(ISD::FMUL, DL, MVT::f32, A32, Y0);
     EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(),
                                   MVT::f32);
     SDValue R = DAG.getSelect(DL, MVT::f32,
                               DAG.getSetCC(DL, CCVT, Q, Q, ISD::SETUO), Simple, Q);
-    R = DAG.getSelect(
-        DL, MVT::f32,
-        DAG.getSetCC(DL, CCVT, A, DAG.getConstantFP(0.0, DL, MVT::f16),
-                     ISD::SETOEQ),
-        Simple, R);
+    if (!Pow2)
+      R = DAG.getSelect(
+          DL, MVT::f32,
+          DAG.getSetCC(DL, CCVT, A, DAG.getConstantFP(0.0, DL, MVT::f16),
+                       ISD::SETOEQ),
+          Simple, R);
     return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, R,
                        DAG.getTargetConstant(0, DL, MVT::i32));
   }
@@ -2926,6 +3998,16 @@ SDValue AGXTargetLowering::lowerFDIV(SDValue Op, SelectionDAG &DAG) const {
     return R;
   return DAG.getNode(ISD::FMUL, DL, VT, A, R, Flags);
 }
+
+static cl::opt<bool> HalfSqrtProduct(
+    "agx-half-sqrt-product",
+    cl::desc("half sqrt as the float x rsqrt_special(x) rounded to half"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> SqrtScaleSelect(
+    "agx-sqrt-scale-select",
+    cl::desc("float sqrt's 2^-32 rescale as a product by a selected scale"),
+    cl::init(true), cl::Hidden);
 
 /// float sqrt without afn, correctly rounded (denormals flushed): from
 /// y = rsqrt_special(x) (within 1 ulp; 1 for 0 and infinity),
@@ -2948,6 +4030,12 @@ SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
     EVT CCVT = getSetCCResultType(DAG.getDataLayout(), *DAG.getContext(), VT);
     SDValue Y = getAGXIntrinsic(DAG, DL, Intrinsic::agx_rsqrt_special, VT, X);
     SDValue S0 = DAG.getNode(ISD::FMUL, DL, VT, X, Y);
+    // The float product itself, rounded to half, is the correctly rounded
+    // half square root for every half (simulator, all 65536): no correction
+    // step (L15-E334).
+    if (HalfSqrtProduct)
+      return DAG.getNode(ISD::FP_ROUND, DL, MVT::f16, S0,
+                         DAG.getTargetConstant(0, DL, MVT::i32));
     SDValue H = DAG.getNode(ISD::FMUL, DL, VT, Y, DAG.getConstantFP(0.5, DL, VT));
     SDValue Rem = DAG.getNode(ISD::FMA, DL, VT,
                               DAG.getNode(ISD::FNEG, DL, VT, S0), S0, X);
@@ -2973,6 +4061,13 @@ SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
                             DAG.getNode(ISD::FNEG, DL, VT, S0), S0, XS);
   SDValue S = DAG.getNode(ISD::FMA, DL, VT, Rem, H, S0);
   S = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, S, S, ISD::SETUO), S0, S);
+  // S times (Small ? 2^-32 : 1), with the constants in uniforms: the select
+  // reads x alone, off the chain to S, where selecting between S 2^-32 and S
+  // reads x and both (a 3-source fcmpsel). S is never denormal (x >= 2^-80
+  // or scaled), so S 1 is S (L15-E698).
+  if (SqrtScaleSelect && AGX::uniformConstantsEnabled())
+    return DAG.getNode(ISD::FMUL, DL, VT, S,
+                       DAG.getSelect(DL, VT, Small, K(0x1p-32f), K(1.0f)));
   return DAG.getSelect(DL, VT, Small,
                        DAG.getNode(ISD::FMUL, DL, VT, S, K(0x1p-32f)), S);
 }
@@ -2986,6 +4081,12 @@ SDValue AGXTargetLowering::lowerFSQRT(SDValue Op, SelectionDAG &DAG) const {
 static cl::opt<bool> SelectMinimumMaximum(
     "agx-select-minimum-maximum",
     cl::desc("minimum / maximum as unordered compare-selects"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> NaNPropSelect(
+    "agx-nanprop-select",
+    cl::desc("minimum / maximum's compare-select and NaN select as one "
+             "fcmpsel with a NaN-losing condition on swapped operands"),
     cl::init(true), cl::Hidden);
 
 /// minimum / maximum (NaN if either operand is one, -0 below +0) as
@@ -3012,7 +4113,15 @@ static SDValue lowerFMinimumMaximum(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
   // (agx-tv: maximum(-denormal, -0) is -0, not the denormal).
   if (Zeros && CB && Max == !CB->isNegative())
     Zeros = false;
-  SDValue R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, CC), A, B);
+  // (with a NaN b possible: the select of a NaN b in the one compare-select,
+  // whose "n" conditions make a NaN lose, on (b, a): L15-E452)
+  bool NaNSelect = !(CB && !CB->isNaN());
+  bool OneSelect = NaNSelect && NaNPropSelect && (VT == MVT::f32 || VT == MVT::f16);
+  SDValue R =
+      OneSelect
+          ? DAG.getNode(Max ? AGXISD::FMAX_NANPROP : AGXISD::FMIN_NANPROP, DL,
+                        VT, A, B)
+          : DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, CC), A, B);
   if (Zeros) {
     EVT IntVT = VT.changeTypeToInteger();
     // Equal to a zero b (a = +-0 or a denormal the comparison flushes): the
@@ -3036,7 +4145,7 @@ static SDValue lowerFMinimumMaximum(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
     R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, A, B, ISD::SETOEQ), Eq,
                       R);
   }
-  if (!(CB && !CB->isNaN()))
+  if (NaNSelect && !OneSelect)
     R = DAG.getSelect(DL, VT, DAG.getSetCC(DL, CCVT, B, B, ISD::SETUO), B, R);
   return R;
 }
@@ -3360,6 +4469,14 @@ static bool isBF16Exact(SelectionDAG &DAG, SDValue V, unsigned Depth = 0) {
   case ISD::SELECT:
     return isBF16Exact(DAG, V.getOperand(1), Depth + 1) &&
            isBF16Exact(DAG, V.getOperand(2), Depth + 1);
+  // An integer of at most 8 significant bits (an i8's) converted: bfloat's
+  // 8-bit significand holds it, so the float's low half is zero (L15-E312).
+  case ISD::SINT_TO_FP: {
+    SDValue I = V.getOperand(0);
+    return I.getScalarValueSizeInBits() - DAG.ComputeNumSignBits(I) + 1 <= 8;
+  }
+  case ISD::UINT_TO_FP:
+    return DAG.computeKnownBits(V.getOperand(0)).countMaxActiveBits() <= 8;
   case ISD::SELECT_CC:
     return isBF16Exact(DAG, V.getOperand(2), Depth + 1) &&
            isBF16Exact(DAG, V.getOperand(3), Depth + 1);
@@ -3388,10 +4505,12 @@ SDValue AGXTargetLowering::lowerFP_TO_BF16(SDValue Op,
   // The f32 arithmetic's NaN is 0x7fc00000, which the rounding keeps a NaN:
   // a result of it needs no NaN test (unless NaNs follow PTX's canonical
   // form, whose 0x7fffffff the rounding would carry out of).
+  // An integer converted is never a NaN (L15-E312).
   unsigned SrcOp = Src.getOpcode();
-  if (!DAG.getSubtarget<AGXSubtarget>().hasCanonicalNaN() &&
-      (SrcOp == ISD::FADD || SrcOp == ISD::FSUB || SrcOp == ISD::FMUL ||
-       SrcOp == ISD::FMA || SrcOp == ISD::FMAD))
+  if ((!DAG.getSubtarget<AGXSubtarget>().hasCanonicalNaN() &&
+       (SrcOp == ISD::FADD || SrcOp == ISD::FSUB || SrcOp == ISD::FMUL ||
+        SrcOp == ISD::FMA || SrcOp == ISD::FMAD)) ||
+      SrcOp == ISD::SINT_TO_FP || SrcOp == ISD::UINT_TO_FP)
     return DAG.getNode(ISD::TRUNCATE, DL, Op.getValueType(),
                        DAG.getNode(ISD::SRL, DL, MVT::i32, R, C(16)));
   // A NaN keeps its top half, quieted; the test is a float compare of the

@@ -1,6 +1,8 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs -agx-aggregate-atomics=0 < %s | FileCheck %s --check-prefix=OFF
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -mattr=+ieee-fp32 -verify-machineinstrs < %s | FileCheck %s --check-prefix=IEEE
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s --check-prefix=NB
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs -agx-aggregate-atomics-neighbor-test=0 < %s | FileCheck %s --check-prefix=NONB
 
 ; Atomic additions on device memory: the threads of a SIMD group on the address
 ; of the lowest pending thread add their sum with one atomic (Cycles' film
@@ -19,6 +21,18 @@
 ; OFF-NOT:       simd_fadd
 ; OFF:           atomic sub, 0, _,
 ; OFF-NOT:       atomic sub
+; (first, whether any thread's address is the one before it's: where none
+; is, the plain atomic, L15-E798)
+; NB-LABEL: film:
+; NB:            simd_shuffle_rotate_up
+; NB:            simd_shuffle_rotate_up
+; NB:            icmp_ballot
+; NB:            atomic sub, 0, _,
+; NB:            icmp_ballot
+; NB:            popcount
+; NONB-LABEL: film:
+; NONB-NOT:      simd_shuffle_rotate_up
+; NONB:          popcount
 ; IEEE-LABEL: film:
 ; IEEE-NOT:      simd_fadd
 define agx_kernel void @film(ptr addrspace(1) %buf, ptr addrspace(1) %x) {

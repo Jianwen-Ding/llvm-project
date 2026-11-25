@@ -5,8 +5,9 @@
 ; condition of a private and a device address, as InstCombine leaves GEPs of a
 ; select) share one tag test: the run is copied for each memory.
 
+; (the device copy is short enough to run under its mask without a jump)
 ; CHECK-LABEL: run:
-; CHECK:         jmp_exec_none
+; CHECK:         if_icmp
 ; CHECK-NOT:     jmp_exec_none
 ; CHECK:         device_load
 ; CHECK:         device_load
@@ -19,7 +20,7 @@
 ; CHECK-NOT:     jmp_exec_none
 ; CHECK:         stop
 ; OFF-LABEL: run:
-; OFF-COUNT-6:   jmp_exec_none
+; OFF-COUNT-3:   if_icmp
 define agx_kernel void @run(ptr addrspace(1) %g, ptr addrspace(1) %out, i32 %n) {
   %i = call i32 @llvm.agx.thread.position.in.grid.x()
   %loc = alloca [4 x float], align 4, addrspace(5)

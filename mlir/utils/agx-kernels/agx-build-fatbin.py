@@ -10,7 +10,8 @@ The kernel source names no chip. It is compiled through AIR, the same for every 
   mlir-translate --mlir-to-llvmir   (the functions of the gpu.module)
   opt -mtriple=air -passes=air-portable            (AIR's portable passes)
   opt -mtriple=agx -mcpu=CHIP -O3                  (agx-lower-air first; one run shared by the G13 and G14 chips)
-  llc -mtriple=agx -mcpu=CHIP -O3 -filetype=obj
+  llc -mtriple=agx -mcpu=CHIP -O3 -agx-uniform-constants -filetype=obj
+                                                   (wide constants preloaded by the runtime: --no-uniform-constants)
 
 With --agx-strict (the default), each G13 and G14 chip also gets an entry named "CHIP+agx-strict", compiled with the
 target feature +agx-strict in opt and llc, so that only the instructions Mesa's asahi compiler emits are used. A
@@ -93,7 +94,9 @@ def optimize(a, chip, tmp, features):
     mattr = ["-mattr=" + features] if features else []
     cpu = [] if chip is None else ["-mcpu=" + chip]
     optimized = os.path.join(tmp, (chip or "shared") + features + ".opt.bc")
-    subprocess.run([a.opt, "-mtriple=agx", *cpu, *mattr, "-O3", a.portable, "-o", optimized], check=True)
+    # (opt's AGX unrolling choices see the constants' mode too)
+    uc = ["-agx-uniform-constants"] if a.uniform_constants else []
+    subprocess.run([a.opt, "-mtriple=agx", *cpu, *mattr, "-O3", *uc, a.portable, "-o", optimized], check=True)
     return optimized
 
 
@@ -146,7 +149,10 @@ def main():
     ap.add_argument("--opt", default=None, help="LLVM opt (default: next to llc)")
     ap.add_argument("--chips", default=",".join(DEFAULT_CHIPS))
     ap.add_argument("--llc-arg", dest="llc_args", action="append", default=[],
-                    help="an extra llc option (repeatable), e.g. --llc-arg=-agx-uniform-constants")
+                    help="an extra llc option (repeatable)")
+    ap.add_argument("--no-uniform-constants", dest="uniform_constants", action="store_false",
+                    help="keep wide constants in mov_imm instead of the uniforms the runtime preloads (.agx.kernels "
+                         "extension 6, which agx_runtime sets, as for the PTX front end's agx_libs builds)")
     ap.add_argument("--no-agx-strict", dest="agx_strict", action="store_false",
                     help="leave out the CHIP+agx-strict entries")
     # The only pipeline now; accepted for the builds that still pass it.
@@ -160,6 +166,8 @@ def main():
     ap.add_argument("source")
     a = ap.parse_args()
     a.opt = a.opt or os.path.join(os.path.dirname(a.llc), "opt")
+    if a.uniform_constants:
+        a.llc_args = ["-agx-uniform-constants"] + a.llc_args
     with tempfile.TemporaryDirectory() as tmp:
         chips = [c for c in a.chips.split(",") if c]
         a.portable = portable_air(a, a.source, tmp)

@@ -48,6 +48,11 @@ static cl::opt<bool> AGXThreadgroupRanges(
     cl::desc("Bound the threadgroup's special registers by the kernel's "
              "agx-max-threads-per-threadgroup"));
 
+static cl::opt<bool> AGXThreadgroupShapeRanges(
+    "agx-threadgroup-shape-ranges", cl::init(true), cl::Hidden,
+    cl::desc("Bound the threadgroup's positions and sizes by the kernel's "
+             "agx-threads-per-threadgroup"));
+
 static cl::opt<cl::boolOrDefault> AGXKnownGridRanges(
     "agx-known-grid-ranges", cl::Hidden,
     cl::desc("Bound grid positions by the kernel's known grid "
@@ -128,6 +133,29 @@ threadgroupBounds(Intrinsic::ID ID, uint64_t N) {
   }
 }
 
+/// The bounds of the threadgroup's registers for a launch of exactly the
+/// threadgroup shape E ("agx-threads-per-threadgroup", MLIR's
+/// known_block_size): each position below its extent, each size exactly it.
+static std::optional<std::pair<uint64_t, uint64_t>>
+shapeBounds(Intrinsic::ID ID, const std::array<uint64_t, 3> &E) {
+  switch (ID) {
+  case Intrinsic::agx_thread_position_in_threadgroup_x:
+    return std::pair(uint64_t(0), E[0]);
+  case Intrinsic::agx_thread_position_in_threadgroup_y:
+    return std::pair(uint64_t(0), E[1]);
+  case Intrinsic::agx_thread_position_in_threadgroup_z:
+    return std::pair(uint64_t(0), E[2]);
+  case Intrinsic::agx_threads_per_threadgroup_x:
+    return std::pair(E[0], E[0] + 1);
+  case Intrinsic::agx_threads_per_threadgroup_y:
+    return std::pair(E[1], E[1] + 1);
+  case Intrinsic::agx_threads_per_threadgroup_z:
+    return std::pair(E[2], E[2] + 1);
+  default:
+    return std::nullopt;
+  }
+}
+
 /// The extents "a,b,c" a kernel attribute gives (agx-threads-per-grid,
 /// agx-threadgroups-per-grid: the launch's known grid), each in [1, 2^32).
 static std::optional<std::array<uint64_t, 3>> extents(const Function &F,
@@ -166,6 +194,57 @@ gridBounds(const Function &F, Intrinsic::ID ID) {
   return std::nullopt;
 }
 
+static cl::opt<unsigned> AGXUpperBoundRanges(
+    "agx-upper-bound-ranges", cl::init(1), cl::Hidden,
+    cl::desc("Bound thread and threadgroup positions by the kernel's "
+             "agx-upper-bounds:<AIR system value> attributes: 0 not, 1 in "
+             "AGXNarrowInductions' bounds, 2 also as the reads' ranges"));
+
+/// [0, b) of a position, b from the kernel's "agx-upper-bounds:<role>"
+/// attribute ("x,y,z", 0 where unknown): MLIR's upper_bound of a read every
+/// execution of the kernel reaches (L15-E391).
+static std::optional<std::pair<uint64_t, uint64_t>>
+upperBounds(const Function &F, Intrinsic::ID ID) {
+  if (!AGXUpperBoundRanges)
+    return std::nullopt;
+  unsigned D;
+  StringRef Role;
+  switch (ID) {
+  case Intrinsic::agx_thread_position_in_threadgroup_x: D = 0; Role = "air.thread_position_in_threadgroup"; break;
+  case Intrinsic::agx_thread_position_in_threadgroup_y: D = 1; Role = "air.thread_position_in_threadgroup"; break;
+  case Intrinsic::agx_thread_position_in_threadgroup_z: D = 2; Role = "air.thread_position_in_threadgroup"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_x: D = 0; Role = "air.threadgroup_position_in_grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_y: D = 1; Role = "air.threadgroup_position_in_grid"; break;
+  case Intrinsic::agx_threadgroup_position_in_grid_z: D = 2; Role = "air.threadgroup_position_in_grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_x: D = 0; Role = "air.thread_position_in_grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_y: D = 1; Role = "air.thread_position_in_grid"; break;
+  case Intrinsic::agx_thread_position_in_grid_z: D = 2; Role = "air.thread_position_in_grid"; break;
+  default:
+    return std::nullopt;
+  }
+  Attribute A = F.getFnAttribute((Twine("agx-upper-bounds:") + Role).str());
+  if (!A.isStringAttribute())
+    return std::nullopt;
+  SmallVector<StringRef, 3> Parts;
+  A.getValueAsString().split(Parts, ',');
+  uint64_t B;
+  if (Parts.size() != 3 || Parts[D].getAsInteger(10, B) || B == 0 ||
+      B >= (1ull << 32))
+    return std::nullopt;
+  return std::pair(uint64_t(0), B);
+}
+
+std::optional<uint64_t> AGX::knownUpperBound(const Function &F,
+                                            unsigned IntrinsicID) {
+  std::optional<uint64_t> R;
+  if (auto G = gridBounds(F, Intrinsic::ID(IntrinsicID)))
+    R = G->second;
+  if (auto U = upperBounds(F, Intrinsic::ID(IntrinsicID)))
+    if (!R || U->second < *R)
+      R = U->second;
+  return R;
+}
+
 std::optional<uint64_t> AGX::knownGridExtent(const Function &F,
                                             unsigned IntrinsicID) {
   if (auto G = gridBounds(F, Intrinsic::ID(IntrinsicID)))
@@ -174,13 +253,16 @@ std::optional<uint64_t> AGX::knownGridExtent(const Function &F,
 }
 
 bool AGX::addSpecialRegisterRanges(Function &F,
-                                   SmallVectorImpl<WeakVH> *Added) {
+                                   SmallVectorImpl<WeakVH> *Added,
+                                   bool ForAnalysis) {
   bool Changed = false;
   // The known grid's bounds only in a kernel without loops: in a loop, the
   // offsets they let the DAG fold into addresses become immediates of a
-  // 64-bit base recomputed each iteration (L15-E191).
-  bool GridRanges = AGXKnownGridRanges == cl::boolOrDefault::BOU_TRUE;
-  if (AGXKnownGridRanges == cl::boolOrDefault::BOU_UNSET) {
+  // 64-bit base recomputed each iteration (L15-E191). (For an analysis whose
+  // ranges are taken off again, the grid's and the upper bounds always.)
+  bool GridRanges =
+      ForAnalysis || AGXKnownGridRanges == cl::boolOrDefault::BOU_TRUE;
+  if (!ForAnalysis && AGXKnownGridRanges == cl::boolOrDefault::BOU_UNSET) {
     SmallVector<std::pair<const BasicBlock *, const BasicBlock *>, 4> Edges;
     FindFunctionBackedges(F, Edges);
     GridRanges = Edges.empty();
@@ -191,6 +273,11 @@ bool AGX::addSpecialRegisterRanges(Function &F,
         F.getFnAttributeAsParsedInteger("agx-max-threads-per-threadgroup", 0);
   if (MaxThreads > 1024)
     MaxThreads = 0;
+  std::optional<std::array<uint64_t, 3>> Shape;
+  if (AGXThreadgroupShapeRanges)
+    Shape = extents(F, "agx-threads-per-threadgroup");
+  if (Shape && (*Shape)[0] * (*Shape)[1] * (*Shape)[2] > 1024)
+    Shape.reset();
   for (Instruction &I : instructions(F)) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
     if (!II || !II->getType()->isIntegerTy(32))
@@ -199,10 +286,18 @@ bool AGX::addSpecialRegisterRanges(Function &F,
     if (B && MaxThreads)
       if (auto T = threadgroupBounds(II->getIntrinsicID(), MaxThreads))
         B = T;
+    if (B && Shape)
+      if (auto T = shapeBounds(II->getIntrinsicID(), *Shape))
+        if (T->second - T->first < B->second - B->first)
+          B = T;
     if (GridRanges)
       if (auto G = gridBounds(F, II->getIntrinsicID()))
         if (!B || G->second - G->first < B->second - B->first)
           B = G;
+    if (AGXUpperBoundRanges >= 2 || (ForAnalysis && AGXUpperBoundRanges))
+      if (auto U = upperBounds(F, II->getIntrinsicID()))
+        if (!B || U->second - U->first < B->second - B->first)
+          B = U;
     if (!B || II->getRetAttributes().hasAttribute(Attribute::Range))
       continue;
     II->addRetAttr(Attribute::get(

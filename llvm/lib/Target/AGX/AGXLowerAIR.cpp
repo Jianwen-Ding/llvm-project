@@ -48,6 +48,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -835,6 +836,18 @@ bool LowerAIR::lowerSIMD(IRBuilder<> &B, CallInst &CI, StringRef Name,
     Result = B.CreateIntrinsic(Shuffle, {Ty}, {CI.getArgOperand(0), Lane(1)});
     return true;
   }
+  // Rotates: lane i reads lane (i - delta) mod n (up) or (i + delta) mod n
+  // (down, the rotate up by n - delta).
+  if ((Op == "shuffle_rotate_up" || Op == "shuffle_rotate_down") &&
+      CI.arg_size() == 2) {
+    Value *Delta = Lane(1);
+    if (Op == "shuffle_rotate_down")
+      Delta = B.CreateAnd(B.CreateSub(B.getInt32(0), Delta), Quad ? 3 : 31);
+    Result = B.CreateIntrinsic(
+        Quad ? agx_quad_shuffle_rotate_up : agx_simd_shuffle_rotate_up, {Ty},
+        {CI.getArgOperand(0), Delta});
+    return true;
+  }
   if (Op == "broadcast_first" && CI.arg_size() == 1) {
     Value *First = B.CreateIntrinsic(Intrinsic::cttz, {B.getInt32Ty()},
                                      {Active(), B.getFalse()});
@@ -1157,10 +1170,16 @@ static bool isMatrix(Type *T) {
           VT->getElementType()->isBFloatTy());
 }
 
+// A comparison of matrices' elements (<64 x i1>), a select's condition.
+static bool isMatrixMask(Type *T) {
+  auto *VT = dyn_cast<FixedVectorType>(T);
+  return VT && VT->getNumElements() == 64 && VT->getElementType()->isIntegerTy(1);
+}
+
 static bool usesMatrix(const Instruction &I) {
-  return isMatrix(I.getType()) || any_of(I.operands(), [](const Use &U) {
-           return isMatrix(U->getType());
-         });
+  auto M = [](Type *T) { return isMatrix(T) || isMatrixMask(T); };
+  return M(I.getType()) ||
+         any_of(I.operands(), [&](const Use &U) { return M(U->getType()); });
 }
 
 // The SIMD-group matrices of AIR (air.simdgroup_matrix_8x8_*) as AGX's: each
@@ -1255,6 +1274,22 @@ void LowerAIR::lowerMatrices(Function &F) {
                                    Get(S->getFalseValue()), I.getName());
         continue;
       }
+      // (L15-E855) a comparison of matrices' elements, and a select of
+      // matrices by one: on the two elements a thread holds
+      if (auto *C = dyn_cast<CmpInst>(&I);
+          C && isMatrixMask(C->getType()) && isMatrix(C->getOperand(0)->getType())) {
+        Frag[&I] = IB.CreateCmp(C->getPredicate(), Get(C->getOperand(0)),
+                                Get(C->getOperand(1)), I.getName());
+        continue;
+      }
+      if (auto *S = dyn_cast<SelectInst>(&I);
+          S && isMatrixMask(S->getCondition()->getType()) &&
+          isMatrix(S->getType())) {
+        Frag[&I] = IB.CreateSelect(Get(S->getCondition()),
+                                   Get(S->getTrueValue()),
+                                   Get(S->getFalseValue()), I.getName());
+        continue;
+      }
       // fpext and fptrunc between matrix element types.
       if (auto *C = dyn_cast<CastInst>(&I);
           C && isMatrix(C->getType()) && isMatrix(C->getSrcTy())) {
@@ -1329,7 +1364,28 @@ void LowerAIR::lowerMatrices(Function &F) {
                Arg(First + 1)->getType() == V2I64 &&
                Arg(First + 2)->getType() == V2I64;
       };
+      // (L15-E856) a row stride of 1: a thread's two elements, (r, c) and
+      // (r, c + 1), adjacent, moved by one access of the pair (aligned as an
+      // element)
+      auto UnitX = [&](Value *Strides) {
+        auto *C = dyn_cast<Constant>(Strides);
+        auto *X = C ? dyn_cast_or_null<ConstantInt>(C->getAggregateElement(0u))
+                    : nullptr;
+        return X && X->isOne();
+      };
       if (Name.starts_with("load.") && Shape(1) &&
+          Arg(0)->getType()->isPointerTy() && UnitX(Arg(2))) {
+        Type *EltTy = cast<VectorType>(CI->getType())->getElementType();
+        Frag[&I] = IB.CreateAlignedLoad(
+            FragTy(CI->getType()), Element(IB, EltTy, Arg(0), Arg(2), Arg(3), 0),
+            Align(EltTy->getPrimitiveSizeInBits() / 8));
+      } else if (Name.starts_with("store.") && Shape(2) &&
+                 Arg(1)->getType()->isPointerTy() && UnitX(Arg(3))) {
+        Type *EltTy = cast<VectorType>(Arg(0)->getType())->getElementType();
+        IB.CreateAlignedStore(Get(Arg(0)),
+                              Element(IB, EltTy, Arg(1), Arg(3), Arg(4), 0),
+                              Align(EltTy->getPrimitiveSizeInBits() / 8));
+      } else if (Name.starts_with("load.") && Shape(1) &&
           Arg(0)->getType()->isPointerTy()) {
         Type *EltTy = cast<VectorType>(CI->getType())->getElementType();
         Value *V = PoisonValue::get(FragTy(CI->getType()));
@@ -1742,21 +1798,36 @@ void LowerAIR::recoverAGXOperations(Function &F) {
       auto *MM = dyn_cast<IntrinsicInst>(Ordered);
       if (auto *ZSel = dyn_cast<SelectInst>(Ordered)) {
         MM = dyn_cast<IntrinsicInst>(ZSel->getFalseValue());
-        Value *X, *Y, *Or;
+        Value *Or, *P, *Q;
         bool Min = MM && MM->getIntrinsicID() == Intrinsic::minnum;
+        // The bits of an operand: bitcast(v), or v's constant bits folded
+        // (maximum(x, 0): or(bits(x), 0), L15-E400).
+        auto BitsOf = [&](Value *I, Value *V) {
+          if (match(I, m_BitCast(m_Specific(V))))
+            return true;
+          auto *C = dyn_cast<Constant>(V);
+          return C && isa<Constant>(I) &&
+                 ConstantFoldCastOperand(Instruction::BitCast, C, I->getType(),
+                                         F.getDataLayout()) == I;
+        };
+        auto BothBits = [&](Value *L, Value *R) {
+          Value *A0 = MM->getArgOperand(0), *A1 = MM->getArgOperand(1);
+          return (BitsOf(L, A0) && BitsOf(R, A1)) ||
+                 (BitsOf(L, A1) && BitsOf(R, A0));
+        };
         // zero_check: (bits(a) | bits(b)) << 1 == 0; the zero: bits(a) | bits(b)
         // for minimum, bits(a) & bits(b) for maximum.
         if (!MM ||
             !match(ZSel->getCondition(),
                    m_SpecificICmp(ICmpInst::ICMP_EQ,
                                   m_Shl(m_Value(Or), m_One()), m_Zero())) ||
-            !match(Or, m_Or(m_BitCast(m_Value(X)), m_BitCast(m_Value(Y)))) ||
-            !((X == MM->getArgOperand(0) && Y == MM->getArgOperand(1)) ||
-              (X == MM->getArgOperand(1) && Y == MM->getArgOperand(0))) ||
-            !(Min ? match(ZSel->getTrueValue(), m_BitCast(m_Specific(Or)))
-                  : match(ZSel->getTrueValue(),
-                          m_BitCast(m_c_And(m_BitCast(m_Specific(X)),
-                                            m_BitCast(m_Specific(Y)))))))
+            !match(Or, m_Or(m_Value(P), m_Value(Q))) || !BothBits(P, Q))
+          MM = nullptr;
+        Value *Z;
+        if (MM && !(Min ? match(ZSel->getTrueValue(), m_BitCast(m_Specific(Or)))
+                        : match(ZSel->getTrueValue(), m_BitCast(m_Value(Z))) &&
+                              match(Z, m_And(m_Value(P), m_Value(Q))) &&
+                              BothBits(P, Q)))
           MM = nullptr;
       }
       if (MM &&
@@ -1975,7 +2046,8 @@ void LowerAIR::recoverDoubles() {
       continue;
     bool Directed = Name.consume_back("_r");
     if (!NativeF64 && !is_contained({"add", "sub", "mul", "fma", "div", "sqrt", "from_f32",
-                                     "to_f32", "to_i64", "to_u64", "from_i64", "from_u64"},
+                                     "to_f32", "to_f16", "to_bf16", "to_i64", "to_u64",
+                                     "from_i64", "from_u64"},
                                     Name))
       continue;
     for (User *U : make_early_inc_range(Lib.users())) {
@@ -2032,6 +2104,15 @@ void LowerAIR::recoverDoubles() {
                                F64));
       else if (Name == "to_f32" && NArgs == 1)
         R = B.CreateBitCast(B.CreateFPTrunc(D(0), F32), I32);
+      // (to half and bfloat: AGXSoftF64's short path for a normal result,
+      // L15-E314; the bits of the 16-bit format in the low half)
+      else if ((Name == "to_f16" || Name == "to_bf16") && NArgs == 1)
+        R = B.CreateZExt(
+            B.CreateBitCast(B.CreateFPTrunc(D(0), Name == "to_f16"
+                                                      ? B.getHalfTy()
+                                                      : B.getBFloatTy()),
+                            B.getInt16Ty()),
+            CI->getType());
       else if (Name == "to_i64" && NArgs == 1)
         R = B.CreateIntrinsic(Intrinsic::fptosi_sat, {I64, F64}, {D(0)});
       else if (Name == "to_u64" && NArgs == 1)
@@ -2424,7 +2505,13 @@ public:
 
   StringRef getPassName() const override { return "AGX Lower AIR"; }
   bool runOnModule(Module &M) override {
-    return TM && LowerAIR(M, *TM).run();
+    bool Changed = TM && LowerAIR(M, *TM).run();
+    // (llc: the positions' wrap flags before the versioning passes' scalar
+    // evolution, L15-E867)
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        Changed |= AGX::boundedPositionFlags(F);
+    return Changed;
   }
 };
 } // namespace

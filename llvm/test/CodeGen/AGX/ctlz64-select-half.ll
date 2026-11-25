@@ -1,11 +1,15 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs \
 ; RUN:   -agx-select-count-half=0 < %s | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs \
+; RUN:   -agx-headroom-gprs=0 < %s | FileCheck %s --check-prefix=OFF
 
 ; A 64-bit ctlz / cttz selects the half that decides first and counts it
 ; with one ffs (-1 for zero, as an M2 Max gives it): 31 - ffs(hi), or
 ; 63 - ffs(lo) where hi is zero, 64 for zero, where the function has register
-; headroom; not both halves' counts and a select.
+; headroom (an estimated pressure of at most -agx-headroom-gprs, 64 since
+; L15-E757: the soft doubles of up to 64 registers); not both halves' counts
+; and a select.
 
 ; CHECK-LABEL: lz:
 ; CHECK-COUNT-1: ffs

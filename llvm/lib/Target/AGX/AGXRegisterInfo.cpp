@@ -8,6 +8,7 @@
 
 #include "AGXRegisterInfo.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/ADT/SmallSet.h"
 #include "AGX.h"
 #include "AGXFrameLowering.h"
 #include "AGXSubtarget.h"
@@ -16,6 +17,9 @@
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/CodeGen/LiveRegMatrix.h"
 #include "llvm/IR/Instructions.h"
 
 using namespace llvm;
@@ -127,6 +131,131 @@ unsigned AGXRegisterInfo::getRegPressureSetLimit(const MachineFunction &MF,
   return Limit;
 }
 
+static cl::opt<bool> AGXCrossHalfHints(
+    "agx-cross-half-hints", cl::init(true), cl::Hidden,
+    cl::desc("Allocate a 16-bit destination of an instruction with two or "
+             "more register sources outside the registers whose other half "
+             "it reads, and those sources outside its register"));
+
+/// An instruction that writes one 16-bit half and reads the other half of
+/// the same register among two or more register sources waits for its
+/// destination's earlier write (AGX Performance Simulator, cost.rs, measured
+/// on hardware: 1.99 per step with no data dependence): a register allocated
+/// so for no reason costs that wait. The registers \p VirtReg should not
+/// take go last in its order (L15-E632).
+bool AGXRegisterInfo::getRegAllocationHints(
+    Register VirtReg, ArrayRef<MCPhysReg> Order,
+    SmallSetVector<MCPhysReg, 16> &Hints, const MachineFunction &MF,
+    const VirtRegMap *VRM, const LiveRegMatrix *Matrix) const {
+  bool Hard = TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
+                                                        MF, VRM, Matrix);
+  if (!AGXCrossHalfHints || Hard || !VRM)
+    return Hard;
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  const TargetRegisterClass *RC = MRI.getRegClass(VirtReg);
+  bool Is16 = RC == &AGX::GPR16RegClass, Is32 = RC == &AGX::GPR32RegClass;
+  if (!Is16 && !Is32)
+    return false;
+  // The physical register an operand reads or writes, if assigned yet.
+  auto Phys = [&](const MachineOperand &MO) -> MCPhysReg {
+    Register R = MO.getReg();
+    MCPhysReg P = R.isPhysical() ? R.asMCReg().id()
+                  : VRM->hasPhys(R) ? VRM->getPhys(R).id()
+                                    : MCPhysReg(0);
+    if (P && MO.getSubReg())
+      P = getSubReg(P, MO.getSubReg());
+    return P;
+  };
+  // The other half of a 16-bit register's 32-bit register.
+  auto Sibling = [&](MCPhysReg H) -> MCPhysReg {
+    for (unsigned Idx : {unsigned(AGX::lo16), unsigned(AGX::hi16)})
+      if (MCPhysReg Super = getMatchingSuperReg(H, Idx, &AGX::GPR32RegClass))
+        return getSubReg(Super, Idx == AGX::lo16 ? AGX::hi16 : AGX::lo16);
+    return 0;
+  };
+  SmallSet<MCPhysReg, 8> Bad;
+  for (const MachineInstr &MI : MRI.reg_nodbg_instructions(VirtReg)) {
+    if (MI.getNumExplicitDefs() != 1 || !MI.getOperand(0).isReg())
+      continue;
+    const MachineOperand &Def = MI.getOperand(0);
+    // (a 16-bit destination)
+    if (Def.getReg().isVirtual()
+            ? MRI.getRegClass(Def.getReg()) != &AGX::GPR16RegClass ||
+                  Def.getSubReg()
+            : !AGX::GPR16RegClass.contains(Def.getReg()))
+      continue;
+    SmallVector<const MachineOperand *, 4> Srcs;
+    for (const MachineOperand &MO : MI.explicit_uses())
+      if (MO.isReg() && MO.getReg())
+        Srcs.push_back(&MO);
+    if (Srcs.size() < 2)
+      continue;
+    if (Is16 && Def.getReg() == VirtReg && !Def.getSubReg()) {
+      // (this the destination: not the other half of a source's register)
+      for (const MachineOperand *S : Srcs)
+        if (S->getReg() != VirtReg)
+          if (MCPhysReg P = Phys(*S); P && AGX::GPR16RegClass.contains(P))
+            if (MCPhysReg O = Sibling(P))
+              Bad.insert(O);
+      continue;
+    }
+    MCPhysReg D = Phys(Def);
+    if (!D || !AGX::GPR16RegClass.contains(D))
+      continue;
+    // (this a source: not in the destination's register's other half)
+    for (const MachineOperand *S : Srcs) {
+      if (S->getReg() != VirtReg)
+        continue;
+      if (Is16 && !S->getSubReg()) {
+        if (MCPhysReg O = Sibling(D))
+          Bad.insert(O);
+      } else if (Is32 && S->getSubReg()) {
+        // (its half other than the destination's: the register holding D)
+        if (MCPhysReg Super =
+                getMatchingSuperReg(D, AGX::lo16, &AGX::GPR32RegClass)) {
+          if (S->getSubReg() != AGX::lo16)
+            Bad.insert(Super);
+        } else if (MCPhysReg Super = getMatchingSuperReg(
+                       D, AGX::hi16, &AGX::GPR32RegClass)) {
+          if (S->getSubReg() != AGX::hi16)
+            Bad.insert(Super);
+        }
+      }
+    }
+  }
+  if (Bad.empty())
+    return false;
+  // (the copy hints first, then the order, the bad registers dropped from
+  // the preference and so tried last)
+  // (but not at the price of a register no other value holds yet, which
+  // could cost a SIMD-group: among the registers in use, the good ones
+  // first, then the bad ones, then the order as it was)
+  auto InUse = [&](MCPhysReg R) {
+    if (!Matrix)
+      return true;
+    MCPhysReg Super = R;
+    if (AGX::GPR16RegClass.contains(R))
+      for (unsigned Idx : {unsigned(AGX::lo16), unsigned(AGX::hi16)})
+        if (MCPhysReg S = getMatchingSuperReg(R, Idx, &AGX::GPR32RegClass))
+          Super = S;
+    return Matrix->isPhysRegUsed(Super);
+  };
+  SmallSetVector<MCPhysReg, 16> Kept;
+  for (MCPhysReg H : Hints)
+    if (!Bad.count(H))
+      Kept.insert(H);
+  for (MCPhysReg R : Order)
+    if (!Bad.count(R) && InUse(R))
+      Kept.insert(R);
+  for (MCPhysReg R : Order)
+    if (Bad.count(R) && InUse(R))
+      Kept.insert(R);
+  for (MCPhysReg R : Order)
+    Kept.insert(R);
+  Hints = std::move(Kept);
+  return false;
+}
+
 BitVector AGXRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   BitVector Reserved(getNumRegs());
   auto ReserveWithAliases = [&](MCRegister Reg) {
@@ -209,7 +338,9 @@ bool AGXRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   MachineFunction &MF = *MI.getMF();
   MachineOperand &FIOp = MI.getOperand(FIOperandNum);
   int FI = FIOp.getIndex();
-  int64_t Offset = MF.getFrameInfo().getObjectOffset(FI);
+  // (plus the constant AGXTargetLowering::finalizeLowering put in its flags)
+  int64_t Offset =
+      MF.getFrameInfo().getObjectOffset(FI) + FIOp.getTargetFlags();
   if (agxExperimentalLeafCallsEnabled() &&
       MF.getFunction().getCallingConv() != CallingConv::AGX_KERNEL) {
     // After the kernel's region, one per depth (depth 0: an entry point of a
@@ -224,6 +355,6 @@ bool AGXRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   }
   if (Offset < 0 || Offset > 0x7fff)
     report_fatal_error("AGX stack frame too large");
-  FIOp.ChangeToImmediate(Offset);
+  FIOp.ChangeToImmediate(Offset, /*TargetFlags=*/0);
   return false;
 }

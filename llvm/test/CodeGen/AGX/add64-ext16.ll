@@ -19,13 +19,9 @@ define agx_kernel void @add_z16(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u0, 0
-; CHECK-NEXT:    bitop 0101, r3, u1, 0
-; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
-; CHECK-NEXT:    device_load 0, i16, x, r2l, r2_r3, 5, signed
+; CHECK-NEXT:    device_load 0, i32, xyzw, r2_r3_r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    iadd r2_r3, r4_r5, r2l
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4h
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -57,17 +53,12 @@ define agx_kernel void @add_bool(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u0, 0
-; CHECK-NEXT:    bitop 0101, r3, u1, 0
-; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
-; CHECK-NEXT:    device_load 1, i32, xy, r2_r3, r2_r3, 2, signed
-; CHECK-NEXT:    wait 1
-; CHECK-NEXT:    or r2, r2, r3
+; CHECK-NEXT:    device_load 0, i32, xyzw, r2_r3_r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    icmpsel slt, r3, r5, 0, 1, 0
-; CHECK-NEXT:    icmpsel ueq, r2, r2, 0, 0, r3
-; CHECK-NEXT:    iadd r2_r3, r4_r5, r2
+; CHECK-NEXT:    or r4, r4, r5
+; CHECK-NEXT:    icmpsel slt, r5, r3, 0, 1, 0
+; CHECK-NEXT:    icmpsel ueq, r4, r4, 0, 0, r5
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -99,13 +90,9 @@ define agx_kernel void @add_s16(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u0, 0
-; CHECK-NEXT:    bitop 0101, r3, u1, 0
-; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
-; CHECK-NEXT:    device_load 0, i16, x, r2l, r2_r3, 4, signed
+; CHECK-NEXT:    device_load 0, i32, xyzw, r2_r3_r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    iadd r2_r3, r4_r5, r2l.sx
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4l.sx
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -135,13 +122,9 @@ define agx_kernel void @sub_hi(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u0, 0
-; CHECK-NEXT:    bitop 0101, r3, u1, 0
-; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
-; CHECK-NEXT:    device_load 0, i16, x, r2l, r2_r3, 5, signed
+; CHECK-NEXT:    device_load 0, i32, xyzw, r2_r3_r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    isub r2_r3, r4_r5, r2l.sx
+; CHECK-NEXT:    isub r2_r3, r2_r3, r4h.sx
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -172,15 +155,10 @@ define agx_kernel void @add_zsx(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u0, 0
-; CHECK-NEXT:    bitop 0101, r3, u1, 0
-; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
-; CHECK-NEXT:    device_load 1, i16, x, r2, r2_r3, 4, signed
-; CHECK-NEXT:    wait 1
-; CHECK-NEXT:    iadd r2, r2l.sx, 0
+; CHECK-NEXT:    device_load 0, i32, xyzw, r2_r3_r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    iadd r2_r3, r4_r5, r2
+; CHECK-NEXT:    iadd r4, r4l.sx, 0
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap
@@ -212,13 +190,9 @@ define agx_kernel void @add_szx(ptr addrspace(1) %p) {
 ; CHECK-NEXT:    // stack size: 0 bytes
 ; CHECK-NEXT:  // %bb.0:
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
-; CHECK-NEXT:    bitop 0101, r2, u0, 0
-; CHECK-NEXT:    bitop 0101, r3, u1, 0
-; CHECK-NEXT:    device_load 0, i32, xy, r4_r5, u0_u1, r1, signed, lsl 2
-; CHECK-NEXT:    iadd r2_r3, r2_r3, r1.sx, lsl 4
-; CHECK-NEXT:    device_load 0, i16, x, r2l, r2_r3, 5, signed
+; CHECK-NEXT:    device_load 0, i32, xyzw, r2_r3_r4_r5, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    wait 0
-; CHECK-NEXT:    iadd r2_r3, r4_r5, r2l
+; CHECK-NEXT:    iadd r2_r3, r2_r3, r4h
 ; CHECK-NEXT:    device_store 0, i32, xy, r2_r3, u0_u1, r1, signed, lsl 2
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

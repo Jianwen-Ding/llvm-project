@@ -1,5 +1,10 @@
 // RUN: mlir-opt %s --convert-gpu-to-air=use-bare-ptr-memref-call-conv=1 --split-input-file | FileCheck %s
 // RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 narrow-loops=0 linearize-indices=0 simdgroup-all-reduce=0" --split-input-file | FileCheck %s --check-prefix=OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 approximate-half-functions=0" --split-input-file | FileCheck %s --check-prefix=HALFOFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 expm1-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=E1OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 f64-polynomial-fma=1" --split-input-file | FileCheck %s --check-prefix=PFMA
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 log1p-f64-direct=0" --split-input-file | FileCheck %s --check-prefix=L1OFF
+// RUN: mlir-opt %s --convert-gpu-to-air="use-bare-ptr-memref-call-conv=1 small-float-ext-via-half=0" --split-input-file | FileCheck %s --check-prefix=SFINT
 
 // System values are calls of AIR's functions, components of the
 // three-dimensional ones; kernels carry "air-kernel"; memrefs are bare
@@ -130,12 +135,12 @@ gpu.module @default_space {
 
 // -----
 
-// A known threadgroup size is an AGX hint on the kernel; the threadgroup
-// size and SIMD-group count are constants then, and the thread positions
-// and SIMD-group index are bounded by it.
+// A known threadgroup size is an AGX hint on the kernel (its thread count
+// and its shape); the threadgroup size and SIMD-group count are constants
+// then, and the thread positions and SIMD-group index are bounded by it.
 gpu.module @block_size {
   // CHECK-LABEL: llvm.func @k(
-  // CHECK-SAME: passthrough = ["air-kernel", ["agx-max-threads-per-threadgroup", "128"]]
+  // CHECK-SAME: passthrough = ["air-kernel", ["agx-max-threads-per-threadgroup", "128"], ["agx-threads-per-threadgroup", "64,2,1"]]
   gpu.func @k(%out: memref<8xindex, 1>) kernel attributes {known_block_size = array<i32: 64, 2, 1>} {
     // CHECK-NOT: @air.threads_per_threadgroup
     // CHECK: llvm.mlir.constant(2 : i64) : i64
@@ -187,7 +192,9 @@ gpu.module @one_simdgroup {
 // Shuffles by constant offsets within the SIMD-group are AIR's shuffle_up,
 // shuffle_down and shuffle_xor (xor within any power of two): the lanes a
 // shift leaves keep their value, which is what gpu.shuffle's valid flag
-// says; other shuffles read the lane they compute.
+// says; other shuffles read the lane they compute (L15-E285: shifts within
+// narrower segments and idx of a constant lane too, with a select of the own
+// value).
 gpu.module @shuffles {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%out: memref<8xi32, 1>, %v: i32, %o: i32) kernel {
@@ -207,12 +214,44 @@ gpu.module @shuffles {
     %down, %okdown = gpu.shuffle down %v, %c16, %c32 : i32
     // CHECK: llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
     %x8, %okx8 = gpu.shuffle xor %v, %c2, %c8 : i32
-    // Within segments of 8 lanes, a shift needs the lane arithmetic.
-    // CHECK: llvm.icmp "sge"
-    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // Within segments of 8 lanes, a shift by a constant is the same
+    // shuffle_down, and the thread's own value where the source lane is past
+    // its segment's end; an idx of a constant lane, the shuffle of that lane
+    // and the own value outside its segment (no per-thread lane). The tests:
+    // lane % 8 < 8 - 2, and lane & -8 == 2 & -8 (L15-E306).
+    // CHECK: %[[L8:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: %[[SEVEN:.*]] = llvm.mlir.constant(7 : i32) : i32
+    // CHECK: %[[P8:.*]] = llvm.and %[[L8]], %[[SEVEN]]
+    // CHECK: %[[SIX:.*]] = llvm.mlir.constant(6 : i32) : i32
+    // CHECK: %[[OK8:.*]] = llvm.icmp "ult" %[[P8]], %[[SIX]]
+    // CHECK: %[[D8:.*]] = llvm.call @air.simd_shuffle_down.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // CHECK: llvm.select %[[OK8]], %[[D8]], %{{.*}} : i1, i32
     %d8, %okd8 = gpu.shuffle down %v, %c2, %c8 : i32
-    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // CHECK: %[[S8:.*]] = llvm.and %{{.*}}, %{{.*}} : i32
+    // CHECK: %[[Z:.*]] = llvm.mlir.constant(0 : i32) : i32
+    // CHECK: %[[OKI:.*]] = llvm.icmp "eq" %[[S8]], %[[Z]]
+    // CHECK: %[[I8:.*]] = llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    // CHECK: llvm.select %[[OKI]], %[[I8]], %{{.*}} : i1, i32
+    %i8, %oki8 = gpu.shuffle idx %v, %c2, %c8 : i32
+    // A uniform mask (a kernel argument): AIR's shuffle_xor of it, and the
+    // own value where lane ^ mask leaves the segment (L15-E286).
+    // CHECK: %[[M:.*]] = llvm.trunc %{{.*}} : i32 to i16
+    // CHECK: llvm.xor
+    // CHECK: %[[XO:.*]] = llvm.call @air.simd_shuffle_xor.u.i32(%{{.*}}, %[[M]]) : (i32, i16) -> i32
+    // CHECK: llvm.select %{{.*}}, %[[XO]], %{{.*}} : i1, i32
     %xo, %okxo = gpu.shuffle xor %v, %o, %c32 : i32
+    // Down by a uniform offset of either sign: shuffle_down by it, or
+    // shuffle_up by its negation, by its sign (L15-E296).
+    // CHECK: %[[DN:.*]] = llvm.call @air.simd_shuffle_down.u.i32
+    // CHECK: %[[UP:.*]] = llvm.call @air.simd_shuffle_up.u.i32
+    // CHECK: llvm.select %{{.*}}, %[[DN]], %[[UP]] : i1, i32
+    %du, %okdu = gpu.shuffle down %v, %o, %c8 : i32
+    // A per-thread mask: the general path, the lane it computes.
+    // CHECK: %[[LD:.*]] = llvm.call @air.thread_index_in_simdgroup()
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %{{.*}}) : (i32, i16) -> i32
+    %ln = gpu.lane_id
+    %lo = arith.index_cast %ln : index to i32
+    %xd, %okxd = gpu.shuffle xor %v, %lo, %c32 : i32
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2i = arith.constant 2 : index
@@ -223,6 +262,12 @@ gpu.module @shuffles {
     memref.store %x8, %out[%c2i] : memref<8xi32, 1>
     memref.store %d8, %out[%c3] : memref<8xi32, 1>
     memref.store %xo, %out[%c4] : memref<8xi32, 1>
+    %c5 = arith.constant 5 : index
+    memref.store %i8, %out[%c5] : memref<8xi32, 1>
+    %c6 = arith.constant 6 : index
+    memref.store %xd, %out[%c6] : memref<8xi32, 1>
+    %c7 = arith.constant 7 : index
+    memref.store %du, %out[%c7] : memref<8xi32, 1>
     gpu.return
   }
 }
@@ -249,24 +294,52 @@ gpu.module @clusters {
 
 // maximumf / minimumf of f32 (NaN if any lane's is, -0.0 below +0.0, which
 // AIR's float maximum, a maxnum, does not give): the signed i32 maximum of
-// the keys b ^ ((b >>s 31) & 0x7fffffff), decoded, or a NaN where the
-// group's or of "is NaN" is set.
+// the keys b ^ ((b >>s 31) & 0x7fffffff), decoded. A value reduced once: a
+// NaN's key replaced by the quiet NaN's (by 0xffffffff's, INT32_MIN, whose
+// decoded NaN then selects the quiet NaN), no or of "is NaN". A value that
+// two reductions share: its own key, and a NaN where the group's or of
+// "is NaN" is set.
 gpu.module @ordered_float_reduce {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%out: memref<8xf32, 1>, %v: f32) kernel {
     // CHECK: %[[F:.*]] = llvm.freeze
+    // CHECK: llvm.fcmp "uno" %[[F]], %[[F]]
     // CHECK: %[[B:.*]] = llvm.bitcast %[[F]] : f32 to i32
     // CHECK: %[[S:.*]] = llvm.ashr %[[B]]
     // CHECK: %[[M:.*]] = llvm.and %[[S]]
     // CHECK: %[[K:.*]] = llvm.xor %[[B]], %[[M]]
     // CHECK: llvm.call @air.simd_max.s.i32(%[[K]])
-    // CHECK: llvm.fcmp "uno" %[[F]], %[[F]]
     // CHECK: llvm.call @air.simd_or.s.i32
     // CHECK: llvm.select
     %mx = gpu.subgroup_reduce maximumf %v : (f32) -> f32
     // CHECK: llvm.call @air.quad_min.s.i32
     // CHECK: llvm.call @air.quad_or.s.i32
     %mn = gpu.subgroup_reduce minimumf %v cluster(size = 4) : (f32) -> f32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    memref.store %mx, %out[%c0] : memref<8xf32, 1>
+    memref.store %mn, %out[%c1] : memref<8xf32, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @single(
+  gpu.func @single(%out: memref<8xf32, 1>, %v: f32, %w: f32) kernel {
+    // CHECK: %[[F:.*]] = llvm.freeze
+    // CHECK: %[[N:.*]] = llvm.fcmp "uno" %[[F]], %[[F]]
+    // CHECK: %[[B:.*]] = llvm.bitcast %[[F]] : f32 to i32
+    // CHECK: %[[S:.*]] = llvm.ashr %[[B]]
+    // CHECK: %[[M:.*]] = llvm.and %[[S]]
+    // CHECK: %[[K0:.*]] = llvm.xor %[[B]], %[[M]]
+    // CHECK: %[[K:.*]] = llvm.select %[[N]], %{{.*}}, %[[K0]] : i1, i32
+    // CHECK: llvm.call @air.simd_max.s.i32(%[[K]])
+    // CHECK-NOT: _or.s.i32
+    %mx = gpu.subgroup_reduce maximumf %v : (f32) -> f32
+    // CHECK: %[[Q:.*]] = llvm.call @air.quad_min.s.i32
+    // CHECK-NOT: _or.s.i32
+    // CHECK: %[[R:.*]] = llvm.bitcast %{{.*}} : i32 to f32
+    // CHECK: %[[RN:.*]] = llvm.fcmp "uno" %[[R]], %[[R]]
+    // CHECK: llvm.select %[[RN]], %{{.*}}, %[[R]]
+    // CHECK-NOT: _or.s.i32
+    %mn = gpu.subgroup_reduce minimumf %w cluster(size = 4) : (f32) -> f32
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     memref.store %mx, %out[%c0] : memref<8xf32, 1>
@@ -474,6 +547,63 @@ gpu.module @narrow_loops {
     air.simdgroup_matrix_store %acc, %c[%c0, %c0] : vector<64xf32> -> memref<8x8xf32, 1>
     gpu.return
   }
+  // A loop by 1 between i32 values cast to index (a CSR row's) is the loop
+  // over i32 between them, compared signed for signed casts; an iv that
+  // indexes a memref each iteration is not negative, cast unsigned.
+  // CHECK-LABEL: llvm.func @csr_row(
+  // CHECK-SAME: %[[B:[^:]*]]: i32, %[[E:[^:]*]]: i32)
+  // CHECK: llvm.br ^bb1(%[[B]], %{{.*}} : i32, f32)
+  // CHECK: ^bb1(%[[J:.*]]: i32, %{{.*}}: f32):
+  // CHECK: llvm.icmp "slt" %[[J]], %[[E]] : i32
+  // CHECK: llvm.zext %[[J]] : i32 to i64
+  // CHECK: llvm.add %[[J]], %{{.*}} : i32
+  // OFF-LABEL: llvm.func @csr_row(
+  // OFF: llvm.icmp "slt" %{{.*}}, %{{.*}} : i64
+  gpu.func @csr_row(%a: memref<1048576xf32, 1>, %o: memref<1xf32, 1>, %b: i32, %e: i32) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %zero = arith.constant 0.0 : f32
+    %lb = arith.index_cast %b : i32 to index
+    %ub = arith.index_cast %e : i32 to index
+    %s = scf.for %j = %lb to %ub step %c1 iter_args(%acc = %zero) -> f32 {
+      %v = memref.load %a[%j] : memref<1048576xf32, 1>
+      %r = arith.addf %acc, %v : f32
+      scf.yield %r : f32
+    }
+    memref.store %s, %o[%c0] : memref<1xf32, 1>
+    gpu.return
+  }
+  // From a constant (-8: signed), the iv's index arithmetic is 32-bit;
+  // unsigned casts give an unsigned loop.
+  // CHECK-LABEL: llvm.func @i32_bounds(
+  // CHECK-SAME: %[[N:[^:]*]]: i32, %[[U:[^:]*]]: i32)
+  // CHECK: %[[M8:.*]] = llvm.mlir.constant(-8 : i32) : i32
+  // CHECK: llvm.br ^bb1(%[[M8]] : i32)
+  // CHECK: ^bb1(%[[J:.*]]: i32):
+  // CHECK: llvm.icmp "slt" %[[J]], %[[N]] : i32
+  // CHECK: %[[J1:.*]] = llvm.add %[[J]], %{{.*}} : i32
+  // CHECK: llvm.mul %[[J1]], %[[J1]] : i32
+  // CHECK: llvm.add %[[J]], %{{.*}} overflow<nsw> : i32
+  // CHECK: ^bb4(%[[K:.*]]: i32):
+  // CHECK: llvm.icmp "ult" %[[K]], %[[U]] : i32
+  // CHECK: llvm.add %[[K]], %{{.*}} overflow<nuw> : i32
+  gpu.func @i32_bounds(%a: memref<1048576xf32, 1>, %n: i32, %u: i32) kernel {
+    %cm8 = arith.constant -8 : index
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %f = arith.constant 1.0 : f32
+    %ub = arith.index_cast %n : i32 to index
+    scf.for %j = %cm8 to %ub step %c1 {
+      %k = arith.addi %j, %c1 : index
+      %k2 = arith.muli %k, %k : index
+      memref.store %f, %a[%k2] : memref<1048576xf32, 1>
+    }
+    %uu = arith.index_castui %u : i32 to index
+    scf.for %j = %c0 to %uu step %c1 {
+      memref.store %f, %a[%j] : memref<1048576xf32, 1>
+    }
+    gpu.return
+  }
 }
 
 // -----
@@ -573,6 +703,98 @@ gpu.module @simdgroup_all_reduce {
     memref.store %s, %a[%c0] : memref<1024xf32, 1>
     gpu.return
   }
+  // Consecutive reductions whose results are used only after the last of
+  // them share one round: both partials stored under one lane-0 guard, one
+  // barrier, then both reductions of the partials.
+  // CHECK-LABEL: llvm.func @two_sums(
+  gpu.func @two_sums(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: %[[P:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK: %[[Q:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[P]], %{{.*}} : f32, !llvm.ptr<3>
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.store %[[Q]], %{{.*}} : f32, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: %[[R:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: %[[S:.*]] = llvm.call @air.simd_sum.f32(%{{.*}}) : (f32) -> f32
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.fadd %[[R]], %[[S]]
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    %v2 = arith.mulf %v, %v : f32
+    %q = gpu.all_reduce add %v2 uniform {} : (f32) -> (f32)
+    %t = arith.addf %s, %q : f32
+    memref.store %t, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // maximumf of f32: the SIMD-group reductions are subgroup_reduce's
+  // (the ordered keys' signed maximum), no shuffles.
+  // CHECK-LABEL: llvm.func @maximum(
+  gpu.func @maximum(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 256, 1, 1>} {
+    // CHECK-NOT: llvm.call @air.simd_shuffle
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK-NOT: llvm.call @air.simd_shuffle
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK-NOT: llvm.call @air.simd_shuffle
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce maximumf %v uniform {} : (f32) -> (f32)
+    memref.store %s, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
+  // Integers of 8, 16 and 64 bits as well (exact in any order): their partials
+  // in threadgroup memory and one barrier, instead of the generic lowering.
+  // CHECK-LABEL: llvm.func @sum_i64(
+  gpu.func @sum_i64(%a: memref<1024xi64, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: llvm.store %{{.*}}, %{{.*}} : i64, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.load %{{.*}} : !llvm.ptr<3> -> i64
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xi64, 1>
+    %s = gpu.all_reduce add %v uniform {} : (i64) -> (i64)
+    memref.store %s, %a[%c0] : memref<1024xi64, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @max_i16(
+  gpu.func @max_i16(%a: memref<1024xi16, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: llvm.store %{{.*}}, %{{.*}} : i16, !llvm.ptr<3>
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.load %{{.*}} : !llvm.ptr<3> -> i16
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xi16, 1>
+    %s = gpu.all_reduce maxsi %v uniform {} : (i16) -> (i16)
+    memref.store %s, %a[%c0] : memref<1024xi16, 1>
+    gpu.return
+  }
+  // A reduction whose result feeds the next one keeps its own round.
+  // CHECK-LABEL: llvm.func @dependent(
+  gpu.func @dependent(%a: memref<1024xf32, 1>) kernel
+      attributes {known_block_size = array<i32: 128, 1, 1>} {
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK: llvm.call @air.wg.barrier
+    // CHECK-NOT: llvm.call @air.wg.barrier
+    // CHECK: llvm.return
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<1024xf32, 1>
+    %s = gpu.all_reduce add %v uniform {} : (f32) -> (f32)
+    %d = arith.subf %v, %s : f32
+    %q = gpu.all_reduce add %d uniform {} : (f32) -> (f32)
+    memref.store %q, %a[%c0] : memref<1024xf32, 1>
+    gpu.return
+  }
   // CHECK-LABEL: llvm.func @partial(
   gpu.func @partial(%a: memref<1024xf32, 1>) kernel
       attributes {known_block_size = array<i32: 48, 1, 1>} {
@@ -622,16 +844,17 @@ gpu.module @clustered_reduce {
 
 // -----
 
-// Reductions AIR has no op for: of i64 (64-bit xor shuffles at 1 .. 16, the
-// shuffle lowering splitting each), and over clusters of 8 of f16 (AIR's
-// quad-group reduction, then a shuffle at 4).
+// Reductions AIR has no op for: an i64 product (64-bit xor shuffles at 1 ..
+// 16, the shuffle lowering splitting each; i64 minima, maxima, sums and
+// bitwise reductions are i32 reductions, L15-E442 / E443), and over clusters
+// of 8 of f16 (AIR's quad-group reduction, then a shuffle at 4).
 gpu.module @shuffle_reduce {
-  // CHECK-LABEL: llvm.func @i64max(
-  gpu.func @i64max(%a: memref<64xi64, 1>) kernel {
+  // CHECK-LABEL: llvm.func @i64mul(
+  gpu.func @i64mul(%a: memref<64xi64, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<64xi64, 1>
     // CHECK-COUNT-10: llvm.call @air.simd_shuffle_xor.u.i32
-    %r = gpu.subgroup_reduce maxui %v : (i64) -> i64
+    %r = gpu.subgroup_reduce mul %v : (i64) -> i64
     memref.store %r, %a[%c0] : memref<64xi64, 1>
     gpu.return
   }
@@ -644,6 +867,43 @@ gpu.module @shuffle_reduce {
     // CHECK: llvm.fadd %{{.*}} : f16
     %r = gpu.subgroup_reduce add %v cluster(size = 8) : (f16) -> f16
     memref.store %r, %a[%c0] : memref<64xf16, 1>
+    gpu.return
+  }
+  // maximumf / minimumf of f16: the f32 ordered-key reduction of the values
+  // extended, truncated; no shuffles.
+  // CHECK-LABEL: llvm.func @f16maximum(
+  gpu.func @f16maximum(%a: memref<64xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf16, 1>
+    // CHECK-NOT: simd_shuffle
+    // CHECK: llvm.fpext %{{.*}} : f16 to f32
+    // CHECK: llvm.call @air.simd_max.s.i32
+    // CHECK: llvm.fptrunc %{{.*}} : f32 to f16
+    // CHECK-NOT: simd_shuffle
+    %r = gpu.subgroup_reduce maximumf %v : (f16) -> f16
+    memref.store %r, %a[%c0] : memref<64xf16, 1>
+    gpu.return
+  }
+  // i8 and i16: AIR's i32 reduction of the values extended (signed for a
+  // signed minimum or maximum), truncated; no shuffles.
+  // CHECK-LABEL: llvm.func @narrow(
+  gpu.func @narrow(%a: memref<64xi16, 1>, %b: memref<64xi8, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xi16, 1>
+    %w = memref.load %b[%c0] : memref<64xi8, 1>
+    // CHECK-NOT: simd_shuffle
+    // CHECK: %[[S:.*]] = llvm.sext %{{.*}} : i16 to i32
+    // CHECK: %[[M:.*]] = llvm.call @air.quad_min.s.i32(%[[S]])
+    // CHECK: llvm.trunc %[[M]] : i32 to i16
+    %r = gpu.subgroup_reduce minsi %v cluster(size = 4) : (i16) -> i16
+    // CHECK-NOT: simd_shuffle
+    // CHECK: %[[Z:.*]] = llvm.zext %{{.*}} : i8 to i32
+    // CHECK: %[[A:.*]] = llvm.call @air.simd_sum.s.i32(%[[Z]])
+    // CHECK: llvm.trunc %[[A]] : i32 to i8
+    // CHECK-NOT: simd_shuffle
+    %q = gpu.subgroup_reduce add %w : (i8) -> i8
+    memref.store %r, %a[%c0] : memref<64xi16, 1>
+    memref.store %q, %b[%c0] : memref<64xi8, 1>
     gpu.return
   }
 }
@@ -681,14 +941,19 @@ gpu.module @accurate_m1 {
 // asinh, acosh, atanh, cbrt and erf, which MathToLLVM does not lower: the
 // first three through an accurate log1p (no log(x + sqrt(x^2 +- 1))), cbrt
 // as exp2(log2|x| / 3) and a Newton step, erf by the f32 polynomial; half in
-// float.
+// float. asinh and acosh take one log, of 1 + t below 4096 and of |x| (x)
+// above, for log1p's and log |x| + ln 2's two (L15-E308).
 gpu.module @inverse_hyperbolic {
   // CHECK-LABEL: llvm.func @k(
   gpu.func @k(%a: memref<8xf32, 1>, %h: memref<8xf16, 1>) kernel {
     %c0 = arith.constant 0 : index
     %v = memref.load %a[%c0] : memref<8xf32, 1>
     // CHECK-NOT: math.
-    // CHECK: llvm.intr.log
+    // CHECK: %[[NEAR:.*]] = llvm.fcmp "olt" %[[ABS:.*]], %{{.*}} : f32
+    // CHECK: %[[ARG:.*]] = llvm.select %[[NEAR]], %{{.*}}, %[[ABS]] : i1, f32
+    // CHECK: %[[LOG:.*]] = llvm.intr.log(%[[ARG]]) : (f32) -> f32
+    // CHECK-NOT: llvm.intr.log(
+    // CHECK: llvm.select %[[NEAR]], %{{.*}}, %{{.*}} : i1, f32
     // CHECK: llvm.intr.log2
     // CHECK: llvm.intr.exp2
     %s = math.asinh %v : f32
@@ -817,7 +1082,20 @@ gpu.module @exp_log_f64 {
     // CHECK-NOT: llvm.intr.exp
     // CHECK: llvm.intr.roundeven
     // CHECK: llvm.fdiv
-    // CHECK: llvm.shl
+    // y 2^k1 on y's exponent field, then one multiplication by 2^k2
+    // (L15-E326)
+    // CHECK-NEXT: llvm.fsub
+    // CHECK-NEXT: llvm.fsub
+    // CHECK-NEXT: %[[Y:.*]] = llvm.fsub
+    // CHECK-NEXT: %[[K:.*]] = llvm.fptosi
+    // CHECK: %[[K1:.*]] = llvm.ashr %[[K]]
+    // CHECK: %[[YB:.*]] = llvm.bitcast %[[Y]] : f64 to i64
+    // CHECK: %[[KS:.*]] = llvm.shl %[[K1]]
+    // CHECK: %[[SB:.*]] = llvm.add %[[YB]], %[[KS]] : i64
+    // CHECK: %[[S:.*]] = llvm.bitcast %[[SB]] : i64 to f64
+    // CHECK: %[[NAN:.*]] = llvm.fcmp "uno" %[[Y]], %[[Y]]
+    // CHECK: %[[SY:.*]] = llvm.select %[[NAN]], %[[Y]], %[[S]]
+    // CHECK: llvm.fmul %[[SY]], %{{.*}} : f64
     // CHECK-NOT: llvm.intr.log
     // CHECK: llvm.fdiv
     // CHECK: llvm.sitofp
@@ -852,6 +1130,911 @@ gpu.module @more_f64_functions {
     %e7 = math.sinh %e6 : f64
     %e8 = math.tanh %e7 : f64
     memref.store %e8, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 cosh and sinh: one exp, of |x| below 709 and of |x| / 2 from it
+// (sinh's expm1(|x|) from it too) (L15-E309).
+gpu.module @f64_cosh_sinh {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK: %[[A:.*]] = llvm.intr.fabs(%{{.*}}) : (f64) -> f64
+    // CHECK: %[[BELOW:.*]] = llvm.fcmp "olt" %[[A]], %{{.*}} : f64
+    // CHECK: %[[H:.*]] = llvm.fmul %[[A]], %{{.*}} : f64
+    // CHECK: llvm.select %[[BELOW]], %[[A]], %[[H]] : i1, f64
+    // CHECK-NOT: llvm.intr.fabs
+    // CHECK: llvm.select %[[BELOW]]
+    %e = math.cosh %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @s(
+  gpu.func @s(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK: %[[A:.*]] = llvm.intr.fabs(%{{.*}}) : (f64) -> f64
+    // CHECK: %[[BELOW:.*]] = llvm.fcmp "olt" %[[A]], %{{.*}} : f64
+    // CHECK: %[[H:.*]] = llvm.fmul %[[A]], %{{.*}} : f64
+    // CHECK: llvm.select %[[BELOW]], %[[A]], %[[H]] : i1, f64
+    // CHECK: llvm.select %[[BELOW]]
+    %e = math.sinh %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// arith.floordivsi by 2^k is the arithmetic shift by k; ceildivsi by 2^k that
+// shift plus 1 where a low bit is set (L15-E290).
+gpu.module @pow2_floor_ceil_div {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xi32, 1>, %v: i32) kernel {
+    %c8 = arith.constant 8 : i32
+    %c16 = arith.constant 16 : i32
+    %c6 = arith.constant 6 : i32
+    // CHECK: %[[F:.*]] = llvm.ashr %{{.*}}, %{{.*}} : i32
+    // CHECK-NOT: llvm.sdiv
+    %f = arith.floordivsi %v, %c8 : i32
+    // CHECK: %[[S:.*]] = llvm.ashr %{{.*}}, %{{.*}} : i32
+    // CHECK: %[[L:.*]] = llvm.and %{{.*}}, %{{.*}} : i32
+    // CHECK: llvm.icmp "ne" %[[L]]
+    // CHECK: llvm.add %[[S]]
+    // CHECK-NOT: llvm.sdiv
+    %g = arith.ceildivsi %v, %c16 : i32
+    // Another positive constant: s ^ ((x ^ s) / d), s the sign splat
+    // (L15-E293).
+    // CHECK: %[[SG:.*]] = llvm.ashr %{{.*}}, %{{.*}} : i32
+    // CHECK: %[[XS:.*]] = llvm.xor %{{.*}}, %[[SG]] : i32
+    // CHECK: %[[Q:.*]] = llvm.sdiv %[[XS]], %{{.*}} : i32
+    // CHECK: llvm.xor %[[Q]], %[[SG]] : i32
+    %h = arith.floordivsi %v, %c6 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    memref.store %f, %out[%c0] : memref<8xi32, 1>
+    memref.store %g, %out[%c1] : memref<8xi32, 1>
+    memref.store %h, %out[%c2] : memref<8xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A shuffle by the induction variable of a loop with uniform bounds (a
+// broadcast of each lane in turn) is a uniform shuffle of that lane, not a
+// per-thread source lane (L15-E297).
+gpu.module @loop_uniform_shuffle {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c32 = arith.constant 32 : index
+    %w = arith.constant 32 : i32
+    %zero = arith.constant 0.0 : f32
+    // CHECK: %[[L:.*]] = llvm.trunc %{{.*}} : i32 to i16
+    // CHECK: llvm.call @air.simd_shuffle.u.i32(%{{.*}}, %[[L]])
+    // CHECK: llvm.select %{{.*}}, %{{.*}}, %{{.*}} : i1, f32
+    %s = scf.for %k = %c0 to %c32 step %c1 iter_args(%acc = %zero) -> f32 {
+      %ki = arith.index_cast %k : index to i32
+      %b, %ok = gpu.shuffle idx %v, %ki, %w : f32
+      %acc2 = arith.addf %acc, %b : f32
+      scf.yield %acc2 : f32
+    }
+    memref.store %s, %out[%c0] : memref<8xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// gpu.rotate: a shuffle down by the offset and up by width - offset, both AIR
+// shifts, and a select by the lane's position in its segment; valid below
+// width. gpu.subgroup_broadcast: AIR's shuffle of the lane, or its broadcast
+// of the first active lane (L15-E298).
+gpu.module @rotate_broadcast {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xf32, 1>, %v: f32, %l: i32) kernel {
+    // CHECK: llvm.call @air.simd_shuffle_down.u.i32
+    // CHECK: llvm.call @air.simd_shuffle_up.u.i32
+    // CHECK: llvm.select
+    %r, %ok = gpu.rotate %v, 1, 8 : f32
+    // CHECK: llvm.call @air.simd_shuffle.u.i32
+    %b = gpu.subgroup_broadcast %v, specific_lane %l : f32
+    // CHECK: llvm.call @air.simd_broadcast_first.u.i32
+    %f = gpu.subgroup_broadcast %v, first_active_lane : f32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    memref.store %r, %out[%c0] : memref<8xf32, 1>
+    memref.store %b, %out[%c1] : memref<8xf32, 1>
+    memref.store %f, %out[%c2] : memref<8xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A shuffle offset a loop carries from a uniform start through uniform
+// updates (a scan's doubling offset) is uniform too (L15-E299).
+gpu.module @loop_carried_offset {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%out: memref<8xi32, 1>, %v: i32) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c5 = arith.constant 5 : index
+    %one = arith.constant 1 : i32
+    %w = arith.constant 32 : i32
+    // CHECK: llvm.call @air.simd_shuffle_up.u.i32
+    // CHECK-NOT: llvm.call @air.simd_shuffle.u.i32
+    %r:2 = scf.for %k = %c0 to %c5 step %c1 iter_args(%x = %v, %off = %one) -> (i32, i32) {
+      %u, %ok = gpu.shuffle up %x, %off, %w : i32
+      %x2 = arith.addi %x, %u : i32
+      %off2 = arith.shli %off, %one : i32
+      scf.yield %x2, %off2 : i32, i32
+    }
+    memref.store %r#0, %out[%c0] : memref<8xi32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 sinh and tanh: one division each of their own beside those of the exp
+// and expm1 they use (sinh's t^2 or t by t + 1, tanh's t or 2 by t + 2, the
+// dividend selected: L15-E323), and the expm1 fdlibm's, with one division
+// (L15-E814): 4 divisions in all; 8 with exp, log and Kahan's division
+// (expm1-f64-direct=0), 10 before L15-E323.
+gpu.module @f64_sinh_tanh_one_division {
+  // CHECK-LABEL: llvm.func @k(
+  // E1OFF-LABEL: gpu.module @f64_sinh_tanh_one_division
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    // CHECK-COUNT-4: llvm.fdiv
+    // CHECK-NOT: llvm.fdiv
+    // CHECK: llvm.return
+    // E1OFF-COUNT-8: llvm.fdiv
+    // E1OFF-NOT: llvm.fdiv
+    // E1OFF: llvm.return
+    %s = math.sinh %v : f64
+    %t = math.tanh %s : f64
+    memref.store %t, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 exp's polynomial in fdlibm's multiplies and adds, not fmas (the
+// emulated fma costs more than both: L15-E815); f64-polynomial-fma=1: fmas.
+gpu.module @f64_polynomial_mul_add {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.fma
+  // CHECK: llvm.return
+  // PFMA-LABEL: gpu.module @f64_polynomial_mul_add
+  // PFMA-COUNT-4: llvm.intr.fma
+  // PFMA-NOT: llvm.intr.fma
+  // PFMA: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.exp %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 log1p as fdlibm's (L15-E818): one division of doubles (log's s), the
+// correction c / u in f32 by the hardware's reciprocal; log1p-f64-direct=0:
+// log(1 + x) and Kahan's division, two.
+gpu.module @f64_log1p {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK: llvm.fdiv {{.*}} fastmath<afn> : f32
+  // CHECK: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK: llvm.return
+  // L1OFF-LABEL: gpu.module @f64_log1p
+  // L1OFF-COUNT-2: llvm.fdiv {{.*}} : f64
+  // L1OFF-NOT: llvm.fdiv
+  // L1OFF: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.log1p %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 asinh, acosh, atanh and cbrt (L15-E820; none lowered before): fdlibm's
+// forms from f64 log1p and sqrt: asinh 1 division and log1p's, acosh log1p's,
+// atanh 1 and log1p's, cbrt 3 (8 of doubles; log1p's f32 corrections 3).
+gpu.module @f64_inverse_hyperbolic {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: math.
+  // CHECK-COUNT-8: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: math.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.asinh %v : f64
+    %f = math.acosh %e : f64
+    %g = math.atanh %f : f64
+    %h = math.cbrt %g : f64
+    memref.store %h, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 atan, atan2, asin and acos (L15-E821; llvm.atan.f64 and the others had
+// no emulation): fdlibm's forms, atan one division (its operands selected),
+// atan2 y / x and its atan's, asin and acos their rational's and the square
+// root's correction (7), no intrinsic call of theirs left.
+gpu.module @f64_inverse_trig {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.{{a(tan|sin|cos)}}
+  // CHECK-COUNT-7: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: llvm.intr.{{a(tan|sin|cos)}}
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.atan %v : f64
+    %f = math.atan2 %e, %v : f64
+    %g = math.asin %f : f64
+    %h = math.acos %g : f64
+    memref.store %h, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 sin, cos and tan (L15-E822; llvm.sin.f64 and the others had no
+// emulation): fdlibm's kernels on x reduced by pi/2, Cody and Waite's below
+// 2^19 pi/2, Payne and Hanek's from it in a branch of its own (its window of
+// 2/pi's bits, its product's normalization and error fma); tan's one
+// division. No intrinsic call of theirs left.
+gpu.module @f64_trig {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.{{(sin|cos|tan)}}(
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.intr.ctlz
+  // CHECK: llvm.intr.fma
+  // CHECK: llvm.intr.roundeven
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.cond_br
+  // CHECK: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: llvm.intr.{{(sin|cos|tan)}}(
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.sin %v : f64
+    %f = math.cos %e : f64
+    %g = math.tan %f : f64
+    memref.store %g, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 pow (L15-E823; llvm.pow.f64 had no emulation): fdlibm's e_pow.c,
+// branch-free: log2|x| in two parts (a reciprocal), times y in two parts,
+// 2^z by exp's rational (a division); no intrinsic call of its left.
+gpu.module @f64_pow {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.pow
+  // CHECK-COUNT-2: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: llvm.intr.pow
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.powf %v, %v : f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 erf and erfc (L15-E824; before, left unlowered): fdlibm's s_erf.c with
+// its four rationals as one of selected coefficients (1/x^2, the quotient),
+// the tail's two exponentials as one (its division) and r / |x|: 4 divisions
+// each, no math op left.
+gpu.module @f64_erf {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: math.
+  // CHECK-COUNT-8: llvm.fdiv {{.*}} : f64
+  // CHECK-NOT: llvm.fdiv
+  // CHECK-NOT: math.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = math.erf %v : f64
+    %f = math.erfc %e : f64
+    memref.store %f, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f64 math on vectors (L15-E825): one scalar op an element, which the f64
+// rewrites expand (before, MathToLLVM's vector intrinsic was scalarized into
+// llvm.exp.f64 calls that the AIR target's f64 emulation does not take).
+gpu.module @f64_vector_math {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.exp
+  // CHECK-COUNT-2: llvm.intr.roundeven({{.*}}) : (f64) -> f64
+  // CHECK-NOT: llvm.intr.exp
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<8xf64, 1>, vector<2xf64>
+    %e = math.exp %v : vector<2xf64>
+    vector.store %e, %a[%c0] : memref<8xf64, 1>, vector<2xf64>
+    gpu.return
+  }
+}
+
+// -----
+
+// gpu.subgroup_reduce of f64 (L15-E826): AIR has no SIMD-group reduction of
+// doubles (it was air.simd_sum.s.i64 of the double, an integer sum of its
+// bits that the backend could not select): a butterfly of 32-bit shuffles of
+// both halves and the emulated adds, as for i64.
+gpu.module @f64_subgroup_reduce {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: air.simd_sum
+  // CHECK-COUNT-5: llvm.fadd {{.*}} : f64
+  // CHECK-NOT: air.simd_sum
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf64, 1>
+    %e = gpu.subgroup_reduce add %v : (f64) -> f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// vector.reduction of f64 (L15-E827): its scalar operations in order (LLVM's
+// ordered llvm.vector.reduce.fadd.v4f64 had no f64 emulation in the AIR
+// target).
+gpu.module @f64_vector_reduction {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: llvm.intr.vector.reduce
+  // CHECK-COUNT-3: llvm.fadd {{.*}} : f64
+  // CHECK-NOT: llvm.intr.vector.reduce
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<8xf64, 1>, vector<4xf64>
+    %e = vector.reduction <add>, %v : vector<4xf64> into f64
+    memref.store %e, %a[%c0] : memref<8xf64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// n-D vectors (L15-E828): shape casts, transposes and contractions lowered to
+// 1-D vectors first, as ConvertVectorToLLVMPass does (before, they were left
+// in the output); the contraction's outer products as fmuladds.
+#nd_map0 = affine_map<(i, j, k) -> (i, k)>
+#nd_map1 = affine_map<(i, j, k) -> (k, j)>
+#nd_map2 = affine_map<(i, j, k) -> (i, j)>
+gpu.module @nd_vectors {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: vector.
+  // CHECK: llvm.intr.fmuladd
+  // CHECK-NOT: vector.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<64xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<64xf32, 1>, vector<4xf32>
+    %m = vector.shape_cast %v : vector<4xf32> to vector<2x2xf32>
+    %t = vector.transpose %m, [1, 0] : vector<2x2xf32> to vector<2x2xf32>
+    %z = arith.constant dense<0.0> : vector<2x2xf32>
+    %r = vector.contract {indexing_maps = [#nd_map0, #nd_map1, #nd_map2], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %m, %t, %z : vector<2x2xf32>, vector<2x2xf32> into vector<2x2xf32>
+    %f = vector.shape_cast %r : vector<2x2xf32> to vector<4xf32>
+    vector.store %f, %a[%c0] : memref<64xf32, 1>, vector<4xf32>
+    gpu.return
+  }
+}
+
+// -----
+
+// complex functions with no ComplexToLLVM pattern (L15-E829): ComplexToStandard's
+// forms on the parts (complex.exp: e^re cos(im), e^re sin(im)); the ops
+// ComplexToLLVM lowers stay its own.
+gpu.module @complex_functions {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK-NOT: complex.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xcomplex<f32>, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xcomplex<f32>, 1>
+    %e = complex.exp %v : complex<f32>
+    %f = complex.mul %e, %v : complex<f32>
+    memref.store %f, %a[%c0] : memref<8xcomplex<f32>, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// gpu.dynamic_shared_memory (L15-E830; before, illegal): an external-size
+// threadgroup global the backend places after the static ones.
+gpu.module @dynamic_shared_memory {
+  // CHECK: llvm.mlir.global internal @__dynamic_shmem__0() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK: llvm.mlir.addressof @__dynamic_shmem__0 : !llvm.ptr<3>
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %sh = gpu.dynamic_shared_memory : memref<?xi8, #gpu.address_space<workgroup>>
+    %v = memref.view %sh[%c0][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<8xf32, #gpu.address_space<workgroup>>
+    %x = memref.load %a[%c0] : memref<8xf32, 1>
+    memref.store %x, %v[%c0] : memref<8xf32, #gpu.address_space<workgroup>>
+    gpu.return
+  }
+}
+
+// -----
+
+// An i1 in memory (L15-E831; AIR has none): a byte, loaded and truncated,
+// stored zero-extended, its GEPs over i8.
+gpu.module @i1_memory {
+  // CHECK-LABEL: llvm.func @k(
+  // CHECK: llvm.getelementptr {{.*}} -> !llvm.ptr<1>, i8
+  // CHECK: llvm.load {{.*}} : !llvm.ptr<1> -> i8
+  // CHECK: llvm.trunc {{.*}} : i8 to i1
+  // CHECK: llvm.zext {{.*}} : i1 to i8
+  // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
+  // CHECK-NOT: -> i1
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<8xi1, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v = memref.load %a[%c1] : memref<8xi1, 1>
+    %t = arith.constant true
+    %e = arith.xori %v, %t : i1
+    memref.store %e, %a[%c0] : memref<8xi1, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f16 functions computed in f32 with the hardware's approximations of the
+// steps for which every f16 input's result is the same (L15-E330): cbrt all
+// of them, asinh its square root only; off with approximate-half-functions=0.
+gpu.module @half_approximations {
+  // CHECK-LABEL: llvm.func @k(
+  // HALFOFF-LABEL: gpu.module @half_approximations
+  // HALFOFF-NOT: fastmath<afn>
+  // HALFOFF: llvm.return
+  gpu.func @k(%a: memref<8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf16, 1>
+    // CHECK: llvm.intr.log2(%{{.*}}) fastmath<afn> : (f32) -> f32
+    // CHECK: llvm.intr.exp2(%{{.*}}) fastmath<afn> : (f32) -> f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    // CHECK: llvm.intr.sqrt(%{{.*}}) fastmath<afn> : (f32) -> f32
+    // CHECK-NOT: fastmath<afn>
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} : f32
+    // CHECK: llvm.return
+    %c = math.cbrt %v : f16
+    %s = math.asinh %c : f16
+    memref.store %s, %a[%c0] : memref<8xf16, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// f16 erfc (widened to f32): its two divisions by the reciprocal (afn);
+// f32 erfc keeps the correctly rounded ones (L15-E337).
+gpu.module @half_erfc {
+  // CHECK-LABEL: llvm.func @k(
+  gpu.func @k(%a: memref<8xf16, 1>, %b: memref<8xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<8xf16, 1>
+    %w = memref.load %b[%c0] : memref<8xf32, 1>
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} fastmath<afn> : f32
+    // CHECK: llvm.fptrunc
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} : f32
+    // CHECK: llvm.fdiv %{{.*}}, %{{.*}} : f32
+    // CHECK: llvm.return
+    %e = math.erfc %v : f16
+    %f = math.erfc %w : f32
+    memref.store %e, %a[%c0] : memref<8xf16, 1>
+    memref.store %f, %b[%c0] : memref<8xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// The upper_bounds of positions read in the kernel's entry block before any
+// op with regions or a call hold for every execution: AGX hints, one
+// "x,y,z" per AIR system value, 0 where unknown (the backend's loop
+// analyses bound the position registers by them, L15-E391). A read after
+// a loop gives none.
+gpu.module @upper_bounds {
+  // CHECK-LABEL: llvm.func @entry(
+  // CHECK-SAME: ["agx-upper-bounds:air.threadgroup_position_in_grid", "256,0,0"]
+  // CHECK-SAME: ["agx-upper-bounds:air.thread_position_in_grid", "0,1024,0"]
+  gpu.func @entry(%out: memref<8xindex, 1>) kernel {
+    %b = gpu.block_id x upper_bound 256
+    %g = gpu.global_id y upper_bound 1024
+    %s = arith.addi %b, %g : index
+    %c0 = arith.constant 0 : index
+    memref.store %s, %out[%c0] : memref<8xindex, 1>
+    gpu.return
+  }
+  // CHECK-LABEL: llvm.func @after_loop(
+  // CHECK-NOT: agx-upper-bounds
+  // CHECK: llvm.return
+  gpu.func @after_loop(%out: memref<8xindex, 1>, %n: index) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %n step %c1 {
+      memref.store %i, %out[%c0] : memref<8xindex, 1>
+    }
+    %b = gpu.block_id x upper_bound 256
+    memref.store %b, %out[%c1] : memref<8xindex, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// i64 minimum / maximum reductions: two i32 AIR reductions, the high words'
+// in the operation's signedness, then the unsigned low words' of the lanes
+// whose high word is the result (L15-E442), no shuffles.
+gpu.module @k {
+  // CHECK-LABEL: llvm.func @reduce_i64
+  gpu.func @reduce_i64(%b: memref<64xi64, 1>, %o: memref<64xi64, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %w = memref.load %b[%c0] : memref<64xi64, 1>
+    // CHECK-NOT: shuffle
+    // CHECK: %[[H:.*]] = llvm.call @air.simd_max.s.i32(%[[HI:.*]]) : (i32) -> i32
+    // CHECK: %[[EQ:.*]] = llvm.icmp "eq" %[[HI]], %[[H]] : i32
+    // CHECK: %[[LO:.*]] = llvm.select %[[EQ]], %{{.*}}, %{{.*}} : i1, i32
+    // CHECK: llvm.call @air.simd_max.u.i32(%[[LO]]) : (i32) -> i32
+    %m = gpu.subgroup_reduce maxsi %w : (i64) -> i64
+    // CHECK: llvm.call @air.quad_min.u.i32
+    // CHECK: llvm.call @air.quad_min.u.i32
+    // CHECK-NOT: shuffle
+    %n = gpu.subgroup_reduce minui %w cluster(size = 4) : (i64) -> i64
+    // A sum: the high words', and the low words' two 16-bit halves' (no
+    // carry lost: below 2^21 over 32 lanes); xor: each word's (L15-E443).
+    // CHECK-COUNT-3: llvm.call @air.simd_sum.s.i32
+    // CHECK-COUNT-2: llvm.call @air.simd_xor.s.i32
+    // CHECK-NOT: shuffle
+    %s = gpu.subgroup_reduce add %w : (i64) -> i64
+    %x = gpu.subgroup_reduce xor %w : (i64) -> i64
+    %c2 = arith.constant 2 : index
+    %c3 = arith.constant 3 : index
+    memref.store %m, %o[%c0] : memref<64xi64, 1>
+    memref.store %n, %o[%c1] : memref<64xi64, 1>
+    memref.store %s, %o[%c2] : memref<64xi64, 1>
+    memref.store %x, %o[%c3] : memref<64xi64, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Views of memrefs (L15-E840): a subview, an expand_shape and a
+// collapse_shape as their sources' pointers with offsets computed in i64 (the
+// subview's from its dynamic offsets, r * 64 + q), no memref op left.
+gpu.module @memref_views {
+  // CHECK-LABEL: gpu.module @memref_views
+  // CHECK: llvm.func @k(
+  // CHECK: %[[RQ:.*]] = llvm.mul %arg2, %{{.*}} overflow<nsw> : i64
+  // CHECK: llvm.add %[[RQ]], %arg3 : i64
+  // CHECK-NOT: memref.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<16x64xf32, 1>, %b: memref<256xf32, 1>, %r: index, %q: index) kernel {
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %s = memref.subview %a[%r, %q] [4, 8] [2, 3] : memref<16x64xf32, 1> to memref<4x8xf32, strided<[128, 3], offset: ?>, 1>
+    %v = memref.load %s[%c1, %c2] : memref<4x8xf32, strided<[128, 3], offset: ?>, 1>
+    %e = memref.expand_shape %b [[0, 1]] output_shape [16, 16] : memref<256xf32, 1> into memref<16x16xf32, 1>
+    %w = memref.load %e[%c2, %c1] : memref<16x16xf32, 1>
+    %c = memref.collapse_shape %a [[0, 1]] : memref<16x64xf32, 1> into memref<1024xf32, 1>
+    %x = arith.addf %v, %w : f32
+    memref.store %x, %c[%q] : memref<1024xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A SIMD-group reduction of a vector as reductions of its elements, and a
+// constant mask as a constant (L15-E840).
+gpu.module @subgroup_reduce_vector {
+  // CHECK-LABEL: gpu.module @subgroup_reduce_vector
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.mlir.constant(dense<[true, false]> : vector<2xi1>)
+  // CHECK: llvm.extractelement
+  // CHECK: llvm.call @air.simd_sum.f32(
+  // CHECK: llvm.extractelement
+  // CHECK: llvm.call @air.simd_sum.f32(
+  // CHECK: llvm.intr.masked.store
+  gpu.func @k(%a: memref<64xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = vector.load %a[%c0] : memref<64xf32, 1>, vector<2xf32>
+    %r = gpu.subgroup_reduce add %v : (vector<2xf32>) -> vector<2xf32>
+    %m = vector.constant_mask [1] : vector<2xi1>
+    vector.maskedstore %a[%c0], %m, %r : memref<64xf32, 1>, vector<2xi1>, vector<2xf32>
+    gpu.return
+  }
+}
+
+// -----
+
+// The affine dialect's ops (an outlined kernel's index maps, loads and
+// stores) to arith and memref before the conversion (L15-E842): d0 * 2 + 1,
+// min(d0 floordiv 3, 50) by a compare and select.
+gpu.module @affine_ops {
+  // CHECK-LABEL: gpu.module @affine_ops
+  // CHECK: llvm.func @k(
+  // CHECK-NOT: affine.
+  // CHECK: llvm.icmp "slt"
+  // CHECK: llvm.select
+  // CHECK: llvm.load
+  // CHECK: llvm.store
+  // CHECK-NOT: affine.
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<256xf32, 1>, %i: index) kernel {
+    %c1 = arith.constant 1 : index
+    %j = affine.apply affine_map<(d0)[s0] -> (d0 * 2 + s0)>(%i)[%c1]
+    %k = affine.min affine_map<(d0) -> (d0 floordiv 3, 50)>(%i)
+    %v = affine.load %a[%j] : memref<256xf32, 1>
+    affine.store %v, %a[%k] : memref<256xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// A 1-D transfer that may run out of bounds as a masked load (its mask from
+// the memref's size), an in-bounds one as a plain store, and cf.assert as a
+// trap where its condition fails, not a call of puts and abort (L15-E843).
+gpu.module @assert_transfer {
+  // CHECK-LABEL: gpu.module @assert_transfer
+  // CHECK-NOT: llvm.func @abort
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.icmp "sgt" {{.*}} : vector<4xi32>
+  // CHECK: llvm.intr.masked.load
+  // CHECK: llvm.cond_br %{{.*}}, ^[[OK:.*]], ^[[FAIL:.*]]
+  // CHECK: ^[[OK]]:
+  // CHECK: llvm.store {{.*}} : vector<4xf32>, !llvm.ptr<1>
+  // CHECK: ^[[FAIL]]:
+  // CHECK-NEXT: llvm.intr.trap
+  // CHECK-NEXT: llvm.unreachable
+  gpu.func @k(%a: memref<256xf32, 1>, %i: index) kernel {
+    %p = arith.constant 0.0 : f32
+    %v = vector.transfer_read %a[%i], %p : memref<256xf32, 1>, vector<4xf32>
+    %e = vector.extract %v[0] : f32 from vector<4xf32>
+    %c = arith.cmpf oge, %e, %p : f32
+    cf.assert %c, "negative"
+    vector.transfer_write %v, %a[%i] {in_bounds = [true]} : vector<4xf32>, memref<256xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Conversions of small floats (L15-E844): an f8E4M3FN code extended to f32
+// as the half its fields make (the sign moved up by a multiply-add), scaled
+// by 2^8, its two NaN codes by one compare of their magnitude (L15-E851)
+// (L15-E846; with small-float-ext-via-half=0 in integer operations, its
+// denormals by uitofp and a scale), f32 rounded to f8E5M2 through the
+// hardware's half made round-to-odd (L15-E848) and f64 to f4E2M1FN on its
+// own bits (no double rounding either way), the codes stored as integers.
+gpu.module @small_floats {
+  // CHECK-LABEL: gpu.module @small_floats
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.load {{.*}} -> i8
+  // CHECK: llvm.zext {{.*}} : i8 to i16
+  // CHECK: llvm.add
+  // CHECK: llvm.shl
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.fmul
+  // CHECK: llvm.intr.fabs
+  // CHECK: llvm.fcmp "oeq"
+  // CHECK: llvm.select
+  // CHECK: llvm.store {{.*}} : f32, !llvm.ptr<1>
+  // SFINT-LABEL: gpu.module @small_floats
+  // SFINT: llvm.load {{.*}} -> i8
+  // SFINT-NOT: llvm.fpext {{.*}} : f16 to f32
+  // SFINT: llvm.uitofp {{.*}} : i32 to f32
+  // SFINT: llvm.store {{.*}} : f32, !llvm.ptr<1>
+  // CHECK: llvm.fptrunc {{.*}} : f32 to f16
+  // CHECK: llvm.fpext {{.*}} : f16 to f32
+  // CHECK: llvm.fcmp "une"
+  // CHECK: llvm.trunc {{.*}} : i16 to i8
+  // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
+  // CHECK: llvm.load {{.*}} -> f64
+  // CHECK-NOT: llvm.fptrunc
+  // CHECK: llvm.trunc {{.*}} : i64 to i4
+  // CHECK: llvm.store {{.*}} : i4, !llvm.ptr<1>
+  gpu.func @k(%a: memref<64xf8E4M3FN, 1>, %b: memref<64xf32, 1>, %c: memref<64xf8E5M2, 1>, %d: memref<64xf64, 1>, %e: memref<64xf4E2M1FN, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %a[%c0] : memref<64xf8E4M3FN, 1>
+    %x = arith.extf %v : f8E4M3FN to f32
+    memref.store %x, %b[%c0] : memref<64xf32, 1>
+    %t = arith.truncf %x : f32 to f8E5M2
+    memref.store %t, %c[%c0] : memref<64xf8E5M2, 1>
+    %w = memref.load %d[%c0] : memref<64xf64, 1>
+    %u = arith.truncf %w : f64 to f4E2M1FN
+    memref.store %u, %e[%c0] : memref<64xf4E2M1FN, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// Arithmetic and comparisons of small floats in f32 (L15-E845): the product
+// rounded to f8E4M3FN, and the comparison of the rounded product (extended
+// again), not of the f32 product.
+gpu.module @small_float_arith {
+  // CHECK-LABEL: gpu.module @small_float_arith
+  // CHECK: llvm.func @k(
+  // (the operands' denormal scales, then the product)
+  // CHECK: llvm.fmul
+  // CHECK: llvm.fmul
+  // CHECK: %[[P:.*]] = llvm.fmul %{{.*}}, %{{.*}} : f32
+  // CHECK-NOT: llvm.fcmp "olt" %[[P]],
+  // CHECK: llvm.fcmp "olt"
+  // CHECK: llvm.store {{.*}} : i8, !llvm.ptr<1>
+  gpu.func @k(%a: memref<64xf8E4M3FN, 1>, %b: memref<64xi1, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %v = memref.load %a[%c0] : memref<64xf8E4M3FN, 1>
+    %w = memref.load %a[%c1] : memref<64xf8E4M3FN, 1>
+    %s = arith.mulf %v, %w : f8E4M3FN
+    %c = arith.cmpf olt, %s, %v : f8E4M3FN
+    memref.store %s, %a[%c0] : memref<64xf8E4M3FN, 1>
+    memref.store %c, %b[%c0] : memref<64xi1, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// int4 weights (L15-E850): a vector.bitcast of bytes to i4 converted to f32
+// as each nibble under a half's 0x6400 (xor 0x6408 for a signed one) minus
+// 1032, extended to i32 by shifts at 32 bits, the nibbles interleaved; no i4
+// vector (which the backend scalarized into a byte load an element).
+gpu.module @int4 {
+  // CHECK-LABEL: gpu.module @int4
+  // CHECK: llvm.func @k(
+  // CHECK-NOT: i4>
+  // CHECK: llvm.load {{.*}} -> vector<2xi8>
+  // CHECK: llvm.and {{.*}} : vector<2xi16>
+  // CHECK: llvm.xor {{.*}} : vector<2xi16>
+  // CHECK: llvm.fadd {{.*}} : vector<2xf16>
+  // CHECK: llvm.lshr {{.*}} : vector<2xi16>
+  // CHECK: llvm.shufflevector {{.*}} [0, 2, 1, 3] : vector<2xf16>
+  // CHECK: llvm.and {{.*}} : vector<2xi32>
+  // CHECK: llvm.lshr {{.*}} : vector<2xi32>
+  // CHECK-NOT: i4>
+  // CHECK: llvm.return
+  gpu.func @k(%a: memref<64xi8, 1>, %o: memref<64xf32, 1>, %p: memref<64xi32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %b = vector.load %a[%c0] : memref<64xi8, 1>, vector<2xi8>
+    %q = vector.bitcast %b : vector<2xi8> to vector<4xi4>
+    %f = arith.sitofp %q : vector<4xi4> to vector<4xf32>
+    vector.store %f, %o[%c0] : memref<64xf32, 1>, vector<4xf32>
+    %u = arith.extui %q : vector<4xi4> to vector<4xi32>
+    vector.store %u, %p[%c0] : memref<64xi32, 1>, vector<4xi32>
+    gpu.return
+  }
+}
+
+// -----
+
+// gpu.subgroup_mma on AIR's 8x8 SIMD-group matrices (L15-E852): a 16x16
+// matrix is four, loaded and stored block by block (a transposed load's
+// blocks swapped), a 16x16x16 product eight multiply-accumulates, a
+// constant matrix a fill, a loop's matrix four iteration values.
+gpu.module @subgroup_mma {
+  // CHECK-LABEL: gpu.module @subgroup_mma
+  // CHECK: llvm.func @k(
+  // CHECK-COUNT-1: llvm.call @air.simdgroup_matrix_8x8_init_filled
+  // CHECK-COUNT-8: llvm.call @air.simdgroup_matrix_8x8_load
+  // CHECK-COUNT-8: llvm.call @air.simdgroup_matrix_8x8_multiply_accumulate
+  // CHECK-COUNT-4: llvm.call @air.simdgroup_matrix_8x8_store
+  // CHECK-NOT: gpu.subgroup_mma
+  gpu.func @k(%a: memref<32x32xf16, 1>, %b: memref<32x32xf16, 1>, %c: memref<32x32xf32, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %c16 = arith.constant 16 : index
+    %c32 = arith.constant 32 : index
+    %z = arith.constant 0.0 : f32
+    %acc0 = gpu.subgroup_mma_constant_matrix %z : !gpu.mma_matrix<16x16xf32, "COp">
+    %acc = scf.for %k = %c0 to %c32 step %c16 iter_args(%s = %acc0) -> (!gpu.mma_matrix<16x16xf32, "COp">) {
+      %A = gpu.subgroup_mma_load_matrix %a[%c0, %k] leadDimension 32 : memref<32x32xf16, 1> -> !gpu.mma_matrix<16x16xf16, "AOp">
+      %B = gpu.subgroup_mma_load_matrix %b[%c0, %k] leadDimension 32 transpose : memref<32x32xf16, 1> -> !gpu.mma_matrix<16x16xf16, "BOp">
+      %D = gpu.subgroup_mma_compute %A, %B, %s : !gpu.mma_matrix<16x16xf16, "AOp">, !gpu.mma_matrix<16x16xf16, "BOp"> -> !gpu.mma_matrix<16x16xf32, "COp">
+      scf.yield %D : !gpu.mma_matrix<16x16xf32, "COp">
+    }
+    gpu.subgroup_mma_store_matrix %acc, %c[%c0, %c0] leadDimension 32 : !gpu.mma_matrix<16x16xf32, "COp">, memref<32x32xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// With bare pointers, a memref argument of a dynamic leading size that
+// nothing reads the size of is one of a static size (L15-E853): its pointer
+// is all the indexing reads.
+gpu.module @dynamic_leading {
+  // CHECK-LABEL: gpu.module @dynamic_leading
+  // CHECK: llvm.func @k(%{{.*}}: !llvm.ptr<1>, %{{.*}}: !llvm.ptr<1>, %{{.*}}: i64)
+  // CHECK: llvm.load
+  // CHECK: llvm.store
+  gpu.func @k(%a: memref<?xf32, 1>, %o: memref<?x4xf32, 1>, %i: index) kernel {
+    %c2 = arith.constant 2 : index
+    %v = memref.load %a[%i] : memref<?xf32, 1>
+    memref.store %v, %o[%i, %c2] : memref<?x4xf32, 1>
+    gpu.return
+  }
+}
+
+// -----
+
+// subgroup_mma_elementwise as the operation on each block's vector<64 x T>
+// (L15-E855): addf an fadd, maxf an ordered compare and select with the NaN
+// where either is one, truncf an fptrunc; the AGX backend applies them to
+// the elements each thread holds.
+gpu.module @subgroup_mma_elementwise {
+  // CHECK-LABEL: gpu.module @subgroup_mma_elementwise
+  // CHECK: llvm.func @k(
+  // CHECK: llvm.fadd {{.*}} : vector<64xf32>
+  // CHECK: llvm.fcmp "ogt" {{.*}} : vector<64xf32>
+  // CHECK: llvm.fcmp "uno" {{.*}} : vector<64xf32>
+  // CHECK: llvm.fptrunc {{.*}} : vector<64xf32> to vector<64xf16>
+  // CHECK: llvm.call @air.simdgroup_matrix_8x8_store
+  gpu.func @k(%a: memref<8x8xf32, 1>, %c: memref<8x8xf16, 1>) kernel {
+    %c0 = arith.constant 0 : index
+    %z = arith.constant 0.0 : f32
+    %A = gpu.subgroup_mma_load_matrix %a[%c0, %c0] leadDimension 8 : memref<8x8xf32, 1> -> !gpu.mma_matrix<8x8xf32, "COp">
+    %Z = gpu.subgroup_mma_constant_matrix %z : !gpu.mma_matrix<8x8xf32, "COp">
+    %S = gpu.subgroup_mma_elementwise addf %A, %A : (!gpu.mma_matrix<8x8xf32, "COp">, !gpu.mma_matrix<8x8xf32, "COp">) -> !gpu.mma_matrix<8x8xf32, "COp">
+    %M = gpu.subgroup_mma_elementwise maxf %S, %Z : (!gpu.mma_matrix<8x8xf32, "COp">, !gpu.mma_matrix<8x8xf32, "COp">) -> !gpu.mma_matrix<8x8xf32, "COp">
+    %H = gpu.subgroup_mma_elementwise truncf %M : (!gpu.mma_matrix<8x8xf32, "COp">) -> !gpu.mma_matrix<8x8xf16, "COp">
+    gpu.subgroup_mma_store_matrix %H, %c[%c0, %c0] leadDimension 8 : !gpu.mma_matrix<8x8xf16, "COp">, memref<8x8xf16, 1>
     gpu.return
   }
 }

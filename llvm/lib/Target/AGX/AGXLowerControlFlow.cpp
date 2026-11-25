@@ -38,6 +38,7 @@
 #include "AGXInstrInfo.h"
 #include "AGXSubtarget.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/Support/CommandLine.h"
@@ -83,11 +84,23 @@ static cl::opt<bool> RegisterOnlyBetweenFences(
              "fence before, and a fence right after the same fence"),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> AGXSkipLoads(
+    "agx-unskipped-loads",
+    cl::desc("Let an if or else body run with an empty execution mask also "
+             "when it has plain loads"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> AGXSkipDeviceStores(
+    "agx-unskipped-device-stores",
+    cl::desc("Let an if or else body run with an empty execution mask also "
+             "when it has plain device stores"),
+    cl::init(true), cl::Hidden);
+
 static cl::opt<unsigned> MaxUnskippedInstrs(
     "agx-max-unskipped-instrs",
     cl::desc("Most ALU instructions an if or else body may have and still be "
              "run with an empty execution mask instead of jumped over"),
-    cl::init(4), cl::Hidden);
+    cl::init(12), cl::Hidden);
 
 // Integer conditions.
 static constexpr unsigned ICondUEQ = 0;
@@ -151,7 +164,13 @@ static bool isControlFlowPseudo(unsigned Opc) {
 
 /// Whether the blocks a jump_exec_none at the end of MBB would skip, up to
 /// Target, are a straight run of at most MaxUnskippedInstrs ALU instructions,
-/// so that running them with an empty execution mask is cheaper than the jump.
+/// plain loads and plain device stores, so that running them with an empty
+/// execution mask is cheaper than the jump. B31 measured a masked
+/// device_load + wait at 10-17 ns and a masked device_store at 7-10 ns; the
+/// jump costs its issue where a lane enters the body and a taken jump's
+/// latency and scheduler hold where none does. E135 kept memory accesses out
+/// before the simulator modelled the masked costs; with them, the jump loses
+/// even where no lane ever enters a body of one access (L15-E432, E433).
 static bool isShortALURun(MachineBasicBlock &MBB, MachineBasicBlock *Target) {
   unsigned Count = 0;
   MachineFunction &MF = *MBB.getParent();
@@ -170,9 +189,21 @@ static bool isShortALURun(MachineBasicBlock &MBB, MachineBasicBlock *Target) {
       // A branch to the next block is left out.
       if (MI.getOpcode() == AGX::AGX_BR && MI.getOperand(0).getMBB() == Next)
         continue;
-      if (isControlFlowPseudo(MI.getOpcode()) || MI.mayLoadOrStore() ||
-          MI.hasUnmodeledSideEffects() || MI.isCall() || MI.isTerminator() ||
-          AGXInstrInfo::isExecMaskOp(MI))
+      // A plain load (not an atomic or volatile access) touches nothing
+      // with an empty mask either (L15-E432), nor does a plain device store
+      // (L15-E433; B31 measured it, unlike a threadgroup store's).
+      bool Load = AGXSkipLoads && MI.mayLoad() && !MI.mayStore() &&
+                  !MI.hasOrderedMemoryRef();
+      bool Store =
+          AGXSkipDeviceStores && MI.mayStore() && !MI.mayLoad() &&
+          !MI.hasOrderedMemoryRef() && !MI.memoperands_empty() &&
+          llvm::all_of(MI.memoperands(), [](const MachineMemOperand *M) {
+            return M->getAddrSpace() == AGX::DEVICE_ADDRESS;
+          });
+      if (isControlFlowPseudo(MI.getOpcode()) ||
+          (MI.mayLoadOrStore() && !Load && !Store) ||
+          MI.hasUnmodeledSideEffects() ||
+          MI.isCall() || MI.isTerminator() || AGXInstrInfo::isExecMaskOp(MI))
         return false;
       // A shuffle also moves its index to r0h and resets it.
       Count += isShuffle(MI.getOpcode()) ? 3 : 1;
@@ -451,6 +482,78 @@ static bool removeFencesAfterBarriers(MachineFunction &MF) {
   return Changed;
 }
 
+static cl::opt<bool> RemoveTrailingFences(
+    "agx-remove-trailing-fences", cl::init(true), cl::Hidden,
+    cl::desc("Remove a kernel's fences that no memory access, barrier or call "
+             "follows on any path to its end"));
+
+/// A fence orders the thread's accesses before it against those after it:
+/// in a kernel, a fence that no memory access, barrier or call follows on
+/// any path to the stop (an acq_rel atomic's acquire fence at the end, a
+/// histogram's) orders nothing (L15-E438), and neither does the wait of an
+/// acquire's sequence (wait 0, then the fence) there: AGXInsertWaits, which
+/// runs after, still waits before the stop for load results in flight.
+/// Barriers count: a fence before one orders this thread's stores for the
+/// threads after it.
+static bool removeTrailingFences(MachineFunction &MF) {
+  if (!RemoveTrailingFences ||
+      MF.getFunction().getCallingConv() != CallingConv::AGX_KERNEL)
+    return false;
+  auto Relevant = [](const MachineInstr &MI) {
+    if (MI.isMetaInstruction() || MI.getOpcode() == AGX::MEMORY_BARRIER ||
+        MI.getOpcode() == AGX::WAIT)
+      return false;
+    if (MI.mayLoadOrStore() || MI.isCall() || MI.isInlineAsm() ||
+        MI.getOpcode() == AGX::THREADGROUP_BARRIER ||
+        MI.getOpcode() == AGX::BLOCK_BARRIER)
+      return true;
+    // (the execution mask's instructions and the stop order no memory)
+    return MI.hasUnmodeledSideEffects() && !AGXInstrInfo::isExecMaskOp(MI) &&
+           !MI.isTerminator() && !MI.isBranch();
+  };
+  // Clean[B]: no relevant instruction from B's end on any path (the
+  // greatest fixpoint: a path through one clears it).
+  DenseMap<const MachineBasicBlock *, bool> Clean, Inside;
+  for (MachineBasicBlock &MBB : MF) {
+    Inside[&MBB] = llvm::none_of(MBB, Relevant);
+    Clean[&MBB] = true;
+  }
+  for (bool Again = true; Again;) {
+    Again = false;
+    for (MachineBasicBlock &MBB : MF) {
+      bool C = llvm::all_of(MBB.successors(), [&](MachineBasicBlock *S) {
+        return Inside[S] && Clean[S];
+      });
+      // (a block that ends otherwise than in a stop or by its successors:
+      // a return to a caller, which kernels have none of)
+      if (MBB.succ_empty() && !(MBB.getFirstTerminator() != MBB.end() &&
+                                MBB.getFirstTerminator()->getOpcode() ==
+                                    AGX::AGX_STOP))
+        C = false;
+      if (C != Clean[&MBB]) {
+        Clean[&MBB] = C;
+        Again = true;
+      }
+    }
+  }
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    bool C = Clean[&MBB];
+    for (MachineInstr &MI : make_early_inc_range(reverse(MBB))) {
+      if ((MI.getOpcode() == AGX::MEMORY_BARRIER ||
+           MI.getOpcode() == AGX::WAIT) &&
+          C) {
+        MI.eraseFromParent();
+        Changed = true;
+        continue;
+      }
+      if (Relevant(MI))
+        C = false;
+    }
+  }
+  return Changed;
+}
+
 /// Remove the r0h resets that the next shuffle index of their block
 /// overwrites before the execution mask can change.
 static void removeRedundantIndexResets(MachineFunction &MF) {
@@ -484,10 +587,157 @@ static void removeRedundantIndexResets(MachineFunction &MF) {
   }
 }
 
+static cl::opt<bool> ShareLoopLevels(
+    "agx-share-loop-levels", cl::init(true), cl::Hidden,
+    cl::desc("A loop whose exit pop is followed at once by another pop runs "
+             "at the level of the construct around it, without its own push "
+             "and pop"));
+
+/// The loop entry push (if_fcmp r0l, eq, 0.0, 0.0, 1) and the exit pop of a
+/// loop whose exit pop is followed at once by another pop (of the construct
+/// the loop ends) are left out. With the push, a thread at level v > 0 on
+/// entry is at v + 1 in the loop, one that leaves it at 1; the two pops take
+/// these to v - 1 and 0. Without, they are at v and 1 in the loop and the
+/// one pop takes them to the same levels. In the loop, the threads that are
+/// active are the same: its own mask instructions (while, n = 1) only change
+/// active threads, and each construct inside it pushes before it tells
+/// levels apart (an else toggles level 1 only after its if has pushed every
+/// inactive thread deeper). Calls (which push 2 and rely on their callee's
+/// levels) are left alone.
+static unsigned countOpcode(MachineBasicBlock &MBB, unsigned Opc) {
+  return llvm::count_if(
+      MBB, [&](MachineInstr &MI) { return MI.getOpcode() == Opc; });
+}
+
+/// Whether MBB starts with two pops (it holds two end.cf pseudos, which go to
+/// its start), or holds one alone and falls through to a block that starts
+/// with one.
+static bool popFollowedByPop(MachineBasicBlock &MBB) {
+  unsigned Pops = countOpcode(MBB, AGX::AGX_END_CF);
+  if (Pops != 1)
+    return Pops >= 2;
+  bool Alone = llvm::all_of(MBB, [](MachineInstr &MI) {
+    return MI.isMetaInstruction() || MI.getOpcode() == AGX::AGX_END_CF;
+  });
+  if (!Alone || MBB.succ_size() != 1)
+    return false;
+  MachineBasicBlock *Next = *MBB.succ_begin();
+  return MBB.isLayoutSuccessor(Next) &&
+         countOpcode(*Next, AGX::AGX_END_CF) != 0;
+}
+
+static void eraseOne(MachineBasicBlock &MBB, unsigned Opc) {
+  for (MachineInstr &MI : MBB)
+    if (MI.getOpcode() == Opc) {
+      MI.eraseFromParent();
+      return;
+    }
+}
+
+static bool shareLoopLevels(MachineFunction &MF) {
+  if (!ShareLoopLevels || MF.getFrameInfo().hasCalls())
+    return false;
+  auto count = countOpcode;
+  bool Changed = false;
+  for (MachineBasicBlock &L : MF) {
+    MachineInstr *Latch = nullptr;
+    unsigned HeaderOp = 0;
+    for (MachineInstr &MI : L) {
+      switch (MI.getOpcode()) {
+      case AGX::AGX_LOOP:
+        Latch = &MI, HeaderOp = 1;
+        break;
+      case AGX::AGX_LOOP_ICMP:
+      case AGX::AGX_LOOP_FCMP:
+      case AGX::AGX_LOOP_ICMP16:
+        Latch = &MI, HeaderOp = 5;
+        break;
+      default:
+        break;
+      }
+    }
+    if (!Latch || L.succ_size() != 2)
+      continue;
+    MachineBasicBlock *Header = Latch->getOperand(HeaderOp).getMBB();
+    MachineBasicBlock *Exit = nullptr;
+    for (MachineBasicBlock *S : L.successors())
+      if (S != Header)
+        Exit = S;
+    if (!Exit || Exit->pred_size() != 1 || !L.isLayoutSuccessor(Exit) ||
+        Header->pred_size() != 2)
+      continue;
+    MachineBasicBlock *Pre = nullptr;
+    for (MachineBasicBlock *P : Header->predecessors())
+      if (P != &L)
+        Pre = P;
+    if (!Pre || Pre == &L || count(*Pre, AGX::AGX_LOOP_BEGIN) != 1)
+      continue;
+    if (!popFollowedByPop(*Exit))
+      continue;
+    for (MachineInstr &MI : make_early_inc_range(*Pre))
+      if (MI.getOpcode() == AGX::AGX_LOOP_BEGIN)
+        MI.eraseFromParent();
+    eraseOne(*Exit, AGX::AGX_END_CF);
+    Changed = true;
+  }
+  return Changed;
+}
+
+static cl::opt<bool> ShareIfLevels(
+    "agx-share-if-levels", cl::init(true), cl::Hidden,
+    cl::desc("An if without an else whose pop is followed at once by another "
+             "pop deactivates its threads by a while at the level of the "
+             "construct around it, without its own pop"));
+
+/// The ifs without an else whose pop is followed at once by another pop (of
+/// the construct the if ends): their compare is a while (n = 1), which
+/// deactivates the active threads where it fails (level 1) and leaves the
+/// inactive ones where they are, and their pop is left out. With the if, a
+/// thread at level v > 0 goes to v + 1 and one that fails to 1, and the two
+/// pops take them to v - 1 and 0; with the while, to v and 1, and the one
+/// pop gives the same. The active threads in the if are the same (the
+/// argument of shareLoopLevels). An else would tell its if's failing threads
+/// from the inactive ones by their level, so ifs with one are left alone.
+/// Inner ifs go first (from the end of the function), so that a run of them
+/// ending together shares one level.
+static void shareIfLevels(MachineFunction &MF,
+                          SmallPtrSetImpl<MachineInstr *> &Shared) {
+  if (!ShareIfLevels || MF.getFrameInfo().hasCalls())
+    return;
+  for (MachineBasicBlock &MBB : llvm::reverse(MF)) {
+    MachineInstr *If = nullptr;
+    unsigned TargetOp = 0;
+    for (MachineInstr &MI : MBB)
+      switch (MI.getOpcode()) {
+      case AGX::AGX_IF:
+        If = &MI, TargetOp = 1;
+        break;
+      case AGX::AGX_IF_ICMP:
+      case AGX::AGX_IF_FCMP:
+      case AGX::AGX_IF_ICMP16:
+        If = &MI, TargetOp = 5;
+        break;
+      default:
+        break;
+      }
+    if (!If)
+      continue;
+    MachineBasicBlock &Flow = *If->getOperand(TargetOp).getMBB();
+    if (countOpcode(Flow, AGX::AGX_ELSE) || !popFollowedByPop(Flow))
+      continue;
+    eraseOne(Flow, AGX::AGX_END_CF);
+    Shared.insert(If);
+  }
+}
+
 bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
   const AGXInstrInfo &TII = *MF.getSubtarget<AGXSubtarget>().getInstrInfo();
   bool HasControlFlow = false;
   bool HasShuffleIndex = false;
+
+  shareLoopLevels(MF);
+  SmallPtrSet<MachineInstr *, 8> SharedIfs;
+  shareIfLevels(MF, SharedIfs);
 
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : make_early_inc_range(MBB)) {
@@ -495,7 +745,9 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
       const DebugLoc &DL = MI.getDebugLoc();
       switch (MI.getOpcode()) {
       case AGX::AGX_IF: {
-        buildExecOp(MBB, I, DL, TII, AGX::IF_ICMP, ICondNE)
+        buildExecOp(MBB, I, DL, TII,
+                    SharedIfs.count(&MI) ? AGX::WHILE_ICMP : AGX::IF_ICMP,
+                    ICondNE)
             .addImm(0)
             .add(MI.getOperand(0))
             .addImm(0)
@@ -552,10 +804,12 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
         bool Float = Opc == AGX::AGX_IF_FCMP || Opc == AGX::AGX_LOOP_FCMP;
         bool Half = Opc == AGX::AGX_IF_ICMP16 || Opc == AGX::AGX_LOOP_ICMP16;
         unsigned CC = MI.getOperand(0).getImm() ^ (Loop ? 8 : 0);
+        // An if that shares the level around it is a while (shareIfLevels).
+        bool While = Loop || SharedIfs.count(&MI);
         unsigned Exec =
-            Half ? (Loop ? AGX::WHILE_ICMP16 : AGX::IF_ICMP16)
-            : Loop ? (Float ? AGX::WHILE_FCMP : AGX::WHILE_ICMP)
-                   : (Float ? AGX::IF_FCMP : AGX::IF_ICMP);
+            Half ? (While ? AGX::WHILE_ICMP16 : AGX::IF_ICMP16)
+            : While ? (Float ? AGX::WHILE_FCMP : AGX::WHILE_ICMP)
+                    : (Float ? AGX::IF_FCMP : AGX::IF_ICMP);
         buildExecOp(MBB, I, DL, TII, Exec, CC)
             .add(MI.getOperand(1))
             .add(MI.getOperand(2))
@@ -612,6 +866,7 @@ bool AGXLowerControlFlow::runOnMachineFunction(MachineFunction &MF) {
   removeRepeatedBarriers(MF);
   if (MergeBarrierFences)
     removeFencesAfterBarriers(MF);
+  removeTrailingFences(MF);
 
   MachineBasicBlock &Entry = MF.front();
   if (HasShuffleIndex)

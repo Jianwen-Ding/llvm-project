@@ -11,8 +11,16 @@
 // (measured on the M2 Max: ptx-re-blockers B34). Like SIInsertWaitcnts, this
 // pass inserts a wait on a group before any instruction reads or overwrites a
 // register with a pending result in it, both groups before barriers and at the
-// end of every block with pending results (so that no wait is needed across
-// control flow). At most sixteen requests are kept outstanding (-agx-max-pending).
+// end of a block with pending results whose successors could not take them
+// over. At most sixteen requests are kept outstanding.
+//
+// A request's lanes are those of its issue: a result stays pending across
+// control flow (exec mask changes included) into a later block whose
+// predecessors all come before it in the layout (an if's side and join, not a
+// loop's header), with the union of its predecessors' pending registers
+// (L15-E428). A block that ends the function takes them only when it reads
+// or overwrites one of them: its end would wait for the others, also after a
+// side that waited for them.
 //
 // A write of part of a register pair carries an implicit use and def of the
 // pair, which keep its other half live; they neither read nor write that
@@ -35,6 +43,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
@@ -63,14 +72,17 @@ INITIALIZE_PASS(AGXInsertWaits, DEBUG_TYPE, "AGX Insert Waits", false, false)
 
 FunctionPass *llvm::createAGXInsertWaitsPass() { return new AGXInsertWaits(); }
 
-#include "llvm/Support/CommandLine.h"
-// Sixteen requests outstanding (Mesa keeps eight): measured correct on G14C
-// (32 M loads checked; tile GEMMs, llama.cpp and PTX-formalization identical)
-// and 1-4% faster in the tile GEMMs (playground novel-results 2026-11-11-
-// pending-loads-shared-unit). Larger values are untested.
+static cl::opt<bool> AGXCrossBlockWaits(
+    "agx-cross-block-waits", cl::init(true), cl::Hidden,
+    cl::desc("Keep load results pending into later blocks reached only from "
+             "earlier ones instead of waiting at every block end"));
+
+/// (B34 measured 16 independent loads in flight behind one wait; a request
+/// beyond what the hardware tracks would stall its issue, not change a
+/// result: L15-E437, from 8)
 static cl::opt<unsigned> MaxPending(
-    "agx-max-pending", cl::init(16), cl::Hidden,
-    cl::desc("Asynchronous requests kept outstanding before a wait"));
+    "agx-max-pending-loads", cl::init(16), cl::Hidden,
+    cl::desc("Most load requests kept outstanding before a wait"));
 
 static bool isBarrier(const MachineInstr &MI) {
   return MI.getOpcode() == AGX::THREADGROUP_BARRIER ||
@@ -97,7 +109,8 @@ static bool isPartialWriteBookkeeping(const MachineInstr &MI,
 /// the index of the first later instruction that touches one of its results,
 /// is a barrier or ends the block.
 static DenseMap<const MachineInstr *, unsigned>
-firstUses(MachineBasicBlock &MBB, const TargetRegisterInfo &TRI) {
+firstUses(MachineBasicBlock &MBB, const TargetRegisterInfo &TRI,
+          bool Carries) {
   DenseMap<const MachineInstr *, unsigned> Out;
   SmallVector<MachineInstr *, 64> Instrs;
   for (MachineInstr &MI : MBB)
@@ -109,7 +122,7 @@ firstUses(MachineBasicBlock &MBB, const TargetRegisterInfo &TRI) {
     unsigned Use = Instrs.size();
     for (unsigned J = I + 1; J < Instrs.size() && Use == Instrs.size(); ++J) {
       const MachineInstr &UI = *Instrs[J];
-      if (isBarrier(UI) || UI.isCall() || UI.isTerminator()) {
+      if (isBarrier(UI) || UI.isCall() || (UI.isTerminator() && !Carries)) {
         Use = J;
         break;
       }
@@ -134,6 +147,29 @@ bool AGXInsertWaits::runOnMachineFunction(MachineFunction &MF) {
   const TargetRegisterInfo &TRI = *ST.getRegisterInfo();
   bool Changed = false;
 
+  // Blocks that may pass pending results on (to successors later in the
+  // layout, reached by no later block).
+  DenseMap<const MachineBasicBlock *, unsigned> Index;
+  for (const MachineBasicBlock &MBB : MF)
+    Index[&MBB] = Index.size();
+  auto Forward = [&](const MachineBasicBlock &S) {
+    return AGXCrossBlockWaits && !S.pred_empty() &&
+           llvm::all_of(S.predecessors(), [&](const MachineBasicBlock *P) {
+             return Index.lookup(P) < Index.lookup(&S);
+           });
+  };
+  auto Carries = [&](const MachineBasicBlock &P) {
+    return !P.succ_empty() &&
+           llvm::all_of(P.successors(), [&](const MachineBasicBlock *S) {
+             return Index.lookup(S) > Index.lookup(&P) && Forward(*S);
+           });
+  };
+  struct OutState {
+    BitVector Pending[2];
+    unsigned Count[2] = {0, 0};
+  };
+  DenseMap<const MachineBasicBlock *, OutState> Out;
+
   for (MachineBasicBlock &MBB : MF) {
     // Register allocation can insert a reload between CALL and its return
     // pop. RET has masked the returning lanes, so that reload would not run.
@@ -154,7 +190,9 @@ bool AGXInsertWaits::runOnMachineFunction(MachineFunction &MF) {
       }
     }
 
-    DenseMap<const MachineInstr *, unsigned> FirstUse = firstUses(MBB, TRI);
+    bool Carry = Carries(MBB);
+    DenseMap<const MachineInstr *, unsigned> FirstUse =
+        firstUses(MBB, TRI, Carry);
     struct Group {
       BitVector Pending;
       unsigned Count = 0;
@@ -185,13 +223,40 @@ bool AGXInsertWaits::runOnMachineFunction(MachineFunction &MF) {
       }
       return false;
     };
+    auto Ends = [&](const MachineInstr &MI) {
+      return isBarrier(MI) || MI.isCall() || (MI.isTerminator() && !Carry);
+    };
+
+    // The predecessors' pending results, needed at their first touch here.
+    if (Forward(MBB)) {
+      for (const MachineBasicBlock *P : MBB.predecessors()) {
+        auto It = Out.find(P);
+        if (It == Out.end())
+          continue;
+        for (unsigned G = 0; G < 2; ++G) {
+          Groups[G].Pending |= It->second.Pending[G];
+          Groups[G].Count = std::max(Groups[G].Count, It->second.Count[G]);
+        }
+      }
+      for (unsigned G = 0; G < 2; ++G) {
+        if (!Groups[G].Count)
+          continue;
+        unsigned K = 0;
+        for (const MachineInstr &MI : MBB) {
+          if (Ends(MI) || Touches(MI, G))
+            break;
+          ++K;
+        }
+        Groups[G].Needed = K;
+      }
+    }
 
     for (MachineInstr &MI : MBB) {
       if (MI.getOpcode() == AGX::WAIT) {
         Clear(MI.getOperand(0).getImm() & 1);
         continue;
       }
-      bool All = isBarrier(MI) || MI.isCall() || MI.isTerminator();
+      bool All = Ends(MI);
       for (unsigned G = 0; G < 2; ++G)
         if (Groups[G].Count && (All || Touches(MI, G)))
           Wait(MI.getIterator(), G);
@@ -235,6 +300,34 @@ bool AGXInsertWaits::runOnMachineFunction(MachineFunction &MF) {
       ++Groups[G].Count;
       Groups[G].Needed = std::min(Groups[G].Needed, Use);
       Changed = true;
+    }
+    // A block that ends the function takes them only to touch one: else its
+    // end would wait for them, also after a side that waited.
+    if (Carry)
+      for (const MachineBasicBlock *S : MBB.successors()) {
+        if (!S->succ_empty())
+          continue;
+        bool Used = false;
+        for (const MachineInstr &MI : *S) {
+          if (MI.isTerminator())
+            break;
+          Used |= Touches(MI, 0) || Touches(MI, 1);
+        }
+        if (!Used) {
+          Carry = false;
+          for (unsigned G = 0; G < 2; ++G)
+            if (Groups[G].Count)
+              Wait(MBB.getFirstTerminator(), G);
+          break;
+        }
+      }
+    if (Carry) {
+      OutState &O = Out[&MBB];
+      for (unsigned G = 0; G < 2; ++G) {
+        O.Pending[G] = Groups[G].Pending;
+        O.Count[G] = Groups[G].Count;
+      }
+      continue;
     }
     for (unsigned G = 0; G < 2; ++G)
       if (Groups[G].Count)

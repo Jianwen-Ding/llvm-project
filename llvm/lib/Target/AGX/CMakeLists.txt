@@ -32,14 +32,22 @@ add_llvm_target(AGXCodeGen
   AGXUniformConstants.cpp
   AGXLowerRecursion.cpp
   AGXFoldOperands.cpp
+  AGXInvariantHalves.cpp
+  AGXPairedHalfBitops.cpp
+  AGXAdvancePointers.cpp
   AGXHoistReloads.cpp
   AGXLoadLanesLive.cpp
   AGXHoistFromElseFlow.cpp
   AGXSinkRemat.cpp
   AGXFrameLowering.cpp
   AGXHoistGuardedLoads.cpp
+  AGXAliasVersioning.cpp
+  AGXWideIndexVersioning.cpp
+  AGXWordCounterVersioning.cpp
+  AGXSplitWideAccumulators.cpp
   AGXAlignmentVersioning.cpp
   AGXNarrowInductions.cpp
+  AGXWordIndices.cpp
   AGXSpecialRegisterRanges.cpp
   AGXVectorAccesses.cpp
   AGXISelDAGToDAG.cpp

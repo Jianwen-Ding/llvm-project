@@ -125,11 +125,27 @@ def AGXcvt_f_to_u8 : SDNode<"AGXISD::CVT_F_TO_U8", SDTAGXCvtF8>;
 def AGXcvt_f_to_s8 : SDNode<"AGXISD::CVT_F_TO_S8", SDTAGXCvtF8>;
 // Clamp to [0, 1], a NaN to +0 (the .sat output modifier).
 def AGXfsat : SDNode<"AGXISD::FSAT", SDTFPUnaryOp>;
+// maximum / minimum without the order of zeros: the larger (smaller) of a
+// and b, a NaN operand the result (b where both are). One fcmpsel: the "n"
+// conditions, which make a NaN lose, on (b, a) selecting a or b.
+def AGXfmax_nanprop : SDNode<"AGXISD::FMAX_NANPROP", SDTFPBinOp>;
+def AGXfmin_nanprop : SDNode<"AGXISD::FMIN_NANPROP", SDTFPBinOp>;
+// A 16-bit truth value (0 / 1) selected on a comparison: a select between
+// compares and 0 / 1 narrowed to 16 bits (L15-E369), with its own patterns
+// so that 8-bit immediate arms do not change other 16-bit selects.
+def AGXtruthsel : SDNode<"AGXISD::TRUTH_SELECT", SDTSelect>;
 // The 64-bit product of two 32-bit values, unsigned or signed (one imadd).
 def SDT_AGXMulWide : SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i32>,
                                           SDTCisVT<2, i32>]>;
 def AGXmul_wide_u : SDNode<"AGXISD::MUL_WIDE_U", SDT_AGXMulWide, [SDNPCommutative]>;
 def AGXmul_wide_s : SDNode<"AGXISD::MUL_WIDE_S", SDT_AGXMulWide, [SDNPCommutative]>;
+// A 64-bit value plus or minus one whose low word is zero, given as its
+// high word: the high words added (the low word is the first's, no carry),
+// one 32-bit iadd instead of the 64-bit one (L15-E660).
+def SDT_AGXAddHi : SDTypeProfile<1, 2, [SDTCisVT<0, i64>, SDTCisVT<1, i64>,
+                                        SDTCisVT<2, i32>]>;
+def AGXadd_hi : SDNode<"AGXISD::ADD_HI", SDT_AGXAddHi>;
+def AGXsub_hi : SDNode<"AGXISD::SUB_HI", SDT_AGXAddHi>;
 
 // Shifts with the hardware's 7-bit amount (0 to 127; bits shifted past the
 // register are gone), for 64-bit shifts by a variable amount: bfi a, b, s
@@ -138,7 +154,13 @@ def SDT_AGXBitfield : SDTypeProfile<1, 3, [SDTCisVT<0, i32>, SDTCisVT<1, i32>,
                                            SDTCisVT<2, i32>, SDTCisVT<3, i32>]>;
 def AGXbfi7 : SDNode<"AGXISD::BFI7", SDT_AGXBitfield>;
 def AGXextr7 : SDNode<"AGXISD::EXTR7", SDT_AGXBitfield>;
+// shlhi a, b, s: the bits of b that a left shift by s moves into the high
+// word, b >> (32 - s) below 32 and b << (s - 32) from it, over a.
+def AGXshlhi7 : SDNode<"AGXISD::SHLHI7", SDT_AGXBitfield>;
 def AGXsra7 : SDNode<"AGXISD::SRA7", SDTIntBinOp>;
+// asrh x, s: the low word of (sext(x) << 32) >> s (x's bits that an
+// arithmetic right shift of x:lo by s moves into the low word).
+def AGXasrh7 : SDNode<"AGXISD::ASRH7", SDTIntBinOp>;
 
 def AGXballot : SDNode<"AGXISD::BALLOT", SDTIntUnaryOp>;
 def AGXquad_ballot : SDNode<"AGXISD::QUAD_BALLOT", SDTIntUnaryOp>;

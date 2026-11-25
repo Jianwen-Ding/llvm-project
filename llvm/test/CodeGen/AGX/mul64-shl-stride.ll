@@ -56,7 +56,6 @@ define agx_kernel void @xblock(ptr addrspace(1) %p, ptr addrspace(1) %ix, i32 %n
 ; CHECK-NEXT:    get_sr r1, sr80 (thread_position_in_grid.x)
 ; CHECK-NEXT:    bitop 0101, r2, u5, 0
 ; CHECK-NEXT:    if_icmp r0l, ult, r1, u5, 1
-; CHECK-NEXT:    jmp_exec_none .LBB1_2
 ; CHECK-NEXT:  // %bb.1: // %body
 ; CHECK-NEXT:    device_load 0, i32, xy, r3_r4, u2_u3, r1, signed, lsl 1
 ; CHECK-NEXT:    bitop 0101, r8, u0, 0
@@ -70,7 +69,7 @@ define agx_kernel void @xblock(ptr addrspace(1) %p, ptr addrspace(1) %ix, i32 %n
 ; CHECK-NEXT:    iadd r4_r5, r8_r9, r4_r5, lsl 2
 ; CHECK-NEXT:    device_store 0, i32, x, r1, r6_r7, 0, signed
 ; CHECK-NEXT:    device_store 0, i32, x, r2, r4_r5, 0, signed
-; CHECK-NEXT:  .LBB1_2: // %done
+; CHECK-NEXT:  // %bb.2: // %done
 ; CHECK-NEXT:    pop_exec r0l, 1
 ; CHECK-NEXT:    stop
 ; CHECK-NEXT:    trap

@@ -169,13 +169,11 @@ define agx_kernel void @stack(ptr addrspace(1) %out, i32 %i) {
 ; CHECK-NEXT:    // threadgroup memory: 0 bytes
 ; CHECK-NEXT:    // stack size: 112 bytes
 ; CHECK-NEXT:  // %bb.0:
-; CHECK-NEXT:    mov_imm r1, 0
-; CHECK-NEXT:    iadd r1, r1, u2, lsl 2
+; CHECK-NEXT:    iadd r1, 0, u2, lsl 2
 ; CHECK-NEXT:    bitop 0101, r2, u2, 0
 ; CHECK-NEXT:    stack_adjust 28
 ; CHECK-NEXT:    stack_store 0, i32, x, r2, r1
-; CHECK-NEXT:    mov_imm r1, 12
-; CHECK-NEXT:    stack_load 0, i32, x, r1, r1
+; CHECK-NEXT:    stack_load 0, i32, x, r1, 12
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    device_store 0, i32, x, r1, u0_u1, 0, signed
 ; CHECK-NEXT:    stop

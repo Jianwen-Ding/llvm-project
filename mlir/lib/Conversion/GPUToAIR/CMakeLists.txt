@@ -6,7 +6,11 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
 
   LINK_LIBS PUBLIC
   MLIRAIRDialect
+  MLIRAffineDialect
+  MLIRAffineToStandard
   MLIRArithToLLVM
+  MLIRArithTransforms
+  MLIRComplexToStandard
   MLIRFuncToLLVM
   MLIRGPUDialect
   MLIRGPUToGPURuntimeTransforms
@@ -16,8 +20,11 @@ add_mlir_conversion_library(MLIRGPUToAIRTransforms
   MLIRMathDialect
   MLIRMathTransforms
   MLIRMemRefToLLVM
+  MLIRMemRefTransforms
   MLIRPass
   MLIRSCFDialect
   MLIRSCFToControlFlow
+  MLIRSCFTransforms
   MLIRVectorDialect
+  MLIRVectorTransforms
   )

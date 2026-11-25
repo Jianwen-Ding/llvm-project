@@ -13,6 +13,9 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 ; CHECK-NEXT: %s = call float @llvm.agx.simd.shuffle.f32(float %f, i32 %[[L]])
 ; CHECK: %x = call i32 @llvm.agx.simd.shuffle.xor.i32(i32 %i, i32 5)
 ; CHECK: %u = call i32 @llvm.agx.quad.shuffle.down.i32(i32 %i, i32 1)
+; Rotates: up by the delta, down as up by -delta mod the group's size.
+; CHECK: %ru = call i32 @llvm.agx.simd.shuffle.rotate.up.i32(i32 %i, i32 3)
+; CHECK: %rd = call i32 @llvm.agx.quad.shuffle.rotate.up.i32(i32 %i, i32 3)
 ; CHECK: %fsum = call float @llvm.agx.simd.reduce.f32(float %f, i32 1)
 ; CHECK: %isum = call i32 @llvm.agx.simd.reduce.i32(i32 %i, i32 16)
 ; CHECK: %smin = call i32 @llvm.agx.simd.reduce.i32(i32 %i, i32 20)
@@ -32,6 +35,8 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 declare float @air.simd_shuffle.f32(float, i16)
 declare i32 @air.simd_shuffle_xor.s.i32(i32, i16)
 declare i32 @air.quad_shuffle_down.u.i32(i32, i16)
+declare i32 @air.simd_shuffle_rotate_up.u.i32(i32, i16)
+declare i32 @air.quad_shuffle_rotate_down.u.i32(i32, i16)
 declare float @air.simd_sum.f32(float)
 declare i32 @air.simd_sum.s.i32(i32)
 declare i32 @air.simd_min.s.i32(i32)
@@ -50,6 +55,8 @@ define void @k(ptr addrspace(1) %out, i16 %lane) {
   %s = call float @air.simd_shuffle.f32(float %f, i16 %lane)
   %x = call i32 @air.simd_shuffle_xor.s.i32(i32 %i, i16 5)
   %u = call i32 @air.quad_shuffle_down.u.i32(i32 %i, i16 1)
+  %ru = call i32 @air.simd_shuffle_rotate_up.u.i32(i32 %i, i16 3)
+  %rd = call i32 @air.quad_shuffle_rotate_down.u.i32(i32 %i, i16 1)
   %fsum = call float @air.simd_sum.f32(float %f)
   %isum = call i32 @air.simd_sum.s.i32(i32 %i)
   %smin = call i32 @air.simd_min.s.i32(i32 %i)
@@ -63,7 +70,9 @@ define void @k(ptr addrspace(1) %out, i16 %lane) {
   %r1 = fadd float %s, %fsum
   %r2 = fadd float %r1, %excl
   store float %r2, ptr addrspace(1) %out
-  %r3 = add i32 %x, %u
+  %r3a = add i32 %x, %u
+  %r3b = add i32 %r3a, %ru
+  %r3 = add i32 %r3b, %rd
   %r4 = add i32 %r3, %isum
   %r5 = add i32 %r4, %smin
   %r6 = add i32 %r5, %umax

@@ -728,9 +728,19 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
     `air.wg.barrier`, SIMD-group functions and matrices), kernels are marked
     `air-kernel`, and the other dialects are converted to the LLVM dialect in
     AIR's address spaces.
+
+    Before the conversion the pass lowers what the LLVM dialect patterns do
+    not take: affine ops and memref views (subview, expand_shape,
+    collapse_shape) to arith and reinterpret casts; n-D vectors, transfers
+    and masks to 1-D ones; `gpu.subgroup_mma_*` to AIR's 8x8 SIMD-group
+    matrices; f64 math functions as fdlibm's algorithms; complex functions;
+    conversions of small floats (f8, f6, f4) exactly, and their arithmetic
+    in f32; extensions of i4 vectors as shifts of bytes; and `cf.assert` as a
+    trap.
   }];
   let dependentDialects = [
     "air::AIRDialect",
+    "affine::AffineDialect",
     "cf::ControlFlowDialect",
     "math::MathDialect",
     "memref::MemRefDialect",
@@ -752,16 +762,69 @@ def ConvertGpuOpsToAIROps : Pass<"convert-gpu-to-air", "gpu::GPUModuleOp"> {
            "Run scf.for loops over index whose iterations an in-bounds "
            "memref access or constant bounds keep below 2^31 over an "
            "unsigned i32 offset from the lower bound">,
+    Option<"speculateGuardedLoads", "speculate-guarded-loads", "bool",
+           /*default=*/"true",
+           "Run an scf.if whose regions only load from static memrefs and "
+           "compute without side effects on both sides, each load's indices "
+           "clamped into its memref, and select the results">,
+    Option<"constantTripLoops", "constant-trip-loops", "bool",
+           /*default=*/"true",
+           "Run scf.for loops whose lower bound is a lane or thread position "
+           "and whose constant upper bound and step give every value of it "
+           "the same trip count over that count from 0">,
     Option<"linearizeIndices", "linearize-indices", "bool",
            /*default=*/"true",
            "With narrow-indices, linearize the indices of memref loads and "
            "stores of static multi-dimensional memrefs whose elements are "
            "within 2^32 of the base in 32 bits">,
+    Option<"columnNoWrap", "column-no-wrap", "bool", /*default=*/"true",
+           "With linearize-indices, compute without wrapping (nuw) the "
+           "linear index of an access in a loop that stores nothing and "
+           "steps an outer dimension: a column's, which LLVM then reads "
+           "through one pointer at immediate offsets">,
     Option<"simdgroupAllReduce", "simdgroup-all-reduce", "bool",
            /*default=*/"true",
            "Lower uniform gpu.all_reduce in kernels of a known threadgroup "
            "size that is a multiple of 32 to SIMD-group reductions and one "
            "round through threadgroup memory">,
+    Option<"erfReciprocalDivision", "erf-reciprocal-division", "bool",
+           /*default=*/"true",
+           "Divide f32 erf's rational approximation by the hardware's "
+           "reciprocal, one Newton step and a residual correction, where "
+           "every input's result is the same">,
+    Option<"f64PolynomialFma", "f64-polynomial-fma", "bool",
+           /*default=*/"false",
+           "Evaluate the f64 exp, log and expm1 expansions' polynomials with "
+           "fma, not fdlibm's multiplies and adds">,
+    Option<"trigF64SharedPolynomial", "trig-f64-shared-polynomial", "bool",
+           /*default=*/"true",
+           "f64 sin and cos with one polynomial chain of selected "
+           "coefficients, not both kernels">,
+    Option<"staticLeadingDimArgs", "static-leading-dim-args", "bool",
+           /*default=*/"true",
+           "With bare pointers, a kernel's memref argument of a dynamic leading "
+           "size that nothing reads the size of as one of a static size">,
+    Option<"subByteRewrites", "sub-byte-rewrites", "bool",
+           /*default=*/"true",
+           "Rewrite extensions of sub-byte integer vectors (bitcasts of bytes "
+           "to i4) as shifts of the bytes">,
+    Option<"smallFloatExtViaHalf", "small-float-ext-via-half", "bool",
+           /*default=*/"true",
+           "Extend a small float of at most 5 exponent bits as the half its "
+           "fields make, scaled, not by integer operations">,
+    Option<"log1pF64Direct", "log1p-f64-direct", "bool",
+           /*default=*/"true",
+           "math.log1p of f64 as fdlibm's log1p, not log with Kahan's "
+           "division">,
+    Option<"expm1F64Direct", "expm1-f64-direct", "bool",
+           /*default=*/"true",
+           "math.expm1 of f64 (and sinh's and tanh's) as fdlibm's expm1, not "
+           "exp with Kahan's log correction">,
+    Option<"approximateHalfFunctions", "approximate-half-functions", "bool",
+           /*default=*/"true",
+           "Compute f16 and bf16 cbrt, acosh, atanh, asinh, expm1 and log1p "
+           "with the hardware's approximations of some of their f32 steps, "
+           "where every input's result is the same">,
   ];
 }
 

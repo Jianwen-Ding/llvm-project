@@ -27,7 +27,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "AGX.h"
+#include "Utils/AGXBaseInfo.h"
+#include "llvm/IR/IntrinsicsAGX.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -41,11 +47,17 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "agx-narrow-inductions"
+
+static cl::opt<bool> AGXUnknownRanges(
+    "agx-upper-bound-unknown-ranges", cl::init(true), cl::Hidden,
+    cl::desc("The upper bound of a value SCEV does not analyze is its "
+             "unsigned range's"));
 
 static cl::opt<bool> AGXNonNegativeCasts(
     "agx-non-negative-casts", cl::init(true), cl::Hidden,
@@ -104,6 +116,10 @@ static cl::opt<bool> AGXSignedNarrowing(
     cl::desc("Narrow 64-bit inductions whose signed range fits 32 bits, "
              "with sign-extended uses"));
 
+static cl::opt<bool> AGXLatchBoundNarrowing(
+    "agx-latch-bound-narrowing", cl::init(true), cl::Hidden,
+    cl::desc("Narrow an induction the latch's unsigned exit test bounds"));
+
 static bool fitsSigned32(ScalarEvolution &SE, Value *V) {
   return SE.getUnsignedRange(SE.getSCEV(V)).getUnsignedMax().ult(1u << 31);
 }
@@ -123,6 +139,34 @@ static bool narrow(PHINode &Phi, Loop &L, ScalarEvolution &SE) {
   // uses, the narrow add without unsigned wrap flags.
   bool Unsigned = fitsSigned32(SE, &Phi) && fitsSigned32(SE, Inc) &&
                   fitsSigned32(SE, Step);
+  // The latch's exit test bounds it more closely than scalar evolution's
+  // range (its maximum trip count times the step's maximum: a grid-stride
+  // loop's {0, +, umin(grid, 2^20)} below umin(n - i, 2^20) came out near
+  // 2^32): where the loop continues only while inc <u b, phi is at most
+  // max(start, b - 1), and inc (no unsigned wrap) at most that plus the step.
+  if (!Unsigned && AGXLatchBoundNarrowing && Inc->hasNoUnsignedWrap()) {
+    auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+    auto *Cmp = Br ? dyn_cast<ICmpInst>(Br->getCondition()) : nullptr;
+    if (Cmp && Cmp->getOperand(0) == Inc &&
+        L.isLoopInvariant(Cmp->getOperand(1)) &&
+        Br->getSuccessor(0) == L.getHeader() &&
+        !L.contains(Br->getSuccessor(1)) &&
+        (Cmp->getPredicate() == ICmpInst::ICMP_ULT ||
+         (Cmp->getPredicate() == ICmpInst::ICMP_SLT && Cmp->hasSameSign()))) {
+      auto UMax = [&](Value *V) {
+        return SE.getUnsignedRange(SE.getSCEV(V)).getUnsignedMax();
+      };
+      APInt BoundMax = UMax(Cmp->getOperand(1)), StartMax = UMax(Start),
+            StepMax = UMax(Step);
+      APInt Lim(64, uint64_t(1) << 31);
+      if (BoundMax.ult(Lim) && StartMax.ult(Lim) && StepMax.ult(Lim)) {
+        APInt PhiMax = APIntOps::umax(StartMax, BoundMax.isZero()
+                                                     ? BoundMax
+                                                     : BoundMax - 1);
+        Unsigned = (PhiMax + StepMax).ult(Lim);
+      }
+    }
+  }
   auto SignedFits = [&](Value *V) {
     ConstantRange R = SE.getSignedRange(SE.getSCEV(V));
     return R.getSignedMin().sge(APInt::getSignedMinValue(32).sext(64)) &&
@@ -659,12 +703,26 @@ static cl::opt<bool> AGXSignedCounterIndices(
              "signed index"));
 
 static cl::opt<bool> AGXIntegerAddressCounters(
-    "agx-integer-address-counters", cl::init(false), cl::Hidden,
+    "agx-integer-address-counters", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter also for i64 addresses (inttoptr users)"));
+static cl::opt<bool> AGXDoubleWordCounters(
+    "agx-double-word-counters", cl::init(true), cl::Hidden,
+    cl::desc("pointerFromCounter also for accesses of 64-bit elements (i64, "
+             "double)"));
 static cl::opt<bool> AGXRelativeCounters(
     "agx-relative-counters", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter with the counter less its start, where the "
              "trip count bounds it"));
+static cl::opt<unsigned> AGXCounterBaseOffsets(
+    "agx-counter-base-offsets", cl::init(1), cl::Hidden,
+    cl::desc("pointerFromCounter for an i64 address only where its accesses "
+             "take at most this many constant offsets"));
+static cl::opt<bool> AGXRelativeCounterPhis(
+    "agx-relative-counter-phis", cl::init(true), cl::Hidden,
+    cl::desc("A relative counter as a recurrence of its own"));
+static cl::opt<bool> AGXRelativeCounters32(
+    "agx-relative-counters-32", cl::init(true), cl::Hidden,
+    cl::desc("A relative counter's index up to 2^32 (its unsigned range)"));
 static cl::opt<bool> AGXRuntimeCounterStarts(
     "agx-runtime-counter-starts", cl::init(true), cl::Hidden,
     cl::desc("pointerFromCounter also for a counter whose start is not a "
@@ -697,7 +755,8 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
   if (Sp->isNegative() || Sp->isZero())
     return false;
   // the accesses: P itself (through an inttoptr for an i64), of 32-bit
-  // elements
+  // elements, or 64-bit ones (two words each: the index register counts
+  // the words, L15-E680)
   auto Access = [&](User *U, Value *Ptr) {
     Type *T = nullptr;
     if (auto *Ld = dyn_cast<LoadInst>(U))
@@ -705,12 +764,16 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     else if (auto *St = dyn_cast<StoreInst>(U))
       T = St->getPointerOperand() == Ptr ? St->getValueOperand()->getType()
                                          : nullptr;
-    return T && T->getScalarSizeInBits() == 32 &&
+    return T &&
+           (T->getScalarSizeInBits() == 32 ||
+            (AGXDoubleWordCounters && T->getScalarSizeInBits() == 64)) &&
            L.contains(cast<Instruction>(U));
   };
   // For an i64: each pointer an access takes, inttoptr(P) or a constant
   // GEP of bytes from it, with its offset (folded into a base of its own).
   SmallVector<std::pair<Instruction *, int64_t>, 4> Ptrs;
+  // the offsets the accesses take
+  SmallSet<int64_t, 4> Offsets;
   for (User *U : P.users()) {
     if (U == Inc)
       continue;
@@ -720,11 +783,15 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
       continue;
     }
     auto *I2P = dyn_cast<IntToPtrInst>(U);
-    if (!I2P || !L.contains(I2P) || I2P->use_empty())
+    // (device accesses: a threadgroup access takes no index register)
+    if (!I2P || !L.contains(I2P) || I2P->use_empty() ||
+        I2P->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
       return false;
     for (User *V : I2P->users()) {
-      if (Access(V, I2P))
+      if (Access(V, I2P)) {
+        Offsets.insert(0);
         continue;
+      }
       auto *G = dyn_cast<GetElementPtrInst>(V);
       const APInt *C;
       if (!G || G->getPointerOperand() != I2P || G->getNumIndices() != 1 ||
@@ -733,9 +800,16 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
           !all_of(G->users(), [&](User *W) { return Access(W, G); }))
         return false;
       Ptrs.push_back({G, C->getSExtValue()});
+      Offsets.insert(C->getSExtValue());
     }
     Ptrs.push_back({I2P, 0});
   }
+  // Each constant offset takes a base register pair of its own (an access
+  // with an index register has no immediate offset): one pointer with
+  // accesses at four offsets (an unrolled loop) kept its pointer and its
+  // immediate offsets, one 64-bit addition against four pairs.
+  if (IsInt && Offsets.size() > AGXCounterBaseOffsets)
+    return false;
   for (PHINode &J : L.getHeader()->phis()) {
     if (!J.getType()->isIntegerTy(32) || J.getNumIncomingValues() != 2)
       continue;
@@ -751,10 +825,16 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     uint64_t AbsT = T->abs().getZExtValue();
     auto *MaxBTC =
         dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
-    bool Bounded = AGXRelativeCounters && MaxBTC &&
-                   MaxBTC->getAPInt().getActiveBits() <= 31 &&
-                   (MaxBTC->getAPInt().getZExtValue() + 1) * AbsT <
-                       (uint64_t(1) << 31);
+    // (j - j0 is zero-extended to the 32-bit unsigned index: exact while
+    // the last iteration's, |t| times the maximum backedge-taken count, is
+    // below 2^32; -agx-relative-counters-32 = 0: below 2^31 after one more.)
+    bool Bounded =
+        AGXRelativeCounters && MaxBTC &&
+        MaxBTC->getAPInt().getActiveBits() <= 32 &&
+        (AGXRelativeCounters32
+             ? MaxBTC->getAPInt().getZExtValue() * AbsT < (uint64_t(1) << 32)
+             : (MaxBTC->getAPInt().getZExtValue() + 1) * AbsT <
+                   (uint64_t(1) << 31));
     bool Relative =
         Bounded && (T->isNegative() ||
                     (!isa<ConstantInt>(J0) && !SE.getUnsignedRange(SE.getSCEV(&J))
@@ -798,7 +878,42 @@ static bool pointerFromCounter(PHINode &P, Loop &L, ScalarEvolution &SE) {
     Value *P0 = P.getIncomingValueForBlock(Pre);
     IRBuilder<> B(L.getHeader(), L.getHeader()->getFirstInsertionPt());
     Value *Z;
-    if (Relative)
+    if (Relative && AGXRelativeCounterPhis) {
+      // its own recurrence, 0 then +|t| at the latch (not j - j0 before the
+      // accesses, which an access then waits for)
+      // (one per step: the loop's other pointers share it)
+      PHINode *R = nullptr;
+      for (PHINode &Q : L.getHeader()->phis())
+        if (Q.getType() == J.getType() && Q.getNumIncomingValues() == 2 &&
+            match(Q.getIncomingValueForBlock(Pre), m_Zero()) &&
+            match(Q.getIncomingValueForBlock(Latch),
+                  m_Add(m_Specific(&Q), m_SpecificInt(AbsT))))
+          R = &Q;
+      if (!R) {
+        R = B.CreatePHI(J.getType(), 2, J.getName() + ".rel");
+        R->addIncoming(ConstantInt::get(J.getType(), 0), Pre);
+        // beside j's own add (which the exit test follows)
+        IRBuilder<> LB(JInc->getNextNode());
+        Value *RInc =
+            LB.CreateAdd(R, ConstantInt::get(J.getType(), AbsT));
+        R->addIncoming(RInc, Latch);
+        // The exit test j + t == x as r + |t| == x - j0 (j0 - x for a
+        // negative t), so that j and its add can go.
+        for (User *U : make_early_inc_range(JInc->users())) {
+          auto *Cmp = dyn_cast<ICmpInst>(U);
+          if (!Cmp || !Cmp->isEquality() || !L.contains(Cmp))
+            continue;
+          unsigned XI = Cmp->getOperand(0) == JInc ? 1 : 0;
+          Value *X = Cmp->getOperand(XI);
+          if (X == JInc || !L.isLoopInvariant(X))
+            continue;
+          Value *NX = T->isNegative() ? PB.CreateSub(J0, X) : PB.CreateSub(X, J0);
+          Cmp->setOperand(XI, NX);
+          Cmp->setOperand(1 - XI, RInc);
+        }
+      }
+      Z = B.CreateZExt(R, I64);
+    } else if (Relative)
       Z = B.CreateZExt(T->isNegative() ? B.CreateSub(J0, &J) : B.CreateSub(&J, J0),
                        I64);
     else
@@ -858,6 +973,11 @@ static cl::opt<bool> AGXDeadAfterNarrowing(
     cl::desc("Delete what narrowing a loop's inductions left dead before the "
              "rewrites that count uses"));
 
+static cl::opt<bool> AGXMergeDownCountersByStep(
+    "agx-merge-down-counters-by-step", cl::init(true), cl::Hidden,
+    cl::desc("Also a down-counter by a constant d > 1 from a constant d "
+             "divides"));
+
 static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
   using namespace PatternMatch;
   BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
@@ -865,9 +985,22 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
       C.getNumIncomingValues() != 2)
     return false;
   auto *Cn = dyn_cast<BinaryOperator>(C.getIncomingValueForBlock(Latch));
-  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_AllOnes())) ||
-      Cn->getParent() != Latch || !C.hasOneUse())
+  // c' = c - d: d = 1, or (an unrolled loop's counter, L15-E439) a larger d
+  // from a constant c0 that d divides, which reaches zero after c0 / d
+  // iterations
+  const APInt *Dec;
+  if (!Cn || !match(Cn, m_Add(m_Specific(&C), m_APInt(Dec))) ||
+      !Dec->isNegative() || Cn->getParent() != Latch || !C.hasOneUse())
     return false;
+  APInt D = -*Dec;
+  std::optional<APInt> Trips;
+  if (!D.isOne()) {
+    auto *C0 = dyn_cast<ConstantInt>(C.getIncomingValueForBlock(Pre));
+    if (!AGXMergeDownCountersByStep || !C0 || C0->getValue().isNegative() ||
+        C0->isZero() || !C0->getValue().urem(D).isZero())
+      return false;
+    Trips = C0->getValue().udiv(D);
+  }
   // c' only in the phi and one exit test against zero by the latch's branch
   ICmpInst *Cmp = nullptr;
   for (User *U : Cn->users()) {
@@ -894,17 +1027,23 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
     // s = 2^m odd: s c' = s n holds for c' = n mod 2^(32 - m) only, so with
     // fewer than 2^(32 - m) iterations (the trip count's constant bound).
     if (unsigned M = S->countr_zero()) {
-      auto *Max =
-          dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
-      if (!Max || Max->getAPInt().getActiveBits() > 32 - M ||
-          !(Max->getAPInt().zext(64) + 1).ult(APInt(64, 1).shl(32 - M)))
-        continue;
+      if (Trips) {
+        if (!Trips->zext(64).ult(APInt(64, 1).shl(32 - M)))
+          continue;
+      } else {
+        auto *Max =
+            dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
+        if (!Max || Max->getAPInt().getActiveBits() > 32 - M ||
+            !(Max->getAPInt().zext(64) + 1).ult(APInt(64, 1).shl(32 - M)))
+          continue;
+      }
     }
     IRBuilder<> PB(Pre->getTerminator());
     Value *End = PB.CreateAdd(
         I.getIncomingValueForBlock(Pre),
-        PB.CreateMul(C.getIncomingValueForBlock(Pre),
-                     ConstantInt::get(C.getType(), *S)));
+        Trips ? ConstantInt::get(C.getType(), *Trips * *S)
+              : PB.CreateMul(C.getIncomingValueForBlock(Pre),
+                             ConstantInt::get(C.getType(), *S)));
     IRBuilder<> B(Latch->getTerminator());
     Value *NewCmp = B.CreateICmp(Cmp->getPredicate(), In, End);
     Cmp->replaceAllUsesWith(NewCmp);
@@ -915,6 +1054,795 @@ static bool mergeDownCounter(PHINode &C, Loop &L, ScalarEvolution &SE) {
     return true;
   }
   return false;
+}
+
+/// (5: quant_dyn's four offsets each an index add as before, 30 -> 27
+/// GPRs, tput 418.7 -> 412.2; nothing else changed, L15-E720)
+static cl::opt<unsigned> LoopIndexBases(
+    "agx-loop-index-bases", cl::init(5), cl::Hidden,
+    cl::desc("Device accesses of a loop's block at B[zext(X + C)] for this "
+             "many distinct constants C != 0 or more share B + zext(X), the "
+             "C as immediate indices (0: never)"));
+
+/// A bound (inclusive) on the unsigned value of S over its loop's
+/// iterations: constants, the thread and threadgroup positions (the
+/// threadgroup's shape or 1024, the known grid or 2^31), their sums,
+/// products and zero extensions, and add recurrences up to the loop's
+/// constant maximum trip count.
+static std::optional<APInt> upperBoundStructural(const SCEV *S,
+                                                 ScalarEvolution &SE,
+                                                 const Function &F,
+                                                 unsigned Depth);
+
+/// The structural bound, or SCEV's unsigned range where that has none (a
+/// sum with a negative term, 1024 - lane, in L15-E481's raised start).
+static std::optional<APInt> upperBound(const SCEV *S, ScalarEvolution &SE,
+                                       const Function &F, unsigned Depth = 0) {
+  std::optional<APInt> R = upperBoundStructural(S, SE, F, Depth);
+  if (R || !AGXUnknownRanges || Depth > 8)
+    return R;
+  APInt M = SE.getUnsignedRangeMax(S);
+  if (M.getActiveBits() <= 63)
+    return M.zext(128);
+  return std::nullopt;
+}
+
+static std::optional<APInt> upperBoundStructural(const SCEV *S,
+                                                 ScalarEvolution &SE,
+                                                 const Function &F,
+                                                 unsigned Depth) {
+  if (Depth > 8)
+    return std::nullopt;
+  auto Fits = [](APInt V) -> std::optional<APInt> {
+    return V.getActiveBits() <= 63 ? std::optional<APInt>(V) : std::nullopt;
+  };
+  if (auto *C = dyn_cast<SCEVConstant>(S))
+    return C->getAPInt().isNegative() ? std::nullopt
+                                      : Fits(C->getAPInt().zext(128));
+  if (auto *Z = dyn_cast<SCEVZeroExtendExpr>(S))
+    return upperBound(Z->getOperand(), SE, F, Depth + 1);
+  // (a truncation is at most its operand and its width's maximum; an
+  // unsigned minimum at most any of its operands)
+  if (auto *T = dyn_cast<SCEVTruncateExpr>(S)) {
+    APInt Max = APInt::getMaxValue(T->getType()->getScalarSizeInBits()).zext(128);
+    std::optional<APInt> B = upperBound(T->getOperand(), SE, F, Depth + 1);
+    return B && B->ult(Max) ? *B : Max;
+  }
+  if (auto *MM = dyn_cast<SCEVUMinExpr>(S)) {
+    std::optional<APInt> R;
+    for (const SCEV *Op : MM->operands())
+      if (std::optional<APInt> B = upperBound(Op, SE, F, Depth + 1))
+        if (!R || B->ult(*R))
+          R = B;
+    return R;
+  }
+  // (an unsigned maximum at most the largest of its operands', all bounded:
+  // E481's start, umin(s', umax(n, s)))
+  if (auto *MM = dyn_cast<SCEVUMaxExpr>(S)) {
+    APInt R(128, 0);
+    for (const SCEV *Op : MM->operands()) {
+      std::optional<APInt> B = upperBound(Op, SE, F, Depth + 1);
+      if (!B)
+        return std::nullopt;
+      if (B->ugt(R))
+        R = *B;
+    }
+    return R;
+  }
+  if (auto *U = dyn_cast<SCEVUnknown>(S)) {
+    auto *II = dyn_cast<IntrinsicInst>(U->getValue());
+    if (!II) {
+      // (another value: SCEV's range, a select of bounded values among
+      // them: a loop count min(n, ...) or 0, L15-E481)
+      APInt R = SE.getUnsignedRangeMax(S);
+      if (AGXUnknownRanges && R.getActiveBits() <= 63)
+        return R.zext(128);
+      return std::nullopt;
+    }
+    Intrinsic::ID ID = II->getIntrinsicID();
+    if (std::optional<uint64_t> E = AGX::knownUpperBound(F, ID))
+      return APInt(128, *E - 1);
+    // (a range the call carries: AGXSpecialRegisterRanges', from the
+    // kernel's upper bounds, L15-E391)
+    if (std::optional<ConstantRange> R = II->getRange();
+        R && !R->isFullSet() && !R->isWrappedSet())
+      return R->getUnsignedMax().zext(128);
+    switch (ID) {
+    case Intrinsic::agx_thread_position_in_threadgroup_x:
+    case Intrinsic::agx_thread_position_in_threadgroup_y:
+    case Intrinsic::agx_thread_position_in_threadgroup_z:
+    case Intrinsic::agx_thread_index_in_threadgroup:
+      return APInt(128, 1023);
+    // (32 lanes; at most 1024 threads, 32 SIMD-groups, a threadgroup)
+    case Intrinsic::agx_thread_index_in_simdgroup:
+    case Intrinsic::agx_simdgroup_index_in_threadgroup:
+      return APInt(128, 31);
+    case Intrinsic::agx_threadgroup_position_in_grid_x:
+    case Intrinsic::agx_threadgroup_position_in_grid_y:
+    case Intrinsic::agx_threadgroup_position_in_grid_z:
+      return APInt(128, 0x7ffffffe);
+    default:
+      return std::nullopt;
+    }
+  }
+  if (auto *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+    auto *T = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+    auto *N = dyn_cast<SCEVConstant>(
+        SE.getConstantMaxBackedgeTakenCount(AR->getLoop()));
+    std::optional<APInt> B = upperBound(AR->getStart(), SE, F, Depth + 1);
+    if (!AR->isAffine() || !T || T->getAPInt().isNegative() || !B)
+      return std::nullopt;
+    std::optional<APInt> R;
+    if (N)
+      R = Fits(*B + T->getAPInt().zext(128) * N->getAPInt().zext(128));
+    // or by the exit: where the latch goes on only while the next value is
+    // below X, every value is the start or below X (L15-E481's raised
+    // start, which leaves SCEV's count unbounded)
+    const Loop *L = AR->getLoop();
+    if (BasicBlock *Latch = L->getLoopLatch())
+      if (auto *Br = dyn_cast<CondBrInst>(Latch->getTerminator());
+          Br && Br->getSuccessor(0) == L->getHeader())
+        if (auto *C = dyn_cast<ICmpInst>(Br->getCondition());
+            C && C->getPredicate() == ICmpInst::ICMP_ULT &&
+            L->isLoopInvariant(C->getOperand(1)) &&
+            SE.isSCEVable(C->getOperand(0)->getType()) &&
+            SE.getSCEV(C->getOperand(0)) == AR->getPostIncExpr(SE))
+          if (std::optional<APInt> XB =
+                  upperBound(SE.getSCEV(C->getOperand(1)), SE, F, Depth + 1)) {
+            APInt E = XB->isZero() ? *B : APIntOps::umax(*B, *XB - 1);
+            if (!R || E.ult(*R))
+              R = E;
+          }
+    return R;
+  }
+  bool Add = isa<SCEVAddExpr>(S), Mul = isa<SCEVMulExpr>(S);
+  if (!Add && !Mul)
+    return std::nullopt;
+  APInt R(128, Add ? 0 : 1);
+  for (const SCEV *Op : cast<SCEVNAryExpr>(S)->operands()) {
+    std::optional<APInt> B = upperBound(Op, SE, F, Depth + 1);
+    if (!B)
+      return std::nullopt;
+    R = Add ? R + *B : R * *B;
+    if (R.getActiveBits() > 63)
+      return std::nullopt;
+  }
+  return R;
+}
+
+std::optional<APInt> AGX::scevUpperBound(const SCEV *S, ScalarEvolution &SE,
+                                         const Function &F) {
+  return upperBound(S, SE, F);
+}
+
+/// A lower bound on S's value where upperBound bounds it (so no step of it
+/// wraps): constants, positions (0), sums, products, zero extensions, and
+/// the start of a non-decreasing recurrence.
+static std::optional<APInt> lowerBound(const SCEV *S, ScalarEvolution &SE,
+                                       unsigned Depth = 0) {
+  if (Depth > 8)
+    return std::nullopt;
+  if (auto *C = dyn_cast<SCEVConstant>(S))
+    return C->getAPInt().isNegative()
+               ? std::nullopt
+               : std::optional<APInt>(C->getAPInt().zext(128));
+  if (auto *Z = dyn_cast<SCEVZeroExtendExpr>(S))
+    return lowerBound(Z->getOperand(), SE, Depth + 1);
+  if (isa<SCEVUnknown>(S))
+    return APInt(128, 0);
+  if (auto *AR = dyn_cast<SCEVAddRecExpr>(S))
+    return lowerBound(AR->getStart(), SE, Depth + 1);
+  bool Add = isa<SCEVAddExpr>(S), Mul = isa<SCEVMulExpr>(S);
+  if (!Add && !Mul)
+    return std::nullopt;
+  APInt R(128, Add ? 0 : 1);
+  for (const SCEV *Op : cast<SCEVNAryExpr>(S)->operands()) {
+    std::optional<APInt> B = lowerBound(Op, SE, Depth + 1);
+    if (!B)
+      return std::nullopt;
+    R = Add ? R + *B : R * *B;
+  }
+  return R;
+}
+
+static cl::opt<bool> AGXMergeCongruentCounters(
+    "agx-merge-congruent-counters", cl::init(true), cl::Hidden,
+    cl::desc("One of two 32-bit header phis with the same recurrence for both "
+             "(a narrowed index beside its own 32-bit copy)"));
+
+/// Two integer phis of a block whose incoming values from each predecessor
+/// are the same value, or each the phi itself plus the same constant, hold
+/// the same value on every path (the narrowed load index lsr.iv.lo, split
+/// from a 64-bit counter, beside an index_cast's i32 copy of it in an MLIR
+/// loop): the later one's uses take the first, and its increment is the
+/// first's, moved before it where needed, with the flags both have
+/// (L15-E431).
+static bool mergeCongruentCounters(Function &F) {
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    SmallVector<PHINode *, 4> Phis;
+    for (PHINode &P : BB.phis())
+      if (P.getType()->isIntegerTy())
+        Phis.push_back(&P);
+    for (unsigned I = 0; I < Phis.size(); ++I) {
+      PHINode *P = Phis[I];
+      if (!P)
+        continue;
+      for (unsigned J = I + 1; J < Phis.size(); ++J) {
+        PHINode *Q = Phis[J];
+        if (!Q || Q->getType() != P->getType())
+          continue;
+        // the pairs of increments, P + c and Q + c
+        SmallVector<std::pair<BinaryOperator *, BinaryOperator *>, 2> Steps;
+        bool Same = true;
+        for (BasicBlock *Pred : predecessors(&BB)) {
+          Value *A = P->getIncomingValueForBlock(Pred);
+          Value *B = Q->getIncomingValueForBlock(Pred);
+          if (A == B)
+            continue;
+          const APInt *CA, *CB;
+          if (match(A, m_Add(m_Specific(P), m_APInt(CA))) &&
+              match(B, m_Add(m_Specific(Q), m_APInt(CB))) && *CA == *CB &&
+              cast<Instruction>(A)->getParent() ==
+                  cast<Instruction>(B)->getParent()) {
+            Steps.push_back(
+                {cast<BinaryOperator>(A), cast<BinaryOperator>(B)});
+            continue;
+          }
+          Same = false;
+          break;
+        }
+        if (!Same || Steps.empty())
+          continue;
+        for (auto [PN, QN] : Steps) {
+          if (QN->comesBefore(PN))
+            PN->moveBefore(QN->getIterator());
+          PN->andIRFlags(QN);
+          QN->replaceAllUsesWith(PN);
+          QN->eraseFromParent();
+        }
+        Q->replaceAllUsesWith(P);
+        Q->eraseFromParent();
+        Phis[J] = nullptr;
+        Changed = true;
+      }
+    }
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXNarrowOffsetCompares(
+    "agx-narrow-offset-compares", cl::init(true), cl::Hidden,
+    cl::desc("A 64-bit unsigned compare of zext(x) + c with a constant as "
+             "the 32-bit compare of x with the constant minus c where x + c "
+             "stays in [0, 2^32)"));
+
+/// zext(x) + c <u k (or another unsigned or equality compare; x an i32, c
+/// and k constants) with x + c in [0, 2^32) for every x of its range: the
+/// 32-bit compare of x with k - c, where that is in [0, 2^32). Loop
+/// strength reduction writes an unrolled loop's exit test i | 12 < 1020 as
+/// zext(i') - 4 <u 1020 on the 32-bit counter i' = i + 16 once that is
+/// narrowed, a 64-bit subtraction and compare (five instructions) where
+/// i' <u 1024 is the branch's own (L15-E496).
+static bool narrowOffsetCompares(Function &F, ScalarEvolution &SE) {
+  if (!AGXNarrowOffsetCompares)
+    return false;
+  using namespace PatternMatch;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *Cmp = dyn_cast<ICmpInst>(&I);
+    Value *X;
+    const APInt *C, *K;
+    if (!Cmp || !(Cmp->isUnsigned() || Cmp->isEquality()) ||
+        !Cmp->getOperand(0)->getType()->isIntegerTy(64) ||
+        !match(Cmp->getOperand(0), m_Add(m_ZExt(m_Value(X)), m_APInt(C))) ||
+        !match(Cmp->getOperand(1), m_APInt(K)) ||
+        !X->getType()->isIntegerTy(32))
+      continue;
+    ConstantRange R = SE.getUnsignedRange(SE.getSCEV(X)).zeroExtend(128);
+    APInt C128 = C->sext(128), K128 = K->zext(128);
+    APInt Top = APInt(128, 1).shl(32);
+    APInt Lo = R.getUnsignedMin() + C128, Hi = R.getUnsignedMax() + C128;
+    APInt NK = K128 - C128;
+    if (R.isFullSet() || Lo.isNegative() || !Hi.ult(Top) || NK.isNegative() ||
+        !NK.ult(Top))
+      continue;
+    IRBuilder<> B(Cmp);
+    Value *N = B.CreateICmp(Cmp->getPredicate(), X,
+                            ConstantInt::get(X->getType(), NK.trunc(32)));
+    N->takeName(Cmp);
+    Value *Old = Cmp->getOperand(0);
+    Cmp->replaceAllUsesWith(N);
+    Cmp->eraseFromParent();
+    RecursivelyDeleteTriviallyDeadInstructions(Old);
+    SE.forgetValue(X);
+    Changed = true;
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXRebaseCompares(
+    "agx-rebase-compares", cl::init(true), cl::Hidden,
+    cl::desc("A compare of an induction value with an invariant on another "
+             "header phi of the same step (its offset added to the "
+             "invariant) where neither side can wrap"));
+
+/// In a loop, a compare of A = {a0,+,s} (an induction value the loop only
+/// computes for it, attention's causal mask j = lane + c <= row) with a
+/// loop-invariant B is the compare of a 32-bit header phi I = {i0,+,s} of
+/// the same step (the load's index base + lane + c) with B + D, D = i0 - a0
+/// invariant: I = A + D at every iteration, and an unsigned order (or
+/// equality) holds of A + D and B + D where neither passes 2^32 (bounds of
+/// A, B and D). B + D is computed before the loop; A's add (and a counter
+/// left only to the exit test: mergeUpCounter) goes (L15-E447).
+static bool rebaseCompares(Loop &L, ScalarEvolution &SE, const Function &F) {
+  BasicBlock *Pre = L.getLoopPreheader();
+  if (!AGXRebaseCompares || !Pre || !L.isInnermost())
+    return false;
+  using namespace PatternMatch;
+  auto Bound = [&](const SCEV *X) -> std::optional<APInt> {
+    APInt R = SE.getUnsignedRangeMax(X).zext(128);
+    std::optional<APInt> B = upperBound(X, SE, F);
+    return B && B->ult(R) ? *B : R;
+  };
+  Type *I32 = Type::getInt32Ty(F.getContext());
+  // a 32-bit value V stands for (an i32, the zero extension of one, a
+  // constant below 2^32)
+  auto Narrow = [&](Value *V) -> Value * {
+    if (V->getType() == I32)
+      return V;
+    Value *X;
+    if (match(V, m_ZExt(m_Value(X))) && X->getType() == I32)
+      return X;
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      if (C->getValue().isIntN(32))
+        return ConstantInt::get(I32, C->getZExtValue());
+    return nullptr;
+  };
+  SmallVector<ICmpInst *, 4> Cmps;
+  for (BasicBlock *BB : L.blocks())
+    for (Instruction &I : *BB)
+      if (auto *C = dyn_cast<ICmpInst>(&I))
+        if (C->isUnsigned() || C->isEquality())
+          Cmps.push_back(C);
+  bool Changed = false;
+  APInt Top = APInt(128, 1).shl(32);
+  for (ICmpInst *C : Cmps) {
+    for (unsigned Side = 0; Side < 2; ++Side) {
+      Value *A = Narrow(C->getOperand(Side)),
+            *B = Narrow(C->getOperand(1 - Side));
+      if (!A || !B || !L.isLoopInvariant(B))
+        continue;
+      auto *SA = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(A));
+      if (!SA || SA->getLoop() != &L || !SA->isAffine())
+        continue;
+      PHINode *Found = nullptr;
+      const SCEV *D = nullptr;
+      for (PHINode &P : L.getHeader()->phis()) {
+        if (P.getType() != I32 || &P == A)
+          continue;
+        auto *SI = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(&P));
+        if (!SI || SI->getLoop() != &L || !SI->isAffine() ||
+            SI->getStepRecurrence(SE) != SA->getStepRecurrence(SE))
+          continue;
+        const SCEV *Diff = SE.getMinusSCEV(SI->getStart(), SA->getStart());
+        if (!SE.isLoopInvariant(Diff, &L) || isa<SCEVCouldNotCompute>(Diff) ||
+            Diff->isZero())
+          continue;
+        std::optional<APInt> BA = Bound(SA), BB = Bound(SE.getSCEV(B)),
+                             BD = Bound(Diff);
+        if (!BA || !BB || !BD || !(*BA + *BD).ult(Top) ||
+            !(*BB + *BD).ult(Top))
+          continue;
+        Found = &P;
+        D = Diff;
+        break;
+      }
+      if (!Found)
+        continue;
+      SCEVExpander Exp(SE, "agx.rebase");
+      if (!Exp.isSafeToExpand(D))
+        continue;
+      Value *DV = Exp.expandCodeFor(D, I32, Pre->getTerminator());
+      IRBuilder<> PB(Pre->getTerminator());
+      Value *NB = PB.CreateAdd(B, DV, "agx.rebased");
+      IRBuilder<> CB(C);
+      Value *N = Side == 0 ? CB.CreateICmp(C->getPredicate(), Found, NB)
+                           : CB.CreateICmp(C->getPredicate(), NB, Found);
+      C->replaceAllUsesWith(N);
+      Value *Old = C->getOperand(Side);
+      C->eraseFromParent();
+      RecursivelyDeleteTriviallyDeadInstructions(Old);
+      SE.forgetLoop(&L);
+      Changed = true;
+      break;
+    }
+  }
+  return Changed;
+}
+
+static cl::opt<bool> AGXMergeLaggingCounters(
+    "agx-merge-lagging-counters", cl::init(true), cl::Hidden,
+    cl::desc("A counter one step behind another of the same step: its "
+             "increment as the other counter"));
+
+/// Two header phis stepped by the same constant k, p = c, c + k, ... and
+/// q = c - k, c, c + k, ...: q's increment q + k is p at every iteration
+/// (find_first: loop strength reduction's count from -1 for the exit value
+/// beside the narrowed index from 0). Where q has no other use, the uses of
+/// its increment take p, and q and the increment go: an add an iteration and
+/// a register fewer. p's increment keeps only the wrap flags both have (it
+/// computes what q's did: p_n = p_{n-1} + k, q'_n = p_{n-1} + k), so p is
+/// poison no more often than q' was (L15-E794).
+static cl::opt<bool> AGXExitValueFromIncrement(
+    "agx-exit-value-from-increment", cl::init(true), cl::Hidden,
+    cl::desc("A counter's value after its loop as its increment less the "
+             "step there"));
+
+static bool mergeLaggingCounters(Loop &L, DominatorTree &DT) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch)
+    return false;
+  struct Counter {
+    PHINode *P;
+    BinaryOperator *Inc;
+    APInt Start, Step;
+  };
+  SmallVector<Counter, 4> Counters;
+  for (PHINode &P : L.getHeader()->phis()) {
+    if (!P.getType()->isIntegerTy() || P.getNumIncomingValues() != 2)
+      continue;
+    auto *C = dyn_cast<ConstantInt>(P.getIncomingValueForBlock(Pre));
+    auto *Inc = dyn_cast<BinaryOperator>(P.getIncomingValueForBlock(Latch));
+    const APInt *K;
+    if (!C || !Inc || !L.contains(Inc) ||
+        !match(Inc, m_Add(m_Specific(&P), m_APInt(K))))
+      continue;
+    Counters.push_back({&P, Inc, C->getValue(), *K});
+  }
+  for (Counter &Q : Counters)
+    for (Counter &P : Counters) {
+      if (&P == &Q || P.P->getType() != Q.P->getType() || P.Step != Q.Step ||
+          Q.Start + Q.Step != P.Start || !Q.P->hasOneUse() ||
+          Q.P->user_back() != Q.Inc)
+        continue;
+      if (!Q.Inc->hasNoUnsignedWrap())
+        P.Inc->setHasNoUnsignedWrap(false);
+      if (!Q.Inc->hasNoSignedWrap())
+        P.Inc->setHasNoSignedWrap(false);
+      Q.Inc->replaceAllUsesWith(P.P);
+      RecursivelyDeleteDeadPHINode(Q.P);
+      return true;
+    }
+  // A counter read after the loop is live past its increment, so the two
+  // take two registers and the phi a copy every iteration (find_first's
+  // exit value). Outside the loop it is the increment less the step, in
+  // each block of such uses that the increment dominates: one add after
+  // the loop (L15-E795).
+  bool Changed = false;
+  if (AGXExitValueFromIncrement)
+    for (Counter &P : Counters) {
+      DenseMap<BasicBlock *, Value *> Before;
+      for (Use &U : make_early_inc_range(P.P->uses())) {
+        auto *I = dyn_cast<Instruction>(U.getUser());
+        if (!I || isa<PHINode>(I) || L.contains(I) ||
+            !DT.dominates(P.Inc, I->getParent()))
+          continue;
+        Value *&V = Before[I->getParent()];
+        if (!V)
+          V = BinaryOperator::CreateAdd(
+              P.Inc, ConstantInt::get(P.Inc->getType(), -P.Step),
+              P.P->getName() + ".exit",
+              I->getParent()->getFirstInsertionPt());
+        U.set(V);
+        Changed = true;
+      }
+    }
+  return Changed;
+}
+
+static cl::opt<bool> AGXNarrowAfterCounters(
+    "agx-narrow-bounded-after-counters", cl::init(true), cl::Hidden,
+    cl::desc("agx-narrow-bounded-i64 again after the counters are narrowed"));
+
+static cl::opt<bool> AGXMergeUpCounters(
+    "agx-merge-up-counters", cl::init(true), cl::Hidden,
+    cl::desc("Exit on an index rather than on a counter up from zero that "
+             "only the exit test uses"));
+
+static cl::opt<bool> AGXMergeUpCountersVariableStep(
+    "agx-merge-up-counters-variable-step", cl::init(true), cl::Hidden,
+    cl::desc("Also for a step invariant in the loop (not a constant): "
+             "equality tests, and <u where the bounds fit"));
+
+/// The up-counting form of mergeDownCounter: c = 0, s, 2s, ... with c' = c +
+/// s used only by the latch's exit test c' <u n (or c' != n), beside an
+/// index i = i0, i0 + s, ... stepped by the same s (an MLIR loop from the
+/// lane in steps of 32 after narrowing: the counter against the trip, the
+/// index for the address). Then i' = i0 + c' (mod 2^32) at every iteration,
+/// so the test is i' != i0 + n, exactly; for <u, i0 + c' and i0 + n must not
+/// wrap: c' stays below n + s, so upperBound(i0) + upperBound(n) + s < 2^32
+/// suffices. Where i0 is unbounded (a threadgroup position) and s is a
+/// power of two, c' <u n is c' != t for t, the first multiple of s at or
+/// above max(n, 1), so i' != i0 + t. One add an iteration fewer, and a register (L15-E386).
+/// A step s invariant in the loop but not constant (a grid stride) takes
+/// upperBound(s) in place of s: equality tests always, <u where the bounds
+/// fit (L15-E417).
+static bool mergeUpCounter(PHINode &C, Loop &L, ScalarEvolution &SE,
+                           const Function &F) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader(), *Latch = L.getLoopLatch();
+  if (!Pre || !Latch || !C.getType()->isIntegerTy(32) ||
+      C.getNumIncomingValues() != 2 ||
+      !match(C.getIncomingValueForBlock(Pre), m_Zero()))
+    return false;
+  auto *Cn = dyn_cast<BinaryOperator>(C.getIncomingValueForBlock(Latch));
+  if (!Cn || Cn->getParent() != Latch || !C.hasOneUse())
+    return false;
+  // The step: a constant, or a value invariant in the loop (a grid stride,
+  // with <u where the bounds fit; L15-E417).
+  const APInt *S = nullptr;
+  Value *SV = nullptr;
+  if (match(Cn, m_Add(m_Specific(&C), m_APInt(S)))) {
+    if (S->isZero() || S->isNegative())
+      return false;
+  } else if (!AGXMergeUpCountersVariableStep ||
+             !match(Cn, m_c_Add(m_Specific(&C), m_Value(SV))) ||
+             !L.isLoopInvariant(SV)) {
+    return false;
+  }
+  ICmpInst *Cmp = nullptr;
+  for (User *U : Cn->users()) {
+    if (U == &C)
+      continue;
+    auto *I = dyn_cast<ICmpInst>(U);
+    if (Cmp || !I || I->getOperand(0) != Cn || !I->hasOneUse() ||
+        I->user_back() != Latch->getTerminator() ||
+        (I->getPredicate() != ICmpInst::ICMP_ULT && !I->isEquality()))
+      return false;
+    Cmp = I;
+  }
+  if (!Cmp)
+    return false;
+  Value *N = Cmp->getOperand(1);
+  if (!L.isLoopInvariant(N))
+    return false;
+  for (PHINode &I : L.getHeader()->phis()) {
+    if (&I == &C || !I.getType()->isIntegerTy(32) ||
+        I.getNumIncomingValues() != 2)
+      continue;
+    auto *In = dyn_cast<BinaryOperator>(I.getIncomingValueForBlock(Latch));
+    const APInt *T;
+    if (!In || In->getParent() != Latch ||
+        !In->comesBefore(Latch->getTerminator()))
+      continue;
+    Value *TV = nullptr;
+    if (S ? !match(In, m_Add(m_Specific(&I), m_APInt(T))) || *T != *S
+          : !match(In, m_c_Add(m_Specific(&I), m_Value(TV))) ||
+                !L.isLoopInvariant(TV) ||
+                SE.getSCEV(TV) != SE.getSCEV(SV))
+      continue;
+    Value *I0 = I.getIncomingValueForBlock(Pre);
+    ICmpInst::Predicate Pred = Cmp->getPredicate();
+    bool RoundUp = false;
+    if (!Cmp->isEquality()) {
+      // (upperBound's or scalar evolution's range, the smaller)
+      auto Bound = [&](Value *V) {
+        const SCEV *X = SE.getSCEV(V);
+        APInt R = SE.getUnsignedRangeMax(X).zext(128);
+        std::optional<APInt> B = upperBound(X, SE, F);
+        return B && B->ult(R) ? *B : R;
+      };
+      std::optional<APInt> BI = Bound(I0), BN = Bound(N);
+      APInt BS = S ? S->zext(128) : Bound(SV);
+      APInt Top = APInt(128, 1).shl(32);
+      if (!BN || !(*BN + BS).ult(Top))
+        continue;
+      if (!BI || !(*BI + *BN + BS).ult(Top)) {
+        // i0 + n may wrap: exit where c' first reaches n, at
+        // t = s * ceil(max(n, 1) / s), i' != i0 + t (exact mod 2^32).
+        if (!S || !S->isPowerOf2())
+          continue;
+        RoundUp = true;
+        Pred = ICmpInst::ICMP_NE;
+      }
+    }
+    IRBuilder<> PB(Pre->getTerminator());
+    Value *Trip = N;
+    if (RoundUp) {
+      // (max(n, 1) is n where the loop is only entered for n != 0)
+      const SCEV *SN = SE.getSCEV(N);
+      if (!SE.isLoopEntryGuardedByCond(&L, ICmpInst::ICMP_NE, SN,
+                                       SE.getZero(SN->getType())))
+        Trip = PB.CreateBinaryIntrinsic(Intrinsic::umax, N,
+                                        ConstantInt::get(N->getType(), 1));
+      Trip = PB.CreateAnd(
+          PB.CreateNUWAdd(Trip, ConstantInt::get(N->getType(), *S - 1)),
+          ConstantInt::get(N->getType(), -*S));
+    }
+    Value *End = PB.CreateAdd(I0, Trip);
+    IRBuilder<> B(Latch->getTerminator());
+    Value *NewCmp = B.CreateICmp(Pred, In, End);
+    Cmp->replaceAllUsesWith(NewCmp);
+    Cmp->eraseFromParent();
+    Cn->replaceAllUsesWith(PoisonValue::get(Cn->getType()));
+    Cn->eraseFromParent();
+    C.eraseFromParent();
+    SE.forgetLoop(&L);
+    return true;
+  }
+  return false;
+}
+
+/// In a loop, device accesses at B[zext(X + C_k)] (an unrolled column walk:
+/// x[i + 512 k]) each take a 32-bit addition for their index and a register
+/// for each C_k; B + zext(X), one 64-bit addition an iteration (its uniform
+/// base's copy hoisted), with the C_k as immediate indices, where X + C_k
+/// provably does not wrap (upperBound). Before the structurizer, which
+/// leaves SCEV no trip count. L15-E230 found the straight-line version no
+/// better: there the copy is paid where the additions were.
+static cl::opt<unsigned> AGXHoistAddressOffsets(
+    "agx-hoist-address-offsets", cl::init(8), cl::Hidden,
+    cl::desc("In an innermost loop, an i64 address (b + x) + c with b "
+             "invariant as (b + c) + x, for up to this many new bases"));
+
+/// The PTX front end's integer address of a field, gep i8 (inttoptr (b + x)),
+/// c, with b invariant in the loop and x not: as inttoptr ((b + c) + x), its
+/// base hoisted, the access takes the base and x as its index register (a
+/// 64-bit addition per access each iteration before: embedding's second
+/// half of a float4). A new base is a register pair live through the loop:
+/// at most AGXHoistAddressOffsets of them per loop.
+static bool hoistAddressOffsets(Loop &L) {
+  using namespace PatternMatch;
+  BasicBlock *Pre = L.getLoopPreheader();
+  if (!Pre || !AGXHoistAddressOffsets)
+    return false;
+  struct Use_ {
+    GetElementPtrInst *G;
+    Value *B, *X;
+    int64_t C;
+  };
+  SmallVector<Use_, 8> Uses;
+  for (BasicBlock *BB : L.blocks())
+    for (Instruction &I : *BB) {
+      auto *G = dyn_cast<GetElementPtrInst>(&I);
+      const APInt *C;
+      if (!G || G->getNumIndices() != 1 ||
+          !G->getSourceElementType()->isIntegerTy(8) ||
+          !match(G->getOperand(1), m_APInt(C)) || C->isZero() ||
+          G->getAddressSpace() != AGX::DEVICE_ADDRESS)
+        continue;
+      auto *I2P = dyn_cast<IntToPtrInst>(G->getPointerOperand());
+      if (!I2P)
+        continue;
+      auto *A = dyn_cast<BinaryOperator>(I2P->getOperand(0));
+      if (!A || A->getOpcode() != Instruction::Add || !L.contains(A) ||
+          !A->getType()->isIntegerTy(64))
+        continue;
+      Value *B = A->getOperand(0), *X = A->getOperand(1);
+      if (!L.isLoopInvariant(B))
+        std::swap(B, X);
+      if (!L.isLoopInvariant(B) || L.isLoopInvariant(X) ||
+          isa<Constant>(B))
+        continue;
+      // only accesses through it
+      if (!all_of(G->users(), [&](User *U) {
+            if (auto *Ld = dyn_cast<LoadInst>(U))
+              return Ld->getPointerOperand() == G;
+            if (auto *St = dyn_cast<StoreInst>(U))
+              return St->getPointerOperand() == G;
+            return false;
+          }))
+        continue;
+      Uses.push_back({G, B, X, C->getSExtValue()});
+    }
+  SmallVector<std::pair<Value *, int64_t>, 4> Bases;
+  for (Use_ &U : Uses)
+    if (!is_contained(Bases, std::make_pair(U.B, U.C)))
+      Bases.push_back({U.B, U.C});
+  if (Uses.empty() || Bases.size() > AGXHoistAddressOffsets)
+    return false;
+  IRBuilder<> PB(Pre->getTerminator());
+  DenseMap<std::pair<Value *, int64_t>, Value *> NewBase;
+  for (auto [B, C] : Bases)
+    NewBase[{B, C}] = PB.CreateAdd(B, ConstantInt::get(B->getType(), C));
+  for (Use_ &U : Uses) {
+    IRBuilder<> B(U.G);
+    Value *A = B.CreateAdd(NewBase[{U.B, U.C}], U.X);
+    U.G->replaceAllUsesWith(B.CreateIntToPtr(A, U.G->getType()));
+    U.G->eraseFromParent();
+  }
+  return true;
+}
+
+static bool shareLoopIndexBases(Function &F, LoopInfo &LI,
+                                ScalarEvolution &SE) {
+  if (!LoopIndexBases || LI.empty())
+    return false;
+  const DataLayout &DL = F.getDataLayout();
+  struct Member {
+    GetElementPtrInst *GEP;
+    int64_t C;
+  };
+  using Key = std::tuple<BasicBlock *, Value *, Value *, Type *>;
+  MapVector<Key, SmallVector<Member, 8>> Groups;
+  for (Instruction &I : instructions(F)) {
+    if (!LI.getLoopFor(I.getParent()))
+      continue;
+    Value *Ptr = getLoadStorePointerOperand(&I);
+    if (!Ptr || Ptr->getType()->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+      continue;
+    Type *Ty = getLoadStoreType(&I);
+    auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
+    if (!Ty->isSized() || !GEP || GEP->getNumIndices() != 1 ||
+        GEP->getParent() != I.getParent())
+      continue;
+    auto *Z = dyn_cast<ZExtInst>(GEP->getOperand(1));
+    if (!Z || !Z->getSrcTy()->isIntegerTy(32) || !Z->getDestTy()->isIntegerTy(64))
+      continue;
+    Value *N = Z->getOperand(0), *X = N;
+    int64_t C = 0;
+    const APInt *CA;
+    using namespace PatternMatch;
+    if (match(N, m_Add(m_Value(X), m_APInt(CA))) ||
+        match(N, m_DisjointOr(m_Value(X), m_APInt(CA)))) {
+      C = CA->getSExtValue();
+      // X + C wraps for no X: below 2^32 above, and at least -C below (the
+      // bounds hold as the upper one keeps X's own sums from wrapping).
+      const SCEV *SX = SE.getSCEV(X);
+      std::optional<APInt> B = upperBound(SX, SE, F);
+      if (!B || (*B + std::max<int64_t>(C, 0)).ugt(APInt(128, 0xffffffffu)))
+        continue;
+      if (C < 0) {
+        std::optional<APInt> Lo = lowerBound(SX, SE);
+        if (!Lo || Lo->ult(APInt(128, uint64_t(-C))))
+          continue;
+      }
+    }
+    Type *Elt = GEP->getSourceElementType();
+    uint64_t Size = DL.getTypeAllocSize(Elt);
+    unsigned EltBits = Ty->isPointerTy() ? 64 : Ty->getScalarSizeInBits();
+    if (!isPowerOf2_32(EltBits) || EltBits < 8)
+      continue;
+    int64_t Unit = std::min(EltBits, 32u) / 8, Bytes = C * int64_t(Size);
+    if (Bytes % Unit || !isInt<16>(Bytes / Unit))
+      continue;
+    Groups[{GEP->getParent(), GEP->getPointerOperand(), X, Elt}].push_back(
+        {GEP, C});
+  }
+  bool Changed = false;
+  SmallVector<WeakTrackingVH, 16> Dead;
+  for (auto &[K, Members] : Groups) {
+    SmallSet<int64_t, 8> Cs;
+    for (const Member &M : Members)
+      if (M.C)
+        Cs.insert(M.C);
+    if (Cs.size() < LoopIndexBases)
+      continue;
+    auto [BB, Base, X, Elt] = K;
+    Instruction *First = Members.front().GEP;
+    for (const Member &M : Members)
+      if (M.GEP->comesBefore(First))
+        First = M.GEP;
+    IRBuilder<> B(First);
+    Value *P = B.CreateGEP(Elt, Base, B.CreateZExt(X, B.getInt64Ty()),
+                           "loop.base");
+    uint64_t Size = DL.getTypeAllocSize(Elt);
+    for (const Member &M : Members) {
+      Value *New = P;
+      if (M.C) {
+        IRBuilder<> MB(M.GEP);
+        New = MB.CreateGEP(MB.getInt8Ty(), P, MB.getInt64(M.C * int64_t(Size)));
+      }
+      M.GEP->replaceAllUsesWith(New);
+      Dead.push_back(M.GEP);
+    }
+    Changed = true;
+  }
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(Dead);
+  return Changed;
 }
 
 bool AGXNarrowInductions::runOnFunction(Function &F) {
@@ -1000,8 +1928,20 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
       for (PHINode &Phi : L->getHeader()->phis())
         if (Phi.getType()->isPointerTy() || Phi.getType()->isIntegerTy(64))
           Ptrs.push_back(&Phi);
+      bool Rewritten = false;
       for (PHINode *Phi : Ptrs)
-        Changed |= pointerFromCounter(*Phi, *L, SE);
+        Rewritten |= pointerFromCounter(*Phi, *L, SE);
+      if (Rewritten) {
+        // counters whose exit test moved to a relative one (j, j + t)
+        SE.forgetLoop(L);
+        SmallVector<WeakTrackingVH, 4> Counters;
+        for (PHINode &Phi : L->getHeader()->phis())
+          Counters.push_back(&Phi);
+        for (WeakTrackingVH &V : Counters)
+          if (auto *Phi = dyn_cast_or_null<PHINode>(V))
+            RecursivelyDeleteDeadPHINode(Phi);
+      }
+      Changed |= Rewritten;
     }
     if (AGXMergeDownCounters && L->isInnermost()) {
       SmallVector<PHINode *, 4> Counters;
@@ -1014,6 +1954,22 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
           break;
         }
     }
+    if (AGXMergeUpCounters && L->isInnermost()) {
+      SmallVector<PHINode *, 4> Counters;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isIntegerTy(32))
+          Counters.push_back(&Phi);
+      for (PHINode *Phi : Counters)
+        if (mergeUpCounter(*Phi, *L, SE, F)) {
+          Changed = true;
+          break;
+        }
+    }
+    if (AGXMergeLaggingCounters)
+      while (mergeLaggingCounters(*L, DT)) {
+        SE.forgetLoop(L);
+        Changed = true;
+      }
     if (AGXSplitOffsetInductions && L->isInnermost()) {
       SmallVector<PHINode *, 4> Wide;
       for (PHINode &Phi : L->getHeader()->phis())
@@ -1023,6 +1979,13 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
         Changed |= splitOffsets(*Phi, *L, SE, DT);
     }
   }
+  Changed |= shareLoopIndexBases(F, LI, SE);
+  for (Loop *L : LI.getLoopsInPreorder())
+    if (L->isInnermost())
+      Changed |= hoistAddressOffsets(*L);
+  // (a narrowed index's element index beside a 32-bit copy of the index)
+  if (AGXMergeCongruentCounters)
+    Changed |= mergeCongruentCounters(F);
   if (!AGXSplitWideCounters)
     return Changed;
   // Innermost loops only: each split adds blocks that the other loops'
@@ -1040,5 +2003,50 @@ bool AGXNarrowInductions::runOnFunction(Function &F) {
   }
   for (const WideCounter &W : Counters)
     splitWideCounter(W);
-  return Changed || !Counters.empty();
+  Changed |= !Counters.empty();
+  // (a split counter's low word beside a 32-bit copy of the counter)
+  if (AGXMergeCongruentCounters && !Counters.empty())
+    Changed |= mergeCongruentCounters(F);
+  // (64-bit trees of the narrowed counters' extensions, which the
+  // CodeGenPrepare pass saw as 64-bit phis: a mask j <= i of j = lane + c)
+  if (AGXNarrowAfterCounters)
+    Changed |= AGX::narrowBoundedI64(F);
+  // (on the final 32-bit compares, with analyses of the function as it now
+  // is: the splits added blocks)
+  if (AGXRebaseCompares || AGXNarrowOffsetCompares) {
+    DominatorTree DT2(F);
+    LoopInfo LI2(DT2);
+    TargetLibraryInfoImpl TLII(F.getParent()->getTargetTriple());
+    TargetLibraryInfo TLI(TLII, &F);
+    AssumptionCache AC(F);
+    ScalarEvolution SE2(F, TLI, AC, DT2, LI2);
+    Changed |= narrowOffsetCompares(F, SE2);
+    if (!AGXRebaseCompares)
+      return Changed;
+    for (Loop *L : LI2.getLoopsInPreorder()) {
+      if (!rebaseCompares(*L, SE2, F) || !AGXMergeUpCounters)
+        continue;
+      Changed = true;
+      // (what the rebased compare's operand left dead, whose uses the
+      // counter's one-use test would count)
+      SmallVector<WeakTrackingVH, 8> Dead;
+      for (BasicBlock *BB : L->blocks())
+        for (Instruction &I : *BB)
+          if (isInstructionTriviallyDead(&I))
+            Dead.push_back(&I);
+      for (WeakTrackingVH &V : Dead)
+        if (auto *I = dyn_cast_or_null<Instruction>(V)) {
+          SE2.forgetValue(I);
+          RecursivelyDeleteTriviallyDeadInstructions(I);
+        }
+      SmallVector<PHINode *, 4> Counters;
+      for (PHINode &Phi : L->getHeader()->phis())
+        if (Phi.getType()->isIntegerTy(32))
+          Counters.push_back(&Phi);
+      for (PHINode *Phi : Counters)
+        if (mergeUpCounter(*Phi, *L, SE2, F))
+          break;
+    }
+  }
+  return Changed;
 }

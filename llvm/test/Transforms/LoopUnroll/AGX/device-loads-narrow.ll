@@ -2,12 +2,13 @@
 ; RUN: opt -mtriple=agx -mcpu=agx-g14c -passes='loop-unroll' -agx-device-unroll-narrow=0 -S < %s | FileCheck %s --check-prefix=FOUR
 
 ; A device-load loop (device-loads.ll) whose loads are all of one or two
-; bytes (half, int8 rows) is unrolled 16 times where 16 divides its trip
-; count, 4 otherwise; one with a wider load keeps 4 (L15-E234).
+; bytes (half, int8 rows) is unrolled 32 times where 32 divides its trip
+; count (L15-E509; 16 in L15-E234), 4 otherwise; one with a wider load keeps
+; 4 (L15-E234).
 
 define void @sumh512(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 ; CHECK-LABEL: @sumh512(
-; CHECK-COUNT-16: load half
+; CHECK-COUNT-32: load half
 ; CHECK-NOT: load half
 ; CHECK: br i1
 ; FOUR-LABEL: @sumh512(
@@ -30,7 +31,7 @@ exit:
   ret void
 }
 
-; 520 iterations: 16 does not divide them, so 4.
+; 520 iterations: 32 does not divide them, so 4.
 define void @sumb520(ptr addrspace(1) %p, ptr addrspace(1) %o) {
 ; CHECK-LABEL: @sumb520(
 ; FOUR-LABEL: @sumb520(
@@ -54,7 +55,8 @@ exit:
   ret void
 }
 
-; A half and a float load: 4.
+; A half and a float load: 4. (Two bases, but scalars: not
+; device-loads-streams.ll's factors, L15-E508.)
 define void @mixed512(ptr addrspace(1) %p, ptr addrspace(1) %q, ptr addrspace(1) %o) {
 ; CHECK-LABEL: @mixed512(
 ; CHECK-COUNT-4: load float

@@ -29,6 +29,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/GPUToAIR/GPUToAIRPass.h"
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+#include "mlir/Conversion/ComplexToStandard/ComplexToStandard.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
@@ -40,7 +44,9 @@
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/AIR/IR/AIRDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
@@ -49,12 +55,17 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Math/Transforms/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
+#include "mlir/Dialect/Vector/Transforms/VectorRewritePatterns.h"
 #include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -163,6 +174,63 @@ static std::optional<int64_t> constantInt(Value converted, Value original) {
     return c;
   return getConstantIntValue(original);
 }
+
+/// Whether \p v (an original, unconverted value) is the same in every thread
+/// of a threadgroup: a constant, a kernel argument, a threadgroup-level id or
+/// size, the induction variable of a loop with uniform bounds, or pure arith
+/// of those (L15-E286).
+static bool isThreadgroupUniform(Value v, unsigned depth,
+                                 SmallPtrSetImpl<Value> &assumed) {
+  if (depth > 12)
+    return false;
+  if (getConstantIntValue(v))
+    return true;
+  auto uniform = [&](Value o) {
+    return isThreadgroupUniform(o, depth + 1, assumed);
+  };
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    // The induction variable of a loop whose bounds and step are uniform
+    // (every thread runs the same iterations) (L15-E297), and a value it
+    // carries from a uniform start through uniform updates, the carried
+    // value assumed uniform in its own update (L15-E299).
+    if (auto loop =
+            dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp())) {
+      if (!uniform(loop.getLowerBound()) || !uniform(loop.getUpperBound()) ||
+          !uniform(loop.getStep()))
+        return false;
+      if (arg == loop.getInductionVar())
+        return true;
+      if (!assumed.insert(v).second)
+        return true;
+      unsigned n = arg.getArgNumber() - loop.getNumInductionVars();
+      auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+      return uniform(loop.getInitArgs()[n]) && uniform(yield.getOperand(n));
+    }
+    auto func = dyn_cast<gpu::GPUFuncOp>(arg.getOwner()->getParentOp());
+    return func && arg.getOwner()->isEntryBlock() &&
+           arg.getArgNumber() < func.getNumArguments() &&
+           isa<IntegerType, IndexType>(arg.getType());
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<gpu::BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp, gpu::NumSubgroupsOp,
+          gpu::SubgroupSizeOp>(def))
+    return true;
+  if (def->getDialect()->getNamespace() != "arith" || def->getNumRegions() ||
+      !isMemoryEffectFree(def))
+    return false;
+  return llvm::all_of(def->getOperands(), uniform);
+}
+
+static bool isThreadgroupUniform(Value v) {
+  SmallPtrSet<Value, 8> assumed;
+  return isThreadgroupUniform(v, 0, assumed);
+}
+
+/// Set before the conversion on a gpu.shuffle whose offset
+/// isThreadgroupUniform (whose original values the conversion replaces).
+static constexpr llvm::StringLiteral kUniformOffsetAttr = "air.uniform_offset";
 
 /// Extend or truncate an i32 to the index type.
 static Value toIndexBitwidth(ConversionPatternRewriter &rewriter, Location loc,
@@ -428,20 +496,129 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
           native = "air.simd_shuffle_xor.u.i32";
         break;
       case gpu::ShuffleMode::UP:
-        if (*width == 32)
-          native = "air.simd_shuffle_up.u.i32";
+        native = "air.simd_shuffle_up.u.i32";
         break;
       case gpu::ShuffleMode::DOWN:
-        if (*width == 32)
-          native = "air.simd_shuffle_down.u.i32";
+        native = "air.simd_shuffle_down.u.i32";
         break;
       case gpu::ShuffleMode::IDX:
         break;
       }
     }
+    // A narrower power-of-two segment (up, down) or a constant lane (idx):
+    // the same AIR shuffle with a uniform offset or lane, and the thread's own
+    // value where the source lane is outside its segment, as below (no
+    // per-thread lane, which would take a shuffle per quad position)
+    // (L15-E285).
+    bool ownOutside = false;
+    // A uniform lane (idx) or mask (xor) that is not a constant: AIR's shuffle
+    // or shuffle_xor of it, the source lane being the lane or lane ^ mask
+    // (past the SIMD-group: outside the segment), and the own value outside
+    // the segment, as for a constant (L15-E286).
+    // Up and down by a uniform offset of either sign: AIR's shift by it, or
+    // the opposite shift by its negation where it is negative (the source
+    // lane lane -+ offset either way), selected by its sign (L15-E296).
+    bool uniformOffset = false;
+    StringRef opposite;
+    if (!offset && width && *width <= 32 && llvm::isPowerOf2_64(*width) &&
+        op->hasAttr(kUniformOffsetAttr)) {
+      switch (op.getMode()) {
+      case gpu::ShuffleMode::IDX:
+        native = "air.simd_shuffle.u.i32";
+        break;
+      case gpu::ShuffleMode::XOR:
+        native = "air.simd_shuffle_xor.u.i32";
+        break;
+      case gpu::ShuffleMode::UP:
+        native = "air.simd_shuffle_up.u.i32";
+        opposite = "air.simd_shuffle_down.u.i32";
+        break;
+      case gpu::ShuffleMode::DOWN:
+        native = "air.simd_shuffle_down.u.i32";
+        opposite = "air.simd_shuffle_up.u.i32";
+        break;
+      }
+      ownOutside = uniformOffset = true;
+    }
+    if (width && offset && *offset >= 0 && *width <= 32 &&
+        llvm::isPowerOf2_64(*width) &&
+        ((native.empty() && op.getMode() == gpu::ShuffleMode::IDX &&
+          *offset < 32) ||
+         (*width < 32 && *offset < *width &&
+          (op.getMode() == gpu::ShuffleMode::UP ||
+           op.getMode() == gpu::ShuffleMode::DOWN)))) {
+      if (op.getMode() == gpu::ShuffleMode::IDX)
+        native = "air.simd_shuffle.u.i32";
+      ownOutside = true;
+    }
 
     Value valid, lane16;
-    if (!native.empty()) {
+    if (ownOutside) {
+      Value off = uniformOffset ? adaptor.getOffset()
+                                : LLVM::ConstantOp::create(rewriter, loc, i32,
+                                                           *offset)
+                                      .getResult();
+      lane16 = uniformOffset ? LLVM::TruncOp::create(rewriter, loc, i16, off)
+                                   .getResult()
+                             : LLVM::ConstantOp::create(rewriter, loc, i16,
+                                                        *offset)
+                                   .getResult();
+      Value lane = callAIR(rewriter, op, "air.thread_index_in_simdgroup", i32,
+                           {}, AIREffects::None, laneRange);
+      auto c = [&](int64_t v) {
+        return LLVM::ConstantOp::create(rewriter, loc, i32, v);
+      };
+      // A constant offset's test is the lane's position in its segment (or,
+      // for idx, the segment): up by k, lane % w >= k; down, lane % w < w - k;
+      // idx of lane c, lane & -w == c & -w (L15-E306).
+      if (!uniformOffset) {
+        Value pos = LLVM::AndOp::create(rewriter, loc, i32, lane,
+                                        c(op.getMode() == gpu::ShuffleMode::IDX
+                                              ? -*width
+                                              : *width - 1));
+        switch (op.getMode()) {
+        case gpu::ShuffleMode::UP:
+          valid = LLVM::ICmpOp::create(rewriter, loc,
+                                       LLVM::ICmpPredicate::uge, pos,
+                                       c(*offset));
+          break;
+        case gpu::ShuffleMode::DOWN:
+          valid = LLVM::ICmpOp::create(rewriter, loc,
+                                       LLVM::ICmpPredicate::ult, pos,
+                                       c(*width - *offset));
+          break;
+        default:
+          valid = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::eq,
+                                       pos, c(*offset & -*width));
+          break;
+        }
+      } else {
+        Value start =
+            LLVM::AndOp::create(rewriter, loc, i32, lane, c(-*width));
+        Value srcLane;
+        switch (op.getMode()) {
+        case gpu::ShuffleMode::UP:
+          srcLane = LLVM::SubOp::create(rewriter, loc, i32, lane, off);
+          break;
+        case gpu::ShuffleMode::DOWN:
+          srcLane = LLVM::AddOp::create(rewriter, loc, i32, lane, off);
+          break;
+        case gpu::ShuffleMode::XOR:
+          srcLane = LLVM::XOrOp::create(rewriter, loc, i32, lane, off);
+          break;
+        default:
+          srcLane = off;
+          break;
+        }
+        // (the source lane in the segment: a uniform offset may be negative)
+        Value aboveStart = LLVM::ICmpOp::create(
+            rewriter, loc, LLVM::ICmpPredicate::sge, srcLane, start);
+        Value belowEnd = LLVM::ICmpOp::create(
+            rewriter, loc, LLVM::ICmpPredicate::slt, srcLane,
+            LLVM::AddOp::create(rewriter, loc, i32, start, c(*width)));
+        valid = LLVM::AndOp::create(rewriter, loc, aboveStart, belowEnd);
+      }
+    } else if (!native.empty()) {
       lane16 = LLVM::ConstantOp::create(rewriter, loc, i16, *offset);
       if (op.getMode() == gpu::ShuffleMode::XOR || *offset == 0) {
         valid = LLVM::ConstantOp::create(rewriter, loc, i1, 1);
@@ -504,12 +681,69 @@ struct GPUShuffleOpLowering : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
                                     parts)))
       return rewriter.notifyMatchFailure(op, "cannot split value into i32");
     SmallVector<Value> shuffled;
-    for (Value part : parts)
-      shuffled.push_back(callAIR(rewriter, op, native, i32, {part, lane16},
-                                 AIREffects::Convergent));
+    Value nonNegative, negLane16;
+    if (!opposite.empty()) {
+      Value off = adaptor.getOffset();
+      Value zero32 = LLVM::ConstantOp::create(rewriter, loc, i32, 0);
+      nonNegative = LLVM::ICmpOp::create(rewriter, loc,
+                                         LLVM::ICmpPredicate::sge, off, zero32);
+      negLane16 = LLVM::TruncOp::create(
+          rewriter, loc, i16, LLVM::SubOp::create(rewriter, loc, zero32, off));
+    }
+    for (Value part : parts) {
+      Value v = callAIR(rewriter, op, native, i32, {part, lane16},
+                        AIREffects::Convergent);
+      if (!opposite.empty())
+        v = LLVM::SelectOp::create(
+            rewriter, loc, nonNegative, v,
+            callAIR(rewriter, op, opposite, i32, {part, negLane16},
+                    AIREffects::Convergent));
+      shuffled.push_back(v);
+    }
     Value result = LLVM::composeValue(rewriter, loc, shuffled,
                                       adaptor.getValue().getType());
+    if (ownOutside)
+      result = LLVM::SelectOp::create(rewriter, loc, valid, result,
+                                      adaptor.getValue());
     rewriter.replaceOp(op, {result, valid});
+    return success();
+  }
+};
+
+/// gpu.subgroup_broadcast: AIR's shuffle of the (uniform) lane, or its
+/// broadcast of the first active lane (the first set bit of the ballot of
+/// the active lanes), per 32-bit part (L15-E298).
+struct GPUSubgroupBroadcastOpLowering
+    : ConvertOpToLLVMPattern<gpu::SubgroupBroadcastOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupBroadcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    Type i32 = rewriter.getI32Type();
+    bool first =
+        op.getBroadcastType() == gpu::BroadcastType::first_active_lane;
+    Value lane16;
+    if (!first) {
+      if (!adaptor.getLane())
+        return rewriter.notifyMatchFailure(op, "no lane");
+      lane16 = LLVM::TruncOp::create(rewriter, loc, rewriter.getI16Type(),
+                                     adaptor.getLane());
+    }
+    SmallVector<Value> parts;
+    if (failed(LLVM::decomposeValue(rewriter, loc, adaptor.getSrc(), i32,
+                                    parts)))
+      return rewriter.notifyMatchFailure(op, "cannot split value into i32");
+    SmallVector<Value> results;
+    for (Value part : parts)
+      results.push_back(
+          first ? callAIR(rewriter, op, "air.simd_broadcast_first.u.i32", i32,
+                          {part}, AIREffects::Convergent)
+                : callAIR(rewriter, op, "air.simd_shuffle.u.i32", i32,
+                          {part, lane16}, AIREffects::Convergent));
+    rewriter.replaceOp(op, LLVM::composeValue(rewriter, loc, results,
+                                              adaptor.getSrc().getType()));
     return success();
   }
 };
@@ -547,11 +781,33 @@ static Value orderedFloatKey(ConversionPatternRewriter &rewriter, Location loc,
   return LLVM::XOrOp::create(rewriter, loc, bits, mask);
 }
 
+/// Whether another gpu.subgroup_reduce maximumf / minimumf reduces the value
+/// of \p op: they share its key and "is NaN" (and, over the same lanes, the
+/// or of it).
+static bool sharesNaNOr(gpu::SubgroupReduceOp op) {
+  for (Operation *user : op.getValue().getUsers()) {
+    auto other = dyn_cast<gpu::SubgroupReduceOp>(user);
+    if (other && other != op &&
+        (other.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+         other.getOp() == gpu::AllReduceOperation::MINIMUMF))
+      return true;
+  }
+  return false;
+}
+
 /// gpu.subgroup_reduce maximumf / minimumf of f32: AIR's float SIMD-group
 /// maximum and minimum are maxnum and minnum, which drop NaNs and may order
 /// the zeros either way, so it is the signed i32 maximum (minimum) of the
-/// floats' keys, decoded, or a NaN where the group's or of "is NaN" is set
-/// (alive2: tests/alive-tv/gpu/subgroup-maximum-key, subgroup-minimum-key).
+/// floats' keys, decoded. A NaN's key is replaced by the largest (smallest)
+/// float's, the quiet NaN 0x7fc00000's (0xffffffff's), so that a NaN anywhere
+/// gives that key, which decodes to the quiet NaN (to a NaN, which is replaced
+/// by the quiet NaN), without a second reduction, an or of "is NaN"
+/// (L15-E276; alive2: tests/alive-tv/gpu/subgroup-maximum-nan-key,
+/// subgroup-minimum-nan-key). Where another such reduction of the value
+/// shares the key, the keys are the values' own and a NaN is selected where
+/// the or of "is NaN" is set (alive2: subgroup-maximum-key,
+/// subgroup-minimum-key), which keeps the selects off the key's path to the
+/// reductions (agx_cost throughput: a maximum and minimum of one value).
 static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
                                 gpu::SubgroupReduceOp op, Value value,
                                 StringRef group) {
@@ -559,30 +815,47 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
   Type i32 = rewriter.getI32Type();
   Type f32 = value.getType();
   bool isMax = op.getOp() == gpu::AllReduceOperation::MAXIMUMF;
+  auto i32Cst = [&](int64_t v) {
+    return LLVM::ConstantOp::create(rewriter, loc, i32,
+                                    rewriter.getI32IntegerAttr(v));
+  };
+  Value nan = LLVM::ConstantOp::create(
+      rewriter, loc, f32,
+      rewriter.getFloatAttr(f32, APFloat::getQNaN(APFloat::IEEEsingle())));
   // Used twice: one value even if it is undefined.
   value = LLVM::FreezeOp::create(rewriter, loc, value);
+  Value isNaN = LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno,
+                                     value, value);
   Value key = orderedFloatKey(
       rewriter, loc, LLVM::BitcastOp::create(rewriter, loc, i32, value));
+  bool shared = sharesNaNOr(op);
+  // (key(0x7fc00000) = 0x7fc00000, key(0xffffffff) = INT32_MIN)
+  if (!shared)
+    key = LLVM::SelectOp::create(rewriter, loc, isNaN,
+                                 i32Cst(isMax ? 0x7fc00000 : INT32_MIN), key);
   Value reduced =
       callAIR(rewriter, op,
               ("air." + group + (isMax ? "_max" : "_min") + ".s.i32").str(),
               i32, {key}, AIREffects::Convergent);
   Value result = LLVM::BitcastOp::create(
       rewriter, loc, f32, orderedFloatKey(rewriter, loc, reduced));
-  Value isNaN = LLVM::ZExtOp::create(
-      rewriter, loc, i32,
-      LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno, value,
-                           value));
-  Value anyNaN = callAIR(rewriter, op, ("air." + group + "_or.s.i32").str(),
-                         i32, {isNaN}, AIREffects::Convergent);
-  Value nan = LLVM::ConstantOp::create(
-      rewriter, loc, f32,
-      rewriter.getFloatAttr(f32, APFloat::getQNaN(APFloat::IEEEsingle())));
-  return LLVM::SelectOp::create(
-      rewriter, loc,
-      LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::ne, anyNaN,
-                           LLVM::ConstantOp::create(rewriter, loc, i32, 0)),
-      nan, result);
+  Value anyNaN;
+  if (shared) {
+    Value any =
+        callAIR(rewriter, op, ("air." + group + "_or.s.i32").str(), i32,
+                {LLVM::ZExtOp::create(rewriter, loc, i32, isNaN)},
+                AIREffects::Convergent);
+    anyNaN = LLVM::ICmpOp::create(rewriter, loc, LLVM::ICmpPredicate::ne, any,
+                                  i32Cst(0));
+  } else if (!isMax) {
+    // The minimum's key is INT32_MIN, 0xffffffff's, exactly where there is a
+    // NaN: the decoded result is a NaN exactly there.
+    anyNaN = LLVM::FCmpOp::create(rewriter, loc, LLVM::FCmpPredicate::uno,
+                                  result, result);
+  } else {
+    return result;
+  }
+  return LLVM::SelectOp::create(rewriter, loc, anyNaN, nan, result);
 }
 
 /// math.expm1 and math.log1p accurate for small arguments, where MathToLLVM's
@@ -593,6 +866,270 @@ static Value reduceOrderedFloat(ConversionPatternRewriter &rewriter,
 /// from 1/2, u - 1 and log(u), which do not cancel there (1 + x is exact
 /// below -1/2), and whose products would overflow (expm1(88), log1p(3e38)).
 /// A NaN propagates; -0 gives -0; infinities as exp and log give them.
+/// expm1(x) from u = exp(x) by rewriteAccurateM1's form: x where u is 1 and
+/// (u - 1) x / log(u) for |x| < 1/2, else u - 1 (the caller's u may be the
+/// exp of another argument where it does not read the result: L15-E309).
+static Value accurateExpM1(OpBuilder &b, Location loc, Value x, Value u) {
+  Type t = x.getType();
+  Value one = arith::ConstantOp::create(b, loc, t, b.getFloatAttr(t, 1.0));
+  Value small = arith::CmpFOp::create(
+      b, loc, arith::CmpFPredicate::OLT, math::AbsFOp::create(b, loc, x),
+      arith::ConstantOp::create(b, loc, t, b.getFloatAttr(t, 0.5)));
+  Value um1 = arith::SubFOp::create(b, loc, u, one);
+  Value q = arith::DivFOp::create(b, loc,
+                                  arith::MulFOp::create(b, loc, um1, x),
+                                  math::LogOp::create(b, loc, u));
+  Value isOne =
+      arith::CmpFOp::create(b, loc, arith::CmpFPredicate::OEQ, u, one);
+  return arith::SelectOp::create(
+      b, loc, small, arith::SelectOp::create(b, loc, isOne, x, q), um1);
+}
+
+/// Whether convert-gpu-to-air's f64-polynomial-fma is on (set by the pass for
+/// its patterns).
+static thread_local bool f64PolynomialFma = false;
+
+/// u v + w in the f64 expansions' polynomials and fdlibm's steps (exp, log,
+/// expm1): fdlibm's own multiply and add, or an fma with f64-polynomial-fma.
+/// The emulated fma (its exact product, a 106-bit sum) costs more than a
+/// multiply and an add (newk tput 83.0 against 27.2 + 35.6), and the results
+/// differ in a few in 10^4 lanes, within the same maximum error (L15-E815).
+static Value f64Fma(ImplicitLocOpBuilder &b, Value u, Value v, Value w) {
+  if (f64PolynomialFma)
+    return math::FmaOp::create(b, u, v, w);
+  return arith::AddFOp::create(b, arith::MulFOp::create(b, u, v), w);
+}
+
+/// expm1 of an f64 x: fdlibm's s_expm1.c in f64 and i64 operations, its
+/// branches selects (within 1 ulp; L15-E814). x = k ln 2 + r (k =
+/// roundeven(x / ln 2), r = hi - lo with its rounding error c, as exp's
+/// reduction), expm1(r) from fdlibm's rational form with one division, then
+/// its reconstruction, whose six cases are one form here (below); 2^k
+/// applied on the exponent field (each such value normal). x is clamped to
+/// -40 (below which the result rounds to -1) and a NaN or an x above 709.78
+/// (overflow) reduced as 0, the result selected; |x| below 2^-54 gives x
+/// (and -0 -0). Not exp's u - 1 and Kahan's (u - 1) x / log(u) near 0: no
+/// log and two divisions fewer.
+static Value expm1F64(ImplicitLocOpBuilder &b, Value x) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto neg = [&](Value u) { return arith::NegFOp::create(b, u); };
+  auto fma = [&](Value u, Value v, Value w) -> Value {
+    return f64Fma(b, u, v, w);
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v);
+  };
+  auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v); };
+  auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v); };
+  Value over = fcmp(arith::CmpFPredicate::UGT, x, c(7.09782712893383973096e+02));
+  Value xr = sel(fcmp(arith::CmpFPredicate::OLT, x, c(-40.0)), c(-40.0), x);
+  xr = sel(over, c(0.0), xr);
+  Value kf = math::RoundEvenOp::create(b, mul(xr, c(1.44269504088896338700e+00)));
+  Value hi = sub(xr, mul(kf, c(6.93147180369123816490e-01)));
+  Value lo = mul(kf, c(1.90821492927058770002e-10));
+  Value r = sub(hi, lo);
+  Value cr = sub(sub(hi, r), lo);
+  Value hfx = mul(c(0.5), r);
+  Value hxs = mul(r, hfx);
+  Value p = c(-2.01099218183624371326e-07);
+  for (double q : {4.00821782732936239552e-06, -7.93650757867487942473e-05,
+                   1.58730158725481460165e-03, -3.33333333333331316428e-02})
+    p = fma(hxs, p, c(q));
+  Value r1 = fma(hxs, p, c(1.0));
+  Value t = fma(neg(r1), hfx, c(3.0));
+  Value e = mul(hxs, arith::DivFOp::create(b, sub(r1, t),
+                                           fma(neg(r), t, c(6.0))));
+  Value ki = arith::FPToSIOp::create(b, i64, kf);
+  // r 2^k: k added to the exponent field
+  auto scale = [&](Value y) {
+    return dbl(arith::AddIOp::create(b, bits(y),
+                                     arith::ShLIOp::create(b, ki, ci(52))));
+  };
+  // fdlibm's reconstructions are 2^k ((1 - 2^-k) - (e2 - r)), e2 = (r (e -
+  // c) - c) - hxs (for k 0, -1, 1 and below 20: with 64-bit fields 1 - 2^-k
+  // is exact up to k = 52, and the same for k = 0 and from -58, whose
+  // rounding there is the result's), 2^k (1 - ((e2 + 2^-k) - r)) (k from
+  // 53; fdlibm's (r - (e2 + 2^-k)) + 1, the same) and 2 ((r + 1/2) - e2)
+  // (k = 1 and r below -1/4): one form, (r + f) + g, its operands selected
+  // (2^-k of k up to 1000: a 2^-k of a k above 56 does not change the sum)
+  Value e2 = sub(fma(r, sub(e, cr), neg(cr)), hxs);
+  Value big = icmp(arith::CmpIPredicate::sge, ki, ci(53));
+  Value pkBits = arith::ShLIOp::create(
+      b,
+      arith::SubIOp::create(b, ci(1023),
+                            arith::MinSIOp::create(b, ki, ci(1000))),
+      ci(52));
+  Value zeroBits = ci(0);
+  Value e2s = add(e2, dbl(sel(big, pkBits, zeroBits)));
+  Value tk = sub(c(1.0), dbl(sel(big, zeroBits, pkBits)));
+  Value oneLow = arith::AndIOp::create(
+      b, icmp(arith::CmpIPredicate::eq, ki, ci(1)),
+      fcmp(arith::CmpFPredicate::OLT, r, c(-0.25)));
+  Value f = sel(oneLow, c(0.5), neg(e2s));
+  Value g = sel(oneLow, neg(e2), tk);
+  Value res = scale(add(add(r, f), g));
+  res = sel(fcmp(arith::CmpFPredicate::OLT, math::AbsFOp::create(b, x),
+                 c(0x1p-54)),
+            x, res);
+  res = sel(over, c(std::numeric_limits<double>::infinity()), res);
+  return sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, res);
+}
+
+/// log1p of an f64 x: fdlibm's s_log1p.c in f64, i64 and f32 operations
+/// (L15-E818). Outside fdlibm's k = 0 range (x from -0.2929 to 0.4142, where
+/// f = x itself) u = 1 + x is reduced as log's argument, 2^k (1 + f), and
+/// its rounding error c ((1 + x) - u, exactly: 1 - (u - x) from u = 2, else
+/// x - (u - 1); none from 2^53) corrects the result by c / u, at most 2^-53
+/// of it: that quotient in f32 with the hardware's reciprocal, to 2^-21, is
+/// enough (fdlibm divides in double). Then log's s = f / (2 + f), R its
+/// polynomial, k ln2hi - ((f^2/2 - (s (f^2/2 + R) + (k ln2lo + c/u))) - f).
+/// -1 gives -inf, below -1 and NaN the default NaN (as log of 1 + x did),
+/// +inf itself, |x| below 2^-54 x (and -0 -0). Not log(1 + x) with Kahan's
+/// log(u) x / (u - 1) below 1/2: one division of doubles fewer.
+static Value log1pF64(ImplicitLocOpBuilder &b, Value x) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type(), f32 = b.getF32Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto fma = [&](Value u, Value v, Value w) -> Value {
+    return f64Fma(b, u, v, w);
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v);
+  };
+  Value u = add(c(1.0), x);
+  Value bu = arith::BitcastOp::create(b, i64, u);
+  Value hu = arith::ShRUIOp::create(b, bu, ci(32));
+  Value k = arith::SubIOp::create(b, arith::ShRUIOp::create(b, hu, ci(20)),
+                                  ci(1023));
+  Value cr = sel(icmp(arith::CmpIPredicate::sgt, k, ci(0)),
+                 sub(c(1.0), sub(u, x)), sub(x, sub(u, c(1.0))));
+  cr = sel(icmp(arith::CmpIPredicate::sge, k, ci(53)), c(0.0), cr);
+  auto q = arith::DivFOp::create(b, arith::TruncFOp::create(b, f32, cr),
+                                 arith::TruncFOp::create(b, f32, u));
+  q.setFastmath(arith::FastMathFlags::afn);
+  Value cu = arith::ExtFOp::create(b, f64, q.getResult());
+  hu = arith::AndIOp::create(b, hu, ci(0xfffff));
+  Value up = icmp(arith::CmpIPredicate::uge, hu, ci(0x6a09e));
+  Value newHi = arith::OrIOp::create(
+      b, hu, sel(up, ci(0x3fe00000), ci(0x3ff00000)));
+  k = arith::AddIOp::create(b, k, sel(up, ci(1), ci(0)));
+  Value f = sub(arith::BitcastOp::create(
+                    b, f64,
+                    arith::OrIOp::create(
+                        b, arith::ShLIOp::create(b, newHi, ci(32)),
+                        arith::AndIOp::create(b, bu, ci(0xffffffff)))),
+                c(1.0));
+  // fdlibm's k = 0 range: f = x (high words below 0x3fda827a and, negative,
+  // at most 0x3fd2bec3)
+  Value near = arith::AndIOp::create(
+      b, fcmp(arith::CmpFPredicate::OLT, x, c(0x1.a827ap-2)),
+      fcmp(arith::CmpFPredicate::OGT, x, c(-0x1.2bec4p-2)));
+  f = sel(near, x, f);
+  k = sel(near, ci(0), k);
+  cu = sel(near, c(0.0), cu);
+  Value sv = arith::DivFOp::create(b, f, add(c(2.0), f));
+  Value z = mul(sv, sv), w = mul(z, z);
+  Value t1 = mul(w, fma(w, fma(w, c(1.531383769920937332e-01),
+                               c(2.222219843214978396e-01)),
+                        c(3.999999999940941908e-01)));
+  Value t2 = mul(z, fma(w, fma(w, fma(w, c(1.479819860511658591e-01),
+                                      c(1.818357216161805012e-01)),
+                               c(2.857142874366239149e-01)),
+                        c(6.666666666666735130e-01)));
+  Value r = add(t2, t1);
+  Value dk = arith::SIToFPOp::create(b, f64, k);
+  Value hfsq = mul(mul(c(0.5), f), f);
+  Value res = sub(mul(dk, c(6.93147180369123816490e-01)),
+                  sub(sub(hfsq, add(mul(sv, add(hfsq, r)),
+                                    add(mul(dk, c(1.90821492927058770002e-10)),
+                                        cu))),
+                      f));
+  Value inf = c(std::numeric_limits<double>::infinity());
+  res = sel(fcmp(arith::CmpFPredicate::OLT, math::AbsFOp::create(b, x),
+                 c(0x1p-54)),
+            x, res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, x, inf), inf, res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(-1.0)),
+            c(-std::numeric_limits<double>::infinity()), res);
+  return sel(fcmp(arith::CmpFPredicate::ULT, x, c(-1.0)),
+             c(std::numeric_limits<double>::quiet_NaN()), res);
+}
+
+/// The f32 operations of a half function's expansion that may take the
+/// hardware's approximations (fastmath afn: exp, log, square root, division
+/// by the reciprocal).
+enum HalfApprox : unsigned {
+  HalfApproxNone = 0,
+  HalfApproxExpLog = 1,
+  HalfApproxSqrt = 2,
+  HalfApproxDiv = 4,
+};
+
+/// Whether convert-gpu-to-air's approximate-half-functions is on (set by the
+/// pass for its patterns).
+static thread_local bool approximateHalfFunctions = true;
+/// Whether convert-gpu-to-air's expm1-f64-direct is on (set as above).
+static thread_local bool expm1F64Direct = true;
+/// Whether convert-gpu-to-air's log1p-f64-direct is on (set as above).
+static thread_local bool log1pF64Direct = true;
+/// Whether convert-gpu-to-air's trig-f64-shared-polynomial is on.
+static thread_local bool trigSharedPolynomial = true;
+
+/// For a half result computed in f32 from \p x: fastmath afn on the f32
+/// operations of the kinds in \p kinds computing \p r, the kinds for which
+/// every half input's result was checked to be the one the precise
+/// operations give, on the functional model (L15-E330).
+static void approximateForHalf(Value r, Value x, unsigned kinds) {
+  if (!approximateHalfFunctions)
+    return;
+  SmallVector<Value> work{r};
+  DenseSet<Operation *> seen;
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    Operation *op = v.getDefiningOp();
+    if (v == x || !op || !seen.insert(op).second)
+      continue;
+    auto fm = dyn_cast<arith::ArithFastMathInterface>(op);
+    unsigned kind =
+        isa<math::LogOp, math::ExpOp, math::Log2Op, math::Exp2Op>(op)
+            ? HalfApproxExpLog
+        : isa<math::SqrtOp>(op)  ? HalfApproxSqrt
+        : isa<arith::DivFOp>(op) ? HalfApproxDiv
+                                 : HalfApproxNone;
+    if (fm && (kind & kinds))
+      op->setAttr(fm.getFastMathAttrName(),
+                  arith::FastMathFlagsAttr::get(
+                      op->getContext(), fm.getFastMathFlagsAttr().getValue() |
+                                            arith::FastMathFlags::afn));
+    for (Value o : op->getOperands())
+      work.push_back(o);
+  }
+}
+
 template <typename OpTy>
 static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
   auto type = dyn_cast<FloatType>(op.getType());
@@ -621,12 +1158,18 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
       math::AbsFOp::create(rewriter, loc, x), c(0.5f));
   Value r;
   if constexpr (std::is_same_v<OpTy, math::ExpM1Op>) {
-    Value u = math::ExpOp::create(rewriter, loc, x);
-    Value um1 = arith::SubFOp::create(rewriter, loc, u, one);
-    Value q = arith::DivFOp::create(
-        rewriter, loc, arith::MulFOp::create(rewriter, loc, um1, x),
-        math::LogOp::create(rewriter, loc, u));
-    r = sel(small, sel(eq(u, one), x, q), um1);
+    (void)small;
+    if (type.isF64() && expm1F64Direct) {
+      ImplicitLocOpBuilder ib(loc, rewriter);
+      r = expm1F64(ib, x);
+    } else {
+      r = accurateExpM1(rewriter, loc, x,
+                        math::ExpOp::create(rewriter, loc, x));
+    }
+  } else if (type.isF64() && log1pF64Direct) {
+    (void)small;
+    ImplicitLocOpBuilder ib(loc, rewriter);
+    r = log1pF64(ib, x);
   } else {
     Value u = arith::AddFOp::create(rewriter, loc, one, x);
     Value lu = math::LogOp::create(rewriter, loc, u);
@@ -635,14 +1178,24 @@ static LogicalResult rewriteAccurateM1(OpTy op, PatternRewriter &rewriter) {
         arith::SubFOp::create(rewriter, loc, u, one));
     r = sel(small, sel(eq(u, one), x, q), lu);
   }
+  // an f16 or bf16 result: the division by the reciprocal (exp and log
+  // precise: with the hardware's, expm1 and log1p were up to 1.12 ulp off)
+  if (type.isF16() || type.isBF16())
+    approximateForHalf(r, x, HalfApproxDiv);
   if (!type.isF32() && !type.isF64())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
   rewriter.replaceOp(op, r);
   return success();
 }
 
-/// log1p of an f32 x, accurate (rewriteAccurateM1's form).
-static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) {
+/// log1p of an f32 x, accurate (rewriteAccurateM1's form). With \p far and
+/// \p near, the one log is of 1 + x where near holds and of far elsewhere,
+/// and is returned in \p farLog: a caller that selects this log1p where
+/// near holds and something of log(far) elsewhere takes one log, not two,
+/// each lane's selected value the same (L15-E308).
+static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x,
+                              Value far = {}, Value near = {},
+                              Value *farLog = nullptr) {
   Type f32 = rewriter.getF32Type();
   auto c = [&](float v) {
     return arith::ConstantOp::create(rewriter, loc, f32,
@@ -650,7 +1203,12 @@ static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) 
   };
   Value one = c(1.0f);
   Value u = arith::AddFOp::create(rewriter, loc, one, x);
-  Value lu = math::LogOp::create(rewriter, loc, u);
+  Value lu = math::LogOp::create(
+      rewriter, loc,
+      far ? arith::SelectOp::create(rewriter, loc, near, u, far).getResult()
+          : u);
+  if (farLog)
+    *farLog = lu;
   Value q = arith::DivFOp::create(
       rewriter, loc, arith::MulFOp::create(rewriter, loc, lu, x),
       arith::SubFOp::create(rewriter, loc, u, one));
@@ -671,6 +1229,7 @@ static Value accurateLog1pF32(PatternRewriter &rewriter, Location loc, Value x) 
 ///   asinh = log1p(a + a^2 / (1 + sqrt(1 + a^2))), from 2^12 log(a) + ln 2;
 ///   acosh = log1p(t + sqrt(2 t + t^2)), t = x - 1, from 2^12 log(x) + ln 2
 ///           (NaN below 1);
+///   (each one log, of the argument the range picks);
 ///   atanh = log1p(2 a / (1 - a)) / 2 (inf at 1, NaN beyond);
 ///   cbrt  = exp2(log2(a) / 3) and a Newton step y - (y^3 - a) / (3 y^2)
 ///           (inf and NaN themselves, a signed zero below 2^-126: a
@@ -706,16 +1265,20 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
   if constexpr (std::is_same_v<OpTy, math::AsinhOp>) {
     Value a2 = mul(a, a);
     Value s = math::SqrtOp::create(rewriter, loc, add(one, a2));
-    Value nearV = accurateLog1pF32(rewriter, loc, add(a, div(a2, add(one, s))));
-    Value farV = add(math::LogOp::create(rewriter, loc, a), ln2);
-    r = sel(cmp(arith::CmpFPredicate::OLT, a, c(4096.0f)), nearV, farV);
+    Value near = cmp(arith::CmpFPredicate::OLT, a, c(4096.0f));
+    Value logA;
+    Value nearV = accurateLog1pF32(rewriter, loc, add(a, div(a2, add(one, s))),
+                                   a, near, &logA);
+    r = sel(near, nearV, add(logA, ln2));
     r = math::CopySignOp::create(rewriter, loc, r, x);
   } else if constexpr (std::is_same_v<OpTy, math::AcoshOp>) {
     Value t = sub(x, one);
     Value s = math::SqrtOp::create(rewriter, loc, add(add(t, t), mul(t, t)));
-    Value nearV = accurateLog1pF32(rewriter, loc, add(t, s));
-    Value farV = add(math::LogOp::create(rewriter, loc, x), ln2);
-    r = sel(cmp(arith::CmpFPredicate::OLT, x, c(4096.0f)), nearV, farV);
+    Value near = cmp(arith::CmpFPredicate::OLT, x, c(4096.0f));
+    Value logX;
+    Value nearV =
+        accurateLog1pF32(rewriter, loc, add(t, s), x, near, &logX);
+    r = sel(near, nearV, add(logX, ln2));
     // below 1 a NaN (t + sqrt(2 t + t^2) is -1 for large negative x)
     r = sel(cmp(arith::CmpFPredicate::OLT, x, one), c(NAN), r);
   } else if constexpr (std::is_same_v<OpTy, math::AtanhOp>) {
@@ -734,8 +1297,1244 @@ static LogicalResult rewriteInverseHyperbolic(OpTy op,
     r = sel(cmp(arith::CmpFPredicate::OLT, a, c(0x1p-126f)),
             math::CopySignOp::create(rewriter, loc, c(0.0f), x), r);
   }
+  // a half result: cbrt all approximate, acosh and atanh the divisions and
+  // square roots, asinh the square root (each half input's result as before;
+  // asinh's division by the reciprocal changed 4, 2 of them further off, and
+  // the hardware's log changed asinh's and atanh's small results)
+  if (type.isF16() || type.isBF16()) {
+    constexpr bool isCbrt = std::is_same_v<OpTy, math::CbrtOp>;
+    constexpr bool isAsinh = std::is_same_v<OpTy, math::AsinhOp>;
+    constexpr bool isAcosh = std::is_same_v<OpTy, math::AcoshOp>;
+    unsigned all = HalfApproxExpLog | HalfApproxSqrt | HalfApproxDiv;
+    unsigned kinds =
+        type.isF16()
+            ? (isCbrt    ? all
+               : isAsinh ? unsigned(HalfApproxSqrt)
+                         : HalfApproxSqrt | HalfApproxDiv)
+            // bf16 (L15-E332): acosh all; atanh none (its division by the
+            // reciprocal gave 0 for x beyond 2^126, not a NaN); the others
+            // the divisions and square roots (cbrt's hardware log and exp
+            // rounded 2 inputs the other way)
+            : (isAcosh                                ? all
+               : std::is_same_v<OpTy, math::AtanhOp> ? HalfApproxNone
+                                                     : HalfApproxSqrt |
+                                                           HalfApproxDiv);
+    approximateForHalf(r, x, kinds);
+  }
   if (!type.isF32())
     r = arith::TruncFOp::create(rewriter, loc, type, r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// 2/pi's bits after the binary point, 64 a word, the most significant
+/// first, after a word of zeros (L15-E822): remPio2F64's window of a large x.
+static const uint64_t twoOverPiWords[20] = {
+    0x0000000000000000ULL, 0xa2f9836e4e441529ULL, 0xfc2757d1f534ddc0ULL,
+    0xdb6295993c439041ULL, 0xfe5163abdebbc561ULL, 0xb7246e3a424dd2e0ULL,
+    0x06492eea09d1921cULL, 0xfe1deb1cb129a73eULL, 0xe88235f52ebb4484ULL,
+    0xe99c7026b45f7e41ULL, 0x3991d639835339f4ULL, 0x9c845f8bbdf9283bULL,
+    0x1ff897ffde05980fULL, 0xef2f118b5a0a6d1fULL, 0x6d367ecf27cb09b7ULL,
+    0x4f463f669e5fea2dULL, 0x7527bac7ebe5f17bULL, 0x3d0739f78a5292eaULL,
+    0x6bfb5fb11f8d5d08ULL, 0x56033046fc7b6babULL};
+
+/// x = n pi/2 + (y0 + y1) for an f64 x, |y0 + y1| <= pi/4 about, n's low
+/// bits as i64 (L15-E822). fdlibm's e_rem_pio2.c: below 2^19 pi/2 three
+/// rounds of Cody and Waite's reduction by pi/2 in 33-bit parts (fdlibm's
+/// rounds two and three where its cancellation test asks for them; here
+/// always, branch-free, with the second round's rounding error kept, which
+/// fdlibm's third round, taken only after a cancellation, has none of),
+/// n = roundeven(|x| 2/pi).
+/// From 2^19 pi/2 (and for infinities and NaNs, whose results the callers
+/// replace) Payne and Hanek's: x = M 2^e, M the 53-bit significand, and
+/// x 2/pi mod 4 = M W 2^-190 mod 4 for W the 192 bits of 2/pi from the one
+/// of weight 2^-(e + 63) (2/pi's bits above it give multiples of 4): three
+/// 64 x 64-bit products, n the sum's bits 190 and 191, the fraction its 128
+/// bits below, past one half less one (n + 1), normalized to two doubles
+/// times pi/2 in two parts (the product's error by an fma). In an scf.if: a
+/// SIMD group with no such lane runs none of it.
+static std::tuple<Value, Value, Value> remPio2F64(ImplicitLocOpBuilder &b,
+                                                  Value x) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type(), i1 = b.getI1Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto ci = [&](int64_t v) {
+    return arith::ConstantIntOp::create(b, i64, v).getResult();
+  };
+  auto add = [&](Value u, Value v) {
+    return arith::AddFOp::create(b, u, v).getResult();
+  };
+  auto sub = [&](Value u, Value v) {
+    return arith::SubFOp::create(b, u, v).getResult();
+  };
+  auto mul = [&](Value u, Value v) {
+    return arith::MulFOp::create(b, u, v).getResult();
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto iadd = [&](Value u, Value v) {
+    return arith::AddIOp::create(b, u, v).getResult();
+  };
+  auto isub = [&](Value u, Value v) {
+    return arith::SubIOp::create(b, u, v).getResult();
+  };
+  auto iand = [&](Value u, Value v) {
+    return arith::AndIOp::create(b, u, v).getResult();
+  };
+  auto ior = [&](Value u, Value v) {
+    return arith::OrIOp::create(b, u, v).getResult();
+  };
+  auto shl = [&](Value u, Value v) {
+    return arith::ShLIOp::create(b, u, v).getResult();
+  };
+  auto shr = [&](Value u, Value v) {
+    return arith::ShRUIOp::create(b, u, v).getResult();
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v).getResult();
+  };
+  auto bits = [&](Value v) {
+    return arith::BitcastOp::create(b, i64, v).getResult();
+  };
+  auto dbl = [&](Value v) {
+    return arith::BitcastOp::create(b, f64, v).getResult();
+  };
+  Value a = math::AbsFOp::create(b, x);
+  Value neg = icmp(arith::CmpIPredicate::slt, bits(x), ci(0));
+  Value large = arith::CmpFOp::create(b, arith::CmpFPredicate::UGE, a,
+                                      c(0x1.921fbp+19));
+  auto ifOp = scf::IfOp::create(b, TypeRange{f64, f64, i64}, large,
+                                /*withElseRegion=*/true);
+  {
+    OpBuilder::InsertionGuard guard(b);
+    // Payne and Hanek's
+    b.setInsertionPointToStart(&ifOp.getThenRegion().front());
+    Value bx = bits(a);
+    Value m = ior(iand(bx, ci(0xfffffffffffffLL)), ci(1LL << 52));
+    // the window's first bit, from twoOverPiWords' first: e + 62 for x =
+    // M 2^e (e = field - 1075), and its word and the bit in it
+    Value q = isub(shr(bx, ci(52)), ci(1075 - 62));
+    Value wi = shr(q, ci(6)), bo = iand(q, ci(63));
+    auto word = [&](Value idx) {
+      Value w = ci(0);
+      for (int k = 19; k >= 0; --k)
+        w = sel(icmp(arith::CmpIPredicate::eq, idx, ci(k)),
+                ci(int64_t(twoOverPiWords[k])), w);
+      return w;
+    };
+    Value g0 = word(wi), g1 = word(iadd(wi, ci(1))),
+          g2 = word(iadd(wi, ci(2))), g3 = word(iadd(wi, ci(3)));
+    // (u << bo) | (v >> (64 - bo)), the second as two shifts for bo = 0
+    Value rbo = isub(ci(63), bo);
+    auto window = [&](Value u, Value v) {
+      return ior(shl(u, bo), shr(shr(v, ci(1)), rbo));
+    };
+    Value w0 = window(g0, g1), w1 = window(g1, g2), w2 = window(g2, g3);
+    auto p2 = arith::MulUIExtendedOp::create(b, m, w2);
+    auto p1 = arith::MulUIExtendedOp::create(b, m, w1);
+    Value lo0 = arith::MulIOp::create(b, m, w0);
+    Value s1 = iadd(p2.getHigh(), p1.getLow());
+    Value carry = arith::ExtUIOp::create(
+        b, i64, icmp(arith::CmpIPredicate::ult, s1, p2.getHigh()));
+    Value s2 = iadd(iadd(p1.getHigh(), lo0), carry);
+    Value n = shr(s2, ci(62));
+    Value fhi = ior(shl(s2, ci(2)), shr(s1, ci(62)));
+    Value flo = ior(shl(s1, ci(2)), shr(p2.getLow(), ci(62)));
+    // from one half: 1 - f, and n + 1
+    Value half = icmp(arith::CmpIPredicate::slt, fhi, ci(0));
+    n = iadd(n, arith::ExtUIOp::create(b, i64, half));
+    Value nlo = isub(ci(0), flo);
+    Value nhi = isub(isub(ci(0), fhi),
+                     arith::ExtUIOp::create(
+                         b, i64, icmp(arith::CmpIPredicate::ne, flo, ci(0))));
+    fhi = sel(half, nhi, fhi);
+    flo = sel(half, nlo, flo);
+    // normalized: the high word's top bit set (it is not zero: a double's
+    // fraction of pi/2 is at least 2^-62 or so of it)
+    Value sh = math::CountLeadingZerosOp::create(b, fhi);
+    sh = arith::MinUIOp::create(b, sh, ci(63));
+    Value nh = ior(shl(fhi, sh), shr(shr(flo, ci(1)), isub(ci(63), sh)));
+    Value nl = shl(flo, sh);
+    Value h53 = shr(nh, ci(11));
+    Value rest = ior(shl(iand(nh, ci(0x7ff)), ci(53)), shr(nl, ci(11)));
+    auto pow2 = [&](Value e) { return dbl(shl(iadd(e, ci(1023)), ci(52))); };
+    Value hi = mul(arith::UIToFPOp::create(b, f64, h53),
+                   pow2(isub(ci(-53), sh)));
+    Value lo = mul(arith::UIToFPOp::create(b, f64, rest),
+                   pow2(isub(ci(-117), sh)));
+    // (hi + lo) pi/2
+    Value pio2Hi = c(1.5707963267948966), pio2Lo = c(6.123233995736766e-17);
+    Value p = mul(hi, pio2Hi);
+    Value e = math::FmaOp::create(b, hi, pio2Hi,
+                                  arith::NegFOp::create(b, p).getResult());
+    e = add(e, add(mul(hi, pio2Lo), mul(lo, pio2Hi)));
+    Value y0 = add(p, e);
+    Value y1 = sub(e, sub(y0, p));
+    y0 = sel(half, arith::NegFOp::create(b, y0).getResult(), y0);
+    y1 = sel(half, arith::NegFOp::create(b, y1).getResult(), y1);
+    scf::YieldOp::create(b, ValueRange{y0, y1, n});
+  }
+  {
+    OpBuilder::InsertionGuard guard(b);
+    // Cody and Waite's, three rounds
+    b.setInsertionPointToStart(&ifOp.getElseRegion().front());
+    Value fn = math::RoundEvenOp::create(b, mul(a, c(6.36619772367581382433e-01)));
+    // (r1 exact; each later round's rounding error e kept: fdlibm takes its
+    // third round only where the second's subtraction cancelled, exactly)
+    Value r1 = sub(a, mul(fn, c(1.57079632673412561417e+00)));
+    Value w2 = mul(fn, c(6.07710050630396597660e-11));
+    Value r2 = sub(r1, w2);
+    Value e2 = sub(sub(r1, r2), w2);
+    Value w3 = mul(fn, c(2.02226624871116645580e-21));
+    Value r = sub(r2, w3);
+    Value e3 = sub(sub(r2, r), w3);
+    Value w = sub(sub(mul(fn, c(8.47842766036889956997e-32)), e3), e2);
+    Value y0 = sub(r, w);
+    Value y1 = sub(sub(r, y0), w);
+    // (an infinite or NaN |x| goes to the other branch)
+    Value n = arith::FPToSIOp::create(b, i64, fn);
+    scf::YieldOp::create(b, ValueRange{y0, y1, n});
+  }
+  (void)i1;
+  Value y0 = ifOp.getResult(0), y1 = ifOp.getResult(1), n = ifOp.getResult(2);
+  y0 = sel(neg, arith::NegFOp::create(b, y0).getResult(), y0);
+  y1 = sel(neg, arith::NegFOp::create(b, y1).getResult(), y1);
+  n = sel(neg, isub(ci(0), n), n);
+  return {y0, y1, n};
+}
+
+/// fdlibm's __kernel_sin(y0, y1) and FreeBSD's __kernel_cos(y0, y1) on
+/// |y0 + y1| <= pi/4 (L15-E822).
+static Value kernelSinF64(ImplicitLocOpBuilder &b, Value x, Value y) {
+  Type f64 = b.getF64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  Value z = mul(x, x), v = mul(z, x);
+  Value r = c(1.58969099521155010221e-10);
+  for (double k : {-2.50507602534068634195e-08, 2.75573137070700676789e-06,
+                   -1.98412698298579493134e-04, 8.33333333332248946124e-03})
+    r = f64Fma(b, z, r, c(k));
+  // x - ((z (y/2 - v r) - y) - v S1)
+  return sub(x, sub(sub(mul(z, sub(mul(c(0.5), y), mul(v, r))), y),
+                    mul(v, c(-1.66666666666666324348e-01))));
+}
+static Value kernelCosF64(ImplicitLocOpBuilder &b, Value x, Value y) {
+  Type f64 = b.getF64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  Value z = mul(x, x), w = mul(z, z);
+  Value r1 = f64Fma(b, z, f64Fma(b, z, c(2.48015872894767294178e-05),
+                                 c(-1.38888888888741095749e-03)),
+                    c(4.16666666666666019037e-02));
+  Value r2 = f64Fma(b, z, f64Fma(b, z, c(-1.13596475577881948265e-11),
+                                 c(2.08757232129817482790e-09)),
+                    c(-2.75573143513906633035e-07));
+  Value r = add(mul(z, r1), mul(mul(w, w), r2));
+  Value hz = mul(c(0.5), z);
+  Value wv = sub(c(1.0), hz);
+  return add(wv, add(sub(sub(c(1.0), wv), hz), sub(mul(z, r), mul(x, y))));
+}
+/// FreeBSD's __kernel_tan(y0, y1, odd ? -1 : 1): tan, or -1/tan for odd n;
+/// from |y| 0.6744 tan(pi/4 - y)'s identity; the two divisions (that
+/// form's and -1 / (x + r)'s) one, of operands selected (L15-E822).
+static Value kernelTanF64(ImplicitLocOpBuilder &b, Value x, Value y,
+                          Value odd) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto lowCleared = [&](Value v) {
+    return arith::BitcastOp::create(
+               b, f64,
+               arith::AndIOp::create(
+                   b, arith::BitcastOp::create(b, i64, v),
+                   arith::ConstantIntOp::create(
+                       b, i64, int64_t(0xffffffff00000000ULL))))
+        .getResult();
+  };
+  Value ax = math::AbsFOp::create(b, x);
+  Value big = arith::CmpFOp::create(b, arith::CmpFPredicate::OGE, ax,
+                                    c(0x1.59428p-1));
+  Value negx = arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, x, c(0.0));
+  // big: pi/4 - |x| (with y's sign as x's), y = 0
+  Value xs = sel(negx, arith::NegFOp::create(b, x).getResult(), x);
+  Value ys = sel(negx, arith::NegFOp::create(b, y).getResult(), y);
+  Value xb = add(sub(c(7.85398163397448278999e-01), xs),
+                 sub(c(3.06161699786838301793e-17), ys));
+  x = sel(big, xb, x);
+  y = sel(big, c(0.0), y);
+  Value z = mul(x, x), w = mul(z, z);
+  Value r = c(-1.85586374855275456654e-05);
+  for (double k : {7.81794442939557092300e-05, 5.88041240820264096874e-04,
+                   3.59207910759131235356e-03, 2.18694882948595424599e-02,
+                   1.33333333333201242699e-01})
+    r = f64Fma(b, w, r, c(k));
+  Value v = c(2.59073051863633712884e-05);
+  for (double k : {7.14072491382608190305e-05, 2.46463134818469906812e-04,
+                   1.45620945432529025516e-03, 8.86323982359930005737e-03,
+                   5.39682539762260521377e-02})
+    v = f64Fma(b, w, v, c(k));
+  v = mul(z, v);
+  Value s = mul(z, x);
+  r = add(add(y, mul(z, add(mul(s, add(r, v)), y))),
+          mul(s, c(3.33333333333334091986e-01)));
+  Value wv = add(x, r);
+  Value iy = sel(odd, c(-1.0), c(1.0));
+  // the one division: w^2 / (w + iy) (big), -1 / w (odd)
+  Value q = arith::DivFOp::create(b, sel(big, mul(wv, wv), c(-1.0)),
+                                  sel(big, add(wv, iy), wv));
+  Value bigV = mul(sel(negx, c(-1.0), c(1.0)),
+                   sub(iy, mul(c(2.0), sub(x, sub(q, r)))));
+  // -1 / (x + r) to full precision: t = -1 / w's high word, its correction
+  Value zh = lowCleared(wv);
+  Value vv = sub(r, sub(zh, x));
+  Value t = lowCleared(q);
+  Value sv = add(c(1.0), mul(t, zh));
+  Value oddV = add(t, mul(q, add(sv, mul(t, vv))));
+  return sel(big, bigV, sel(odd, oddV, wv));
+}
+
+/// sin, cos and tan of f64 (L15-E822; before, llvm.sin.f64 and the others
+/// had no emulation and the kernel did not compile): fdlibm's s_sin.c,
+/// s_cos.c and s_tan.c, x reduced by remPio2F64 and the kernels selected by
+/// n mod 4 (sin: sin, cos, -sin, -cos; cos: cos, -sin, -cos, sin; tan: tan
+/// or -1/tan); x itself for sin and tan of |x| below 2^-27 (and -0), 1 for
+/// cos; NaN for infinities and NaNs.
+template <typename OpTy>
+static LogicalResult rewriteTrigF64(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto bit = [&](Value n, int64_t k) {
+    return arith::CmpIOp::create(
+               b, arith::CmpIPredicate::ne,
+               arith::AndIOp::create(b, n,
+                                     arith::ConstantIntOp::create(b, i64, k)),
+               arith::ConstantIntOp::create(b, i64, 0))
+        .getResult();
+  };
+  auto neg = [&](Value v) { return arith::NegFOp::create(b, v).getResult(); };
+  Value x = op.getOperand();
+  Value a = math::AbsFOp::create(b, x);
+  auto [y0, y1, n] = remPio2F64(b, x);
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::TanOp>) {
+    r = kernelTanF64(b, y0, y1, bit(n, 1));
+    r = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, a, c(0x1p-27)),
+            x, r);
+  } else {
+    constexpr bool isCos = std::is_same_v<OpTy, math::CosOp>;
+    // cos is sin a quadrant ahead
+    Value odd = bit(n, 1), minus = bit(isCos ? arith::AddIOp::create(
+                                                   b, n,
+                                                   arith::ConstantIntOp::create(
+                                                       b, i64, 1))
+                                                   .getResult()
+                                             : n,
+                                         2);
+    Value v;
+    if (trigSharedPolynomial) {
+      // (L15-E835) one Horner chain in z = y0^2 of the kernel each lane
+      // reads, its coefficients selected: fdlibm's __kernel_cos's six
+      // (C6 .. C1, its original form: r = z (C1 + ... + z C6)) or
+      // __kernel_sin's five (S6 .. S2) after a zero (0 z + S6 is S6: the
+      // same operations), then each kernel's own final steps
+      Value cosK = isCos ? arith::XOrIOp::create(
+                               b, odd,
+                               arith::ConstantIntOp::create(b, b.getI1Type(), 1))
+                               .getResult()
+                         : odd;
+      static const double sinC[6] = {0.0,
+                                     1.58969099521155010221e-10,
+                                     -2.50507602534068634195e-08,
+                                     2.75573137070700676789e-06,
+                                     -1.98412698298579493134e-04,
+                                     8.33333333332248946124e-03};
+      static const double cosC[6] = {-1.13596475577881948265e-11,
+                                     2.08757232129817482790e-09,
+                                     -2.75573143513906633035e-07,
+                                     2.48015872894767294178e-05,
+                                     -1.38888888888741095749e-03,
+                                     4.16666666666666019037e-02};
+      auto add = [&](Value u, Value w) {
+        return arith::AddFOp::create(b, u, w).getResult();
+      };
+      auto sub = [&](Value u, Value w) {
+        return arith::SubFOp::create(b, u, w).getResult();
+      };
+      auto mul = [&](Value u, Value w) {
+        return arith::MulFOp::create(b, u, w).getResult();
+      };
+      Value z = mul(y0, y0);
+      Value p = sel(cosK, c(cosC[0]), c(sinC[0]));
+      for (int k = 1; k < 6; ++k)
+        p = f64Fma(b, p, z, sel(cosK, c(cosC[k]), c(sinC[k])));
+      // sin: x - ((z (y/2 - v r) - y) - v S1), v = z x
+      Value vv = mul(z, y0);
+      Value sinV = sub(y0, sub(sub(mul(z, sub(mul(c(0.5), y1), mul(vv, p))), y1),
+                               mul(vv, c(-1.66666666666666324348e-01))));
+      // cos: w + (((1 - w) - z/2) + (z r - x y)), r = z p, w = 1 - z/2
+      Value hz = mul(c(0.5), z);
+      Value w = sub(c(1.0), hz);
+      Value cosV = add(w, add(sub(sub(c(1.0), w), hz),
+                              sub(mul(z, mul(z, p)), mul(y0, y1))));
+      v = sel(cosK, cosV, sinV);
+    } else {
+      Value s = kernelSinF64(b, y0, y1), co = kernelCosF64(b, y0, y1);
+      v = isCos ? sel(odd, s, co) : sel(odd, co, s);
+    }
+    r = sel(minus, neg(v), v);
+    Value tiny =
+        arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, a, c(0x1p-27));
+    r = sel(tiny, isCos ? c(1.0) : x, r);
+  }
+  r = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::UGE, a,
+                                c(std::numeric_limits<double>::infinity())),
+          c(std::numeric_limits<double>::quiet_NaN()), r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// pow of f64 (L15-E823; before, llvm.pow.f64 had no emulation and the
+/// kernel did not compile): fdlibm's e_pow.c, branch-free. log2|x| as
+/// t1 + t2 (|x| = 2^n m, m within [sqrt(3)/2, sqrt(3)) about 1 or 1.5,
+/// s = (m - b) / (m + b) by a reciprocal in two parts, its polynomial in
+/// s^2, 2/(3 ln 2) in two parts; for |y| from 2^31, fdlibm's series of
+/// |x| near 1 instead), times y = y1 + y2 (high words), z = p_h + p_l, its
+/// overflow and underflow tests, 2^z as 2^n e^(z - n) (n = roundeven(z),
+/// exp's rational with one division), scaled by 2^n in two exact steps (a
+/// denormal result rounded once). The special cases as e_pow.c and C99:
+/// y = 0 or x = 1: 1; NaN; y infinite (|x| = 1: 1); |x| zero or infinite;
+/// x negative: NaN for y not an integer, the sign for y odd; |y| above 2^64
+/// over or underflow.
+static LogicalResult rewritePowF64(math::PowFOp op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto ci = [&](int64_t v) {
+    return arith::ConstantIntOp::create(b, i64, v).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v).getResult(); };
+  auto fma = [&](Value u, Value v, Value w) -> Value { return f64Fma(b, u, v, w); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v).getResult();
+  };
+  auto icmp = [&](arith::CmpIPredicate p, Value u, Value v) {
+    return arith::CmpIOp::create(b, p, u, v).getResult();
+  };
+  auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v).getResult(); };
+  auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v).getResult(); };
+  auto iadd = [&](Value u, Value v) { return arith::AddIOp::create(b, u, v).getResult(); };
+  auto isub = [&](Value u, Value v) { return arith::SubIOp::create(b, u, v).getResult(); };
+  auto iand = [&](Value u, Value v) { return arith::AndIOp::create(b, u, v).getResult(); };
+  auto ior = [&](Value u, Value v) { return arith::OrIOp::create(b, u, v).getResult(); };
+  auto shl = [&](Value u, Value v) { return arith::ShLIOp::create(b, u, v).getResult(); };
+  auto shr = [&](Value u, Value v) { return arith::ShRUIOp::create(b, u, v).getResult(); };
+  auto bnot = [&](Value v) {
+    return arith::XOrIOp::create(
+               b, v, arith::ConstantIntOp::create(b, b.getI1Type(), 1))
+        .getResult();
+  };
+  auto band = [&](Value u, Value v) { return arith::AndIOp::create(b, u, v).getResult(); };
+  auto bor = [&](Value u, Value v) { return arith::OrIOp::create(b, u, v).getResult(); };
+  // a double with its low word cleared
+  auto lowCleared = [&](Value v) {
+    return dbl(iand(bits(v), ci(int64_t(0xffffffff00000000ULL))));
+  };
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  Value x = op.getLhs(), y = op.getRhs();
+  Value ax = math::AbsFOp::create(b, x), ay = math::AbsFOp::create(b, y);
+  // y an integer (|y| from 2^53 is), odd
+  Value yInt = fcmp(arith::CmpFPredicate::OEQ, math::FloorOp::create(b, y), y);
+  Value yHalf = mul(y, c(0.5));
+  Value yOdd = band(yInt, fcmp(arith::CmpFPredicate::ONE,
+                               math::FloorOp::create(b, yHalf), yHalf));
+  Value xNeg = icmp(arith::CmpIPredicate::slt, bits(x), ci(0));
+  // the result's sign: - for x negative and y odd
+  Value minus = band(xNeg, yOdd);
+
+  // log2 |x| = t1 + t2 (|y| below 2^31: fdlibm's general form)
+  Value tinyX = fcmp(arith::CmpFPredicate::OLT, ax, c(0x1p-1022));
+  Value axs = sel(tinyX, mul(ax, c(0x1p53)), ax);
+  Value hx = shr(bits(axs), ci(32));
+  Value n = iadd(isub(shr(hx, ci(20)), ci(0x3ff)), sel(tinyX, ci(-53), ci(0)));
+  Value j = iand(hx, ci(0xfffff));
+  Value k1 = band(icmp(arith::CmpIPredicate::sgt, j, ci(0x3988E)),
+                  icmp(arith::CmpIPredicate::slt, j, ci(0xBB67A)));
+  Value up = icmp(arith::CmpIPredicate::sge, j, ci(0xBB67A));
+  n = iadd(n, sel(up, ci(1), ci(0)));
+  Value ixh = isub(ior(j, ci(0x3ff00000)), sel(up, ci(0x00100000), ci(0)));
+  Value m = dbl(ior(shl(ixh, ci(32)), iand(bits(axs), ci(0xffffffffLL))));
+  Value bp = sel(k1, c(1.5), c(1.0));
+  Value u = sub(m, bp);
+  Value v = div(c(1.0), add(m, bp));
+  Value ss = mul(u, v);
+  Value sH = lowCleared(ss);
+  // t_h = m + bp's high part, from the bits: ((ix >> 1) | 0x20000000) +
+  // 0x00080000 + (k << 18) as its high word
+  Value tH = dbl(shl(iadd(iadd(ior(shr(ixh, ci(1)), ci(0x20000000)),
+                               ci(0x00080000)),
+                          sel(k1, ci(1 << 18), ci(0))),
+                     ci(32)));
+  Value tL = sub(m, sub(tH, bp));
+  Value sL = mul(v, sub(sub(u, mul(sH, tH)), mul(sH, tL)));
+  Value s2 = mul(ss, ss);
+  Value r = c(2.06975017800338417784e-01);
+  for (double kk : {2.30660745775561754067e-01, 2.72728123808534006489e-01,
+                    3.33333329818377432918e-01, 4.28571428578550184252e-01,
+                    5.99999999999994648725e-01})
+    r = fma(s2, r, c(kk));
+  r = mul(mul(s2, s2), r);
+  r = add(r, mul(sL, add(sH, ss)));
+  s2 = mul(sH, sH);
+  Value tHi = lowCleared(add(add(c(3.0), s2), r));
+  Value tLo = sub(r, sub(sub(tHi, c(3.0)), s2));
+  Value uu = mul(sH, tHi);
+  Value vv = add(mul(sL, tHi), mul(tLo, ss));
+  Value pH = lowCleared(add(uu, vv));
+  Value pL = sub(vv, sub(pH, uu));
+  Value zH = mul(c(9.61796700954437255859e-01), pH);
+  Value zL = add(add(mul(c(-7.02846165095275826516e-09), pH),
+                     mul(pL, c(9.61796693925975554329e-01))),
+                 sel(k1, c(1.35003920212974897128e-08), c(0.0)));
+  Value dpH = sel(k1, c(5.84962487220764160156e-01), c(0.0));
+  Value tn = arith::SIToFPOp::create(b, f64, n);
+  Value t1 = lowCleared(add(add(add(zH, zL), dpH), tn));
+  Value t2 = sub(zL, sub(sub(sub(t1, tn), dpH), zH));
+  // |y| from 2^31: |x| near 1's series (a farther x over or underflows)
+  {
+    Value t = sub(ax, c(1.0));
+    Value w = mul(mul(t, t), sub(c(0.5), mul(t, sub(c(0.3333333333333333333333),
+                                                     mul(t, c(0.25))))));
+    // (fdlibm's u = ivln2_h t is not exact: ivln2_h has 24 bits, t up to
+    // 33, and the error, times y, reached 973 units of 2^-53 in z where z
+    // stays in range (2^-20 near 1, |y| to 2^64); t split at its high word,
+    // ivln2_h t's high part exact and the rest in v, 0.0018)
+    Value th = lowCleared(t);
+    Value uN = mul(c(1.44269502162933349609e+00), th);
+    Value vN = sub(add(mul(sub(t, th), c(1.44269502162933349609e+00)),
+                       mul(t, c(1.92596299112661746887e-08))),
+                   mul(w, c(1.44269504088896338700e+00)));
+    Value t1N = lowCleared(add(uN, vN));
+    Value t2N = sub(vN, sub(t1N, uN));
+    Value bigY = fcmp(arith::CmpFPredicate::OGT, ay, c(0x1p31));
+    t1 = sel(bigY, t1N, t1);
+    t2 = sel(bigY, t2N, t2);
+  }
+  // (y1 + y2)(t1 + t2)
+  Value y1 = lowCleared(y);
+  Value pl = add(mul(sub(y, y1), t1), mul(y, t2));
+  Value ph = mul(y1, t1);
+  Value z = add(pl, ph);
+  // overflow from 1024, underflow below -1075 (at the edges by p_l's part)
+  Value over = bor(fcmp(arith::CmpFPredicate::OGT, z, c(1024.0)),
+                   band(fcmp(arith::CmpFPredicate::OEQ, z, c(1024.0)),
+                        fcmp(arith::CmpFPredicate::OGT,
+                             add(pl, c(8.0085662595372944372e-17)),
+                             sub(z, ph))));
+  Value under = bor(fcmp(arith::CmpFPredicate::OLT, z, c(-1075.0)),
+                    band(fcmp(arith::CmpFPredicate::OEQ, z, c(-1075.0)),
+                         fcmp(arith::CmpFPredicate::OLE, pl, sub(z, ph))));
+  // 2^(p_h + p_l): n = roundeven(z) taken off p_h (exact)
+  Value zc = sel(bor(over, under), c(0.0), z);
+  Value nf = math::RoundEvenOp::create(b, zc);
+  ph = sub(sel(bor(over, under), c(0.0), ph), nf);
+  pl = sel(bor(over, under), c(0.0), pl);
+  Value t = lowCleared(add(pl, ph));
+  Value ue = mul(t, c(6.93147182464599609375e-01));
+  Value ve = add(mul(sub(pl, sub(t, ph)), c(6.93147180559945286227e-01)),
+                 mul(t, c(-1.90465429995776804525e-09)));
+  Value ze = add(ue, ve);
+  Value we = sub(ve, sub(ze, ue));
+  Value tt = mul(ze, ze);
+  Value pe = c(4.13813679705723846039e-08);
+  for (double kk : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
+                    -2.77777777770155933842e-03, 1.66666666666666019037e-01})
+    pe = fma(tt, pe, c(kk));
+  Value t1e = sub(ze, mul(tt, pe));
+  Value re = sub(div(mul(ze, t1e), sub(t1e, c(2.0))), add(we, mul(ze, we)));
+  Value e = sub(c(1.0), sub(re, ze));
+  // e 2^n, n within [-1075, 1024], in two exact steps (e within [0.7, 1.42])
+  Value ni = arith::FPToSIOp::create(b, i64, nf);
+  Value n1 = arith::ShRSIOp::create(b, ni, ci(1));
+  auto pow2 = [&](Value k) { return dbl(shl(iadd(k, ci(1023)), ci(52))); };
+  Value res = mul(dbl(iadd(bits(e), shl(n1, ci(52)))), pow2(isub(ni, n1)));
+  res = sel(over, c(inf), sel(under, c(0.0), res));
+  res = sel(minus, arith::NegFOp::create(b, res).getResult(), res);
+
+  // special cases, the last select the first rule
+  Value xZero = fcmp(arith::CmpFPredicate::OEQ, x, c(0.0));
+  Value xInf = fcmp(arith::CmpFPredicate::OEQ, ax, c(inf));
+  Value yPos = fcmp(arith::CmpFPredicate::OGT, y, c(0.0));
+  // |y| above 2^64 (finite): 1 + or - an ulp's power is past any range
+  Value hugeY = band(fcmp(arith::CmpFPredicate::OGT, ay, c(0x1p64)),
+                     fcmp(arith::CmpFPredicate::ONE, ay, c(inf)));
+  Value axBig = fcmp(arith::CmpFPredicate::OGT, ax, c(1.0));
+  Value axOne = fcmp(arith::CmpFPredicate::OEQ, ax, c(1.0));
+  // (|x| above 1 and y positive, or below 1 and y negative: inf; else 0)
+  Value grow = arith::CmpIOp::create(b, arith::CmpIPredicate::eq, axBig, yPos);
+  res = sel(band(hugeY, bnot(axOne)), sel(grow, c(inf), c(0.0)), res);
+  // |y| from 2^31 with |x| not within 2^-20 of 1: the series does not hold,
+  // and the result over or underflows (e_pow.c)
+  Value bigYFar = band(
+      fcmp(arith::CmpFPredicate::OGT, ay, c(0x1p31)),
+      bor(fcmp(arith::CmpFPredicate::OLT, ax, c(0x1.fffffp-1)),
+          fcmp(arith::CmpFPredicate::OGE, ax, c(0x1.00001p+0))));
+  Value farV = sel(grow, c(inf), c(0.0));
+  res = sel(bigYFar, sel(minus, arith::NegFOp::create(b, farV).getResult(), farV),
+            res);
+  // y = 1: x; y = 2: x x (e_pow.c's exact cases)
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, y, c(2.0)), mul(x, x), res);
+  res = sel(fcmp(arith::CmpFPredicate::OEQ, y, c(1.0)), x, res);
+  // x negative, y not an integer
+  res = sel(band(xNeg, bnot(yInt)), c(nan), res);
+  // |x| zero or infinite: |x|^y (inf or 0 by y's sign and x's size), the
+  // sign for y odd
+  Value zeroInf = sel(bor(band(xZero, yPos), band(xInf, bnot(yPos))),
+                      c(0.0), c(inf));
+  zeroInf = sel(minus, arith::NegFOp::create(b, zeroInf).getResult(), zeroInf);
+  res = sel(bor(xZero, xInf), zeroInf, res);
+  // y infinite: |x| = 1 1, else inf or 0
+  Value yInf = fcmp(arith::CmpFPredicate::OEQ, ay, c(inf));
+  res = sel(yInf, sel(axOne, c(1.0), sel(grow, c(inf), c(0.0))), res);
+  // NaN operands
+  res = sel(bor(fcmp(arith::CmpFPredicate::UNO, x, x),
+                fcmp(arith::CmpFPredicate::UNO, y, y)),
+            add(x, y), res);
+  // y = 0 or x = 1: 1, whatever the other
+  res = sel(bor(fcmp(arith::CmpFPredicate::OEQ, y, c(0.0)),
+                fcmp(arith::CmpFPredicate::OEQ, x, c(1.0))),
+            c(1.0), res);
+  rewriter.replaceOp(op, res);
+  return success();
+}
+
+/// e^(hi + lo) of f64 parts with hi + lo at most about 0 (fdlibm's e_exp.c,
+/// its argument in two parts, L15-E824): k = roundeven((hi + lo) / ln 2), r =
+/// ((hi - k ln2hi) + lo) - k ln2lo, hi - k ln2hi exact for an hi with no
+/// bit below 2^-36 (erf's -z^2 - 9/16), so that the sum's rounding is r's,
+/// not that of an argument up to 800 (which e^ magnifies to many ulps); 2^k
+/// in two exact steps, a denormal result rounded once.
+static Value expTwoPartF64(ImplicitLocOpBuilder &b, Value hi, Value lo) {
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v).getResult(); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v).getResult(); };
+  Value s = add(hi, lo);
+  s = arith::SelectOp::create(
+      b, arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, s, c(-1000.0)),
+      c(-1000.0), s);
+  Value k = math::RoundEvenOp::create(b, mul(s, c(1.44269504088896338700e+00)));
+  Value h = add(sub(hi, mul(k, c(6.93147180369123816490e-01))), lo);
+  Value l = mul(k, c(1.90821492927058770002e-10));
+  Value r = sub(h, l);
+  Value t = mul(r, r);
+  Value p = c(4.13813679705723846039e-08);
+  for (double coef : {-1.65339022054652515390e-06, 6.61375632143793436117e-05,
+                      -2.77777777770155933842e-03, 1.66666666666666019037e-01})
+    p = f64Fma(b, t, p, c(coef));
+  Value cc = sub(r, mul(t, p));
+  Value y = sub(c(1.0), sub(sub(l, arith::DivFOp::create(b, mul(r, cc),
+                                                          sub(c(2.0), cc))),
+                            h));
+  Value ki = arith::FPToSIOp::create(b, i64, k);
+  Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
+  Value k2 = arith::SubIOp::create(b, ki, k1);
+  Value scaled = dbl(arith::AddIOp::create(
+      b, arith::BitcastOp::create(b, i64, y), arith::ShLIOp::create(b, k1, ci(52))));
+  return mul(scaled, dbl(arith::ShLIOp::create(
+                         b, arith::AddIOp::create(b, k2, ci(1023)), ci(52))));
+}
+
+/// erf and erfc of f64 (L15-E824; before, math.erf and math.erfc of f64
+/// were left unlowered and the kernel did not compile): fdlibm's s_erf.c
+/// branch-free. Its four ranges' rationals (x^2's below 0.84375, |x| - 1's
+/// below 1.25, 1/x^2's below 1/0.35 and from it) as one numerator and one
+/// denominator of selected coefficients and argument, one division; the
+/// tail's e^(-z^2 - 0.5625) e^((z - |x|)(z + |x|) + R/S) (z = |x|'s high
+/// word) as one exponential of its argument in two parts. erf: x + x y,
+/// erx + P/Q, 1 - r / |x|, 1 from 6, with x's sign; erfc as s_erf.c's
+/// (1 - (x + x y) below 1/4, 1/2 - (x y + (x - 1/2)) from it, 1 - erx - P/Q
+/// or 1 + erx + P/Q, r / |x| or 2 - r / |x|, 2 below -6, 0 from 28). Tiny x:
+/// x + efx x (erf), 1 - x (erfc); NaNs themselves.
+template <typename OpTy>
+static LogicalResult rewriteErfF64(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  constexpr bool isErfc = std::is_same_v<OpTy, math::ErfcOp>;
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v)).getResult();
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v).getResult(); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v).getResult(); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v).getResult(); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v).getResult(); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v).getResult();
+  };
+  auto lt = [&](Value u, double v) {
+    return arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, u, c(v)).getResult();
+  };
+  Value x = op.getOperand();
+  Value a = math::AbsFOp::create(b, x);
+  Value r0 = lt(a, 0.84375), r1 = lt(a, 1.25), r2 = lt(a, 1.0 / 0.35);
+  Value neg = lt(x, 0.0);
+  // the rational's argument: x^2, |x| - 1, 1/x^2
+  Value t = sel(r0, mul(x, x), sel(r1, sub(a, c(1.0)), div(c(1.0), mul(x, x))));
+  static const double num[4][8] = {
+      {1.28379167095512558561e-01, -3.25042107247001499370e-01,
+       -2.84817495755985104766e-02, -5.77027029648944159157e-03,
+       -2.37630166566501626084e-05, 0, 0, 0},
+      {-2.36211856075265944077e-03, 4.14856118683748331666e-01,
+       -3.72207876035701323847e-01, 3.18346619901161753674e-01,
+       -1.10894694282396677476e-01, 3.54783043256182359371e-02,
+       -2.16637559486879084300e-03, 0},
+      {-9.86494403484714822705e-03, -6.93858572707181764372e-01,
+       -1.05586262253232909814e+01, -6.23753324503260060396e+01,
+       -1.62396669462573470355e+02, -1.84605092906711035994e+02,
+       -8.12874355063065934246e+01, -9.81432934416914548592e+00},
+      {-9.86494292470009928597e-03, -7.99283237680523006574e-01,
+       -1.77579549177547519889e+01, -1.60636384855821916062e+02,
+       -6.37566443368389627722e+02, -1.02509513161107724954e+03,
+       -4.83519191608651397019e+02, 0}};
+  static const double den[4][9] = {
+      {1, 3.97917223959155352819e-01, 6.50222499887672944485e-02,
+       5.08130628187576562776e-03, 1.32494738004321644526e-04,
+       -3.96022827877536812320e-06, 0, 0, 0},
+      {1, 1.06420880400844228286e-01, 5.40397917702171048937e-01,
+       7.18286544141962662868e-02, 1.26171219808761642112e-01,
+       1.36370839120290507362e-02, 1.19844998467991074170e-02, 0, 0},
+      {1, 1.96512716674392571292e+01, 1.37657754143519042600e+02,
+       4.34565877475229228821e+02, 6.45387271733267880336e+02,
+       4.29008140027567833386e+02, 1.08635005541779435134e+02,
+       6.57024977031928170135e+00, -6.04244152148580987438e-02},
+      {1, 3.03380607434824582924e+01, 3.25792512996573918826e+02,
+       1.53672958608443695994e+03, 3.19985821950859553908e+03,
+       2.55305040643316442583e+03, 4.74528541206955367215e+02,
+       -2.24409524465858183362e+01, 0}};
+  auto coef = [&](double v0, double v1, double v2, double v3) {
+    return sel(r0, c(v0), sel(r1, c(v1), sel(r2, c(v2), c(v3))));
+  };
+  Value pn = coef(num[0][7], num[1][7], num[2][7], num[3][7]);
+  for (int i = 6; i >= 0; --i)
+    pn = f64Fma(b, pn, t, coef(num[0][i], num[1][i], num[2][i], num[3][i]));
+  Value pd = coef(den[0][8], den[1][8], den[2][8], den[3][8]);
+  for (int i = 7; i >= 0; --i)
+    pd = f64Fma(b, pd, t, coef(den[0][i], den[1][i], den[2][i], den[3][i]));
+  Value q = div(pn, pd);
+  // the tail's r = e^(-z^2 - 0.5625 + (z - |x|)(z + |x|) + R/S)
+  Value z = arith::BitcastOp::create(
+      b, f64,
+      arith::AndIOp::create(b, arith::BitcastOp::create(b, i64, a),
+                            arith::ConstantIntOp::create(
+                                b, i64, int64_t(0xffffffff00000000ULL))));
+  Value hi = sub(arith::NegFOp::create(b, mul(z, z)).getResult(), c(0.5625));
+  Value lo = add(mul(sub(z, a), add(z, a)), q);
+  Value rt = div(expTwoPartF64(b, hi, lo), a);
+  const double erx = 8.45062911510467529297e-01;
+  Value res;
+  if constexpr (!isErfc) {
+    Value small = add(x, mul(x, q));
+    Value mid = add(c(erx), q);
+    Value tail = sub(c(1.0), rt);
+    Value m = sel(r1, mid, sel(lt(a, 6.0), tail, c(1.0)));
+    res = sel(r0, small, math::CopySignOp::create(b, m, x).getResult());
+    res = sel(lt(a, 0x1p-28), add(x, mul(c(1.28379167095512586316e-01), x)),
+              res);
+  } else {
+    Value xq = mul(x, q);
+    Value small = sel(lt(x, 0.25), sub(c(1.0), add(x, xq)),
+                      sub(c(0.5), add(xq, sub(x, c(0.5)))));
+    Value mid = sel(neg, add(c(1.0), add(c(erx), q)), sub(c(1.0 - erx), q));
+    Value tail = sel(neg, sub(c(2.0), rt), rt);
+    tail = sel(arith::AndIOp::create(b, neg, arith::CmpFOp::create(
+                                                 b, arith::CmpFPredicate::OGT,
+                                                 a, c(6.0))),
+               c(2.0), tail);
+    Value far = sel(neg, c(2.0), c(0.0));
+    res = sel(r0, small, sel(r1, mid, sel(lt(a, 28.0), tail, far)));
+    res = sel(lt(a, 0x1p-56), sub(c(1.0), x), res);
+  }
+  res = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::UNO, x, x), x, res);
+  rewriter.replaceOp(op, res);
+  return success();
+}
+
+/// vector.reduction of a 1-D vector of f64 as its scalar operations in
+/// order, from the accumulator if any (LLVM's ordered llvm.vector.reduce.*,
+/// which the AIR target's f64 emulation does not take: L15-E827); the
+/// operations the f64 emulation then expands.
+struct UnrollVectorF64Reduction : public OpRewritePattern<vector::ReductionOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::ReductionOp op,
+                                PatternRewriter &rewriter) const override {
+    VectorType vt = op.getSourceVectorType();
+    if (vt.getRank() != 1 || vt.isScalable() || !vt.getElementType().isF64() ||
+        vt.getNumElements() > 16)
+      return failure();
+    Location loc = op.getLoc();
+    auto combine = [&](Value a, Value b) -> Value {
+      switch (op.getKind()) {
+      case vector::CombiningKind::ADD:
+        return arith::AddFOp::create(rewriter, loc, a, b, op.getFastmath());
+      case vector::CombiningKind::MUL:
+        return arith::MulFOp::create(rewriter, loc, a, b, op.getFastmath());
+      case vector::CombiningKind::MINNUMF:
+        return arith::MinNumFOp::create(rewriter, loc, a, b);
+      case vector::CombiningKind::MAXNUMF:
+        return arith::MaxNumFOp::create(rewriter, loc, a, b);
+      case vector::CombiningKind::MINIMUMF:
+        return arith::MinimumFOp::create(rewriter, loc, a, b);
+      case vector::CombiningKind::MAXIMUMF:
+        return arith::MaximumFOp::create(rewriter, loc, a, b);
+      default:
+        return {};
+      }
+    };
+    Value r = op.getAcc();
+    for (int64_t i = 0, e = vt.getNumElements(); i < e; ++i) {
+      Value x = vector::ExtractOp::create(rewriter, loc, op.getVector(), i);
+      if (!r) {
+        r = x;
+        continue;
+      }
+      r = combine(r, x);
+      if (!r)
+        return failure();
+    }
+    rewriter.replaceOp(op, r);
+    return success();
+  }
+};
+
+/// A math dialect op on a 1-D vector of f64 as one op per element (L15-E825):
+/// the f64 rewrites above take scalars, and a vector op left for MathToLLVM
+/// became a vector intrinsic whose scalarized calls (llvm.exp.f64 and the
+/// others) the AIR target's f64 emulation does not take.
+struct UnrollVectorF64Math : public RewritePattern {
+  UnrollVectorF64Math(MLIRContext *ctx)
+      : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/3, ctx) {}
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (!isa_and_nonnull<math::MathDialect>(op->getDialect()) ||
+        op->getNumResults() != 1 || op->getNumRegions() != 0 ||
+        !op->hasTrait<OpTrait::Elementwise>())
+      return failure();
+    auto vt = dyn_cast<VectorType>(op->getResult(0).getType());
+    if (!vt || vt.getRank() != 1 || vt.isScalable() ||
+        !vt.getElementType().isF64() || vt.getNumElements() > 16)
+      return failure();
+    for (Value o : op->getOperands()) {
+      auto ot = dyn_cast<VectorType>(o.getType());
+      if (!ot || ot.getShape() != vt.getShape())
+        return failure();
+    }
+    Location loc = op->getLoc();
+    Value acc = arith::ConstantOp::create(
+        rewriter, loc, vt, rewriter.getZeroAttr(vt));
+    for (int64_t i = 0, e = vt.getNumElements(); i < e; ++i) {
+      SmallVector<Value> ops;
+      SmallVector<Type> types{vt.getElementType()};
+      for (Value o : op->getOperands())
+        ops.push_back(vector::ExtractOp::create(rewriter, loc, o, i));
+      OperationState st(loc, op->getName().getStringRef(), ops, types,
+                        op->getAttrs());
+      Operation *scalar = rewriter.create(st);
+      acc = vector::InsertOp::create(rewriter, loc, scalar->getResult(0), acc,
+                                     i);
+    }
+    rewriter.replaceOp(op, acc);
+    return success();
+  }
+};
+
+/// atan of an f64 a >= 0 (or NaN): fdlibm's s_atan.c, branch-free. Below
+/// 0.4375 a itself is the polynomial's argument; above, (2a - 1) / (2 + a),
+/// (a - 1) / (a + 1), (a - 1.5) / (1 + 1.5a) or -1 / a by the range (one
+/// division, its operands selected), with atan's value at 0.5, 1, 1.5 or
+/// inf in two parts; the reconstruction hi - ((r S - lo) - r) is fdlibm's
+/// r - r S where hi and lo are 0 (L15-E821).
+static Value atanF64(ImplicitLocOpBuilder &b, Value a) {
+  Type f64 = b.getF64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto fma = [&](Value u, Value v, Value w) -> Value {
+    return f64Fma(b, u, v, w);
+  };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto lt = [&](Value u, double v) {
+    return arith::CmpFOp::create(b, arith::CmpFPredicate::OLT, u, c(v));
+  };
+  Value r0 = lt(a, 0.4375), r1 = lt(a, 0.6875), r2 = lt(a, 1.1875),
+        r3 = lt(a, 2.4375);
+  auto pick = [&](double v0, double v1, double v2, double v3) {
+    return sel(r1, c(v0), sel(r2, c(v1), sel(r3, c(v2), c(v3))));
+  };
+  Value num = sel(r1, sub(add(a, a), c(1.0)),
+                  sel(r2, sub(a, c(1.0)),
+                      sel(r3, sub(a, c(1.5)), c(-1.0))));
+  Value den = sel(r1, add(c(2.0), a),
+                  sel(r2, add(a, c(1.0)),
+                      sel(r3, add(c(1.0), mul(c(1.5), a)), a)));
+  Value x = sel(r0, a, arith::DivFOp::create(b, num, den));
+  Value hi = sel(r0, c(0.0),
+                 pick(4.63647609000806093515e-01, 7.85398163397448278999e-01,
+                      9.82793723247329054082e-01, 1.57079632679489655800e+00));
+  Value lo = sel(r0, c(0.0),
+                 pick(2.26987774529616870924e-17, 3.06161699786838301793e-17,
+                      1.39033110312309984516e-17, 6.12323399573676603587e-17));
+  Value z = mul(x, x), w = mul(z, z);
+  Value s1 = c(1.62858201153657823623e-02);
+  for (double q : {4.97687799461593236017e-02, 6.66107313738753120669e-02,
+                   9.09088713343650656196e-02, 1.42857142725034663711e-01,
+                   3.33333333333329318027e-01})
+    s1 = fma(w, s1, c(q));
+  s1 = mul(z, s1);
+  Value s2 = c(-3.65315727442169155270e-02);
+  for (double q : {-5.83357013379057348645e-02, -7.69187620504482999495e-02,
+                   -1.11111104054623557880e-01, -1.99999999998764832476e-01})
+    s2 = fma(w, s2, c(q));
+  s2 = mul(w, s2);
+  return sub(hi, sub(sub(mul(x, add(s1, s2)), lo), x));
+}
+
+/// asin's and acos's rational R(t) = p(t) / q(t) of fdlibm (e_asin.c's pS
+/// and qS): its dividend and divisor.
+static std::pair<Value, Value> asinRationalF64(ImplicitLocOpBuilder &b,
+                                               Value t) {
+  Type f64 = b.getF64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto fma = [&](Value u, Value v, Value w) -> Value {
+    return f64Fma(b, u, v, w);
+  };
+  Value p = c(3.47933107596021167570e-05);
+  for (double v : {7.91534994289814532176e-04, -4.00555345006794114027e-02,
+                   2.01212532134862925881e-01, -3.25565818622400915405e-01,
+                   1.66666666666666657415e-01})
+    p = fma(t, p, c(v));
+  p = arith::MulFOp::create(b, t, p);
+  Value q = c(7.70381505559019352791e-02);
+  for (double v : {-6.88283971605453293030e-01, 2.02094576023350569471e+00,
+                   -2.40339491173441421878e+00, 1.0})
+    q = fma(t, q, c(v));
+  return {p, q};
+}
+
+/// atan, atan2, asin and acos of f64 (L15-E821; before, llvm.atan.f64 and
+/// the others had no emulation and the kernel did not compile): fdlibm's
+/// s_atan.c, e_atan2.c, e_asin.c and e_acos.c, branch-free:
+///   atan  = atanF64(|x|) with x's sign; x for a NaN;
+///   atan2 = atan(|y / x|) and its quadrant (pi - (z - pi_lo), (z - pi_lo)
+///           - pi), y's sign for x > 0; the zeros', infinities' and the
+///           exponents' 60 apart cases as e_atan2.c; x + y for a NaN;
+///   asin  = x + x R(x^2) below 1/2; from 0.975 pi/2 - (2 (s + s R) -
+///           pi/2_lo), s = sqrt((1 - |x|) / 2); between, fdlibm's form with
+///           s's high word and its correction c (a second division); x's
+///           sign; +-1 +-pi/2, NaN past 1;
+///   acos  = pi/2 - (x - (pi/2_lo - x R(x^2))) below 1/2; below -1/2
+///           pi - 2 (s + (R s - pi/2_lo)); above 1/2 2 (df + (R s + c)), df
+///           s's high word; 1 0, -1 pi, NaN past 1.
+/// One R division each (its argument selected), and sqrt of the far one.
+template <typename OpTy>
+static LogicalResult rewriteInverseTrigF64(OpTy op, PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto abs = [&](Value v) { return math::AbsFOp::create(b, v); };
+  auto copysign = [&](Value m, Value s) {
+    return math::CopySignOp::create(b, m, s);
+  };
+  // s with its low word cleared (fdlibm's SET_LOW_WORD(df, 0))
+  auto highWord = [&](Value v) {
+    return arith::BitcastOp::create(
+        b, f64,
+        arith::AndIOp::create(
+            b, arith::BitcastOp::create(b, i64, v),
+            arith::ConstantIntOp::create(b, i64,
+                                         int64_t(0xffffffff00000000ULL))));
+  };
+  const double pio2Hi = 1.57079632679489655800e+00,
+               pio2Lo = 6.12323399573676603587e-17,
+               pio4Hi = 7.85398163397448278999e-01,
+               pi = 3.1415926535897931160e+00, piLo = 1.2246467991473531772e-16;
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::AtanOp>) {
+    Value x = op.getOperand();
+    r = copysign(atanF64(b, abs(x)), x);
+    r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+  } else if constexpr (std::is_same_v<OpTy, math::Atan2Op>) {
+    Value y = op.getLhs(), x = op.getRhs();
+    Value ay = abs(y), ax = abs(x);
+    Value yNeg = arith::CmpIOp::create(
+        b, arith::CmpIPredicate::slt, arith::BitcastOp::create(b, i64, y),
+        arith::ConstantIntOp::create(b, i64, 0));
+    Value xNeg = arith::CmpIOp::create(
+        b, arith::CmpIPredicate::slt, arith::BitcastOp::create(b, i64, x),
+        arith::ConstantIntOp::create(b, i64, 0));
+    // the exponents' difference (fdlibm's k = (iy - ix) >> 20)
+    auto field = [&](Value v) {
+      return arith::ShRUIOp::create(b, arith::BitcastOp::create(b, i64, v),
+                                    arith::ConstantIntOp::create(b, i64, 52));
+    };
+    Value k = arith::SubIOp::create(b, field(ay), field(ax));
+    Value far = arith::CmpIOp::create(b, arith::CmpIPredicate::sgt, k,
+                                      arith::ConstantIntOp::create(b, i64, 60));
+    Value tinyNeg = arith::AndIOp::create(
+        b, xNeg,
+        arith::CmpIOp::create(b, arith::CmpIPredicate::slt, k,
+                              arith::ConstantIntOp::create(b, i64, -60)));
+    Value z = atanF64(b, abs(div(y, x)));
+    z = sel(far, c(pio2Hi + 0.5 * piLo), sel(tinyNeg, c(0.0), z));
+    // quadrants (far: as for x > 0)
+    Value left = arith::AndIOp::create(
+        b, xNeg, arith::XOrIOp::create(b, far, arith::ConstantIntOp::create(
+                                                   b, b.getI1Type(), 1)));
+    Value q = sel(left, sub(c(pi), sub(z, c(piLo))), z);
+    r = sel(yNeg, arith::NegFOp::create(b, q), q);
+    // y zero: +-0 for x > 0 (and +0), +-pi for x < 0 (and -0)
+    Value yZero = fcmp(arith::CmpFPredicate::OEQ, y, c(0.0));
+    r = sel(yZero, sel(xNeg, copysign(c(pi), y), y), r);
+    // x zero (y not): +-pi/2
+    Value xZero = fcmp(arith::CmpFPredicate::OEQ, x, c(0.0));
+    r = sel(arith::AndIOp::create(
+                b, xZero,
+                arith::XOrIOp::create(
+                    b, yZero, arith::ConstantIntOp::create(b, b.getI1Type(), 1))),
+            copysign(c(pio2Hi), y), r);
+    // infinities
+    Value xInf = fcmp(arith::CmpFPredicate::OEQ, ax, c(inf));
+    Value yInf = fcmp(arith::CmpFPredicate::OEQ, ay, c(inf));
+    Value bothInf = arith::AndIOp::create(b, xInf, yInf);
+    r = sel(yInf, copysign(sel(xInf, sel(xNeg, c(3.0 * pio4Hi), c(pio4Hi)),
+                               c(pio2Hi)),
+                           y),
+            r);
+    r = sel(arith::AndIOp::create(
+                b, xInf,
+                arith::XOrIOp::create(
+                    b, bothInf,
+                    arith::ConstantIntOp::create(b, b.getI1Type(), 1))),
+            copysign(sel(xNeg, c(pi), c(0.0)), y), r);
+    // (fdlibm's x = 1 case, atan(y), is the general path's atan(|y / 1|)
+    // with y's sign: not a second atan)
+    r = sel(arith::OrIOp::create(b, fcmp(arith::CmpFPredicate::UNO, x, x),
+                                 fcmp(arith::CmpFPredicate::UNO, y, y)),
+            add(x, y), r);
+  } else {
+    Value x = op.getOperand();
+    Value a = abs(x);
+    Value small = fcmp(arith::CmpFPredicate::OLT, a, c(0.5));
+    // the rational's argument: x^2 below 1/2, (1 - |x|) / 2 from it
+    Value t = sel(small, mul(x, x), mul(c(0.5), sub(c(1.0), a)));
+    auto [p, q] = asinRationalF64(b, t);
+    Value rr = div(p, q);
+    Value s = math::SqrtOp::create(b, t);
+    Value df = highWord(s);
+    // (t - df^2) / (s + df): what s lacks below its high word
+    Value cc = div(sub(t, mul(df, df)), add(s, df));
+    if constexpr (std::is_same_v<OpTy, math::AsinOp>) {
+      Value nearOne = fcmp(arith::CmpFPredicate::OGE, a, c(0x1.f3333p-1));
+      Value fromOne =
+          sub(c(pio2Hi), sub(mul(c(2.0), add(s, mul(s, rr))), c(pio2Lo)));
+      Value pp = sub(mul(mul(c(2.0), s), rr), sub(c(pio2Lo), mul(c(2.0), cc)));
+      Value qq = sub(c(pio4Hi), mul(c(2.0), df));
+      Value between = sub(c(pio4Hi), sub(pp, qq));
+      r = sel(nearOne, fromOne, between);
+      r = sel(small, add(x, mul(x, rr)), copysign(r, x));
+      r = sel(fcmp(arith::CmpFPredicate::OEQ, a, c(1.0)),
+              add(mul(x, c(pio2Hi)), mul(x, c(pio2Lo))), r);
+      r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-27)), x, r);
+      r = sel(fcmp(arith::CmpFPredicate::UGT, a, c(1.0)), c(nan), r);
+      r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+    } else {
+      static_assert(std::is_same_v<OpTy, math::AcosOp>);
+      Value nearV = sub(c(pio2Hi), sub(x, sub(c(pio2Lo), mul(x, rr))));
+      Value negV =
+          sub(c(pi), mul(c(2.0), add(s, sub(mul(rr, s), c(pio2Lo)))));
+      Value posV = mul(c(2.0), add(df, add(mul(rr, s), cc)));
+      r = sel(small, nearV,
+              sel(fcmp(arith::CmpFPredicate::OLT, x, c(0.0)), negV, posV));
+      r = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(1.0)), c(0.0), r);
+      r = sel(fcmp(arith::CmpFPredicate::OEQ, x, c(-1.0)),
+              c(2.0 * pio2Hi + 2.0 * pio2Lo), r);
+      r = sel(fcmp(arith::CmpFPredicate::UGT, a, c(1.0)), c(nan), r);
+      r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
+    }
+  }
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// asinh, acosh, atanh and cbrt of f64 (L15-E820; before, none lowered):
+/// fdlibm's forms, from math.log1p and math.sqrt of f64 (each rewritten or
+/// emulated in turn), a = |x| and x's sign copied back, x itself for a NaN:
+///   asinh = log1p(a + a^2 / (1 + sqrt(1 + a^2))), from 2^28 log1p(a - 1) +
+///           ln 2 (log(a) + ln 2: a - 1 exact to 2^53, past it its rounding
+///           far below an ulp); x below 2^-28;
+///   acosh = log1p(t + sqrt(2 t + t^2)), t = x - 1, from 2^28 log1p(t) + ln 2;
+///           NaN below 1;
+///   (each one log1p, of the argument the range picks);
+///   atanh = log1p(2a + 2a a / (1 - a)) / 2 below 1/2, log1p(2a / (1 - a)) / 2
+///           from it (one division, its dividend selected); inf at 1, NaN
+///           beyond; x below 2^-28;
+///   cbrt  = s_cbrt.c: a quotient of the high word by 3 (denormals scaled by
+///           2^54 first) for 5 bits, a polynomial to 23 bits, rounded away
+///           from zero to 23 bits, and a Newton step to 53 (within 0.667
+///           ulp); zeros, infinities and NaNs themselves.
+template <typename OpTy>
+static LogicalResult rewriteInverseHyperbolicF64(OpTy op,
+                                                 PatternRewriter &rewriter) {
+  if (!op.getType().isF64())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type f64 = b.getF64Type(), i64 = b.getI64Type();
+  auto c = [&](double v) {
+    return arith::ConstantOp::create(b, f64, b.getF64FloatAttr(v));
+  };
+  auto ci = [&](int64_t v) { return arith::ConstantIntOp::create(b, i64, v); };
+  auto add = [&](Value u, Value v) { return arith::AddFOp::create(b, u, v); };
+  auto sub = [&](Value u, Value v) { return arith::SubFOp::create(b, u, v); };
+  auto mul = [&](Value u, Value v) { return arith::MulFOp::create(b, u, v); };
+  auto div = [&](Value u, Value v) { return arith::DivFOp::create(b, u, v); };
+  auto sel = [&](Value cnd, Value u, Value v) {
+    return arith::SelectOp::create(b, cnd, u, v);
+  };
+  auto fcmp = [&](arith::CmpFPredicate p, Value u, Value v) {
+    return arith::CmpFOp::create(b, p, u, v);
+  };
+  auto log1p = [&](Value v) { return math::Log1pOp::create(b, v); };
+  auto sqrt = [&](Value v) { return math::SqrtOp::create(b, v); };
+  Value x = op.getOperand();
+  Value a = math::AbsFOp::create(b, x);
+  const double ln2 = 6.93147180559945286227e-01;
+  Value r;
+  if constexpr (std::is_same_v<OpTy, math::AsinhOp>) {
+    Value near = fcmp(arith::CmpFPredicate::OLT, a, c(0x1p28));
+    Value a2 = mul(a, a);
+    Value arg = sel(near, add(a, div(a2, add(c(1.0), sqrt(add(c(1.0), a2))))),
+                    sub(a, c(1.0)));
+    r = add(log1p(arg), sel(near, c(0.0), c(ln2)));
+    r = math::CopySignOp::create(b, r, x);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
+  } else if constexpr (std::is_same_v<OpTy, math::AcoshOp>) {
+    Value t = sub(x, c(1.0));
+    Value near = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p28));
+    Value arg = sel(near, add(t, sqrt(add(add(t, t), mul(t, t)))), t);
+    r = add(log1p(arg), sel(near, c(0.0), c(ln2)));
+    r = sel(fcmp(arith::CmpFPredicate::OLT, x, c(1.0)),
+            c(std::numeric_limits<double>::quiet_NaN()), r);
+  } else if constexpr (std::is_same_v<OpTy, math::AtanhOp>) {
+    Value t = add(a, a);
+    Value small = fcmp(arith::CmpFPredicate::OLT, a, c(0.5));
+    Value d = div(sel(small, mul(t, a), t), sub(c(1.0), a));
+    r = mul(c(0.5), log1p(sel(small, add(t, d), d)));
+    r = math::CopySignOp::create(b, r, x);
+    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
+  } else {
+    static_assert(std::is_same_v<OpTy, math::CbrtOp>);
+    auto bits = [&](Value v) { return arith::BitcastOp::create(b, i64, v); };
+    auto dbl = [&](Value v) { return arith::BitcastOp::create(b, f64, v); };
+    Value bx = bits(x);
+    Value sign = arith::AndIOp::create(b, bx, ci(INT64_MIN));
+    // (a denormal scaled by 2^54, its high word's third less 18 << 20)
+    Value tiny = fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-1022));
+    Value as = sel(tiny, mul(a, c(0x1p54)), a);
+    Value hx = arith::ShRUIOp::create(b, bits(as), ci(32));
+    Value hi = arith::AddIOp::create(
+        b, arith::DivUIOp::create(b, hx, ci(3)),
+        sel(tiny, ci(696219795), ci(715094163)));
+    Value t = dbl(arith::OrIOp::create(b, sign,
+                                       arith::ShLIOp::create(b, hi, ci(32))));
+    Value rr = mul(mul(t, t), div(t, x));
+    Value p1 = add(c(1.87595182427177009643),
+                   mul(rr, add(c(-1.88497979543377169875),
+                               mul(rr, c(1.621429720105354466140)))));
+    Value p2 = mul(mul(mul(rr, rr), rr),
+                   add(c(-0.758397934778766047437),
+                       mul(rr, c(0.145996192886612446982))));
+    t = mul(t, add(p1, p2));
+    // rounded away from zero to 23 bits
+    t = dbl(arith::AndIOp::create(
+        b, arith::AddIOp::create(b, bits(t), ci(0x80000000LL)),
+        ci(int64_t(0xffffffffc0000000ULL))));
+    Value s2 = mul(t, t);
+    Value q = div(x, s2);
+    Value w = add(t, t);
+    q = div(sub(q, t), add(w, q));
+    r = add(t, mul(t, q));
+    // zeros, infinities and NaNs themselves
+    r = sel(fcmp(arith::CmpFPredicate::UEQ, a, c(0.0)), x, r);
+    r = sel(fcmp(arith::CmpFPredicate::UEQ, a,
+                 c(std::numeric_limits<double>::infinity())),
+            x, r);
+    rewriter.replaceOp(op, r);
+    return success();
+  }
+  r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
   rewriter.replaceOp(op, r);
   return success();
 }
@@ -794,6 +2593,19 @@ static LogicalResult rewriteErfc(math::ErfcOp op, PatternRewriter &rewriter) {
                               c(0.0f), r);
   r = arith::SelectOp::create(b, cmp(arith::CmpFPredicate::OLT, x, c(0.0f)),
                               arith::SubFOp::create(b, two, r), r);
+  // An f16 or bf16 erfc widened to this one (its argument extended, its
+  // result only rounded back): the two divisions by the reciprocal, every
+  // f16 and bf16 input's result the same (the exp approximate was not:
+  // L15-E337).
+  Type narrow;
+  if (auto ext = x.getDefiningOp<arith::ExtFOp>())
+    narrow = ext.getIn().getType();
+  if (narrow && (narrow.isF16() || narrow.isBF16()) && !op->use_empty() &&
+      llvm::all_of(op->getUsers(), [&](Operation *u) {
+        auto t = dyn_cast<arith::TruncFOp>(u);
+        return t && t.getType() == narrow;
+      }))
+    approximateForHalf(r, x, HalfApproxDiv);
   rewriter.replaceOp(op, r);
   return success();
 }
@@ -820,8 +2632,8 @@ static LogicalResult rewriteExpF64(math::ExpOp op, PatternRewriter &rewriter) {
   auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
   auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
   auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
-  auto fma = [&](Value x, Value y, Value z) {
-    return math::FmaOp::create(b, x, y, z);
+  auto fma = [&](Value x, Value y, Value z) -> Value {
+    return f64Fma(b, x, y, z);
   };
   auto sel = [&](Value cnd, Value x, Value y) {
     return arith::SelectOp::create(b, cnd, x, y);
@@ -853,7 +2665,16 @@ static LogicalResult rewriteExpF64(math::ExpOp op, PatternRewriter &rewriter) {
         b, f64,
         arith::ShLIOp::create(b, arith::AddIOp::create(b, e, ci(1023)), ci(52)));
   };
-  rewriter.replaceOp(op, mul(mul(y, pow2(k1)), pow2(k2)));
+  // y 2^k1 is exact and normal (y within [0.7, 1.42], k1 within [-538,
+  // 512]): k1 added to y's exponent field, one integer addition for a double
+  // multiplication; a NaN x keeps y (L15-E326)
+  Value scaled = arith::BitcastOp::create(
+      b, f64,
+      arith::AddIOp::create(b, arith::BitcastOp::create(b, i64, y),
+                            arith::ShLIOp::create(b, k1, ci(52))));
+  scaled = sel(arith::CmpFOp::create(b, arith::CmpFPredicate::UNO, y, y), y,
+               scaled);
+  rewriter.replaceOp(op, mul(scaled, pow2(k2)));
   return success();
 }
 
@@ -876,8 +2697,8 @@ static LogicalResult rewriteLogF64(math::LogOp op, PatternRewriter &rewriter) {
   auto add = [&](Value x, Value y) { return arith::AddFOp::create(b, x, y); };
   auto sub = [&](Value x, Value y) { return arith::SubFOp::create(b, x, y); };
   auto mul = [&](Value x, Value y) { return arith::MulFOp::create(b, x, y); };
-  auto fma = [&](Value x, Value y, Value z) {
-    return math::FmaOp::create(b, x, y, z);
+  auto fma = [&](Value x, Value y, Value z) -> Value {
+    return f64Fma(b, x, y, z);
   };
   auto sel = [&](Value cnd, Value x, Value y) {
     return arith::SelectOp::create(b, cnd, x, y);
@@ -948,7 +2769,8 @@ static LogicalResult rewriteLogF64(math::LogOp op, PatternRewriter &rewriter) {
 ///     of two; x clamped to [-1080, 1030] keeping a NaN);
 ///   log2 x = k + log(m) log2(e), log10 x = k log10(2) + log(m) log10(e),
 ///     x = 2^k m with m in [sqrt(2)/2, sqrt(2)) (exact for powers of two);
-///   cosh x = (e + 1/e) / 2, e = exp(|x|) (exp(|x| / 2)^2 / 2 from 709);
+///   cosh x = (e + 1/e) / 2, e = exp(|x|) (exp(|x| / 2)^2 / 2 from 709: one
+///     exp, of the argument the range picks);
 ///   sinh x = h (2t - t^2 / (t + 1)) (|x| < 1) or h (t + t / (t + 1))
 ///     (|x| < 22), t = expm1(|x|), h = +-1/2; then h exp(|x|) (exp(|x| /
 ///     2)^2 h 2 from 709);
@@ -998,7 +2820,14 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     e = fma(e, lo, e);
     Value ki = arith::FPToSIOp::create(b, i64, k);
     Value k1 = arith::ShRSIOp::create(b, ki, ci(1));
-    r = mul(mul(e, pow2(k1)), pow2(arith::SubIOp::create(b, ki, k1)));
+    // e 2^k1 exact and normal (e within [0.7, 1.42], k1 within [-540,
+    // 515]): on the exponent field, as in exp (L15-E326)
+    Value scaled = arith::BitcastOp::create(
+        b, f64,
+        arith::AddIOp::create(b, arith::BitcastOp::create(b, i64, e),
+                              arith::ShLIOp::create(b, k1, ci(52))));
+    scaled = sel(fcmp(arith::CmpFPredicate::UNO, e, e), e, scaled);
+    r = mul(scaled, pow2(arith::SubIOp::create(b, ki, k1)));
   } else if constexpr (std::is_same_v<OpTy, math::Log2Op> ||
                        std::is_same_v<OpTy, math::Log10Op>) {
     Value tiny = fcmp(arith::CmpFPredicate::OLT, x, c(0x1p-1022));
@@ -1030,27 +2859,46 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
             c(std::numeric_limits<double>::quiet_NaN()), r);
   } else if constexpr (std::is_same_v<OpTy, math::CoshOp>) {
     Value a = math::AbsFOp::create(b, x);
-    Value e = math::ExpOp::create(b, a);
-    Value near = add(mul(c(0.5), e), div(c(0.5), e));
     // from 709 (where e^|x| overflows): e^(|x|/2) squared, halved; |x| - ln 2
-    // would round |x|'s last bits away (up to 500 ulp)
-    Value w = math::ExpOp::create(b, mul(c(0.5), a));
-    Value far = mul(mul(c(0.5), w), w);
-    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), near, far);
+    // would round |x|'s last bits away (up to 500 ulp). One exp, of |x| or
+    // |x| / 2 as the range picks (L15-E309).
+    Value below = fcmp(arith::CmpFPredicate::OLT, a, c(709.0));
+    Value e = math::ExpOp::create(b, sel(below, a, mul(c(0.5), a)));
+    Value near = add(mul(c(0.5), e), div(c(0.5), e));
+    Value far = mul(mul(c(0.5), e), e);
+    r = sel(below, near, far);
     r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
   } else if constexpr (std::is_same_v<OpTy, math::SinhOp>) {
     Value a = math::AbsFOp::create(b, x);
     Value h = math::CopySignOp::create(b, c(0.5), x);
-    Value t = math::ExpM1Op::create(b, a);
+    // One exp, of |x| below 709 and |x| / 2 from it: expm1(|x|) (read
+    // below 22) from it as math.expm1's rewrite would from exp(|x|), the
+    // large range's e^|x| and the huge range's e^(|x| / 2) (L15-E309).
+    Value below = fcmp(arith::CmpFPredicate::OLT, a, c(709.0));
+    Value arg = sel(below, a, mul(c(0.5), a));
+    Value w, t;
+    if (expm1F64Direct) {
+      // fdlibm's expm1 of the argument (L15-E814), and e^arg = t + 1 where
+      // it is read (|x| from 22: t from 2^31, an integer multiple of its
+      // ulp, so t + 1 is exact)
+      t = expm1F64(b, arg);
+      w = add(t, c(1.0));
+    } else {
+      w = math::ExpOp::create(b, arg);
+      t = accurateExpM1(b, b.getLoc(), a, w);
+    }
     Value tp1 = add(t, c(1.0));
-    Value small = mul(h, sub(mul(c(2.0), t), div(mul(t, t), tp1)));
-    Value mid = mul(h, add(t, div(t, tp1)));
-    Value large = mul(h, math::ExpOp::create(b, a));
-    Value w = math::ExpOp::create(b, mul(c(0.5), a));
+    // (one division by t + 1, of t^2 below 1 and of t from it, each lane's
+    // the same: L15-E323)
+    Value below1 = fcmp(arith::CmpFPredicate::OLT, a, c(1.0));
+    Value q = div(sel(below1, mul(t, t), t), tp1);
+    Value small = mul(h, sub(mul(c(2.0), t), q));
+    Value mid = mul(h, add(t, q));
+    Value large = mul(h, w);
     Value huge = mul(mul(mul(h, c(2.0)), w), mul(c(0.5), w));
-    r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(1.0)), small,
+    r = sel(below1, small,
             sel(fcmp(arith::CmpFPredicate::OLT, a, c(22.0)), mid,
-                sel(fcmp(arith::CmpFPredicate::OLT, a, c(709.0)), large, huge)));
+                sel(below, large, huge)));
     // tiny x: x itself (also -0)
     r = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-28)), x, r);
     r = sel(fcmp(arith::CmpFPredicate::UNO, x, x), x, r);
@@ -1058,16 +2906,19 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
     static_assert(std::is_same_v<OpTy, math::TanhOp>);
     Value a = math::AbsFOp::create(b, x);
     Value t1 = math::ExpM1Op::create(b, mul(c(2.0), a));
-    Value z1 = sub(c(1.0), div(c(2.0), add(t1, c(2.0))));
     // below 1: t / (t + 2) with t = e^2a - 1 > 0, whose relative error
     // passes on scaled by 2 / (t + 2) <= 1 (fdlibm's e^-2a - 1 form scales
-    // it by up to 1.8)
-    Value z2 = div(t1, add(t1, c(2.0)));
-    Value z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(1.0)), z1, z2);
+    // it by up to 1.8); from 1, 1 - 2 / (t + 2). One division, of 2 or t
+    // as the range picks (L15-E323).
+    Value from1 = fcmp(arith::CmpFPredicate::OGE, a, c(1.0));
+    Value q = div(sel(from1, c(2.0), t1), add(t1, c(2.0)));
+    Value z = sel(from1, sub(c(1.0), q), q);
     // below 2^-9: a - a^3/3 + 2a^5/15 (next term 2^-58 relative), as expm1's
     // error would otherwise reach 3 ulp there
     Value a2 = mul(a, a);
-    Value series = fma(mul(a, a2), fma(a2, c(2.0 / 15.0), c(-1.0 / 3.0)), a);
+    // (multiplies and adds: E815's f64Fma)
+    Value series = f64Fma(b, mul(a, a2),
+                          f64Fma(b, a2, c(2.0 / 15.0), c(-1.0 / 3.0)), a);
     z = sel(fcmp(arith::CmpFPredicate::OLT, a, c(0x1p-9)), series, z);
     z = sel(fcmp(arith::CmpFPredicate::OGE, a, c(22.0)), c(1.0), z);
     r = math::CopySignOp::create(b, z, x);
@@ -1076,6 +2927,914 @@ static LogicalResult rewriteF64Function(OpTy op, PatternRewriter &rewriter) {
   }
   rewriter.replaceOp(op, r);
   return success();
+}
+
+static thread_local bool smallFloatExtViaHalf = true;
+static thread_local bool subByteRewrites = true;
+
+namespace {
+/// A float type of at most 8 bits with a sign, a zero and a significand (f4,
+/// f6 and f8 but f8E8M0FNU), and what its conversions need: every code's f32
+/// bits by APFloat, the largest finite magnitude, the infinity's and a quiet
+/// NaN's codes (L15-E844).
+struct SmallFloat {
+  unsigned w = 0, m = 0;
+  int emin = 0;
+  bool hasInf = false, hasNaN = false, nanNegZero = false;
+  uint32_t table[256];
+  uint32_t maxMag = 0, infMag = 0, nanMag = 0;
+  // f32 bits of a normal code: (magnitude << (23 - m)) + k
+  uint32_t k = 0;
+  // the codes whose f32 bits the expansion's formula does not give
+  SmallVector<std::pair<uint32_t, uint32_t>> specials;
+};
+} // namespace
+
+/// The f32 bits the extension's formula gives for code \p c (the IR below
+/// computes the same): a normal code's magnitude shifted into f32's fields
+/// and rebiased, a denormal's significand times its scale, an infinity or
+/// NaN (where the format has them) its f32 counterpart, quieted, and the
+/// sign.
+static uint32_t smallFloatFormula(const SmallFloat &s, uint32_t c) {
+  uint32_t mag = c & ((1u << (s.w - 1)) - 1), e = mag >> s.m,
+           mm = mag & ((1u << s.m) - 1);
+  uint32_t bits;
+  if (s.hasInf && mag >= s.infMag)
+    bits = 0x7f800000u | (mm << (23 - s.m)) | (mm ? 0x400000u : 0);
+  else if (e == 0)
+    bits = llvm::bit_cast<uint32_t>(float(mm) *
+                                    std::ldexp(1.0f, s.emin - int(s.m)));
+  else
+    bits = (mag << (23 - s.m)) + s.k;
+  return bits | ((c >> (s.w - 1)) << 31);
+}
+
+static std::optional<SmallFloat> smallFloat(Type t) {
+  auto ft = dyn_cast<FloatType>(t);
+  if (!ft || ft.getWidth() > 8 || isa<Float8E8M0FNUType>(ft))
+    return std::nullopt;
+  const llvm::fltSemantics &sem = ft.getFloatSemantics();
+  SmallFloat s;
+  s.w = APFloat::semanticsSizeInBits(sem);
+  s.m = APFloat::semanticsPrecision(sem) - 1;
+  s.emin = APFloat::semanticsMinExponent(sem);
+  if (s.w > 8 || s.m == 0 || s.m >= s.w - 1 ||
+      !APFloat::semanticsHasSignedRepr(sem) || !APFloat::semanticsHasZero(sem))
+    return std::nullopt;
+  s.hasInf = APFloat::semanticsHasInf(sem);
+  s.hasNaN = APFloat::semanticsHasNaN(sem);
+  for (uint32_t c = 0; c < (1u << s.w); ++c) {
+    APFloat v(sem, APInt(s.w, c));
+    bool lost;
+    v.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &lost);
+    s.table[c] = v.bitcastToAPInt().getZExtValue();
+  }
+  s.maxMag = APFloat::getLargest(sem).bitcastToAPInt().getZExtValue();
+  if (s.hasInf)
+    s.infMag = APFloat::getInf(sem).bitcastToAPInt().getZExtValue();
+  if (s.hasNaN) {
+    s.nanMag = APFloat::getQNaN(sem).bitcastToAPInt().getZExtValue();
+    s.nanNegZero = s.nanMag == (1u << (s.w - 1));
+  }
+  // an IEEE-like format's specials are the codes from the infinity's up
+  if (s.hasInf && (s.infMag & ((1u << s.m) - 1)) != 0)
+    return std::nullopt;
+  s.k = s.table[1u << s.m] - ((1u << s.m) << (23 - s.m));
+  if (s.k & ((1u << 23) - 1))
+    return std::nullopt;
+  for (uint32_t c = 0; c < (1u << s.w); ++c)
+    if (smallFloatFormula(s, c) != s.table[c])
+      s.specials.push_back({c, s.table[c]});
+  if (s.specials.size() > 4)
+    return std::nullopt;
+  return s;
+}
+
+/// An integer constant of \p ty (a scalar or a vector of it).
+static Value smallFloatConst(ImplicitLocOpBuilder &b, Type ty, uint64_t v) {
+  Type et = getElementTypeOrSelf(ty);
+  TypedAttr a = b.getIntegerAttr(et, APInt(et.getIntOrFloatBitWidth(), v));
+  if (auto vt = dyn_cast<VectorType>(ty))
+    a = DenseElementsAttr::get(vt, a);
+  return arith::ConstantOp::create(b, ty, a);
+}
+
+static Type smallFloatShaped(Type like, Type et) {
+  if (auto vt = dyn_cast<VectorType>(like))
+    return vt.clone(et);
+  return et;
+}
+
+/// arith.extf of a small float (L15-E844): its f32 bits from integer
+/// operations on the code (smallFloatFormula), the specials selected, then
+/// extended or truncated (exactly: every small float is a half, bfloat and
+/// float) to the result type. Exact, as APFloat converts.
+static LogicalResult rewriteSmallFloatExtF(arith::ExtFOp op,
+                                           PatternRewriter &rewriter) {
+  Type srcTy = op.getIn().getType();
+  auto s = smallFloat(getElementTypeOrSelf(srcTy));
+  if (!s)
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Type iw = smallFloatShaped(srcTy, b.getIntegerType(s->w));
+  Type i32 = smallFloatShaped(srcTy, b.getI32Type());
+  Type f32 = smallFloatShaped(srcTy, b.getF32Type());
+  auto c32 = [&](uint64_t v) { return smallFloatConst(b, i32, v); };
+  Type dstTy = op.getType();
+  unsigned dw = getElementTypeOrSelf(dstTy).getIntOrFloatBitWidth();
+  // (L15-E846) with at most 5 exponent bits, the code's fields are a half's
+  // top bits (the sign at 15, the magnitude 10 - m places up: sign-extended,
+  // shifted, masked), whose value is the code's times 2^(bias - 15) for
+  // every code, denormals included (a half's own), so the half extended
+  // and multiplied by 2^(15 - bias) (one f32 multiply with a half source;
+  // nothing for f8E5M2, a half's top byte, to a half) is exact; the codes it
+  // does not give (an infinity or NaN not at a half's, FN's NaN, FNUZ's
+  // 0x80), at most four, selected from the table.
+  if (smallFloatExtViaHalf && s->w - 1 - s->m <= 5) {
+    unsigned up = 10 - s->m;
+    int bias = 1 - s->emin;
+    float scale = std::ldexp(1.0f, 15 - bias);
+    uint32_t magMask = (1u << (s->w - 1)) - 1;
+    SmallVector<std::pair<uint32_t, uint32_t>> specials;
+    bool ok = true;
+    for (uint32_t c = 0; c < (1u << s->w) && ok; ++c) {
+      uint32_t mag = c & magMask;
+      uint16_t hb = uint16_t(((c >> (s->w - 1)) << 15) | (mag << up));
+      APFloat h(APFloat::IEEEhalf(), APInt(16, hb));
+      bool lost;
+      h.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &lost);
+      float hv = llvm::bit_cast<float>(uint32_t(h.bitcastToAPInt().getZExtValue()));
+      uint32_t bits = llvm::bit_cast<uint32_t>(hv * scale);
+      bool bothNaN = std::isnan(hv) &&
+                     (s->table[c] & 0x7fffffffu) > 0x7f800000u;
+      if (bits != s->table[c] && !bothNaN)
+        specials.push_back({c, s->table[c]});
+      ok = specials.size() <= 4;
+    }
+    if (ok) {
+      Type i16 = smallFloatShaped(srcTy, b.getI16Type());
+      Type f16 = smallFloatShaped(srcTy, b.getF16Type());
+      Value code = arith::BitcastOp::create(b, iw, op.getIn());
+      // (the sign moved 5 - e places up, to 15 - up, by adding the sign bit
+      // times 2^(5 - e) - 1: one multiply-add, no sign extension)
+      Value z = arith::ExtUIOp::create(b, i16, code);
+      unsigned e = s->w - 1 - s->m;
+      Value hb = z;
+      if (e < 5)
+        hb = arith::AddIOp::create(
+            b,
+            arith::MulIOp::create(
+                b,
+                arith::AndIOp::create(b, z,
+                                      smallFloatConst(b, i16, 1u << (s->w - 1))),
+                smallFloatConst(b, i16, (1u << (5 - e)) - 1)),
+            z);
+      hb = arith::ShLIOp::create(b, hb, smallFloatConst(b, i16, up));
+      Value h = arith::BitcastOp::create(b, f16, hb);
+      Value r;
+      Type rt = dw == 16 && getElementTypeOrSelf(dstTy).isF16() ? f16 : f32;
+      if (rt == f16 && bias == 15) {
+        r = h;
+      } else {
+        TypedAttr sa = rt == f16 ? TypedAttr(b.getF16FloatAttr(scale))
+                                 : TypedAttr(b.getF32FloatAttr(scale));
+        if (auto vt = dyn_cast<VectorType>(rt))
+          sa = DenseElementsAttr::get(vt, sa);
+        Value hx = rt == f16 ? h : arith::ExtFOp::create(b, f32, h).getResult();
+        r = bias == 15 ? hx
+                       : arith::MulFOp::create(
+                             b, hx, arith::ConstantOp::create(b, rt, sa))
+                             .getResult();
+      }
+      // (L15-E851) specials that are all NaNs whose formula values share a
+      // magnitude no other code gives (FN's 0x7f and 0xff, +-480): one
+      // compare of that magnitude for both, the NaN the result type's
+      {
+        std::optional<float> m;
+        bool merge = specials.size() > 1;
+        auto formulaOf = [&](uint32_t c) {
+          uint32_t mag = c & magMask;
+          uint16_t hbv = uint16_t(((c >> (s->w - 1)) << 15) | (mag << up));
+          APFloat hh(APFloat::IEEEhalf(), APInt(16, hbv));
+          bool lost;
+          hh.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &lost);
+          return std::fabs(hh.convertToFloat() * scale);
+        };
+        for (auto [c, f] : specials) {
+          if ((f & 0x7fffffffu) <= 0x7f800000u)
+            merge = false;
+          float fm = formulaOf(c);
+          if (m && *m != fm)
+            merge = false;
+          m = fm;
+        }
+        for (uint32_t c = 0; merge && c < (1u << s->w); ++c)
+          if (!llvm::any_of(specials, [&](auto p) { return p.first == c; }) &&
+              formulaOf(c) == *m)
+            merge = false;
+        if (merge && !std::isnan(*m)) {
+          Type et = getElementTypeOrSelf(rt);
+          auto splat = [&](TypedAttr a) -> TypedAttr {
+            if (auto vt = dyn_cast<VectorType>(rt))
+              return DenseElementsAttr::get(vt, a);
+            return a;
+          };
+          Value mc = arith::ConstantOp::create(
+              b, rt, splat(b.getFloatAttr(et, *m)));
+          Value nanc = arith::ConstantOp::create(
+              b, rt,
+              splat(b.getFloatAttr(
+                  et, APFloat::getQNaN(cast<FloatType>(et).getFloatSemantics()))));
+          r = arith::SelectOp::create(
+              b,
+              arith::CmpFOp::create(b, arith::CmpFPredicate::OEQ,
+                                    math::AbsFOp::create(b, r), mc),
+              nanc, r);
+          specials.clear();
+        }
+      }
+      for (auto [c, f] : specials) {
+        APFloat v(APFloat::IEEEsingle(), APInt(32, f));
+        bool lost;
+        if (rt == f16)
+          v.convert(APFloat::IEEEhalf(), APFloat::rmNearestTiesToEven, &lost);
+        TypedAttr fa = b.getFloatAttr(getElementTypeOrSelf(rt), v);
+        if (auto vt = dyn_cast<VectorType>(rt))
+          fa = DenseElementsAttr::get(vt, fa);
+        r = arith::SelectOp::create(
+            b,
+            arith::CmpIOp::create(b, arith::CmpIPredicate::eq, code,
+                                  smallFloatConst(b, iw, c)),
+            arith::ConstantOp::create(b, rt, fa), r);
+      }
+      unsigned rw = getElementTypeOrSelf(rt).getIntOrFloatBitWidth();
+      if (rt != dstTy) {
+        if (dw > rw)
+          r = arith::ExtFOp::create(b, dstTy, r);
+        else
+          r = arith::TruncFOp::create(b, dstTy, r);
+      }
+      rewriter.replaceOp(op, r);
+      return success();
+    }
+  }
+  Value c = arith::ExtUIOp::create(
+      b, i32, arith::BitcastOp::create(b, iw, op.getIn()));
+  Value mag = arith::AndIOp::create(b, c, c32((1u << (s->w - 1)) - 1));
+  Value mm = arith::AndIOp::create(b, mag, c32((1u << s->m) - 1));
+  Value normal = arith::AddIOp::create(
+      b, arith::ShLIOp::create(b, mag, c32(23 - s->m)), c32(s->k));
+  TypedAttr scaleAttr =
+      b.getF32FloatAttr(std::ldexp(1.0f, s->emin - int(s->m)));
+  if (auto vt = dyn_cast<VectorType>(f32))
+    scaleAttr = DenseElementsAttr::get(vt, scaleAttr);
+  Value denormal = arith::BitcastOp::create(
+      b, i32,
+      arith::MulFOp::create(b, arith::UIToFPOp::create(b, f32, mm),
+                            arith::ConstantOp::create(b, f32, scaleAttr)));
+  Value bits = arith::SelectOp::create(
+      b,
+      arith::CmpIOp::create(b, arith::CmpIPredicate::ult, mag,
+                            c32(1u << s->m)),
+      denormal, normal);
+  if (s->hasInf) {
+    Value mmUp = arith::ShLIOp::create(b, mm, c32(23 - s->m));
+    Value quiet = arith::SelectOp::create(
+        b, arith::CmpIOp::create(b, arith::CmpIPredicate::ne, mm, c32(0)),
+        c32(0x400000), c32(0));
+    Value special = arith::OrIOp::create(
+        b, arith::OrIOp::create(b, mmUp, quiet), c32(0x7f800000));
+    bits = arith::SelectOp::create(
+        b,
+        arith::CmpIOp::create(b, arith::CmpIPredicate::uge, mag,
+                              c32(s->infMag)),
+        special, bits);
+  }
+  Value sign = arith::ShLIOp::create(
+      b, arith::ShRUIOp::create(b, c, c32(s->w - 1)), c32(31));
+  bits = arith::OrIOp::create(b, bits, sign);
+  for (auto [code, f] : s->specials)
+    bits = arith::SelectOp::create(
+        b, arith::CmpIOp::create(b, arith::CmpIPredicate::eq, c, c32(code)),
+        c32(f), bits);
+  Value r = arith::BitcastOp::create(b, f32, bits);
+  if (dw > 32)
+    r = arith::ExtFOp::create(b, dstTy, r);
+  else if (dw < 32)
+    r = arith::TruncFOp::create(b, dstTy, r);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+/// arith.truncf to a small float (L15-E844), rounding to nearest even as
+/// APFloat converts, in integer operations on the source's bits (a half or
+/// bfloat extended to f32 first, exactly; a double on its own 64 bits, with
+/// no double rounding): a normal result by the magnitude's rounding bias and
+/// shift, rebiased; a denormal one by the significand's shift with its round
+/// and sticky bits; past the largest finite magnitude an infinity, the NaN or
+/// (a format with neither) the largest; a NaN the format's NaN; no negative
+/// zero where the NaN is its encoding.
+static LogicalResult rewriteSmallFloatTruncF(arith::TruncFOp op,
+                                             PatternRewriter &rewriter) {
+  Type dstTy = op.getType();
+  auto s = smallFloat(getElementTypeOrSelf(dstTy));
+  if (!s || op.getRoundingmodeAttr())
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  Value x = op.getIn();
+  Type srcEt = getElementTypeOrSelf(x.getType());
+  if (!srcEt.isF32() && !srcEt.isF64()) {
+    if (srcEt.getIntOrFloatBitWidth() > 32)
+      return failure();
+    x = arith::ExtFOp::create(b, smallFloatShaped(x.getType(), b.getF32Type()),
+                              x);
+    srcEt = b.getF32Type();
+  }
+  // (L15-E848) from f32 to a format of at most 4 exponent bits (or
+  // f8E5M2, a half's top byte): the value scaled by 2^(bias - 15) rounded to
+  // a half by the hardware's conversion, made round-to-odd (an inexact half
+  // one ulp toward zero with its lowest bit set: the first of two roundings
+  // to odd keeps the second, to nearest even at the code's precision, as if
+  // done once; a half has more than m + 2 bits), then rounded by the bias
+  // and shift of its bits as the codes are the half's top bits (E846)
+  unsigned fe = s->w - 1 - s->m;
+  int fbias = 1 - s->emin;
+  if (smallFloatExtViaHalf && srcEt.isF32() &&
+      (fe <= 4 || (fe == 5 && fbias == 15 && s->hasInf))) {
+    auto cmp = [&](arith::CmpIPredicate p, Value l, Value r) {
+      return arith::CmpIOp::create(b, p, l, r);
+    };
+    auto sel = [&](Value cnd, Value t, Value f) {
+      return arith::SelectOp::create(b, cnd, t, f);
+    };
+    using P = arith::CmpIPredicate;
+    using FP = arith::CmpFPredicate;
+    Type f32t = x.getType();
+    Type f16t = smallFloatShaped(f32t, b.getF16Type());
+    Type i16 = smallFloatShaped(f32t, b.getI16Type());
+    auto c16 = [&](uint64_t v) { return smallFloatConst(b, i16, v); };
+    unsigned up = 10 - s->m;
+    Value xs = x;
+    if (fbias != 15) {
+      TypedAttr sa = b.getF32FloatAttr(std::ldexp(1.0f, fbias - 15));
+      if (auto vt = dyn_cast<VectorType>(f32t))
+        sa = DenseElementsAttr::get(vt, sa);
+      xs = arith::MulFOp::create(b, x, arith::ConstantOp::create(b, f32t, sa));
+    }
+    Value h = arith::TruncFOp::create(b, f16t, xs);
+    Value he = arith::ExtFOp::create(b, f32t, h);
+    Value inexact = arith::CmpFOp::create(b, FP::UNE, he, xs);
+    Value over = arith::CmpFOp::create(b, FP::OGT, math::AbsFOp::create(b, he),
+                                       math::AbsFOp::create(b, xs));
+    Value hb = arith::BitcastOp::create(b, i16, h);
+    Value odd = arith::OrIOp::create(
+        b, arith::SubIOp::create(b, hb, arith::ExtUIOp::create(b, i16, over)),
+        arith::ExtUIOp::create(b, i16, inexact));
+    Value magp = arith::AndIOp::create(b, odd, c16(0x7fff));
+    Value lsb = arith::AndIOp::create(
+        b, arith::ShRUIOp::create(b, magp, c16(up)), c16(1));
+    Value mag = arith::ShRUIOp::create(
+        b,
+        arith::AddIOp::create(
+            b, arith::AddIOp::create(b, magp, c16((1u << (up - 1)) - 1)), lsb),
+        c16(up));
+    uint64_t ovf = s->hasInf ? s->infMag : s->hasNaN ? s->nanMag : s->maxMag;
+    mag = sel(cmp(P::ugt, mag, c16(s->maxMag)), c16(ovf), mag);
+    uint64_t nanV;
+    if (s->hasInf)
+      nanV = s->infMag | (1u << (s->m - 1));
+    else
+      nanV = s->hasNaN ? s->nanMag : s->maxMag;
+    // a NaN: the format's (an IEEE-like format's payload is not kept); the
+    // sign the input's, its high half's top bit (the half's conversion
+    // gives a NaN its own sign)
+    // (where an overflow gives the NaN, or with no NaN the largest, a NaN
+    // input needs nothing more: the half's NaN rounds past the largest
+    // magnitude)
+    if (s->hasInf)
+      mag = sel(arith::CmpFOp::create(b, FP::UNO, x, x), c16(nanV), mag);
+    Type i32t = smallFloatShaped(f32t, b.getI32Type());
+    Value xhi = arith::TruncIOp::create(
+        b, i16,
+        arith::ShRUIOp::create(b, arith::BitcastOp::create(b, i32t, x),
+                               smallFloatConst(b, i32t, 16)));
+    Value code = arith::OrIOp::create(
+        b, mag,
+        arith::ShLIOp::create(b, arith::ShRUIOp::create(b, xhi, c16(15)),
+                              c16(s->w - 1)));
+    if (s->nanNegZero) {
+      code = sel(cmp(P::eq, mag, c16(0)), c16(0), code);
+      code = sel(cmp(P::eq, mag, c16(s->nanMag)), c16(s->nanMag), code);
+    }
+    Value narrow = arith::TruncIOp::create(
+        b, smallFloatShaped(f32t, b.getIntegerType(s->w)), code);
+    rewriter.replaceOp(op, arith::BitcastOp::create(b, dstTy, narrow));
+    return success();
+  }
+  bool d64 = srcEt.isF64();
+  unsigned S = d64 ? 64 : 32, F = d64 ? 52 : 23;
+  int64_t srcBias = d64 ? 1023 : 127;
+  int64_t tbias = 127 - int64_t(int32_t(s->k) >> 23);
+  Type is = smallFloatShaped(x.getType(), b.getIntegerType(S));
+  auto cs = [&](uint64_t v) { return smallFloatConst(b, is, v); };
+  auto cmp = [&](arith::CmpIPredicate p, Value l, Value r) {
+    return arith::CmpIOp::create(b, p, l, r);
+  };
+  auto sel = [&](Value cnd, Value t, Value f) {
+    return arith::SelectOp::create(b, cnd, t, f);
+  };
+  using P = arith::CmpIPredicate;
+  uint64_t absMask = (S == 64 ? ~0ull : 0xffffffffull) >> 1;
+  uint64_t fracMask = (1ull << F) - 1;
+  uint64_t infBits = d64 ? 0x7ff0000000000000ull : 0x7f800000ull;
+  unsigned shift = F - s->m;
+  Value xb = arith::BitcastOp::create(b, is, x);
+  Value a = arith::AndIOp::create(b, xb, cs(absMask));
+  Value sgn = arith::ShRUIOp::create(b, xb, cs(S - 1));
+  // a normal result
+  Value lsb = arith::AndIOp::create(b, arith::ShRUIOp::create(b, a, cs(shift)),
+                                    cs(1));
+  Value r = arith::AddIOp::create(
+      b, arith::AddIOp::create(b, a, cs((1ull << (shift - 1)) - 1)), lsb);
+  Value codeN = arith::SubIOp::create(
+      b, arith::ShRUIOp::create(b, r, cs(shift)),
+      cs(uint64_t(srcBias - tbias) << s->m));
+  // a denormal result: the significand's shift d = F - m + emin - E, clamped
+  // to [1, F + 2] (from F + 2 nothing is left, not even the round bit)
+  Value frac = arith::AndIOp::create(b, a, cs(fracMask));
+  Value ef = arith::ShRUIOp::create(b, a, cs(F));
+  Value sig = arith::OrIOp::create(
+      b, frac, sel(cmp(P::ne, ef, cs(0)), cs(1ull << F), cs(0)));
+  Value eun = arith::MaxSIOp::create(b, ef, cs(1));
+  Value dd = arith::SubIOp::create(
+      b, cs(uint64_t(int64_t(F) - s->m + s->emin + srcBias)), eun);
+  dd = arith::MinSIOp::create(b, arith::MaxSIOp::create(b, dd, cs(1)),
+                              cs(F + 2));
+  Value k = arith::ShRUIOp::create(b, sig, dd);
+  Value one = cs(1);
+  Value lowMask =
+      arith::SubIOp::create(b, arith::ShLIOp::create(b, one, dd), one);
+  Value rem = arith::AndIOp::create(b, sig, lowMask);
+  Value half = arith::ShLIOp::create(b, one, arith::SubIOp::create(b, dd, one));
+  Value kOdd = cmp(P::ne, arith::AndIOp::create(b, k, one), cs(0));
+  Value inc = arith::OrIOp::create(
+      b, cmp(P::ugt, rem, half),
+      arith::AndIOp::create(b, cmp(P::eq, rem, half), kOdd));
+  k = arith::AddIOp::create(b, k, arith::ExtUIOp::create(b, is, inc));
+  Value isSub = cmp(P::ult, a, cs(uint64_t(s->emin + srcBias) << F));
+  Value mag = sel(isSub, k, codeN);
+  // past the largest finite magnitude, and a NaN
+  uint64_t ovf = s->hasInf ? s->infMag : s->hasNaN ? s->nanMag : s->maxMag;
+  mag = sel(cmp(P::ugt, mag, cs(s->maxMag)), cs(ovf), mag);
+  Value nan;
+  if (s->hasInf)
+    nan = arith::OrIOp::create(
+        b, arith::ShRUIOp::create(b, frac, cs(shift)),
+        cs(s->infMag | (1u << (s->m - 1))));
+  else
+    nan = cs(s->hasNaN ? s->nanMag : s->maxMag);
+  Value isNaN = cmp(P::ugt, a, cs(infBits));
+  mag = sel(isNaN, nan, mag);
+  Value code = arith::OrIOp::create(
+      b, mag, arith::ShLIOp::create(b, sgn, cs(s->w - 1)));
+  if (s->nanNegZero) {
+    // no -0 (its code is the NaN): +0; the NaN whatever the sign
+    code = sel(cmp(P::eq, mag, cs(0)), cs(0), code);
+    code = sel(cmp(P::eq, mag, cs(s->nanMag)), cs(s->nanMag), code);
+  }
+  Value narrow = arith::TruncIOp::create(
+      b, smallFloatShaped(x.getType(), b.getIntegerType(s->w)), code);
+  rewriter.replaceOp(op, arith::BitcastOp::create(b, dstTy, narrow));
+  return success();
+}
+
+/// (L15-E850) an extension or conversion (extsi, extui, sitofp, uitofp) of
+/// a 1-D vector of i4 that is a vector.bitcast of bytes: each byte's nibbles
+/// in 16 bits (where a byte is loaded), the low one (z << 12) >> 12 and the
+/// high (z << 8) >> 12 signed, z & 15 and z >> 4 unsigned, interleaved (the
+/// bitcast's order, low nibble first), then the op from i16 (a 16-bit
+/// source converts in one instruction).
+template <typename OpTy>
+static LogicalResult rewriteNibbleExt(OpTy op, PatternRewriter &rewriter) {
+  auto bc = op.getIn().template getDefiningOp<vector::BitCastOp>();
+  if (!subByteRewrites || !bc)
+    return failure();
+  auto dst = dyn_cast<VectorType>(bc.getType());
+  auto src = dyn_cast<VectorType>(bc.getSource().getType());
+  if (!dst || !src || dst.getRank() != 1 || src.getRank() != 1 ||
+      dst.isScalable() || !dst.getElementType().isInteger(4) ||
+      !src.getElementType().isInteger(8))
+    return failure();
+  constexpr bool isSigned =
+      std::is_same_v<OpTy, arith::ExtSIOp> || std::is_same_v<OpTy, arith::SIToFPOp>;
+  Type outEt = getElementTypeOrSelf(op.getType());
+  if (outEt.isInteger() && outEt.getIntOrFloatBitWidth() < 8)
+    return failure();
+  ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+  auto v16 = VectorType::get(src.getShape(), b.getI16Type());
+  auto cst = [&](int64_t v) {
+    return arith::ConstantOp::create(
+        b, v16, DenseElementsAttr::get(v16, b.getI16IntegerAttr(v)));
+  };
+  Value z = arith::ExtUIOp::create(b, v16, bc.getSource());
+  Value lo, hi;
+  if (!outEt.isInteger()) {
+    // to a float: each nibble under a half's 0x6400 (1024 + u: 2^10 and
+    // 10 fraction bits), u = nibble ^ 8 for a signed one (n + 8), and the
+    // half minus 1024 (+ 8): exact, two full-rate operations and a half
+    // addition an element, no conversion instruction
+    uint64_t key = isSigned ? 0x6408 : 0x6400;
+    auto h16 = VectorType::get(src.getShape(), b.getF16Type());
+    auto keyed = [&](Value n) {
+      Value k = isSigned ? arith::XOrIOp::create(b, n, cst(key)).getResult()
+                         : arith::OrIOp::create(b, n, cst(key)).getResult();
+      return arith::AddFOp::create(
+          b, arith::BitcastOp::create(b, h16, k),
+          arith::ConstantOp::create(
+              b, h16,
+              DenseElementsAttr::get(
+                  h16, b.getF16FloatAttr(isSigned ? -1032.0 : -1024.0))));
+    };
+    Value fl = keyed(arith::AndIOp::create(b, z, cst(15)));
+    Value fh = keyed(arith::ShRUIOp::create(b, z, cst(4)));
+    Value w = vector::InterleaveOp::create(b, fl, fh);
+    Type outTy = op.getType();
+    unsigned ow = outEt.getIntOrFloatBitWidth();
+    Value r = w;
+    if (outEt.isF16())
+      r = w;
+    else if (ow > 16)
+      r = arith::ExtFOp::create(b, outTy, w);
+    else
+      r = arith::TruncFOp::create(
+          b, outTy,
+          arith::ExtFOp::create(
+              b, VectorType::get(dst.getShape(), b.getF32Type()), w));
+    rewriter.replaceOp(op, r);
+    return success();
+  }
+  // to an integer: the shifts at the result's width (from 16 bits), no
+  // extension after them
+  unsigned ow = outEt.getIntOrFloatBitWidth(), iw = std::max(ow, 16u);
+  auto vi = VectorType::get(src.getShape(), b.getIntegerType(iw));
+  auto ci = [&](int64_t v) {
+    return arith::ConstantOp::create(
+        b, vi, DenseElementsAttr::get(vi, b.getIntegerAttr(b.getIntegerType(iw), v)));
+  };
+  Value zi = iw == 16 ? z : arith::ExtUIOp::create(b, vi, bc.getSource()).getResult();
+  if (isSigned) {
+    lo = arith::ShRSIOp::create(b, arith::ShLIOp::create(b, zi, ci(iw - 4)),
+                                ci(iw - 4));
+    hi = arith::ShRSIOp::create(b, arith::ShLIOp::create(b, zi, ci(iw - 8)),
+                                ci(iw - 4));
+  } else {
+    lo = arith::AndIOp::create(b, zi, ci(15));
+    hi = arith::ShRUIOp::create(b, zi, ci(4));
+  }
+  Value w = vector::InterleaveOp::create(b, lo, hi);
+  Value r = w;
+  if (ow < iw)
+    r = arith::TruncIOp::create(b, op.getType(), w);
+  rewriter.replaceOp(op, r);
+  return success();
+}
+
+
+namespace {
+/// (L15-E852) gpu.subgroup_mma_* on AIR's 8x8 SIMD-group matrices: an
+/// M x N mma_matrix of f16 or f32 (M and N multiples of 8) is its 8x8
+/// blocks in row-major order, each an AIR matrix (vector<64 x T>).
+static std::optional<std::pair<int64_t, int64_t>>
+mmaBlocks(gpu::MMAMatrixType t) {
+  ArrayRef<int64_t> sh = t.getShape();
+  Type et = t.getElementType();
+  if (sh.size() != 2 || sh[0] % 8 || sh[1] % 8 || !(et.isF16() || et.isF32()))
+    return std::nullopt;
+  return std::make_pair(sh[0] / 8, sh[1] / 8);
+}
+
+/// A 2-D memref whose row stride is \p ld (statically) and whose columns are
+/// contiguous, as an AIR matrix load or store reads it.
+static bool mmaMemrefMatches(Value memref, int64_t ld) {
+  auto mt = dyn_cast<MemRefType>(memref.getType());
+  if (!mt || mt.getRank() != 2)
+    return false;
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (failed(mt.getStridesAndOffset(strides, offset)))
+    return false;
+  return strides[1] == 1 && strides[0] == ld;
+}
+
+struct MmaLoadToAIR : OpConversionPattern<gpu::SubgroupMmaLoadMatrixOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaLoadMatrixOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto t = cast<gpu::MMAMatrixType>(op.getType());
+    auto blocks = mmaBlocks(t);
+    if (!blocks || op.getIndices().size() != 2 ||
+        !mmaMemrefMatches(op.getSrcMemref(),
+                          op.getLeadDimension().getSExtValue()))
+      return failure();
+    Location loc = op.getLoc();
+    bool tr = op.getTranspose().value_or(false);
+    Value src = adaptor.getSrcMemref().front();
+    Value i = adaptor.getIndices()[0].front(), j = adaptor.getIndices()[1].front();
+    auto vt = VectorType::get({64}, t.getElementType());
+    SmallVector<Value> parts;
+    for (int64_t bi = 0; bi < blocks->first; ++bi)
+      for (int64_t bj = 0; bj < blocks->second; ++bj) {
+        // (transposed: the block of the source at (8 bj, 8 bi), transposed)
+        int64_t di = 8 * (tr ? bj : bi), dj = 8 * (tr ? bi : bj);
+        Value ii = arith::AddIOp::create(
+            rewriter, loc, i, arith::ConstantIndexOp::create(rewriter, loc, di));
+        Value jj = arith::AddIOp::create(
+            rewriter, loc, j, arith::ConstantIndexOp::create(rewriter, loc, dj));
+        auto l = air::MatrixLoadOp::create(rewriter, loc, vt, src,
+                                           ValueRange{ii, jj});
+        if (tr)
+          l.setTranspose(true);
+        parts.push_back(l);
+      }
+    rewriter.replaceOpWithMultiple(op, {parts});
+    return success();
+  }
+};
+
+struct MmaStoreToAIR : OpConversionPattern<gpu::SubgroupMmaStoreMatrixOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaStoreMatrixOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto t = cast<gpu::MMAMatrixType>(op.getSrc().getType());
+    auto blocks = mmaBlocks(t);
+    if (!blocks || op.getIndices().size() != 2 ||
+        !mmaMemrefMatches(op.getDstMemref(),
+                          op.getLeadDimension().getSExtValue()))
+      return failure();
+    Location loc = op.getLoc();
+    bool tr = op.getTranspose().value_or(false);
+    ValueRange parts = adaptor.getSrc();
+    Value dst = adaptor.getDstMemref().front();
+    Value i = adaptor.getIndices()[0].front(), j = adaptor.getIndices()[1].front();
+    for (int64_t bi = 0; bi < blocks->first; ++bi)
+      for (int64_t bj = 0; bj < blocks->second; ++bj) {
+        int64_t di = 8 * (tr ? bj : bi), dj = 8 * (tr ? bi : bj);
+        Value ii = arith::AddIOp::create(
+            rewriter, loc, i, arith::ConstantIndexOp::create(rewriter, loc, di));
+        Value jj = arith::AddIOp::create(
+            rewriter, loc, j, arith::ConstantIndexOp::create(rewriter, loc, dj));
+        auto st = air::MatrixStoreOp::create(
+            rewriter, loc, parts[bi * blocks->second + bj], dst,
+            ValueRange{ii, jj});
+        if (tr)
+          st.setTranspose(true);
+      }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct MmaComputeToAIR : OpConversionPattern<gpu::SubgroupMmaComputeOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaComputeOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (op.getATranspose().value_or(false) || op.getBTranspose().value_or(false))
+      return failure();
+    auto ta = cast<gpu::MMAMatrixType>(op.getOpA().getType());
+    auto tc = cast<gpu::MMAMatrixType>(op.getOpC().getType());
+    auto ba = mmaBlocks(ta), bc = mmaBlocks(tc);
+    if (!ba || !bc)
+      return failure();
+    // (A and B f16 with C f32, or all one type: AIR's forms)
+    if (ta.getElementType() != tc.getElementType() &&
+        !(ta.getElementType().isF16() && tc.getElementType().isF32()))
+      return failure();
+    int64_t mb = bc->first, nb = bc->second, kb = ba->second;
+    ValueRange a = adaptor.getOpA(), b = adaptor.getOpB(), c = adaptor.getOpC();
+    SmallVector<Value> d;
+    for (int64_t bi = 0; bi < mb; ++bi)
+      for (int64_t bj = 0; bj < nb; ++bj) {
+        Value acc = c[bi * nb + bj];
+        for (int64_t bk = 0; bk < kb; ++bk)
+          acc = air::MatrixMultiplyAccumulateOp::create(
+              rewriter, op.getLoc(), a[bi * kb + bk], b[bk * nb + bj], acc);
+        d.push_back(acc);
+      }
+    rewriter.replaceOpWithMultiple(op, {d});
+    return success();
+  }
+};
+
+struct MmaConstantToAIR : OpConversionPattern<gpu::SubgroupMmaConstantMatrixOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaConstantMatrixOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto t = cast<gpu::MMAMatrixType>(op.getType());
+    auto blocks = mmaBlocks(t);
+    if (!blocks)
+      return failure();
+    auto vt = VectorType::get({64}, t.getElementType());
+    Value fill = air::MatrixFillOp::create(rewriter, op.getLoc(), vt,
+                                           adaptor.getValue().front());
+    SmallVector<Value> parts(blocks->first * blocks->second, fill);
+    rewriter.replaceOpWithMultiple(op, {parts});
+    return success();
+  }
+};
+/// (L15-E855) subgroup_mma_elementwise of float matrices as the operation on
+/// each block's vector<64 x T>: the AGX backend applies element-wise
+/// operations to the two elements each thread holds. maxf / minf as
+/// upstream's NVVM lowering: an ordered compare and select, the NaN where
+/// either is one.
+struct MmaElementwiseToAIR
+    : OpConversionPattern<gpu::SubgroupMmaElementwiseOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(gpu::SubgroupMmaElementwiseOp op, OneToNOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto rt = cast<gpu::MMAMatrixType>(op.getType());
+    auto blocks = mmaBlocks(rt);
+    if (!blocks)
+      return failure();
+    for (Value a : op.getArgs())
+      if (!mmaBlocks(cast<gpu::MMAMatrixType>(a.getType())))
+        return failure();
+    Location loc = op.getLoc();
+    auto vt = VectorType::get({64}, rt.getElementType());
+    using E = gpu::MMAElementwiseOp;
+    E kind = op.getOpType();
+    int64_t n = blocks->first * blocks->second;
+    SmallVector<Value> out;
+    for (int64_t k = 0; k < n; ++k) {
+      SmallVector<Value> x;
+      for (ValueRange r : adaptor.getArgs())
+        x.push_back(r[k]);
+      Value v;
+      auto minmax = [&](bool isMin) {
+        Value c = arith::CmpFOp::create(
+            rewriter, loc,
+            isMin ? arith::CmpFPredicate::OLT : arith::CmpFPredicate::OGT,
+            x[0], x[1]);
+        Value sel = arith::SelectOp::create(rewriter, loc, c, x[0], x[1]);
+        Value nan = arith::CmpFOp::create(rewriter, loc,
+                                          arith::CmpFPredicate::UNO, x[0], x[1]);
+        auto ft = cast<FloatType>(rt.getElementType());
+        Value q = arith::ConstantOp::create(
+            rewriter, loc, vt,
+            DenseElementsAttr::get(
+                vt, rewriter.getFloatAttr(
+                        ft, APFloat::getQNaN(ft.getFloatSemantics()))));
+        return arith::SelectOp::create(rewriter, loc, nan, q, sel).getResult();
+      };
+      switch (kind) {
+      case E::ADDF:
+        v = arith::AddFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::SUBF:
+        v = arith::SubFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::MULF:
+        v = arith::MulFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::DIVF:
+        v = arith::DivFOp::create(rewriter, loc, x[0], x[1]);
+        break;
+      case E::MAXF:
+        v = minmax(false);
+        break;
+      case E::MINF:
+        v = minmax(true);
+        break;
+      case E::NEGATEF:
+        v = arith::NegFOp::create(rewriter, loc, x[0]);
+        break;
+      case E::EXTF:
+        v = arith::ExtFOp::create(rewriter, loc, vt, x[0]);
+        break;
+      case E::TRUNCF:
+        v = arith::TruncFOp::create(rewriter, loc, vt, x[0]);
+        break;
+      default:
+        return failure();
+      }
+      out.push_back(v);
+    }
+    rewriter.replaceOpWithMultiple(op, {out});
+    return success();
+  }
+};
+} // namespace
+
+/// Lowers the module's gpu.subgroup_mma ops to AIR matrices (L15-E852).
+static LogicalResult lowerSubgroupMma(Operation *m) {
+  bool any = false;
+  m->walk([&](Operation *op) {
+    any = isa<gpu::SubgroupMmaLoadMatrixOp, gpu::SubgroupMmaStoreMatrixOp,
+              gpu::SubgroupMmaComputeOp, gpu::SubgroupMmaConstantMatrixOp,
+              gpu::SubgroupMmaElementwiseOp>(op);
+    return any ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  if (!any)
+    return success();
+  MLIRContext *ctx = m->getContext();
+  TypeConverter tc;
+  tc.addConversion([](Type t) { return t; });
+  tc.addConversion([](gpu::MMAMatrixType t, SmallVectorImpl<Type> &out)
+                       -> std::optional<LogicalResult> {
+    auto blocks = mmaBlocks(t);
+    if (!blocks)
+      return std::nullopt;
+    out.append(blocks->first * blocks->second,
+               VectorType::get({64}, t.getElementType()));
+    return success();
+  });
+  ConversionTarget target(*ctx);
+  target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+  target.addIllegalOp<gpu::SubgroupMmaLoadMatrixOp,
+                      gpu::SubgroupMmaStoreMatrixOp, gpu::SubgroupMmaComputeOp,
+                      gpu::SubgroupMmaConstantMatrixOp,
+                      gpu::SubgroupMmaElementwiseOp>();
+  RewritePatternSet patterns(ctx);
+  patterns.add<MmaLoadToAIR, MmaStoreToAIR, MmaComputeToAIR, MmaConstantToAIR,
+               MmaElementwiseToAIR>(tc, ctx);
+  scf::populateSCFStructuralTypeConversionsAndLegality(tc, patterns, target);
+  return applyPartialConversion(m, target, std::move(patterns));
+}
+
+
+/// (L15-E853) a kernel argument of a memref whose only dynamic size is the
+/// leading one (identity layout) that nothing reads the size of (indexing
+/// only: loads, stores, atomics, in-bounds vector accesses, views): with the
+/// bare-pointer convention, whose memrefs must have static shapes, the
+/// argument becomes one of a static leading size (2^40 elements over the
+/// others: no index narrowing assumed) cast to the original type; its
+/// pointer is all the indexing reads.
+static bool readsOnlyAddresses(Value v) {
+  for (Operation *u : v.getUsers()) {
+    if (auto c = dyn_cast<memref::CastOp>(u)) {
+      if (!readsOnlyAddresses(c.getResult()))
+        return false;
+      continue;
+    }
+    if (auto t = dyn_cast<vector::TransferReadOp>(u)) {
+      if (!llvm::all_of(t.getInBoundsValues(), [](bool b) { return b; }) ||
+          t.getMask())
+        return false;
+      continue;
+    }
+    if (auto t = dyn_cast<vector::TransferWriteOp>(u)) {
+      if (!llvm::all_of(t.getInBoundsValues(), [](bool b) { return b; }) ||
+          t.getMask())
+        return false;
+      continue;
+    }
+    if (isa<memref::LoadOp, memref::StoreOp, memref::AtomicRMWOp,
+            memref::GenericAtomicRMWOp, vector::LoadOp, vector::StoreOp,
+            vector::MaskedLoadOp, vector::MaskedStoreOp, vector::GatherOp,
+            vector::ScatterOp, vector::ExpandLoadOp, vector::CompressStoreOp,
+            memref::SubViewOp, gpu::SubgroupMmaLoadMatrixOp,
+            gpu::SubgroupMmaStoreMatrixOp>(u))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+static void staticLeadingDims(gpu::GPUModuleOp m) {
+  m.walk([&](gpu::GPUFuncOp f) {
+    if (!f.isKernel())
+      return;
+    SmallVector<Type> types(f.getArgumentTypes());
+    bool changed = false;
+    for (BlockArgument a : f.getArguments()) {
+      auto mt = dyn_cast<MemRefType>(a.getType());
+      if (!mt || !mt.getLayout().isIdentity() || mt.getRank() == 0 ||
+          !ShapedType::isDynamic(mt.getDimSize(0)) ||
+          llvm::any_of(mt.getShape().drop_front(), ShapedType::isDynamic) ||
+          !readsOnlyAddresses(a))
+        continue;
+      int64_t inner = 1;
+      for (int64_t d : mt.getShape().drop_front())
+        inner *= std::max<int64_t>(d, 1);
+      SmallVector<int64_t> shape(mt.getShape());
+      shape[0] = std::max<int64_t>((int64_t(1) << 40) / inner, 1);
+      auto st = MemRefType::get(shape, mt.getElementType(), mt.getLayout(),
+                                mt.getMemorySpace());
+      OpBuilder b(&f.getBody().front(), f.getBody().front().begin());
+      a.setType(st);
+      auto cast = memref::CastOp::create(b, a.getLoc(), mt, a);
+      a.replaceAllUsesExcept(cast.getResult(), cast);
+      types[a.getArgNumber()] = st;
+      changed = true;
+    }
+    if (changed)
+      f.setFunctionTypeAttr(TypeAttr::get(
+          FunctionType::get(f.getContext(), types, f.getResultTypes())));
+  });
 }
 
 /// math.isinf (no MathToLLVM pattern): |x| == +inf, ordered (false for NaN).
@@ -1098,6 +3857,96 @@ static LogicalResult rewriteIsInf(math::IsInfOp op, PatternRewriter &rewriter) {
 /// function, which a gpu.module cannot call into from outside), with
 /// MathToFuncs's semantics: for p >= 0, b^p by squaring (wrapping); for
 /// p < 0, 1 for b = 1, +-1 for b = -1 (p odd: -1), else 0.
+/// arith.floordivsi by 2^k (k >= 1, a positive constant) is the arithmetic
+/// shift by k, for every value (INT_MIN included); ceildivsi by 2^k that
+/// shift plus 1 where a low bit is set (no x + 2^k - 1 to overflow). The
+/// expansion's division and sign tests go (L15-E290).
+template <typename OpTy>
+static LogicalResult rewritePow2FloorCeilDiv(OpTy op, PatternRewriter &rewriter) {
+  auto type = dyn_cast<IntegerType>(op.getType());
+  std::optional<int64_t> d = getConstantIntValue(op.getRhs());
+  if (!type || !d || *d < 2)
+    return failure();
+  Location loc = op.getLoc();
+  auto c = [&](int64_t v) {
+    return arith::ConstantOp::create(rewriter, loc, type,
+                                     rewriter.getIntegerAttr(type, v));
+  };
+  Value x = op.getLhs();
+  if (!llvm::isPowerOf2_64(*d)) {
+    // floordivsi by another positive constant: s ^ ((x ^ s) / d), s the
+    // sign splat (~x for negative x, never negative, whose truncating
+    // quotient is floor((-x - 1) / d), complemented: floor(x / d), INT_MIN
+    // included); the backend divides the non-negative value unsigned
+    // (L15-E293).
+    if constexpr (!std::is_same_v<OpTy, arith::FloorDivSIOp>)
+      return failure();
+    if (*d >= (int64_t(1) << (type.getWidth() - 1)))
+      return failure();
+    Value sgn = arith::ShRSIOp::create(rewriter, loc, x,
+                                       c(type.getWidth() - 1));
+    Value q = arith::DivSIOp::create(
+        rewriter, loc, arith::XOrIOp::create(rewriter, loc, x, sgn), c(*d));
+    rewriter.replaceOpWithNewOp<arith::XOrIOp>(op, q, sgn);
+    return success();
+  }
+  if (llvm::Log2_64(*d) >= type.getWidth() - 1)
+    return failure();
+  Value q = arith::ShRSIOp::create(rewriter, loc, x, c(llvm::Log2_64(*d)));
+  if constexpr (std::is_same_v<OpTy, arith::CeilDivSIOp>) {
+    Value low = arith::AndIOp::create(rewriter, loc, x, c(*d - 1));
+    Value up = arith::ExtUIOp::create(
+        rewriter, loc, type,
+        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne, low,
+                              c(0)));
+    q = arith::AddIOp::create(rewriter, loc, q, up);
+  }
+  rewriter.replaceOp(op, q);
+  return success();
+}
+
+/// gpu.rotate (AIR has no rotate): lane j of a segment of `width` takes lane
+/// j + offset where that is in the segment, a shuffle down by offset, else
+/// lane j + offset - width, a shuffle up by width - offset; both uniform AIR
+/// shifts over the SIMD-group, and a select by the lane's position in its
+/// segment; valid where the lane is below width (L15-E298).
+static LogicalResult rewriteRotate(gpu::RotateOp op, PatternRewriter &rewriter) {
+  Location loc = op.getLoc();
+  uint32_t off = op.getOffset(), width = op.getWidth();
+  Type i32 = rewriter.getI32Type();
+  auto c = [&](int64_t v) {
+    return arith::ConstantOp::create(rewriter, loc, i32,
+                                     rewriter.getI32IntegerAttr(v));
+  };
+  Value lane = arith::IndexCastOp::create(
+      rewriter, loc, i32,
+      gpu::LaneIdOp::create(rewriter, loc, rewriter.getIndexAttr(32)));
+  Value valid =
+      arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ult, lane,
+                            c(width));
+  Value value = op.getValue();
+  if (off == 0) {
+    rewriter.replaceOp(op, {value, valid});
+    return success();
+  }
+  Value down = gpu::ShuffleOp::create(rewriter, loc, value, c(off), c(32),
+                                      gpu::ShuffleMode::DOWN)
+                   .getShuffleResult();
+  Value up = gpu::ShuffleOp::create(rewriter, loc, value, c(width - off),
+                                    c(32), gpu::ShuffleMode::UP)
+                 .getShuffleResult();
+  Value inSegment = arith::CmpIOp::create(
+      rewriter, loc, arith::CmpIPredicate::ult,
+      arith::AddIOp::create(rewriter, loc,
+                            arith::AndIOp::create(rewriter, loc, lane,
+                                                  c(width - 1)),
+                            c(off)),
+      c(width));
+  rewriter.replaceOp(
+      op, {arith::SelectOp::create(rewriter, loc, inSegment, down, up), valid});
+  return success();
+}
+
 static LogicalResult rewriteIPowI(math::IPowIOp op, PatternRewriter &rewriter) {
   auto type = dyn_cast<IntegerType>(op.getType());
   if (!type)
@@ -1153,7 +4002,9 @@ static bool airSubgroupReduce(gpu::SubgroupReduceOp op) {
     if (op.getClusterStride() != 1 || (*cluster != 4 && *cluster != 32))
       return false;
   Type type = op.getValue().getType();
-  if (!isa<FloatType>(type) && !type.isInteger(32))
+  // (f64: no AIR SIMD-group float of it; a shuffle butterfly of the emulated
+  // adds, as i64's, L15-E826)
+  if (!(type.isF32() || type.isF16() || type.isBF16()) && !type.isInteger(32))
     return false;
   if (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
       op.getOp() == gpu::AllReduceOperation::MINIMUMF)
@@ -1182,8 +4033,8 @@ struct GPUSubgroupReduceOpLowering
     }
     Type type = adaptor.getValue().getType();
     bool isFloat = isa<FloatType>(type);
-    if (!isFloat && !type.isInteger(32))
-      return rewriter.notifyMatchFailure(op, "only i32 and floats");
+    if (!airSubgroupReduce(op))
+      return rewriter.notifyMatchFailure(op, "only i32, f32, f16 and bf16");
     if (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
         op.getOp() == gpu::AllReduceOperation::MINIMUMF) {
       if (!type.isF32())
@@ -1514,7 +4365,8 @@ static void flagNarrowTree(Value v, DenseMap<Value, Value> &done,
 /// computed in i32 (each index below its size, the sum is at most the last
 /// element's offset) into the memref reinterpreted as one dimension from its
 /// base, rather than the 64-bit linearization of the memref lowering.
-static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize) {
+static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize,
+                                bool columnNoWrap) {
   OpBuilder b(m.getContext());
   DenseMap<Value, Value> done;
   auto narrow = [&](Operation *op, MemRefType type, unsigned first) {
@@ -1567,16 +4419,37 @@ static void narrowMemRefIndices(gpu::GPUModuleOp m, bool linearize) {
     b.setInsertionPoint(op);
     if (offset)
       linear = arith::ConstantIntOp::create(b, loc, i32, offset);
+    // A column's access: the innermost loop around it steps an outer
+    // dimension, the last index the same every iteration. Its sum without
+    // wrapping lets LLVM step one pointer and read the unrolled iterations
+    // at immediate offsets from it (L15-E641; a row's word indices, E594,
+    // lost where the flags reached them: rmsnorm +21%).
+    // Not in a loop that stores: its bounds would version it on its
+    // ranges, and the copy's loads, hoisted above its stores, took the
+    // registers that kept groups resident (E627: col_axpy_dyn +16.9%).
+    auto loop = op->getParentOfType<scf::ForOp>();
+    bool column = columnNoWrap && loop &&
+                  loop.isDefinedOutsideOfLoop(
+                      op->getOperand(first + strides.size() - 1)) &&
+                  !loop->walk([](memref::StoreOp) {
+                         return WalkResult::interrupt();
+                       }).wasInterrupted();
     for (auto [k, stride] : llvm::enumerate(strides)) {
       Value index = op->getOperand(first + k);
       if (matchPattern(index, m_Zero()))
         continue;
       Value term = narrowIndex(b, index, done);
       b.setInsertionPoint(op);
+      // (an in-bounds access: each index below its size, each product and
+      // partial sum at most the last element's offset, below 2^32)
+      auto nuw = column ? arith::IntegerOverflowFlags::nuw
+                        : arith::IntegerOverflowFlags::none;
       if (stride != 1)
         term = arith::MulIOp::create(
-            b, loc, term, arith::ConstantIntOp::create(b, loc, i32, stride));
-      linear = linear ? arith::AddIOp::create(b, loc, linear, term) : term;
+            b, loc, term, arith::ConstantIntOp::create(b, loc, i32, stride),
+            nuw);
+      linear =
+          linear ? arith::AddIOp::create(b, loc, linear, term, nuw) : term;
     }
     b.setInsertionPoint(op);
     if (!linear)
@@ -1812,6 +4685,337 @@ static bool narrowBinarySearch(scf::WhileOp w, IRRewriter &rewriter) {
   return true;
 }
 
+/// The i32 of index \p v if it is an i32 cast to index (by a signed cast if
+/// \p isSigned, else an unsigned one) or a constant that one gives.
+static Value i32Bound(OpBuilder &b, Location loc, Value v, bool isSigned) {
+  Type i32 = b.getI32Type();
+  APInt c;
+  if (matchPattern(v, m_ConstantInt(&c))) {
+    if (isSigned ? !c.isSignedIntN(32) : !c.isIntN(32))
+      return {};
+    return arith::ConstantIntOp::create(b, loc, i32, c.trunc(32).getSExtValue());
+  }
+  Operation *def = v.getDefiningOp();
+  if (!def || def->getOperand(0).getType() != i32 ||
+      !(isSigned ? isa<arith::IndexCastOp>(def)
+                 : isa<arith::IndexCastUIOp>(def)))
+    return {};
+  return def->getOperand(0);
+}
+
+/// Whether every iteration of `loop` (that has no undefined behaviour)
+/// accesses a memref at an index that is its iv: before any op of its body
+/// that has regions or calls. The iv is then not negative.
+static bool indexesEveryIteration(scf::ForOp loop) {
+  Value iv = loop.getInductionVar();
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    if (op.getNumRegions() || isa<CallOpInterface>(op))
+      return false;
+    ValueRange indices;
+    if (auto load = dyn_cast<memref::LoadOp>(op))
+      indices = load.getIndices();
+    else if (auto store = dyn_cast<memref::StoreOp>(op))
+      indices = store.getIndices();
+    if (llvm::is_contained(indices, iv))
+      return true;
+  }
+  return false;
+}
+
+/// An scf.for over index by 1 from lb to ub, both i32 values cast to index by
+/// signed casts (or both by unsigned ones), at least one not a constant, is
+/// the loop over i32 from lb to ub (compared signed, or unsigned), its iv the
+/// i32 iv cast to index the same way: the iterations are the same, and the
+/// i32 iv + 1 does not wrap (it is at most ub). (A signed iv from a constant
+/// lb >= 0, or that every iteration uses as a memref index, is not negative,
+/// and is cast unsigned,
+/// which keeps its addresses' extensions zero extensions.) No access bounds are needed
+/// (unlike the offsets loop below) and no trip count is computed.
+static bool narrowI32BoundsLoop(scf::ForOp loop, IRRewriter &rewriter) {
+  if (!matchPattern(loop.getStep(), m_One()))
+    return false;
+  Value lb = loop.getLowerBound(), ub = loop.getUpperBound();
+  if (matchPattern(lb, m_Constant()) && matchPattern(ub, m_Constant()))
+    return false;
+  Location loc = loop.getLoc();
+  for (bool isSigned : {true, false}) {
+    rewriter.setInsertionPoint(loop);
+    Value l = i32Bound(rewriter, loc, lb, isSigned);
+    Value u = l ? i32Bound(rewriter, loc, ub, isSigned) : Value();
+    if (!l || !u) {
+      for (Value v : {l, u})
+        if (v && v.getDefiningOp<arith::ConstantOp>() && v.use_empty())
+          rewriter.eraseOp(v.getDefiningOp());
+      continue;
+    }
+    Value one = arith::ConstantIntOp::create(rewriter, loc,
+                                             rewriter.getI32Type(), 1);
+    auto newLoop = scf::ForOp::create(rewriter, loc, l, u, one,
+                                      loop.getInitArgs(),
+                                      /*bodyBuilder=*/nullptr,
+                                      /*unsignedCmp=*/!isSigned);
+    Block *body = newLoop.getBody();
+    if (!body->empty())
+      rewriter.eraseOp(body->getTerminator());
+    rewriter.setInsertionPointToStart(body);
+    Value iv = newLoop.getInductionVar();
+    Type index = rewriter.getIndexType();
+    APInt lbValue;
+    std::optional<APInt> lbConst;
+    if (matchPattern(lb, m_ConstantInt(&lbValue)))
+      lbConst = lbValue;
+    Value wide =
+        isSigned && !(lbConst && !lbConst->isNegative()) &&
+                !indexesEveryIteration(loop)
+            ? arith::IndexCastOp::create(rewriter, loc, index, iv)
+                       .getResult()
+                 : arith::IndexCastUIOp::create(rewriter, loc, index, iv)
+                       .getResult();
+    SmallVector<Value> args{wide};
+    llvm::append_range(args, newLoop.getRegionIterArgs());
+    rewriter.mergeBlocks(loop.getBody(), body, args);
+    rewriter.replaceOp(loop, newLoop.getResults());
+    return true;
+  }
+  return false;
+}
+
+/// The values [lo, hi] an index takes, where it is built from constants,
+/// lane and thread positions (their upper_bound, the subgroup size 32 or the
+/// known threadgroup size) by additions and multiplications by constants, all
+/// non-negative.
+static std::optional<std::pair<int64_t, int64_t>> indexRange(Value v,
+                                                             int depth = 0) {
+  if (depth > 8)
+    return std::nullopt;
+  if (std::optional<int64_t> c = getConstantIntValue(v))
+    return *c >= 0 ? std::optional(std::make_pair(*c, *c)) : std::nullopt;
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+  if (auto lane = dyn_cast<gpu::LaneIdOp>(op)) {
+    int64_t n = 32;
+    if (std::optional<APInt> b = lane.getUpperBound())
+      n = std::min<int64_t>(n, b->getZExtValue());
+    return std::make_pair(int64_t(0), n - 1);
+  }
+  if (auto tid = dyn_cast<gpu::ThreadIdOp>(op)) {
+    std::optional<int64_t> n;
+    if (std::optional<APInt> b = tid.getUpperBound())
+      n = b->getZExtValue();
+    if (std::optional<uint32_t> bs = gpu::getKnownDimensionSizeAround(
+            tid, gpu::DimensionKind::Block, tid.getDimension()))
+      n = n ? std::min<int64_t>(*n, *bs) : int64_t(*bs);
+    if (!n || *n < 1)
+      return std::nullopt;
+    return std::make_pair(int64_t(0), *n - 1);
+  }
+  if (isa<arith::AddIOp, arith::MulIOp>(op)) {
+    auto a = indexRange(op->getOperand(0), depth + 1);
+    auto b = a ? indexRange(op->getOperand(1), depth + 1) : std::nullopt;
+    if (!b || a->second > (int64_t(1) << 31) || b->second > (int64_t(1) << 31))
+      return std::nullopt;
+    if (isa<arith::AddIOp>(op))
+      return std::make_pair(a->first + b->first, a->second + b->second);
+    return std::make_pair(a->first * b->first, a->second * b->second);
+  }
+  return std::nullopt;
+}
+
+/// An scf.if with results whose regions only compute without side effects
+/// (speculatable) and load from memrefs of static, non-empty shapes runs
+/// both regions before it, each load at its indices clamped into the
+/// memref (umin(i, size - 1)), and selects their results on the condition.
+/// Where the region's load runs in the original its indices are in bounds
+/// (an access out of bounds is undefined), so the clamp keeps them; where
+/// it does not, the clamped access is one of the memref's elements, whose
+/// value the select drops. An index known below its size (a constant, a
+/// position of that upper bound) is not clamped, and an if needing more
+/// than one clamp is left. A scan's guarded load,
+/// in = j < n; v = in ? x[r, j] : 0 (find_first: the if, its exec mask
+/// and the copies it took, L15-E736).
+static void speculateGuardedLoads(gpu::GPUModuleOp m) {
+  constexpr unsigned kMaxOps = 16;
+  SmallVector<scf::IfOp> ifs;
+  m.walk([&](scf::IfOp op) {
+    if (op.getNumResults() && !op.getElseRegion().empty())
+      ifs.push_back(op);
+  });
+  auto knownBelow = [](Value v, int64_t size) {
+    if (std::optional<int64_t> c = getConstantIntValue(v))
+      return *c >= 0 && *c < size;
+    std::optional<APInt> ub;
+    if (auto o = v.getDefiningOp<gpu::ThreadIdOp>())
+      ub = o.getUpperBound();
+    else if (auto o = v.getDefiningOp<gpu::BlockIdOp>())
+      ub = o.getUpperBound();
+    else if (auto o = v.getDefiningOp<gpu::GlobalIdOp>())
+      ub = o.getUpperBound();
+    else if (auto o = v.getDefiningOp<gpu::LaneIdOp>())
+      ub = o.getUpperBound();
+    return ub && ub->getActiveBits() <= 63 &&
+           int64_t(ub->getZExtValue()) <= size;
+  };
+  for (scf::IfOp op : ifs) {
+    auto loadable = [](memref::LoadOp load) {
+      MemRefType type = load.getMemRefType();
+      return type.hasStaticShape() &&
+             llvm::all_of(type.getShape(), [](int64_t d) { return d > 0; });
+    };
+    auto qualifies = [&](Region &r) {
+      if (!r.hasOneBlock())
+        return false;
+      unsigned n = 0;
+      for (Operation &o : r.front().without_terminator()) {
+        if (++n > kMaxOps || o.getNumRegions())
+          return false;
+        if (auto load = dyn_cast<memref::LoadOp>(o)) {
+          if (!loadable(load))
+            return false;
+          continue;
+        }
+        if (!isPure(&o) || !isSpeculatable(&o))
+          return false;
+      }
+      return true;
+    };
+    // (one load at least: otherwise the if is the canonicalizer's to fold;
+    // at most one index to clamp: a padded convolution's taps, two each,
+    // lost their cheap branches on in-bounds positions, conv3x3_pad +54%)
+    bool anyLoad = false;
+    unsigned clamps = 0;
+    op->walk([&](memref::LoadOp load) {
+      anyLoad = true;
+      for (auto [k, size] : llvm::enumerate(load.getMemRefType().getShape()))
+        clamps += !knownBelow(load.getIndices()[k], size);
+    });
+    if (!anyLoad || clamps > 1 || !qualifies(op.getThenRegion()) ||
+        !qualifies(op.getElseRegion()))
+      continue;
+    OpBuilder b(op);
+    auto hoist = [&](Region &r) {
+      Block &blk = r.front();
+      for (Operation &o : llvm::make_early_inc_range(blk.without_terminator())) {
+        o.moveBefore(op);
+        auto load = dyn_cast<memref::LoadOp>(o);
+        if (!load)
+          continue;
+        b.setInsertionPoint(load);
+        for (auto [k, size] : llvm::enumerate(load.getMemRefType().getShape())) {
+          OpOperand &index = load->getOpOperand(1 + k);
+          if (knownBelow(index.get(), size))
+            continue;
+          Value last = arith::ConstantIndexOp::create(b, load.getLoc(),
+                                                      size - 1);
+          index.set(arith::MinUIOp::create(b, load.getLoc(), index.get(),
+                                           last));
+        }
+      }
+      return cast<scf::YieldOp>(blk.getTerminator()).getOperands();
+    };
+    SmallVector<Value> thenValues(hoist(op.getThenRegion()));
+    SmallVector<Value> elseValues(hoist(op.getElseRegion()));
+    b.setInsertionPoint(op);
+    SmallVector<Value> results;
+    Value cond = op.getCondition();
+    for (auto [t, e] : llvm::zip(thenValues, elseValues)) {
+      auto sel = arith::SelectOp::create(b, op.getLoc(), cond, t, e);
+      results.push_back(sel);
+    }
+    op.replaceAllUsesWith(results);
+    op.erase();
+    // A compare of a result used only in an and with the condition reads
+    // the then value, the and a select on the condition: where it is false
+    // the result is false whatever the compare, also of a poison then value
+    // (a plain and would be poison; alive2's speculated-compare test) (the
+    // scan's go = in && v <= t).
+    for (auto [res, t] : llvm::zip(results, thenValues)) {
+      for (OpOperand &use : llvm::make_early_inc_range(res.getUses())) {
+        Operation *cmp = use.getOwner();
+        if (!isa<arith::CmpFOp, arith::CmpIOp>(cmp) ||
+            cmp->getBlock() != res.getDefiningOp()->getBlock() ||
+            !llvm::all_of(cmp->getResult(0).getUsers(), [&](Operation *u) {
+              auto a = dyn_cast<arith::AndIOp>(u);
+              return a && (a.getLhs() == cond || a.getRhs() == cond);
+            }))
+          continue;
+        use.set(t);
+        for (Operation *u : llvm::make_early_inc_range(
+                 cmp->getResult(0).getUsers())) {
+          OpBuilder ab(u);
+          Value f = arith::ConstantIntOp::create(ab, u->getLoc(),
+                                                 ab.getI1Type(), 0);
+          Value sel = arith::SelectOp::create(ab, u->getLoc(), cond,
+                                              cmp->getResult(0), f);
+          u->getResult(0).replaceAllUsesWith(sel);
+          u->erase();
+        }
+      }
+      if (res.use_empty())
+        res.getDefiningOp()->erase();
+    }
+  }
+}
+
+/// An scf.for over index from a lb of values [lo, hi] (indexRange) to a
+/// constant ub by a constant step, where every lb gives the same trip count
+/// T = ceil((ub - lb) / step) > 0: a loop over k from 0 to T by 1, iv = lb +
+/// k * step (the same iterations in the same order). Its trip count is then
+/// a constant LLVM sees (a lane-strided row loop, `scf.for %j = %lane to
+/// %c1024 step %c32`, runs 32 times for every lane), which the AGX unroller
+/// needs (L15-E511).
+static void constantTripLoops(gpu::GPUModuleOp m) {
+  SmallVector<scf::ForOp> loops;
+  m.walk([&](scf::ForOp loop) {
+    if (loop.getInductionVar().getType().isIndex() && !loop.getUnsignedCmp())
+      loops.push_back(loop);
+  });
+  IRRewriter rewriter(m.getContext());
+  for (scf::ForOp loop : loops) {
+    std::optional<int64_t> ub = getConstantIntValue(loop.getUpperBound());
+    std::optional<int64_t> step = getConstantIntValue(loop.getStep());
+    if (!ub || !step || *step <= 0 || *ub <= 0 || *ub > (int64_t(1) << 31) ||
+        getConstantIntValue(loop.getLowerBound()))
+      continue;
+    // (an iv compared, a window's j <= row, keeps its loop: LLVM bounds the
+    // iterations by it)
+    if (any_of(loop.getInductionVar().getUsers(),
+               [](Operation *u) { return isa<arith::CmpIOp>(u); }))
+      continue;
+    std::optional<std::pair<int64_t, int64_t>> r =
+        indexRange(loop.getLowerBound());
+    if (!r || r->second >= *ub)
+      continue;
+    auto trips = [&](int64_t lb) { return (*ub - lb + *step - 1) / *step; };
+    int64_t t = trips(r->first);
+    if (t != trips(r->second) || t < 2)
+      continue;
+    Location loc = loop.getLoc();
+    rewriter.setInsertionPoint(loop);
+    Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value count = arith::ConstantIndexOp::create(rewriter, loc, t);
+    Value one = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    auto newLoop = scf::ForOp::create(rewriter, loc, zero, count, one,
+                                      loop.getInitArgs());
+    Block *body = newLoop.getBody();
+    if (!body->empty())
+      rewriter.eraseOp(body->getTerminator());
+    rewriter.setInsertionPointToStart(body);
+    // (lb + k step <= hi + (T - 1) step < ub: no wrap)
+    auto flags = arith::IntegerOverflowFlags::nuw |
+                 arith::IntegerOverflowFlags::nsw;
+    Value offset = arith::MulIOp::create(rewriter, loc,
+                                         newLoop.getInductionVar(),
+                                         loop.getStep(), flags);
+    Value iv = arith::AddIOp::create(rewriter, loc, loop.getLowerBound(),
+                                     offset, flags);
+    SmallVector<Value> args{iv};
+    llvm::append_range(args, newLoop.getRegionIterArgs());
+    rewriter.mergeBlocks(loop.getBody(), body, args);
+    rewriter.replaceOp(loop, newLoop.getResults());
+  }
+}
+
 /// An scf.for over index whose offsets o = iv - lb are below a bound B <=
 /// 2^31 (loopOffsetBound) is a loop over o in i32, unsigned: from 0 to
 /// umin(ub - lb, B) (0 for ub <= lb) by umin(step, B), with iv = lb + o.
@@ -1835,6 +5039,8 @@ static void narrowLoops(gpu::GPUModuleOp m) {
   });
   IRRewriter rewriter(m.getContext());
   for (scf::ForOp loop : loops) {
+    if (narrowI32BoundsLoop(loop, rewriter))
+      continue;
     std::optional<uint64_t> bound = loopOffsetBound(loop);
     if (!bound)
       continue;
@@ -1902,65 +5108,147 @@ static bool mayRepeat(Operation *op) {
 /// lowering's partial-SIMD-group shuffles and its second round through
 /// threadgroup memory. Where the reduction may run again, a barrier after it
 /// keeps the next round's partials from overwriting ones not yet read.
+namespace {
+/// A gpu.all_reduce lowerAllReducesToSimdgroups takes, with the identity its
+/// out-of-range lanes read (none for min, max, and, or).
+struct SimdgroupReduce {
+  gpu::AllReduceOp op;
+  gpu::AllReduceOperation kind;
+  TypedAttr identity;
+};
+} // namespace
+
+static std::optional<SimdgroupReduce> simdgroupReduce(gpu::AllReduceOp op) {
+  if (!op.getUniform() || !op.getOp() || !op.getBody().empty())
+    return std::nullopt;
+  auto func = op->getParentOfType<gpu::GPUFuncOp>();
+  std::optional<uint64_t> threads = knownThreadgroupThreads(op);
+  if (!func || !threads || *threads == 0 || *threads % 32 || *threads > 1024)
+    return std::nullopt;
+  Type type = op.getType();
+  // (Integers of 8, 16 and 64 bits too, which reduce to the same value in
+  // any order: subgroup_reduce's reductions of them, L15-E278.)
+  if (!type.isF32() && !type.isF16() &&
+      !(type.isInteger(8) || type.isInteger(16) || type.isInteger(32) ||
+        type.isInteger(64)))
+    return std::nullopt;
+  gpu::AllReduceOperation kind = *op.getOp();
+  TypedAttr identity;
+  Builder b(op.getContext());
+  switch (kind) {
+  case gpu::AllReduceOperation::ADD:
+    identity = isa<FloatType>(type)
+                   ? TypedAttr(b.getFloatAttr(
+                         type, APFloat::getZero(
+                                   cast<FloatType>(type).getFloatSemantics(),
+                                   /*Negative=*/true)))
+                   : TypedAttr(b.getIntegerAttr(type, 0));
+    break;
+  case gpu::AllReduceOperation::MUL:
+    identity = isa<FloatType>(type) ? TypedAttr(b.getFloatAttr(type, 1.0))
+                                    : TypedAttr(b.getIntegerAttr(type, 1));
+    break;
+  case gpu::AllReduceOperation::XOR:
+    identity = b.getIntegerAttr(type, 0);
+    break;
+  case gpu::AllReduceOperation::MINSI:
+  case gpu::AllReduceOperation::MINUI:
+  case gpu::AllReduceOperation::MAXSI:
+  case gpu::AllReduceOperation::MAXUI:
+  case gpu::AllReduceOperation::MINNUMF:
+  case gpu::AllReduceOperation::MAXNUMF:
+  case gpu::AllReduceOperation::AND:
+  case gpu::AllReduceOperation::OR:
+    break;
+  // f32: subgroup_reduce's ordered-key maximum (minimum) and NaN or
+  // (reduceOrderedFloat), idempotent like maxnum for the lanes past the
+  // SIMD-group count (L15-E275).
+  case gpu::AllReduceOperation::MAXIMUMF:
+  case gpu::AllReduceOperation::MINIMUMF:
+    // (f16: its subgroup_reduce is the f32 one, L15-E280.)
+    if (!type.isF32() && !type.isF16())
+      return std::nullopt;
+    break;
+  default:
+    return std::nullopt;
+  }
+  return SimdgroupReduce{op, kind, identity};
+}
+
+/// Whether `next` can join the round of `group` (whose last is before it in
+/// the same block): what lies between has no side effects, uses none of the
+/// group's results, and every use of them comes after `next` (where the
+/// joint round puts the results).
+static bool joinsRound(SmallVectorImpl<SimdgroupReduce> &group,
+                       gpu::AllReduceOp next) {
+  gpu::AllReduceOp last = group.back().op;
+  if (last->getBlock() != next->getBlock() ||
+      knownThreadgroupThreads(last) != knownThreadgroupThreads(next))
+    return false;
+  for (Operation *o = last->getNextNode(); o && o != next.getOperation();
+       o = o->getNextNode())
+    if (!isMemoryEffectFree(o) || o->getNumRegions())
+      return false;
+  for (SimdgroupReduce &r : group)
+    for (Operation *user : r.op->getUsers()) {
+      Operation *a = next->getBlock()->findAncestorOpInBlock(*user);
+      if (!a || !next->isBeforeInBlock(a))
+        return false;
+    }
+  return true;
+}
+
+/// A uniform gpu.all_reduce of an f16, f32 or i32 by an operation AIR's
+/// SIMD-group reductions have, in a kernel whose known threadgroup size is a
+/// multiple of 32 (whole SIMD-groups), is the SIMD-group reduction, the
+/// partial of each SIMD-group in a threadgroup buffer, a barrier, and each
+/// SIMD-group's reduction of the partials (lane l reads partial l; the lanes
+/// past the SIMD-group count read partial 0, or the identity of an addition,
+/// multiplication or xor): the result in every thread, without the generic
+/// lowering's partial-SIMD-group shuffles and its second round through
+/// threadgroup memory. Where the reduction may run again, a barrier after it
+/// keeps the next round's partials from overwriting ones not yet read.
+/// Consecutive independent reductions (a layer norm's sum and sum of
+/// squares) share one round: their partials stored together, one barrier
+/// (L15-E273).
 static void lowerAllReducesToSimdgroups(gpu::GPUModuleOp m) {
   SmallVector<gpu::AllReduceOp> ops;
   m.walk([&](gpu::AllReduceOp op) { ops.push_back(op); });
+  SmallVector<SmallVector<SimdgroupReduce, 2>> rounds;
   for (gpu::AllReduceOp op : ops) {
-    if (!op.getUniform() || !op.getOp() || !op.getBody().empty())
+    std::optional<SimdgroupReduce> r = simdgroupReduce(op);
+    if (!r)
       continue;
-    auto func = op->getParentOfType<gpu::GPUFuncOp>();
-    std::optional<uint64_t> threads = knownThreadgroupThreads(op);
-    if (!func || !threads || *threads == 0 || *threads % 32 ||
-        *threads > 1024)
-      continue;
-    Type type = op.getType();
-    if (!type.isF32() && !type.isF16() && !type.isInteger(32))
-      continue;
-    gpu::AllReduceOperation kind = *op.getOp();
-    TypedAttr identity;
-    OpBuilder b(op);
-    switch (kind) {
-    case gpu::AllReduceOperation::ADD:
-      identity = isa<FloatType>(type)
-                     ? TypedAttr(b.getFloatAttr(
-                           type, APFloat::getZero(
-                                     cast<FloatType>(type).getFloatSemantics(),
-                                     /*Negative=*/true)))
-                     : TypedAttr(b.getIntegerAttr(type, 0));
-      break;
-    case gpu::AllReduceOperation::MUL:
-      identity = isa<FloatType>(type) ? TypedAttr(b.getFloatAttr(type, 1.0))
-                                      : TypedAttr(b.getIntegerAttr(type, 1));
-      break;
-    case gpu::AllReduceOperation::XOR:
-      identity = b.getIntegerAttr(type, 0);
-      break;
-    case gpu::AllReduceOperation::MINSI:
-    case gpu::AllReduceOperation::MINUI:
-    case gpu::AllReduceOperation::MAXSI:
-    case gpu::AllReduceOperation::MAXUI:
-    case gpu::AllReduceOperation::MINNUMF:
-    case gpu::AllReduceOperation::MAXNUMF:
-    case gpu::AllReduceOperation::AND:
-    case gpu::AllReduceOperation::OR:
-      break;
-    default:
-      continue;
-    }
-    Location loc = op.getLoc();
-    uint64_t groups = *threads / 32;
-    Value partial = gpu::SubgroupReduceOp::create(b, loc, op.getValue(), kind,
-                                                  /*uniform=*/true);
+    if (!rounds.empty() && joinsRound(rounds.back(), op))
+      rounds.back().push_back(*r);
+    else
+      rounds.push_back({*r});
+  }
+  for (SmallVector<SimdgroupReduce, 2> &round : rounds) {
+    gpu::AllReduceOp last = round.back().op;
+    auto func = last->getParentOfType<gpu::GPUFuncOp>();
+    uint64_t groups = *knownThreadgroupThreads(last) / 32;
+    OpBuilder b(last);
+    Location loc = last.getLoc();
+    SmallVector<Value> partials;
+    for (SimdgroupReduce &r : round)
+      partials.push_back(gpu::SubgroupReduceOp::create(
+          b, r.op.getLoc(), r.op.getValue(), r.kind, /*uniform=*/true));
     if (groups == 1) {
-      op.replaceAllUsesWith(partial);
-      op.erase();
+      for (auto [r, p] : llvm::zip(round, partials)) {
+        r.op.replaceAllUsesWith(p);
+        r.op.erase();
+      }
       continue;
     }
-    auto bufferType = MemRefType::get(
-        {int64_t(groups)}, type, MemRefLayoutAttrInterface(),
-        gpu::AddressSpaceAttr::get(b.getContext(),
-                                   gpu::AddressSpace::Workgroup));
-    Value buffer = func.addWorkgroupAttribution(bufferType, loc);
+    SmallVector<Value> buffers;
+    for (SimdgroupReduce &r : round)
+      buffers.push_back(func.addWorkgroupAttribution(
+          MemRefType::get({int64_t(groups)}, r.op.getType(),
+                          MemRefLayoutAttrInterface(),
+                          gpu::AddressSpaceAttr::get(
+                              b.getContext(), gpu::AddressSpace::Workgroup)),
+          loc));
     Value lane = gpu::LaneIdOp::create(b, loc, /*upper_bound=*/IntegerAttr());
     Value group =
         gpu::SubgroupIdOp::create(b, loc, /*upper_bound=*/IntegerAttr());
@@ -1968,7 +5256,8 @@ static void lowerAllReducesToSimdgroups(gpu::GPUModuleOp m) {
     Value first =
         arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, lane, zero);
     scf::IfOp::create(b, loc, first, [&](OpBuilder &b, Location loc) {
-      memref::StoreOp::create(b, loc, partial, buffer, group);
+      for (auto [p, buf] : llvm::zip(partials, buffers))
+        memref::StoreOp::create(b, loc, p, buf, group);
       scf::YieldOp::create(b, loc);
     });
     gpu::BarrierOp::create(b, loc);
@@ -1976,17 +5265,22 @@ static void lowerAllReducesToSimdgroups(gpu::GPUModuleOp m) {
         b, loc, arith::CmpIPredicate::ult, lane,
         arith::ConstantIndexOp::create(b, loc, groups));
     Value index = arith::SelectOp::create(b, loc, inRange, lane, zero);
-    Value value = memref::LoadOp::create(b, loc, buffer, index);
-    if (identity)
-      value = arith::SelectOp::create(
-          b, loc, inRange, value,
-          arith::ConstantOp::create(b, loc, identity));
-    Value result =
-        gpu::SubgroupReduceOp::create(b, loc, value, kind, /*uniform=*/true);
-    if (mayRepeat(op))
+    SmallVector<Value> results;
+    for (auto [r, buf] : llvm::zip(round, buffers)) {
+      Value value = memref::LoadOp::create(b, loc, buf, index);
+      if (r.identity)
+        value = arith::SelectOp::create(
+            b, loc, inRange, value,
+            arith::ConstantOp::create(b, loc, r.identity));
+      results.push_back(gpu::SubgroupReduceOp::create(b, loc, value, r.kind,
+                                                      /*uniform=*/true));
+    }
+    if (mayRepeat(last))
       gpu::BarrierOp::create(b, loc);
-    op.replaceAllUsesWith(result);
-    op.erase();
+    for (auto [r, v] : llvm::zip(round, results)) {
+      r.op.replaceAllUsesWith(v);
+      r.op.erase();
+    }
   }
 }
 
@@ -2018,6 +5312,8 @@ struct LowerGpuOpsToAIROpsPass final
     options.useBarePtrCallConv = useBarePtrCallConv;
 
     assignDefaultMemorySpaces(m);
+    if (useBarePtrCallConv && staticLeadingDimArgs)
+      staticLeadingDims(m);
 
     // gpu.global_id is AIR's thread_position_in_grid, one 32-bit read
     // (which an address takes as a 32-bit index), where the dimension has
@@ -2049,12 +5345,307 @@ struct LowerGpuOpsToAIROpsPass final
       op.replaceAllUsesWith(v);
       op.erase();
     });
+    // The upper_bounds of the thread and threadgroup positions that hold
+    // for the whole kernel: those of reads in its entry block that every
+    // execution reaches (no op with regions or a call before them). AIR's
+    // position vectors carry a range only where all three components are
+    // bounded; the AGX backend bounds each component's register by these
+    // (L15-E391).
+    llvm::StringMap<std::array<std::array<uint64_t, 3>, 3>> kernelBounds;
+    m.walk([&](gpu::GPUFuncOp f) {
+      if (!f.isKernel() || f.getBody().empty())
+        return;
+      std::array<std::array<uint64_t, 3>, 3> bounds{};
+      bool any = false;
+      auto note = [&](unsigned kind, gpu::Dimension d,
+                      std::optional<APInt> ub) {
+        if (!ub || ub->getActiveBits() > 32)
+          return;
+        uint64_t v = ub->getZExtValue();
+        uint64_t &b = bounds[kind][static_cast<unsigned>(d)];
+        if (v && v < (uint64_t(1) << 32) && (!b || v < b)) {
+          b = v;
+          any = true;
+        }
+      };
+      for (Operation &op : f.getBody().front()) {
+        if (op.getNumRegions() || isa<CallOpInterface>(op))
+          break;
+        if (auto o = dyn_cast<gpu::ThreadIdOp>(op))
+          note(0, o.getDimension(), o.getUpperBound());
+        else if (auto o = dyn_cast<gpu::BlockIdOp>(op))
+          note(1, o.getDimension(), o.getUpperBound());
+        else if (auto o = dyn_cast<gpu::GlobalIdOp>(op))
+          note(2, o.getDimension(), o.getUpperBound());
+      }
+      if (any)
+        kernelBounds[f.getName()] = bounds;
+    });
+    ::approximateHalfFunctions = approximateHalfFunctions;
+    ::expm1F64Direct = expm1F64Direct;
+    ::log1pF64Direct = log1pF64Direct;
+    ::trigSharedPolynomial = trigF64SharedPolynomial;
+    ::smallFloatExtViaHalf = smallFloatExtViaHalf;
+    ::subByteRewrites = subByteRewrites;
+    ::f64PolynomialFma = f64PolynomialFma;
+    if (speculateGuardedLoads)
+      ::speculateGuardedLoads(m);
+    if (constantTripLoops)
+      ::constantTripLoops(m);
     if (narrowLoops)
       ::narrowLoops(m);
     if (narrowIndices)
-      narrowMemRefIndices(m, linearizeIndices);
+      narrowMemRefIndices(m, linearizeIndices, columnNoWrap);
     if (simdgroupAllReduce)
       lowerAllReducesToSimdgroups(m);
+    m.walk([](gpu::ShuffleOp op) {
+      if (!getConstantIntValue(op.getOffset()) &&
+          isThreadgroupUniform(op.getOffset()))
+        op->setAttr(kUniformOffsetAttr, UnitAttr::get(op.getContext()));
+    });
+    // f32 erf's rational approximation P / Q: Q's denominators stay within
+    // a few binades of 1 where the result is used, so the hardware's
+    // reciprocal y0, y = y0 + y0 (1 - Q y0), q0 = P y, q = q0 + y (P - Q q0)
+    // gives the correctly rounded quotient that the general division does
+    // with its exponent scaling and special cases (every f32 input's erf
+    // checked the same, flushing: L15-E499). erf expanded here by upstream's
+    // patterns, the division they create noted.
+    if (erfReciprocalDivision) {
+      SmallVector<Operation *> erfs;
+      m.walk([&](math::ErfOp op) { erfs.push_back(op); });
+      struct Divisions : RewriterBase::Listener {
+        SmallVector<arith::DivFOp> divs;
+        void notifyOperationInserted(Operation *op,
+                                     OpBuilder::InsertPoint) override {
+          if (auto d = dyn_cast<arith::DivFOp>(op))
+            divs.push_back(d);
+        }
+      } listener;
+      if (!erfs.empty()) {
+        RewritePatternSet patterns(ctx);
+        populatePolynomialApproximateErfPattern(patterns);
+        populateMathF32ExpansionPatterns(
+            patterns, [](StringRef name) { return name == "math.erf"; },
+            /*benefit=*/2);
+        GreedyRewriteConfig config;
+        config.setListener(&listener);
+        config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+        (void)applyOpPatternsGreedily(erfs, std::move(patterns), config);
+      }
+      for (arith::DivFOp op : listener.divs) {
+        if (!getElementTypeOrSelf(op.getType()).isF32())
+          continue;
+        OpBuilder b(op);
+        Location loc = op.getLoc();
+        Type type = op.getType();
+        TypedAttr oneAttr = b.getF32FloatAttr(1.0f);
+        if (auto vt = dyn_cast<VectorType>(type))
+          oneAttr = DenseElementsAttr::get(vt, b.getF32FloatAttr(1.0f));
+        Value one = arith::ConstantOp::create(b, loc, type, oneAttr);
+        Value p = op.getLhs(), q = op.getRhs();
+        Value y0 = arith::DivFOp::create(b, loc, one, q,
+                                         arith::FastMathFlags::afn);
+        Value nq = arith::NegFOp::create(b, loc, q);
+        Value e = math::FmaOp::create(b, loc, nq, y0, one);
+        Value y = math::FmaOp::create(b, loc, e, y0, y0);
+        Value q0 = arith::MulFOp::create(b, loc, p, y);
+        Value r = math::FmaOp::create(b, loc, nq, q0, p);
+        Value res = math::FmaOp::create(b, loc, r, y, q0);
+        op.replaceAllUsesWith(res);
+        op.erase();
+      }
+    }
+    // complex functions ComplexToLLVM has no pattern for (exp, log, sqrt,
+    // sin, pow, tanh and the others) by ComplexToStandard's, on the parts'
+    // arith and math ops (which the rewrites below then take), first; the
+    // ops ComplexToLLVM lowers (add, sub, mul, div, abs, create, re, im,
+    // constants) stay its own (L15-E829).
+    {
+      ConversionTarget target(*ctx);
+      target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+      target.addIllegalOp<complex::Atan2Op, complex::CosOp, complex::EqualOp,
+                          complex::ExpOp, complex::Expm1Op, complex::LogOp,
+                          complex::Log1pOp, complex::NegOp,
+                          complex::NotEqualOp, complex::PowOp,
+                          complex::PowiOp, complex::RsqrtOp, complex::SignOp,
+                          complex::SinOp, complex::SqrtOp, complex::TanhOp,
+                          complex::TanOp, complex::ConjOp, complex::AngleOp>();
+      bool any = false;
+      m.walk([&](Operation *op) {
+        if (op->getDialect() &&
+            isa<complex::ComplexDialect>(op->getDialect()) &&
+            target.isIllegal(op))
+          any = true;
+        return any ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (any) {
+        RewritePatternSet patterns(ctx);
+        populateComplexToStandardConversionPatterns(patterns);
+        if (failed(applyPartialConversion(m, target, std::move(patterns))))
+          return signalPassFailure();
+      }
+    }
+    // n-D vectors (linalg vectorization's: shape casts, transposes,
+    // contractions, multi-reductions, n-D broadcasts) to 1-D ones by
+    // ConvertVectorToLLVMPass's progressive lowerings, which VectorToLLVM's
+    // patterns below do not do (L15-E828); only where the module has such a
+    // vector or op, so that 1-D kernels are as they were.
+    {
+      bool nd = false;
+      m.walk([&](Operation *op) {
+        if (isa<vector::ContractionOp, vector::TransposeOp,
+                vector::MultiDimReductionOp, vector::OuterProductOp,
+                vector::ShapeCastOp, vector::ConstantMaskOp,
+                vector::TransferReadOp, vector::TransferWriteOp>(op))
+          nd = true;
+        for (Type t : op->getResultTypes())
+          if (auto vt = dyn_cast<VectorType>(t); vt && vt.getRank() > 1)
+            nd = true;
+        return nd ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (nd) {
+        RewritePatternSet patterns(ctx);
+        vector::populateVectorToVectorCanonicalizationPatterns(patterns);
+        vector::populateVectorBroadcastLoweringPatterns(patterns);
+        vector::populateVectorContractLoweringPatterns(
+            patterns, vector::VectorContractLowering::OuterProduct);
+        vector::populateVectorOuterProductLoweringPatterns(patterns);
+        vector::populateVectorMaskOpLoweringPatterns(patterns);
+        vector::populateVectorShapeCastLoweringPatterns(patterns);
+        vector::populateVectorInterleaveLoweringPatterns(patterns);
+        vector::populateVectorTransposeLoweringPatterns(
+            patterns, vector::VectorTransposeLowering::EltWise);
+        vector::populateVectorMultiReductionReorderPatterns(
+            patterns, vector::VectorMultiReductionLowering::InnerReduction);
+        vector::populateVectorMultiReductionFlatteningPatterns(
+            patterns, vector::VectorMultiReductionLowering::InnerReduction);
+        vector::populateVectorMultiReductionUnrollingPatterns(
+            patterns, vector::VectorMultiReductionLowering::InnerReduction);
+        vector::populateVectorTransferLoweringPatterns(patterns,
+                                                       /*maxTransferRank=*/1);
+        // (L15-E843) a transfer that may run out of bounds as a masked load
+        // or store, its mask from the memref's size
+        vector::populateVectorMaskMaterializationPatterns(
+            patterns, /*force32BitVectorIndices=*/true);
+        vector::populateVectorInsertExtractStridedSliceTransforms(patterns);
+        vector::populateVectorRankReducingFMAPattern(patterns);
+        vector::populateVectorFromElementsUnrollPatterns(patterns);
+        vector::populateVectorToElementsUnrollPatterns(patterns);
+        (void)applyPatternsGreedily(m, std::move(patterns));
+      }
+    }
+    // (L15-E845) arithmetic, comparisons, conversions and math on small
+    // floats (f8, f6, f4) in f32, as arith-emulate-unsupported-floats does:
+    // the operands extended, the result truncated, both by E844's exact
+    // expansions below. Correctly rounded for +, -, *, / and sqrt (f32's 24
+    // bits are at least twice a small float's precision plus 2, so the second
+    // rounding is innocuous) and exact for comparisons, extrema and negation.
+    {
+      SmallVector<Type> small;
+      for (Type t : {Type(Float4E2M1FNType::get(ctx)), Type(Float6E2M3FNType::get(ctx)),
+                     Type(Float6E3M2FNType::get(ctx)),
+                     Type(Float8E3M4Type::get(ctx)),
+                     Type(Float8E4M3Type::get(ctx)),
+                     Type(Float8E4M3B11FNUZType::get(ctx)),
+                     Type(Float8E4M3FNType::get(ctx)),
+                     Type(Float8E4M3FNUZType::get(ctx)),
+                     Type(Float8E5M2Type::get(ctx)),
+                     Type(Float8E5M2FNUZType::get(ctx)),
+                     Type(Float8E8M0FNUType::get(ctx))})
+        small.push_back(t);
+      auto isSmall = [&](Type t) {
+        return llvm::is_contained(small, getElementTypeOrSelf(t));
+      };
+      bool any = false;
+      m.walk([&](Operation *op) {
+        if (isa<arith::ExtFOp, arith::TruncFOp, arith::BitcastOp,
+                arith::ConstantOp, arith::SelectOp, arith::ScalingExtFOp,
+                arith::ScalingTruncFOp>(op) ||
+            !isa_and_nonnull<arith::ArithDialect, math::MathDialect>(
+                op->getDialect()))
+          return WalkResult::advance();
+        any = llvm::any_of(op->getOperandTypes(), isSmall) ||
+              llvm::any_of(op->getResultTypes(), isSmall);
+        return any ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (any) {
+        TypeConverter emulated;
+        arith::populateEmulateUnsupportedFloatsConversions(
+            emulated, small, Float32Type::get(ctx));
+        ConversionTarget target(*ctx);
+        arith::populateEmulateUnsupportedFloatsLegality(target, emulated);
+        target.addDynamicallyLegalDialect<math::MathDialect>(
+            [&](Operation *op) -> std::optional<bool> {
+              return emulated.isLegal(op);
+            });
+        target.addLegalOp<arith::ScalingExtFOp, arith::ScalingTruncFOp>();
+        RewritePatternSet patterns(ctx);
+        arith::populateEmulateUnsupportedFloatsPatterns(patterns, emulated);
+        if (failed(applyPartialConversion(m, target, std::move(patterns))))
+          return signalPassFailure();
+        // (its conversions marked contract, which lets canonicalize fold
+        // extf(truncf(x)) to x: a later use of a result would read it
+        // unrounded; cleared, every operation rounds to its type)
+        m.walk([&](Operation *op) {
+          if (auto e = dyn_cast<arith::ExtFOp>(op);
+              e && isSmall(e.getIn().getType()))
+            e.setFastmath(arith::FastMathFlags::none);
+          if (auto t = dyn_cast<arith::TruncFOp>(op); t && isSmall(t.getType()))
+            t.setFastmath(arith::FastMathFlags::none);
+        });
+      }
+    }
+    // (L15-E852) gpu.subgroup_mma_* as AIR's 8x8 SIMD-group matrices
+    if (failed(lowerSubgroupMma(m)))
+      return signalPassFailure();
+    // (L15-E850) sub-byte integer vectors (an int4 weight's vector.bitcast
+    // of bytes to i4 and its extension): upstream's narrow-type rewrites,
+    // shifts of the bytes, no i4 vector (which the backend scalarized into a
+    // byte load an element)
+    {
+      bool narrow = false;
+      m.walk([&](Operation *op) {
+        for (Type t : op->getResultTypes())
+          if (auto vt = dyn_cast<VectorType>(t);
+              vt && vt.getElementType().isInteger() &&
+              vt.getElementType().getIntOrFloatBitWidth() < 8)
+            narrow = true;
+        return narrow ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (narrow && subByteRewrites) {
+        RewritePatternSet patterns(ctx);
+        patterns.add(rewriteNibbleExt<arith::ExtSIOp>, /*benefit=*/4);
+        patterns.add(rewriteNibbleExt<arith::ExtUIOp>, /*benefit=*/4);
+        patterns.add(rewriteNibbleExt<arith::SIToFPOp>, /*benefit=*/4);
+        patterns.add(rewriteNibbleExt<arith::UIToFPOp>, /*benefit=*/4);
+        vector::populateVectorNarrowTypeRewritePatterns(patterns);
+        vector::populateVectorInterleaveLoweringPatterns(patterns);
+        (void)applyPatternsGreedily(m, std::move(patterns));
+      }
+    }
+    // (L15-E840) views of memrefs (subview, expand_shape, collapse_shape),
+    // which MemRefToLLVM no longer lowers, as reinterpret_casts of their
+    // sources' metadata, their offsets and strides by affine.apply, lowered
+    // to arith; only where the module has such a view. (L15-E842) Likewise
+    // the affine dialect's ops (an outlined kernel's affine.apply / min /
+    // max, loads, stores, loops) to arith, memref and scf, as lower-affine
+    // would.
+    {
+      bool views = false;
+      m.walk([&](Operation *op) {
+        views = isa<memref::SubViewOp, memref::ExpandShapeOp,
+                    memref::CollapseShapeOp>(op) ||
+                isa_and_nonnull<affine::AffineDialect>(op->getDialect());
+        return views ? WalkResult::interrupt() : WalkResult::advance();
+      });
+      if (views) {
+        RewritePatternSet patterns(ctx);
+        memref::populateExpandStridedMetadataPatterns(patterns);
+        memref::populateResolveExtractStridedMetadataPatterns(patterns);
+        populateAffineToStdConversionPatterns(patterns);
+        (void)applyPatternsGreedily(m, std::move(patterns));
+      }
+    }
     // In-dialect lowering of gpu.all_reduce and friends first.
     {
       RewritePatternSet patterns(ctx);
@@ -2062,7 +5653,13 @@ struct LowerGpuOpsToAIROpsPass final
       populateGpuShufflePatterns(patterns);
       patterns.add(rewriteAccurateM1<math::ExpM1Op>);
       patterns.add(rewriteAccurateM1<math::Log1pOp>);
+      patterns.add<UnrollVectorF64Math>(ctx);
+      patterns.add<UnrollVectorF64Reduction>(ctx);
       patterns.add(rewriteInverseHyperbolic<math::AsinhOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::AsinhOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::AcoshOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::AtanhOp>);
+      patterns.add(rewriteInverseHyperbolicF64<math::CbrtOp>);
       patterns.add(rewriteInverseHyperbolic<math::AcoshOp>);
       patterns.add(rewriteInverseHyperbolic<math::AtanhOp>);
       patterns.add(rewriteInverseHyperbolic<math::CbrtOp>);
@@ -2078,6 +5675,12 @@ struct LowerGpuOpsToAIROpsPass final
           },
           /*benefit=*/2);
       patterns.add(rewriteIsInf);
+      // (L15-E844) small floats' conversions; f8E8M0FNU's and the scaling
+      // conversions by upstream's expansions
+      patterns.add(rewriteSmallFloatExtF);
+      patterns.add(rewriteSmallFloatTruncF);
+      arith::populateExpandF8E8M0Patterns(patterns);
+      arith::populateExpandScalingExtTruncPatterns(patterns);
       patterns.add(rewriteExpF64);
       patterns.add(rewriteLogF64);
       patterns.add(rewriteF64Function<math::Exp2Op>);
@@ -2086,14 +5689,205 @@ struct LowerGpuOpsToAIROpsPass final
       patterns.add(rewriteF64Function<math::CoshOp>);
       patterns.add(rewriteF64Function<math::SinhOp>);
       patterns.add(rewriteF64Function<math::TanhOp>);
+      patterns.add(rewriteInverseTrigF64<math::AtanOp>);
+      patterns.add(rewriteTrigF64<math::SinOp>);
+      patterns.add(rewritePowF64);
+      patterns.add(rewriteErfF64<math::ErfOp>);
+      patterns.add(rewriteErfF64<math::ErfcOp>);
+      patterns.add(rewriteTrigF64<math::CosOp>);
+      patterns.add(rewriteTrigF64<math::TanOp>);
+      patterns.add(rewriteInverseTrigF64<math::Atan2Op>);
+      patterns.add(rewriteInverseTrigF64<math::AsinOp>);
+      patterns.add(rewriteInverseTrigF64<math::AcosOp>);
       patterns.add(rewriteIPowI);
+      patterns.add(rewritePow2FloorCeilDiv<arith::FloorDivSIOp>);
+      patterns.add(rewritePow2FloorCeilDiv<arith::CeilDivSIOp>);
+      patterns.add(rewriteRotate);
       (void)applyPatternsGreedily(m, std::move(patterns));
     }
     // A reduction AIR has no op for (over clusters of 2, 8 or 16 lanes: AIR
-    // has quad-group and SIMD-group ones; of i8, i16, i64; maximumf of f16):
-    // xor shuffles at 1, 2, 4, ... within each cluster (the order AIR's
-    // reductions add in), which the shuffle lowering takes to AIR.
+    // has quad-group and SIMD-group ones; of i64, i8 and i16 and f16's
+    // maximumf being widened first): xor shuffles at 1, 2, 4, ... within each
+    // cluster (the order AIR's reductions add in), which the shuffle lowering
+    // takes to AIR.
     {
+      // i8 and i16: the i32 reduction of the values extended (sign-extended
+      // for a signed minimum or maximum), truncated, the same value (the
+      // others are exact modulo 2^n), and AIR's 32-bit reduction instead of
+      // shuffles (L15-E279).
+      // f16 and bf16 maximumf / minimumf likewise in f32 (exact both ways:
+      // the result is one of the values, or a NaN), its ordered-key
+      // reduction instead of shuffles (L15-E280).
+      // (L15-E840) a reduction of a 1-D vector as reductions of its
+      // elements, which the patterns below take as scalars (AIR's SIMD-group
+      // reductions are of scalars; upstream's break-down keeps elements of
+      // the shuffle width whole)
+      {
+        SmallVector<gpu::SubgroupReduceOp> vectors;
+        m.walk([&](gpu::SubgroupReduceOp op) {
+          if (auto vt = dyn_cast<VectorType>(op.getValue().getType());
+              vt && vt.getRank() == 1 && !vt.isScalable())
+            vectors.push_back(op);
+        });
+        for (gpu::SubgroupReduceOp op : vectors) {
+          OpBuilder b(op);
+          Location loc = op.getLoc();
+          auto vt = cast<VectorType>(op.getValue().getType());
+          SmallVector<Value> elems;
+          for (int64_t k = 0, n = vt.getNumElements(); k < n; ++k) {
+            Value e = vector::ExtractOp::create(b, loc, op.getValue(), k);
+            elems.push_back(gpu::SubgroupReduceOp::create(
+                b, loc, e, op.getOp(), op.getUniform(), op.getClusterSize(),
+                op.getClusterStride()));
+          }
+          op.replaceAllUsesWith(
+              vector::FromElementsOp::create(b, loc, vt, elems).getResult());
+          op.erase();
+        }
+      }
+      SmallVector<gpu::SubgroupReduceOp> narrow;
+      m.walk([&](gpu::SubgroupReduceOp op) {
+        Type type = op.getType();
+        if (type.isInteger(8) || type.isInteger(16) ||
+            ((type.isF16() || type.isBF16()) &&
+             (op.getOp() == gpu::AllReduceOperation::MAXIMUMF ||
+              op.getOp() == gpu::AllReduceOperation::MINIMUMF)))
+          narrow.push_back(op);
+      });
+      IRRewriter rewriter(ctx);
+      for (gpu::SubgroupReduceOp op : narrow) {
+        rewriter.setInsertionPoint(op);
+        Location loc = op.getLoc();
+        if (isa<FloatType>(op.getType())) {
+          Value wide = arith::ExtFOp::create(rewriter, loc,
+                                             rewriter.getF32Type(),
+                                             op.getValue());
+          auto reduced = gpu::SubgroupReduceOp::create(
+              rewriter, loc, wide, op.getOp(), op.getUniform(),
+              op.getClusterSize(), op.getClusterStride());
+          rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, op.getType(),
+                                                       reduced.getResult());
+          continue;
+        }
+        Type i32 = rewriter.getI32Type();
+        bool isSigned = op.getOp() == gpu::AllReduceOperation::MINSI ||
+                        op.getOp() == gpu::AllReduceOperation::MAXSI;
+        Value wide =
+            isSigned
+                ? Value(arith::ExtSIOp::create(rewriter, loc, i32, op.getValue()))
+                : Value(arith::ExtUIOp::create(rewriter, loc, i32, op.getValue()));
+        auto reduced = gpu::SubgroupReduceOp::create(
+            rewriter, loc, wide, op.getOp(), op.getUniform(),
+            op.getClusterSize(), op.getClusterStride());
+        rewriter.replaceOpWithNewOp<arith::TruncIOp>(op, op.getType(),
+                                                     reduced.getResult());
+      }
+      // i64 minimum / maximum (signed or not) as two AIR reductions of i32:
+      // the high words' (in the operation's signedness), then the low
+      // words' (unsigned) of the lanes whose high word is that one, the
+      // others giving the identity (0 for a maximum, ~0 for a minimum):
+      // instead of a shuffle butterfly of 64-bit compares (L15-E442).
+      // i64 and / or / xor and sums likewise (L15-E443).
+      SmallVector<gpu::SubgroupReduceOp> wide;
+      m.walk([&](gpu::SubgroupReduceOp op) {
+        std::optional<uint32_t> cluster = op.getClusterSize();
+        if (op.getType().isInteger(64) &&
+            (!cluster || (op.getClusterStride() == 1 &&
+                          (*cluster == 4 || *cluster == 32))) &&
+            (op.getOp() == gpu::AllReduceOperation::MAXUI ||
+             op.getOp() == gpu::AllReduceOperation::MINUI ||
+             op.getOp() == gpu::AllReduceOperation::MAXSI ||
+             op.getOp() == gpu::AllReduceOperation::MINSI ||
+             op.getOp() == gpu::AllReduceOperation::AND ||
+             op.getOp() == gpu::AllReduceOperation::OR ||
+             op.getOp() == gpu::AllReduceOperation::XOR ||
+             op.getOp() == gpu::AllReduceOperation::ADD))
+          wide.push_back(op);
+      });
+      for (gpu::SubgroupReduceOp op : wide) {
+        rewriter.setInsertionPoint(op);
+        Location loc = op.getLoc();
+        Type i32 = rewriter.getI32Type(), i64 = rewriter.getI64Type();
+        auto reduce32 = [&](Value x, gpu::AllReduceOperation kind) -> Value {
+          return gpu::SubgroupReduceOp::create(rewriter, loc, x, kind,
+                                               op.getUniform(),
+                                               op.getClusterSize(),
+                                               op.getClusterStride());
+        };
+        auto c64 = [&](int64_t c) -> Value {
+          return arith::ConstantIntOp::create(rewriter, loc, i64, c);
+        };
+        auto words = [&](Value x) -> std::pair<Value, Value> {
+          return {arith::TruncIOp::create(
+                      rewriter, loc, i32,
+                      arith::ShRUIOp::create(rewriter, loc, x, c64(32))),
+                  arith::TruncIOp::create(rewriter, loc, i32, x)};
+        };
+        auto join = [&](Value h, Value l) -> Value {
+          Value h64 = arith::ShLIOp::create(
+              rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, h),
+              c64(32));
+          return arith::OrIOp::create(
+              rewriter, loc, h64, arith::ExtUIOp::create(rewriter, loc, i64, l));
+        };
+        // and / or / xor: each word on its own. add: the high words modulo
+        // 2^32 and the low words as two 16-bit halves, whose sums over 32
+        // lanes stay below 2^21, recombined in 64 bits.
+        if (op.getOp() == gpu::AllReduceOperation::AND ||
+            op.getOp() == gpu::AllReduceOperation::OR ||
+            op.getOp() == gpu::AllReduceOperation::XOR) {
+          auto [h, l] = words(op.getValue());
+          rewriter.replaceOp(op, join(reduce32(h, op.getOp()),
+                                      reduce32(l, op.getOp())));
+          continue;
+        }
+        if (op.getOp() == gpu::AllReduceOperation::ADD) {
+          auto [h, l] = words(op.getValue());
+          Value c16 = arith::ConstantIntOp::create(rewriter, loc, i32, 16);
+          Value m16 = arith::ConstantIntOp::create(rewriter, loc, i32, 0xffff);
+          Value sh = reduce32(h, gpu::AllReduceOperation::ADD);
+          Value sm = reduce32(arith::ShRUIOp::create(rewriter, loc, l, c16),
+                              gpu::AllReduceOperation::ADD);
+          Value sl = reduce32(arith::AndIOp::create(rewriter, loc, l, m16),
+                              gpu::AllReduceOperation::ADD);
+          Value r = arith::ShLIOp::create(
+              rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, sh),
+              c64(32));
+          r = arith::AddIOp::create(
+              rewriter, loc, r,
+              arith::ShLIOp::create(
+                  rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, sm),
+                  c64(16)));
+          r = arith::AddIOp::create(rewriter, loc, r,
+                                    arith::ExtUIOp::create(rewriter, loc, i64, sl));
+          rewriter.replaceOp(op, r);
+          continue;
+        }
+        bool isMax = op.getOp() == gpu::AllReduceOperation::MAXUI ||
+                     op.getOp() == gpu::AllReduceOperation::MAXSI;
+        Value v = op.getValue();
+        Value c32 = arith::ConstantIntOp::create(rewriter, loc, i64, 32);
+        Value hi = arith::TruncIOp::create(
+            rewriter, loc, i32, arith::ShRUIOp::create(rewriter, loc, v, c32));
+        Value lo = arith::TruncIOp::create(rewriter, loc, i32, v);
+        Value mh = gpu::SubgroupReduceOp::create(
+            rewriter, loc, hi, op.getOp(), op.getUniform(), op.getClusterSize(),
+            op.getClusterStride());
+        Value eq = arith::CmpIOp::create(rewriter, loc,
+                                         arith::CmpIPredicate::eq, hi, mh);
+        Value id = arith::ConstantIntOp::create(rewriter, loc, i32,
+                                                isMax ? 0 : -1);
+        Value lo2 = arith::SelectOp::create(rewriter, loc, eq, lo, id);
+        Value ml = gpu::SubgroupReduceOp::create(
+            rewriter, loc, lo2,
+            isMax ? gpu::AllReduceOperation::MAXUI
+                  : gpu::AllReduceOperation::MINUI,
+            op.getUniform(), op.getClusterSize(), op.getClusterStride());
+        Value h64 = arith::ShLIOp::create(
+            rewriter, loc, arith::ExtUIOp::create(rewriter, loc, i64, mh), c32);
+        Value l64 = arith::ExtUIOp::create(rewriter, loc, i64, ml);
+        rewriter.replaceOpWithNewOp<arith::OrIOp>(op, h64, l64);
+      }
       SmallVector<Operation *> clustered;
       m.walk([&](gpu::SubgroupReduceOp op) {
         if (!airSubgroupReduce(op))
@@ -2183,6 +5977,43 @@ struct LowerGpuOpsToAIROpsPass final
     if (failed(applyPartialConversion(m, target, std::move(llvmPatterns))))
       return signalPassFailure();
 
+    // An i1 in memory (memref<...xi1>) as a byte, which AIR has (it has no
+    // i1 in memory; LLVM gives an i1 element a byte already): loads of i8
+    // truncated, stores of the bit zero-extended, GEPs over i8 (L15-E831).
+    {
+      Type i1 = IntegerType::get(ctx, 1), i8 = IntegerType::get(ctx, 8);
+      SmallVector<Operation *> work;
+      m.walk([&](Operation *op) {
+        if (auto ld = dyn_cast<LLVM::LoadOp>(op); ld && ld.getType() == i1)
+          work.push_back(op);
+        else if (auto st = dyn_cast<LLVM::StoreOp>(op);
+                 st && st.getValue().getType() == i1)
+          work.push_back(op);
+        else if (auto gep = dyn_cast<LLVM::GEPOp>(op);
+                 gep && gep.getElemType() == i1)
+          gep.setElemType(i8);
+      });
+      for (Operation *op : work) {
+        OpBuilder b(op);
+        if (auto ld = dyn_cast<LLVM::LoadOp>(op)) {
+          auto wide = LLVM::LoadOp::create(b, ld.getLoc(), i8, ld.getAddr(),
+                                           ld.getAlignment().value_or(1),
+                                           ld.getVolatile_(),
+                                           ld.getNontemporal());
+          Value bit = LLVM::TruncOp::create(b, ld.getLoc(), i1, wide);
+          ld.getResult().replaceAllUsesWith(bit);
+          ld.erase();
+        } else {
+          auto st = cast<LLVM::StoreOp>(op);
+          Value byte = LLVM::ZExtOp::create(b, st.getLoc(), i8, st.getValue());
+          LLVM::StoreOp::create(b, st.getLoc(), byte, st.getAddr(),
+                                st.getAlignment().value_or(1),
+                                st.getVolatile_(), st.getNontemporal());
+          st.erase();
+        }
+      }
+    }
+
     // Kernels carry the "air-kernel" function attribute, and the threadgroup
     // size when it is known as an AGX hint, which AIR ignores (the AGX
     // backend budgets registers and barriers by it).
@@ -2203,6 +6034,14 @@ struct LowerGpuOpsToAIROpsPass final
         passthrough.push_back(ArrayAttr::get(
             ctx, {StringAttr::get(ctx, "agx-max-threads-per-threadgroup"),
                   StringAttr::get(ctx, std::to_string(threads))}));
+        // and each extent (the AGX backend bounds the threadgroup's
+        // positions and sizes by it)
+        std::string dims;
+        for (int32_t d : size.asArrayRef())
+          dims += (dims.empty() ? "" : ",") + std::to_string(d);
+        passthrough.push_back(ArrayAttr::get(
+            ctx, {StringAttr::get(ctx, "agx-threads-per-threadgroup"),
+                  StringAttr::get(ctx, dims)}));
       }
       // The grid's extents when known (the launch promises them): the AGX
       // backend bounds the position special registers by them just before
@@ -2228,6 +6067,21 @@ struct LowerGpuOpsToAIROpsPass final
                     StringAttr::get(ctx, join(threads))}));
         }
       }
+      if (auto it = kernelBounds.find(f.getName()); it != kernelBounds.end()) {
+        static const char *const roles[] = {
+            "air.thread_position_in_threadgroup",
+            "air.threadgroup_position_in_grid", "air.thread_position_in_grid"};
+        for (auto [kind, b] : llvm::enumerate(it->second)) {
+          if (!b[0] && !b[1] && !b[2])
+            continue;
+          passthrough.push_back(ArrayAttr::get(
+              ctx, {StringAttr::get(ctx, std::string("agx-upper-bounds:") +
+                                             roles[kind]),
+                    StringAttr::get(ctx, std::to_string(b[0]) + "," +
+                                             std::to_string(b[1]) + "," +
+                                             std::to_string(b[2]))}));
+        }
+      }
       f.setPassthroughAttr(ArrayAttr::get(ctx, passthrough));
     });
   }
@@ -2244,8 +6098,34 @@ void mlir::configureGpuToAIRConversionLegality(ConversionTarget &target) {
   target.addLegalOp<gpu::YieldOp, gpu::GPUModuleOp>();
 }
 
+namespace {
+/// (L15-E843) cf.assert as a trap where its condition fails: AIR has no
+/// puts / abort (ControlFlowToLLVM's lowering, whose message global AIR's
+/// module cannot reference either), the AGX backend a trap instruction.
+struct AssertOpToTrapLowering : public ConvertOpToLLVMPattern<cf::AssertOp> {
+  AssertOpToTrapLowering(const LLVMTypeConverter &converter)
+      : ConvertOpToLLVMPattern<cf::AssertOp>(converter, /*benefit=*/2) {}
+  LogicalResult
+  matchAndRewrite(cf::AssertOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Block *opBlock = rewriter.getInsertionBlock();
+    Block *continuation =
+        rewriter.splitBlock(opBlock, rewriter.getInsertionPoint());
+    Block *failure = rewriter.createBlock(opBlock->getParent());
+    LLVM::Trap::create(rewriter, loc);
+    LLVM::UnreachableOp::create(rewriter, loc);
+    rewriter.setInsertionPointToEnd(opBlock);
+    rewriter.replaceOpWithNewOp<LLVM::CondBrOp>(op, adaptor.getArg(),
+                                                continuation, failure);
+    return success();
+  }
+};
+} // namespace
+
 void mlir::populateGpuToAIRConversionPatterns(
     const LLVMTypeConverter &converter, RewritePatternSet &patterns) {
+  patterns.add<AssertOpToTrapLowering>(converter);
   patterns.add<GPUSystemValueLowering<gpu::ThreadIdOp>>(
       converter, "air.thread_position_in_threadgroup", IndexKind::Block,
       IntrType::Id);
@@ -2268,10 +6148,17 @@ void mlir::populateGpuToAIRConversionPatterns(
       converter, "air.simdgroups_per_threadgroup");
   patterns.add<GPUSubgroupSizeOpLowering, GPUBarrierOpLowering,
                GPUShuffleOpLowering, GPUBallotOpLowering,
+               GPUSubgroupBroadcastOpLowering,
                GPUSubgroupReduceOpLowering, MatrixLoadOpLowering,
                MatrixStoreOpLowering, MatrixMultiplyAccumulateOpLowering,
                MatrixFillOpLowering>(converter);
   patterns.add<GPUReturnOpLowering>(converter);
+  // gpu.dynamic_shared_memory: an external threadgroup global of no size,
+  // which the backend places after the kernel's static threadgroup memory
+  // (the launch's threadgroup memory length covers it), 16-byte aligned
+  // (L15-E830; before, the op was illegal)
+  patterns.add<GPUDynamicSharedMemoryOpLowering>(converter,
+                                                 /*alignmentBit=*/128);
   patterns.add<GPUFuncOpLowering>(
       converter,
       GPUFuncOpLoweringOptions{

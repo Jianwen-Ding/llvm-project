@@ -69,7 +69,7 @@ define agx_kernel void @pack_mixed(ptr addrspace(1) %p, ptr addrspace(1) %o, i32
 ; CHECK-NEXT:    device_load 0, i32, x, r2, u0_u1, r1, signed
 ; CHECK-NEXT:    wait 0
 ; CHECK-NEXT:    iadd r4, r2, u4
-; CHECK-NEXT:    imadd r3h, r2l, 3, 0
+; CHECK-NEXT:    iadd r3h, r2l, r2l, lsl 1
 ; CHECK-NEXT:    bitop 0101, r2h, r4l, 0
 ; CHECK-NEXT:    device_store 0, i8, xyzw, r2l_r2h_r3l_r3h, u2_u3, r1, signed, lsl 2
 ; CHECK-NEXT:    stop

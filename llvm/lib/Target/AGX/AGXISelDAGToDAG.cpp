@@ -16,7 +16,10 @@
 #include "AGXSubtarget.h"
 #include "AGXTargetMachine.h"
 #include "MCTargetDesc/AGXMCTargetDesc.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IntrinsicsAGX.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
@@ -32,10 +35,24 @@ static cl::opt<bool> FoldFrameOffsets(
 #define DEBUG_TYPE "agx-isel"
 #define PASS_NAME "AGX DAG->DAG Pattern Instruction Selection"
 
+static cl::opt<bool> AGXSelectBool16(
+    "agx-select-bool16", cl::init(true), cl::Hidden,
+    cl::desc("a select on a 32-bit boolean with high 16 bits known zero "
+             "compares its low half with 0 (one 32-bit register read fewer)"));
+
+static cl::opt<bool> AGXSelectHalfTests(
+    "agx-select-half-tests", cl::init(true), cl::Hidden,
+    cl::desc("a select between two registers on x < 0, or on x == 0 with a "
+             "half of x known zero, compares one 16-bit half of x"));
+
 namespace {
 
 class AGXDAGToDAGISel : public SelectionDAGISel {
   const AGXSubtarget *Subtarget = nullptr;
+  // The function's loops, for patterns that pay only where a value they
+  // need is hoisted out of one (L15-E559).
+  std::unique_ptr<DominatorTree> DT;
+  std::unique_ptr<LoopInfo> Loops;
 
 public:
   AGXDAGToDAGISel() = delete;
@@ -43,8 +60,34 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     Subtarget = &MF.getSubtarget<AGXSubtarget>();
-    return SelectionDAGISel::runOnMachineFunction(MF);
+    Function &F = const_cast<Function &>(MF.getFunction());
+    DT = std::make_unique<DominatorTree>(F);
+    Loops = std::make_unique<LoopInfo>(*DT);
+    bool Changed = SelectionDAGISel::runOnMachineFunction(MF);
+    Loops.reset();
+    DT.reset();
+    return Changed;
   }
+
+  /// Whether the block being selected is in a loop.
+  bool inLoop() const {
+    const BasicBlock *BB = FuncInfo->MBB ? FuncInfo->MBB->getBasicBlock()
+                                         : nullptr;
+    return Loops && BB && Loops->getLoopFor(BB);
+  }
+
+  // The block's 32-bit shifts left by 16 (each, as a zero half carried
+  // through a loop, holds a register across it).
+  unsigned NumShl16 = 0;
+  void PreprocessISelDAG() override {
+    NumShl16 = 0;
+    for (SDNode &N : CurDAG->allnodes())
+      if (N.getOpcode() == ISD::SHL && N.getValueType(0) == MVT::i32)
+        if (auto *C = dyn_cast<ConstantSDNode>(N.getOperand(1));
+            C && C->getZExtValue() == 16)
+          ++NumShl16;
+  }
+  bool fewShl16() const;
 
 private:
 #include "AGXGenDAGISel.inc"
@@ -52,6 +95,7 @@ private:
   void Select(SDNode *N) override;
   bool trySelectShift64(SDNode *N);
   bool trySelectFieldInsert(SDNode *N);
+  bool trySelectFieldBase(SDNode *N);
 
   SDValue getI32Imm(uint64_t Imm, const SDLoc &DL) {
     return CurDAG->getTargetConstant(Imm, DL, MVT::i32);
@@ -100,6 +144,15 @@ private:
   void selectTextureSample(SDNode *N);
 };
 
+static cl::opt<unsigned> AGXShl16HalvesMax(
+    "agx-shl16-halves-max", cl::init(4), cl::Hidden,
+    cl::desc("Shifts left by 16 a loop block may have for them to be a zero "
+             "half carried through the loop (more: bfi)"));
+
+bool AGXDAGToDAGISel::fewShl16() const {
+  return NumShl16 <= AGXShl16HalvesMax;
+}
+
 class AGXDAGToDAGISelLegacy : public SelectionDAGISelLegacy {
 public:
   static char ID;
@@ -117,12 +170,58 @@ FunctionPass *llvm::createAGXISelDag(AGXTargetMachine &TM) {
   return new AGXDAGToDAGISelLegacy(TM);
 }
 
+static cl::opt<bool> FreezeAsUse(
+    "agx-freeze-as-use",
+    cl::desc("select a freeze of an instruction's result as the result "
+             "itself, not a copy"),
+    cl::init(true), cl::Hidden);
+
 void AGXDAGToDAGISel::Select(SDNode *N) {
   if (N->isMachineOpcode()) {
     N->setNodeId(-1);
     return;
   }
   switch (N->getOpcode()) {
+  case ISD::FREEZE: {
+    // A freeze is a COPY (SelectionDAGISel), which keeps MachineCSE from
+    // merging selects of the value and of its bitcast. The result of a
+    // SIMD-group operation (convergent: a shuffle, ballot, reduction or
+    // scan) or of a load is one fixed value in its register, never folded
+    // into or rematerialized at its users: freeze it by using it. Not for
+    // nodes that patterns fold into each user (a compare into a select),
+    // which would read an undef operand again at each, nor for an undef or
+    // a register from another block (an IMPLICIT_DEF).
+    SDValue V = N->getOperand(0);
+    while (V.getOpcode() == ISD::BITCAST)
+      V = V.getOperand(0);
+    bool Fixed = V.getOpcode() == ISD::LOAD;
+    if (V.getOpcode() == ISD::INTRINSIC_WO_CHAIN)
+      switch (V.getConstantOperandVal(0)) {
+      case Intrinsic::agx_simd_shuffle:
+      case Intrinsic::agx_simd_shuffle_xor:
+      case Intrinsic::agx_simd_shuffle_up:
+      case Intrinsic::agx_simd_shuffle_down:
+      case Intrinsic::agx_quad_shuffle:
+      case Intrinsic::agx_quad_shuffle_xor:
+      case Intrinsic::agx_quad_shuffle_up:
+      case Intrinsic::agx_quad_shuffle_down:
+      case Intrinsic::agx_simd_shuffle_rotate_up:
+      case Intrinsic::agx_quad_shuffle_rotate_up:
+      case Intrinsic::agx_simd_ballot:
+      case Intrinsic::agx_quad_ballot:
+      case Intrinsic::agx_simd_reduce:
+      case Intrinsic::agx_simd_prefix:
+      case Intrinsic::agx_quad_reduce:
+      case Intrinsic::agx_quad_prefix:
+        Fixed = true;
+      }
+    if (FreezeAsUse && Fixed) {
+      ReplaceUses(SDValue(N, 0), N->getOperand(0));
+      CurDAG->RemoveDeadNode(N);
+      return;
+    }
+    break;
+  }
   case AGXISD::CALL: {
     SDLoc DL(N);
     // Mesa's push_exec r0l, 2 is if_fcmp r0l, eq, 0.0, 0.0, 2.
@@ -207,6 +306,8 @@ void AGXDAGToDAGISel::Select(SDNode *N) {
   case ISD::OR:
     if (trySelectFieldInsert(N))
       return;
+    if (trySelectFieldBase(N))
+      return;
     break;
   default:
     break;
@@ -243,6 +344,59 @@ bool AGXDAGToDAGISel::trySelectFieldInsert(SDNode *N) {
                        AGX::BFI_I32, DL, MVT::i32,
                        {Zero, And.getOperand(0), Zero, getI32Imm(C >> Shift, DL),
                         Zero, getI32Imm(Shift, DL), getI32Imm(Width, DL)}));
+    return true;
+  }
+  return false;
+}
+
+/// A field of x, x >> s or (x >> s) & m (or x & m), in the bits a constant
+/// c leaves clear, f | c: one bfeil with c as its base, the field as wide as
+/// its known bits allow, instead of the extract and an or (a q4_0 block's
+/// nibble under the bits of 1024 as a half: L15-E630).
+bool AGXDAGToDAGISel::trySelectFieldBase(SDNode *N) {
+  EVT VT = N->getValueType(0);
+  if (!AGX::fieldBase16() || (VT != MVT::i16 && VT != MVT::i32))
+    return false;
+  unsigned Bits = VT.getSizeInBits();
+  for (unsigned I = 0; I < 2; ++I) {
+    SDValue F = N->getOperand(I);
+    auto *CN = dyn_cast<ConstantSDNode>(N->getOperand(1 - I));
+    if (!CN || !F.hasOneUse())
+      continue;
+    SDValue X = F;
+    bool Masked = false;
+    if (X.getOpcode() == ISD::AND) {
+      auto *M = dyn_cast<ConstantSDNode>(X.getOperand(1));
+      if (!M || !isMask_64(M->getZExtValue()))
+        continue;
+      Masked = true;
+      X = X.getOperand(0);
+    }
+    uint64_t Shift = 0;
+    if (X.getOpcode() == ISD::SRL) {
+      auto *SC = dyn_cast<ConstantSDNode>(X.getOperand(1));
+      if (!SC || SC->getZExtValue() == 0 || SC->getZExtValue() >= Bits ||
+          (Masked && !X.hasOneUse()))
+        continue;
+      Shift = SC->getZExtValue();
+      X = X.getOperand(0);
+    } else if (!Masked || !AGX::fieldBaseAnd()) {
+      continue;
+    }
+    KnownBits KB = CurDAG->computeKnownBits(F);
+    unsigned Width = Bits - KB.countMinLeadingZeros();
+    uint64_t C = CN->getZExtValue();
+    if (Width == 0 || Width + Shift > Bits ||
+        (C & maskTrailingOnes<uint64_t>(Width)))
+      continue;
+    SDLoc DL(N);
+    SDValue Zero = getI32Imm(0, DL);
+    unsigned Opc = VT == MVT::i16 ? AGX::BFEIL_I16 : AGX::BFEIL_I32;
+    ReplaceNode(N, CurDAG->getMachineNode(
+                       Opc, DL, VT,
+                       {Zero, CurDAG->getConstant(C, DL, VT), Zero, X, Zero,
+                        getI32Imm(Shift, DL),
+                        getI32Imm(Width == Bits ? 0 : Width, DL)}));
     return true;
   }
   return false;
@@ -522,6 +676,26 @@ bool AGXDAGToDAGISel::SelectExt16Src(SDValue N, SDValue &Src, SDValue &Mods) {
 /// (sext / zext of an i16), or a 32-bit such value extended the same way.
 bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
   unsigned Opc = N.getOpcode();
+  // The low 16 bits of an extended 32-bit value, sign or zero extended in
+  // place (a lane of a vector of 64-bit lanes loaded as 32-bit lanes): the
+  // 32-bit value's low half.
+  bool InReg = Opc == ISD::SIGN_EXTEND_INREG &&
+               cast<VTSDNode>(N.getOperand(1))->getVT() == MVT::i16;
+  bool Mask = Opc == ISD::AND && isa<ConstantSDNode>(N.getOperand(1)) &&
+              N.getConstantOperandVal(1) == 0xffff;
+  if (InReg || Mask) {
+    SDValue E = N.getOperand(0);
+    unsigned EOpc = E.getOpcode();
+    if ((EOpc != ISD::ANY_EXTEND && EOpc != ISD::ZERO_EXTEND &&
+         EOpc != ISD::SIGN_EXTEND) ||
+        E.getOperand(0).getValueType() != MVT::i32)
+      return false;
+    SDLoc DL(N);
+    Src = CurDAG->getTargetExtractSubreg(AGX::lo16, DL, MVT::i16,
+                                         E.getOperand(0));
+    Mods = getI32Imm(InReg ? AGX::SRC_MOD_SX : 0, DL);
+    return true;
+  }
   // A pair with a zero high word: the low word zero-extended.
   if (Opc == ISD::BUILD_PAIR && isNullConstant(N.getOperand(1)))
     Opc = ISD::ZERO_EXTEND;
@@ -541,6 +715,11 @@ bool AGXDAGToDAGISel::SelectExt16Src64(SDValue N, SDValue &Src, SDValue &Mods) {
   bool InnerSX = cast<ConstantSDNode>(Mods)->getZExtValue() & AGX::SRC_MOD_SX;
   return Opc == ISD::SIGN_EXTEND || !InnerSX;
 }
+
+static cl::opt<bool> AGXNegConstantModifiers(
+    "agx-neg-constant-modifiers", cl::init(true), cl::Hidden,
+    cl::desc("A negative floating point constant source is its magnitude "
+             "with the neg modifier"));
 
 /// Floating point sources fold neg and abs into modifiers, and constants
 /// representable as 8-bit floats into the instruction.
@@ -580,6 +759,31 @@ bool AGXDAGToDAGISel::SelectFPSrc(SDValue N, SDValue &Src, SDValue &Mods) {
         Mods = getI32Imm(0, DL);
         return true;
       }
+    }
+    // A negative constant whose magnitude the block also uses is that
+    // negated by the modifier: c and -c share one register (exp's t + 1.5 2^23 - 1.5 2^23, L15-E469).
+    if (AGXNegConstantModifiers && !(M & AGX::SRC_MOD_ABS) &&
+        C->getValueAPF().isNegative() && C->getValueAPF().isFiniteNonZero() &&
+        (N.getValueType() == MVT::f32 || N.getValueType() == MVT::f16 ||
+         N.getValueType() == MVT::bf16)) {
+      APFloat Mag = C->getValueAPF();
+      Mag.clearSign();
+      EVT VT = N.getValueType();
+      // only where the block uses the magnitude itself
+      SDValue Pos = CurDAG->getConstantFP(Mag, DL, VT);
+      if (Pos->use_empty()) {
+        CurDAG->RemoveDeadNode(Pos.getNode());
+        Src = N;
+        Mods = getI32Imm(M, DL);
+        return true;
+      }
+      Src = SDValue(CurDAG->getMachineNode(
+                        VT == MVT::f32 ? AGX::MOV_IMM32 : AGX::MOV_IMM16, DL, VT,
+                        CurDAG->getTargetConstant(
+                            Mag.bitcastToAPInt().getZExtValue(), DL, MVT::i32)),
+                    0);
+      Mods = getI32Imm(M ^ AGX::SRC_MOD_NEG, DL);
+      return true;
     }
   }
 

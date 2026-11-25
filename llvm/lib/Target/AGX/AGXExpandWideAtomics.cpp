@@ -43,6 +43,7 @@
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicsAGX.h"
@@ -645,6 +646,18 @@ static bool isAggregatable(const AtomicRMWInst &RMW, bool FloatOk) {
 ///
 /// A uniform address needs one round and no test. The sum of a float group
 /// is rounded differently from any order of the single additions.
+static cl::opt<bool> AggregateNeighborTest(
+    "agx-aggregate-atomics-neighbor-test", cl::init(true), cl::Hidden,
+    cl::desc("Aggregate a SIMD group's atomic additions only where some "
+             "thread's address is the one before it's (in lane order, "
+             "cyclically): every thread its own address takes the plain "
+             "atomic, without the rounds' ballots and shuffles"));
+
+static cl::opt<bool> AggregateRoundsUnlikely(
+    "agx-aggregate-atomics-rounds-unlikely", cl::init(true), cl::Hidden,
+    cl::desc("The neighbour test's branch to the aggregation rounds weighted "
+             "unlikely, so that the plain atomics fall through"));
+
 static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
   LLVMContext &Ctx = RMW.getContext();
   const DataLayout &DL = RMW.getDataLayout();
@@ -668,6 +681,46 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
   BasicBlock *Rest = Uniform ? nullptr : BasicBlock::Create(Ctx, "atomic.agg.single", F, Exit);
   Pre->getTerminator()->setSuccessor(0, Head);
 
+  // (a scatter-add's threads add to as many words, which the rounds only
+  // find after a ballot, a lowest-thread search, the address's shuffles and
+  // compares and a count: one compare with the previous thread's address,
+  // and the plain atomic where none matches. Threads adding to one word,
+  // as a film's samples to their pixel, are neighbours; a group whose equal
+  // addresses are all apart takes the plain atomics, as before aggregation,
+  // L15-E798)
+  BasicBlock *Plain = nullptr;
+  Instruction *PlainRMW = nullptr;
+  if (!Uniform && AggregateNeighborTest) {
+    Plain = BasicBlock::Create(Ctx, "atomic.agg.plain", F, Exit);
+    IRBuilder<> PB(Pre->getTerminator());
+    unsigned PtrBits =
+        DL.getPointerSizeInBits(Ptr->getType()->getPointerAddressSpace());
+    Value *Addr = PB.CreateZExtOrTrunc(
+        PB.CreatePtrToInt(Ptr, PB.getIntNTy(PtrBits)), PB.getInt64Ty());
+    Value *L = PB.CreateIntrinsic(I32,
+                                  Intrinsic::agx_thread_index_in_simdgroup, {});
+    Value *Before = PB.CreateAnd(PB.CreateAdd(L, PB.getInt32(31)), 31);
+    Value *Dup = PB.CreateICmpEQ(Addr, shuffleWide(PB, Addr, Before, 64));
+    Value *Any = PB.CreateICmpNE(
+        PB.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {Dup}),
+        PB.getInt32(0));
+    Pre->getTerminator()->eraseFromParent();
+    PB.SetInsertPoint(Pre);
+    // (L15-E859) the rounds unlikely: a group whose addresses repeat is
+    // bound by its atomics' serialization, a scatter's plain atomics are not,
+    // so the plain path falls through (AGXColdRegions) where the rounds' is
+    // the jump taken
+    PB.CreateCondBr(Any, Head, Plain,
+                    AggregateRoundsUnlikely
+                        ? MDBuilder(Ctx).createUnlikelyBranchWeights()
+                        : nullptr);
+
+    IRBuilder<> QB(Plain);
+    PlainRMW = RMW.clone();
+    QB.Insert(PlainRMW);
+    QB.CreateBr(Exit);
+  }
+
   IRBuilder<> B(Head);
   PHINode *Round = nullptr;
   if (!Uniform) {
@@ -675,6 +728,11 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
     Round->addIncoming(B.getInt32(0), Pre);
   }
   Value *Pending = B.CreateIntrinsic(I32, Intrinsic::agx_simd_ballot, {B.getTrue()});
+  // (the rounds cold for AGXColdRegions where the neighbour test makes them
+  // unlikely: the structurizer keeps the block, not always the edge's
+  // probability, L15-E860)
+  if (Plain && AggregateRoundsUnlikely)
+    cast<Instruction>(Pending)->setMetadata("agx.cold", MDNode::get(Ctx, {}));
   Value *First = B.CreateBinaryIntrinsic(Intrinsic::cttz, Pending, B.getTrue());
   Value *Multi = nullptr;
   if (Uniform) {
@@ -758,9 +816,11 @@ static void expandAggregate(AtomicRMWInst &RMW, bool Uniform, unsigned Rounds) {
 
   if (Used) {
     B.SetInsertPoint(&RMW);
-    PHINode *Out = B.CreatePHI(Ty, 2);
+    PHINode *Out = B.CreatePHI(Ty, 3);
     Out->addIncoming(Res, Latch);
     Out->addIncoming(Single, Rest);
+    if (PlainRMW)
+      Out->addIncoming(PlainRMW, Plain);
     RMW.replaceAllUsesWith(Out);
   }
   RMW.eraseFromParent();

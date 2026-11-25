@@ -127,7 +127,7 @@ static cl::opt<unsigned> AGXThreadgroupUnroll(
              "contiguous loads become 16-byte ones, 1: no unrolling)"));
 
 static cl::opt<unsigned> AGXDeviceUnrollNarrow(
-    "agx-device-unroll-narrow", cl::init(16), cl::Hidden,
+    "agx-device-unroll-narrow", cl::init(32), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
              "are all of one or two bytes (0: the same)"));
 
@@ -137,10 +137,203 @@ static cl::opt<unsigned> AGXDeviceUnrollStore(
              "device memory, where it divides the trip count (0: the same)"));
 
 static cl::opt<unsigned> AGXDeviceUnrollStrided(
-    "agx-device-unroll-strided", cl::init(8), cl::Hidden,
+    "agx-device-unroll-strided", cl::init(16), cl::Hidden,
     cl::desc("The factor of agx-device-unroll for loops whose device loads "
              "all step more than 64 bytes an iteration, where it divides the "
              "trip count (0: the same)"));
+
+static cl::opt<bool> AGXDeviceUnrollCarriedSelect(
+    "agx-device-unroll-carried-select", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-argmax also for a carried value kept by "
+             "selects on one compare"));
+
+static cl::opt<unsigned> AGXDeviceUnrollArgMax(
+    "agx-device-unroll-argmax", cl::init(32), cl::Hidden,
+    cl::desc("Iterations a device-load arg-max / arg-min loop (a carried "
+             "value selected on a compare against it, and an index) is "
+             "unrolled by (0: no such rule)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollFullMaxSize(
+    "agx-device-unroll-full-max-size", cl::init(1024), cl::Hidden,
+    cl::desc("Trips times the loop's instructions above which "
+             "-agx-device-unroll-full-trips does not unroll it whole"));
+
+static cl::opt<unsigned> AGXDeviceUnrollFullTrips(
+    "agx-device-unroll-full-trips", cl::init(64), cl::Hidden,
+    cl::desc("Device-load loops of at most this many trips (not running "
+             "maxima) unrolled whole (0: not)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollTranscendental(
+    "agx-device-unroll-transcendental", cl::init(8), cl::Hidden,
+    cl::desc("Unroll factor of device-load loops with exponentials that no "
+             "other factor takes (0: the default)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntime(
+    "agx-device-unroll-runtime", cl::init(4), cl::Hidden,
+    cl::desc("Unroll a light device-load loop of a runtime trip count this "
+             "many times, with a remainder loop (0: not)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeStrided(
+    "agx-device-unroll-runtime-strided", cl::init(8), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime's factor where its far loads step by "
+             "a runtime stride (not a gather)"));
+
+static cl::opt<bool> AGXDeviceUnrollSomeStrided(
+    "agx-device-unroll-some-strided", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-strided's factor also where only some of a "
+             "loop's device loads are strided"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeHeavyMax(
+    "agx-device-unroll-runtime-heavy-max", cl::init(true), cl::Hidden,
+    cl::desc("Twice -agx-device-unroll-runtime-contiguous's count for a row's "
+             "NaN-propagating maximum / minimum or argmax"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeHeavyMaxSigned(
+    "agx-device-unroll-runtime-heavy-max-signed", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-heavy-max only for a maximum / "
+             "minimum whose zero sign matters (else one instruction, as "
+             "maxnum)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeContiguous(
+    "agx-device-unroll-runtime-contiguous", cl::init(4), cl::Hidden,
+    cl::desc("Iterations a runtime-trip loop over a thread's row (contiguous "
+             "loads, no stores, light arithmetic) is unrolled by, twice that "
+             "for one load an iteration (0: none)"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeStoresNarrow(
+    "agx-device-unroll-runtime-stores-narrow", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for 1- and 2-byte "
+             "accesses (and roundeven)"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeExp(
+    "agx-device-unroll-runtime-exp", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
+             "of exponentials"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeExpStores(
+    "agx-device-unroll-runtime-exp-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for exponentials"));
+
+static cl::opt<unsigned> AGXDeviceUnrollBlocks(
+    "agx-device-unroll-blocks", cl::init(3), cl::Hidden,
+    cl::desc("Blocks an innermost device-load loop with a conditional device "
+             "store may have for E187's factors (0: one block only)"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeColumns(
+    "agx-device-unroll-runtime-columns", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for far accesses where "
+             "the trip count does not depend on the thread (a column)"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeTanhStores(
+    "agx-device-unroll-runtime-tanh-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for tanh"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeDivStores(
+    "agx-device-unroll-runtime-div-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for divisions"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeMathStores(
+    "agx-device-unroll-runtime-math-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores also for log, log2, sin, cos "
+             "and sqrt"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowStores(
+    "agx-device-unroll-runtime-narrow-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores 4 times for a row of halves "
+             "or bytes"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeColumnFactor(
+    "agx-device-unroll-runtime-column-factor", cl::init(8), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-stores' factor times this for a "
+             "column"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeOwnRowFactor(
+    "agx-device-unroll-runtime-own-row-factor", cl::init(4), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-stores' factor times this for a row "
+             "of words whose loads are all the thread's own"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeInPlaceFactor(
+    "agx-device-unroll-runtime-in-place-factor", cl::init(16), cl::Hidden,
+    cl::desc("agx-device-unroll-runtime-own-row-factor for a row stored in "
+             "place (0: the own row's)"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeColumnStores(
+    "agx-device-unroll-runtime-column-stores", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores twice for a column"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeColumnsOnly(
+    "agx-device-unroll-runtime-columns-only", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-strided twice where every device "
+             "load steps by a runtime stride"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeOwnRows(
+    "agx-device-unroll-runtime-own-rows", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores twice for a row of words "
+             "whose device loads are all the thread's own"));
+
+static cl::opt<bool> AGXDeviceUnrollFullStoreRows(
+    "agx-device-unroll-full-store-rows", cl::init(true), cl::Hidden,
+    cl::desc("Leave a row loop that stores, of affine loads no other loop "
+             "reads, out of -agx-device-unroll-full-trips"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeMax(
+    "agx-device-unroll-runtime-max", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-contiguous also for a thread's row "
+             "maximum or minimum"));
+
+static cl::opt<bool> AGXDeviceUnrollRuntimeNarrowRows(
+    "agx-device-unroll-runtime-narrow-rows", cl::init(true), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-contiguous's factor times 4 over "
+             "the bytes of a row's narrowest load (halves, bytes)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeHeavyFactor(
+    "agx-device-unroll-runtime-heavy-factor", cl::init(2), cl::Hidden,
+    cl::desc("-agx-device-unroll-runtime-stores times this for a plain row "
+             "of sines, cosines, exponentials, tanh, square roots or "
+             "divisions (logarithms where it stores nothing)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollRuntimeStores(
+    "agx-device-unroll-runtime-stores", cl::init(4), cl::Hidden,
+    cl::desc("Iterations a runtime-trip row loop of word loads and stores and "
+             "light arithmetic is unrolled by, with a remainder (0: none)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollStoreLight(
+    "agx-device-unroll-store-light", cl::init(8), cl::Hidden,
+    cl::desc("Iterations a device-load loop that stores words and loads at "
+             "most two words an iteration is unrolled by (0: the store "
+             "factor)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollStoreLightOneBlock(
+    "agx-device-unroll-store-light-one-block", cl::init(16), cl::Hidden,
+    cl::desc("agx-device-unroll-store-light for a loop of one block (0: "
+             "the same)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollStreams(
+    "agx-device-unroll-streams", cl::init(8), cl::Hidden,
+    cl::desc("The factor of agx-device-unroll for loops whose device loads "
+             "step through two or more pointer bases, without stores, where "
+             "it divides the trip count (0: the same)"));
+
+static cl::opt<unsigned> AGXDeviceUnrollStreamsWord(
+    "agx-device-unroll-streams-word", cl::init(16), cl::Hidden,
+    cl::desc("agx-device-unroll-streams' factor where every device load is "
+             "of 4 bytes at most (0: the same)"));
+
+static cl::opt<bool> AGXDeviceUnrollStreamsDWord(
+    "agx-device-unroll-streams-dword", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-streams-word's factor also where every "
+             "device load is of 8 bytes at most"));
+
+static cl::opt<bool> AGXDeviceUnrollStreamsVectors(
+    "agx-device-unroll-streams-vectors", cl::init(true), cl::Hidden,
+    cl::desc("agx-device-unroll-streams only for loops whose device loads are "
+             "all vectors"));
+
+static cl::opt<bool> AGXDeviceUnrollKeepLoop(
+    "agx-device-unroll-keep-loop", cl::init(true), cl::Hidden,
+    cl::desc("A device-load loop of a loop-carried maximum / minimum and more "
+             "than 16 trips stays a loop: its factor at most half the trip "
+             "count, no full unrolling"));
 
 static cl::opt<unsigned> AGXDeviceUnroll(
     "agx-device-unroll", cl::init(4), cl::Hidden,
@@ -169,6 +362,8 @@ static bool isThreadVaryingIntrinsic(Intrinsic::ID ID) {
   case Intrinsic::agx_quad_shuffle_xor:
   case Intrinsic::agx_quad_shuffle_up:
   case Intrinsic::agx_quad_shuffle_down:
+  case Intrinsic::agx_simd_shuffle_rotate_up:
+  case Intrinsic::agx_quad_shuffle_rotate_up:
   case Intrinsic::agx_simd_prefix:
   case Intrinsic::agx_quad_prefix:
   case Intrinsic::agx_quad_reduce:
@@ -230,6 +425,8 @@ AGXTTIImpl::instCombineIntrinsic(InstCombiner &IC, IntrinsicInst &II) const {
   case Intrinsic::agx_quad_shuffle_xor:
   case Intrinsic::agx_quad_shuffle_up:
   case Intrinsic::agx_quad_shuffle_down:
+  case Intrinsic::agx_simd_shuffle_rotate_up:
+  case Intrinsic::agx_quad_shuffle_rotate_up:
     if (isa<Constant>(II.getArgOperand(0)))
       return IC.replaceInstUsesWith(II, II.getArgOperand(0));
     break;
@@ -350,20 +547,51 @@ static std::optional<APInt> deviceLoadStride(const LoadInst &LI, const Loop *L,
 static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
                                    const DataLayout &DL, unsigned Trips,
                                    bool &DeviceLoads) {
-  bool Narrow = true, Stores = false, Strided = true;
+  bool Narrow = true, Stores = false, Strided = true, Word = true,
+       DWord = true, Vectors = true, SomeStrided = false, Store32 = true,
+       Light = true;
+  unsigned NumLoads = 0;
   DeviceLoads = false;
+  // The pointer bases the device loads step through (a dot product's two
+  // rows): L15-E506.
+  SmallPtrSet<const SCEV *, 4> Streams;
   for (const BasicBlock *BB : L->blocks())
     for (const Instruction &I : *BB) {
-      if (auto *SI = dyn_cast<StoreInst>(&I))
-        Stores |= SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+      if (auto *SI = dyn_cast<StoreInst>(&I);
+          SI && SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
+        Stores = true;
+        Store32 &= DL.getTypeStoreSize(SI->getValueOperand()->getType()) == 4;
+      }
+      // (light arithmetic: no call but a multiply-add, a maximum / minimum
+      // or an absolute value)
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        auto *II = dyn_cast<IntrinsicInst>(CB);
+        Light &= II && (II->getIntrinsicID() == Intrinsic::fma ||
+                        II->getIntrinsicID() == Intrinsic::fmuladd ||
+                        II->getIntrinsicID() == Intrinsic::maxnum ||
+                        II->getIntrinsicID() == Intrinsic::minnum ||
+                        II->getIntrinsicID() == Intrinsic::maximum ||
+                        II->getIntrinsicID() == Intrinsic::minimum ||
+                        II->getIntrinsicID() == Intrinsic::fabs);
+      }
       auto *LI = dyn_cast<LoadInst>(&I);
       if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
         continue;
       DeviceLoads = true;
+      ++NumLoads;
       Narrow &= DL.getTypeStoreSize(LI->getType()) <= 2;
-      if (Strided) {
+      Word &= DL.getTypeStoreSize(LI->getType()) <= 4;
+      DWord &= DL.getTypeStoreSize(LI->getType()) <= 8;
+      Vectors &= LI->getType()->isVectorTy();
+      if (const SCEV *P = SE.getSCEV(const_cast<Value *>(LI->getPointerOperand()));
+          isa<SCEVAddRecExpr>(P) &&
+          cast<SCEVAddRecExpr>(P)->getLoop() == L)
+        Streams.insert(SE.getPointerBase(P));
+      {
         std::optional<APInt> S = deviceLoadStride(*LI, L, SE, DL);
-        Strided = S && S->ugt(64);
+        bool Far = S && S->ugt(64);
+        Strided &= Far;
+        SomeStrided |= Far;
       }
     }
   auto Divides = [&](unsigned F) { return F && Trips >= F && Trips % F == 0; };
@@ -371,10 +599,82 @@ static unsigned deviceUnrollFactor(const Loop *L, ScalarEvolution &SE,
     return 0;
   if (Narrow && Divides(AGXDeviceUnrollNarrow))
     return AGXDeviceUnrollNarrow;
+  // (a row loop of at most two word loads, word stores and light
+  // arithmetic, 256 trips or more: 16 iterations' loads held 32 registers,
+  // 8 keep the groups, L15-E564; byte stores, three loads, transcendental
+  // or shared-unit work, a column and 128 trips lost at 8)
+  // (16 in one block since E729's word indices: reverse_rows -9.9%,
+  // inplace, row_relu, row_axpy, row_residual -4.7 to -5.3%; a conditional
+  // store's blocks lost, cond_store +9.1%, L15-E749)
+  if (AGXDeviceUnrollStoreLightOneBlock && !Narrow && Stores && Store32 &&
+      Word && Light && !SomeStrided && NumLoads <= 2 && Trips >= 256 &&
+      L->getNumBlocks() == 1 && Divides(AGXDeviceUnrollStoreLightOneBlock))
+    return AGXDeviceUnrollStoreLightOneBlock;
+  if (AGXDeviceUnrollStoreLight && !Narrow && Stores && Store32 && Word &&
+      Light && !SomeStrided && NumLoads <= 2 && Trips >= 256 &&
+      Divides(AGXDeviceUnrollStoreLight))
+    return AGXDeviceUnrollStoreLight;
   if (!Narrow && Stores && Divides(AGXDeviceUnrollStore))
     return AGXDeviceUnrollStore;
   if (!Narrow && !Stores && Strided && Divides(AGXDeviceUnrollStrided))
     return AGXDeviceUnrollStrided;
+  // (a strided load beside contiguous ones: a naive matrix product's column
+  // of B beside A's row, L15-E535)
+  if (AGXDeviceUnrollSomeStrided && !Narrow && !Stores && SomeStrided &&
+      Divides(AGXDeviceUnrollStrided))
+    return AGXDeviceUnrollStrided;
+  // Two or more streams (no stores): a dot product's iteration is two loads
+  // and a multiply-add per element, so 4 iterations' loads still leave it
+  // waiting; one stream (a row sum, maximum or softmax) keeps 4.
+  // (loads of a word at most: 16, as their iterations' loads are a fourth
+  // of a 16-byte vector's, L15-E507)
+  // (and of 8 bytes at most: four halves, dot_f16x4 -7.3%, bf16_dot_rows
+  // -6.6%; 16-byte vectors keep 8, dot_vec4 +1.3% at 16, L15-E750)
+  if (!Narrow && !Stores && Streams.size() >= 2 &&
+      (Word || (DWord && AGXDeviceUnrollStreamsDWord)) &&
+      (Vectors || !AGXDeviceUnrollStreamsVectors) &&
+      Divides(AGXDeviceUnrollStreamsWord))
+    return AGXDeviceUnrollStreamsWord;
+  if (!Narrow && !Stores && Streams.size() >= 2 &&
+      (Vectors || !AGXDeviceUnrollStreamsVectors) &&
+      Divides(AGXDeviceUnrollStreams))
+    return AGXDeviceUnrollStreams;
+  // An arg-max / arg-min (a carried value chosen by a select on a compare
+  // against it, the index beside it): its compare-selects of 4 iterations
+  // leave it waiting on each 16-byte load; 16 keep 4 in flight
+  // (argmax_rows, L15-E552; a sum's carried adds lost, rowsum +16%); 32
+  // since E729 (argmax_thread -5.6%, argmax_rows -4.9%, L15-E752).
+  if (AGXDeviceUnrollArgMax && !Narrow && !Stores &&
+      any_of(L->getHeader()->phis(), [](const PHINode &P) {
+        return any_of(P.users(), [&](const User *U) {
+          auto *Sel = dyn_cast<SelectInst>(U);
+          auto *C = Sel ? dyn_cast<CmpInst>(Sel->getCondition()) : nullptr;
+          // (the compare also selects the index; or, a conditional count
+          // and sum, the value kept where the compare fails: L15-E555)
+          return C && !C->hasOneUse() &&
+                 (C->getOperand(0) == &P || C->getOperand(1) == &P ||
+                  (AGXDeviceUnrollCarriedSelect &&
+                   (Sel->getTrueValue() == &P ||
+                    Sel->getFalseValue() == &P)));
+        });
+      }) &&
+      Divides(AGXDeviceUnrollArgMax))
+    return AGXDeviceUnrollArgMax;
+  // (a loop of exponentials: their work between the loads takes an unroll
+  // of 8 without the registers that cost groups, online_softmax_vec4,
+  // L15-E542)
+  // (with the constants in uniforms only: their registers held, the
+  // unroll cost more than it hid, online_softmax_vec4 +0.9%)
+  if (AGXDeviceUnrollTranscendental && AGX::uniformConstantsEnabled() &&
+      any_of(L->blocks(), [](const BasicBlock *BB) {
+        return any_of(*BB, [](const Instruction &I) {
+          auto *II = dyn_cast<IntrinsicInst>(&I);
+          return II && (II->getIntrinsicID() == Intrinsic::exp ||
+                        II->getIntrinsicID() == Intrinsic::exp2);
+        });
+      }) &&
+      Divides(AGXDeviceUnrollTranscendental))
+    return AGXDeviceUnrollTranscendental;
   return AGXDeviceUnroll;
 }
 
@@ -388,7 +688,19 @@ void AGXTTIImpl::getUnrollingPreferences(
       return LI && LI->getPointerAddressSpace() == AGX::THREADGROUP_ADDRESS;
     });
   });
-  if (!ThreadgroupLoads && L->getNumBlocks() == 1) {
+  // (or a few blocks around a conditional store, y[j] = x[j] where x[j] > t:
+  // its loads one an iteration otherwise, L15-E572)
+  if (!ThreadgroupLoads &&
+      (L->getNumBlocks() == 1 ||
+       (AGXDeviceUnrollBlocks && L->isInnermost() &&
+        L->getNumBlocks() <= AGXDeviceUnrollBlocks &&
+        any_of(L->blocks(), [&](const BasicBlock *BB) {
+          return BB != L->getHeader() && any_of(*BB, [](const Instruction &I) {
+                   auto *SI = dyn_cast<StoreInst>(&I);
+                   return SI &&
+                          SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+                 });
+        })))) {
     // A loop that loads device memory, with a constant trip count the factor
     // divides (no remainder loop: static shapes): unrolled, its loads of
     // several iterations are in flight at once instead of one wait each
@@ -396,10 +708,535 @@ void AGXTTIImpl::getUnrollingPreferences(
     unsigned Trips = SE.getSmallConstantTripCount(L);
     bool DeviceLoads = false;
     unsigned F = deviceUnrollFactor(L, SE, DL, Trips, DeviceLoads);
+    // A loop-carried maximum / minimum (whose selects
+    // deferredMinMaxReductions rewrites only in a loop) stays a loop: not
+    // unrolled whole, by the factor or LoopUnroll's own full unrolling
+    // (L15-E511).
+    bool MinMax =
+        AGXDeviceUnrollKeepLoop && Trips > 16 &&
+        any_of(L->getHeader()->phis(), [](const PHINode &P) {
+          return any_of(P.users(), [](const User *U) {
+            auto *II = dyn_cast<IntrinsicInst>(U);
+            return II && (II->getIntrinsicID() == Intrinsic::maximum ||
+                          II->getIntrinsicID() == Intrinsic::minimum);
+          });
+        });
+    // (Short loops, 16 trips at most, still whole: newk's logsoftmax and
+    // softmax_f16 of 4 lost as loops.)
+    if (MinMax && F >= Trips && Trips > 16)
+      F = Trips / 2;
+    // (a short loop, at most 32 trips: whole, so that a later pass over the
+    // same data, also whole, takes its loads' and exponentials' values:
+    // L15-E545, softmax_f32v's third pass)
+    // (not a running maxnum / minnum either: online_softmax_exp2_maxnum lost)
+    bool NumMinMax = any_of(L->getHeader()->phis(), [](const PHINode &P) {
+      return any_of(P.users(), [](const User *U) {
+        auto *II = dyn_cast<IntrinsicInst>(U);
+        return II && (II->getIntrinsicID() == Intrinsic::maxnum ||
+                      II->getIntrinsicID() == Intrinsic::minnum ||
+                      II->getIntrinsicID() == Intrinsic::maximum ||
+                      II->getIntrinsicID() == Intrinsic::minimum);
+      });
+    });
+    // (and not past -agx-device-unroll-full-max-size instructions whole:
+    // a thread's 64-float row softmax, 64 trips, took 2521 machine
+    // instructions, L15-E551)
+    // (nor a row loop that stores, its loads affine and of objects no other
+    // loop of the function loads: whole, alias versioning's loop copy is
+    // lost and each load waits on the stores before it, axpy_c64 112.2
+    // against 80.2 at 4; a gather's loads, which no copy frees, and a
+    // softmax's passes over one row keep it, L15-E611)
+    auto LoneStoreRow = [&]() {
+      if (!AGXDeviceUnrollFullStoreRows)
+        return false;
+      bool Stores = false;
+      SmallPtrSet<const Value *, 4> Objects;
+      for (const Instruction &I : *L->getHeader()) {
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+          Stores |= SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+        auto *LI = dyn_cast<LoadInst>(&I);
+        if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+          continue;
+        if (!isa<SCEVAddRecExpr>(SE.getSCEV(const_cast<Value *>(LI->getPointerOperand()))))
+          return false; // a gather
+        Objects.insert(getUnderlyingObject(LI->getPointerOperand()));
+      }
+      if (!Stores)
+        return false;
+      for (const BasicBlock &BB : *L->getHeader()->getParent())
+        if (!L->contains(&BB))
+          for (const Instruction &I : BB)
+            if (auto *LI = dyn_cast<LoadInst>(&I))
+              if (Objects.contains(getUnderlyingObject(LI->getPointerOperand())))
+                return false;
+      return true;
+    };
+    bool StoreRow = DeviceLoads && Trips && F >= 2 && F < Trips &&
+                    LoneStoreRow();
+    if (!MinMax && !NumMinMax && DeviceLoads && Trips &&
+        Trips <= AGXDeviceUnrollFullTrips && F >= 2 && F < Trips &&
+        uint64_t(Trips) * L->getHeader()->size() <= AGXDeviceUnrollFullMaxSize &&
+        !StoreRow)
+      F = Trips;
+
     if (DeviceLoads && F >= 2 && Trips >= F && Trips % F == 0) {
       UP.Partial = true;
       UP.MaxCount = F;
       UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      // (nor LoopUnroll's own whole unrolling of such a row: axpy_c32's 32
+      // trips 60.6 against 56.2 at 16)
+      if (MinMax || StoreRow)
+        UP.FullUnrollMaxCount = F;
+    }
+    // A runtime trip count: a loop of light work per load and no stores
+    // (a matrix product's dot over K) unrolled with a remainder loop, its
+    // loads of several iterations in flight (L15-E536). Loops of
+    // transcendental work hide their loads behind it, and lost (xent_rows).
+    if (!Trips && DeviceLoads && AGXDeviceUnrollRuntime >= 2) {
+      unsigned Insts = 0, Far = 0;
+      bool Light = true, Gather = false, Exps = false, Other = false;
+      for (const Instruction &I : *L->getHeader()) {
+        ++Insts;
+        if (isa<StoreInst>(I) || (isa<CallBase>(I) && !isa<IntrinsicInst>(I)))
+          Light = false;
+        // (a load that does not step by its own size: a column, a gather;
+        // contiguous loads' unrolled copies (an FIR's taps) only took
+        // registers)
+        if (auto *LI = dyn_cast<LoadInst>(&I);
+            LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS) {
+          // (the pointer's step, or its GEP index's, an extended 32-bit one,
+          // times the element's size)
+          auto StepOf = [&](const SCEV *X) -> std::optional<APInt> {
+            auto *AR = dyn_cast<SCEVAddRecExpr>(X);
+            auto *C = AR && AR->getLoop() == L
+                          ? dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE))
+                          : nullptr;
+            if (!C)
+              return std::nullopt;
+            return C->getAPInt().sextOrTrunc(64);
+          };
+          const Value *Ptr = LI->getPointerOperand();
+          std::optional<APInt> Bytes = StepOf(SE.getSCEV(const_cast<Value *>(Ptr)));
+          if (auto *G = dyn_cast<GetElementPtrInst>(Ptr);
+              !Bytes && G && G->getNumIndices() == 1) {
+            const Value *Idx = G->getOperand(1);
+            if (auto *E = dyn_cast<CastInst>(Idx);
+                E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+              Idx = E->getOperand(0);
+            if (std::optional<APInt> St =
+                    StepOf(SE.getSCEV(const_cast<Value *>(Idx))))
+              Bytes = *St * DL.getTypeAllocSize(G->getSourceElementType());
+          }
+          Far += !Bytes || Bytes->abs().ugt(DL.getTypeStoreSize(LI->getType()));
+          // (a gather: an address that is no recurrence of the loop at all)
+          if (!Bytes) {
+            const SCEV *PS = SE.getSCEV(const_cast<Value *>(Ptr));
+            bool Rec = isa<SCEVAddRecExpr>(PS);
+            if (auto *G = dyn_cast<GetElementPtrInst>(Ptr);
+                !Rec && G && G->getNumIndices() == 1) {
+              const Value *Idx = G->getOperand(1);
+              if (auto *E = dyn_cast<CastInst>(Idx);
+                  E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+                Idx = E->getOperand(0);
+              Rec = isa<SCEVAddRecExpr>(SE.getSCEV(const_cast<Value *>(Idx)));
+            }
+            Gather |= !Rec;
+          }
+        }
+        // (light arithmetic only, and no running maximum / minimum, whose
+        // deferral, L15-E444, wants the loop: the causal / window rows lost)
+        if (auto *II = dyn_cast<IntrinsicInst>(&I))
+          switch (II->getIntrinsicID()) {
+          case Intrinsic::fma:
+          case Intrinsic::fmuladd:
+            break;
+          case Intrinsic::exp:
+          case Intrinsic::exp2:
+            Exps = true;
+            Light = false;
+            break;
+          default:
+            Light = false;
+            Other = true;
+          }
+        if (isa<CallBase>(I) && !isa<IntrinsicInst>(I))
+          Other = true;
+        if (I.getOpcode() == Instruction::FDiv || I.isAtomic())
+          Light = false;
+      }
+      // (a column of a runtime length, y[i][c] = f(x[i][c], w[i]): its trip
+      // count does not depend on the thread, as a grid-stride loop's
+      // (n - gid) / grid and a SIMD-group row's (n - lane) / 32 do, L15-E575)
+      auto ThreadFreeTrips = [&]() {
+        if (!AGXDeviceUnrollRuntimeColumns)
+          return false;
+        const SCEV *BTC = SE.getBackedgeTakenCount(L);
+        if (isa<SCEVCouldNotCompute>(BTC))
+          return false;
+        // (through the values SCEV does not see into, a lane's
+        // (n - 1 - lane) computed before the loop)
+        std::function<bool(const Value *, unsigned)> FromCall =
+            [&](const Value *V, unsigned Depth) {
+              if (isa<CallBase>(V))
+                return true;
+              auto *I = dyn_cast<Instruction>(V);
+              if (!I || Depth > 12)
+                return I != nullptr;
+              return any_of(I->operands(), [&](const Use &U) {
+                return FromCall(U.get(), Depth + 1);
+              });
+            };
+        return !SCEVExprContains(BTC, [&](const SCEV *X) {
+          auto *U = dyn_cast<SCEVUnknown>(X);
+          return U && FromCall(U->getValue(), 0);
+        });
+      };
+      // A row loop that stores (y[j] = f(x[j], w[j])): its contiguous word
+      // accesses, light arithmetic, unrolled with a remainder so that alias
+      // versioning's copy has iterations' loads to issue together
+      // (L15-E565).
+      if (!Light && (!Far || (!Gather && ThreadFreeTrips())) && Insts <= 24 &&
+          AGXDeviceUnrollRuntimeStores >= 2 &&
+          all_of(*L->getHeader(), [&](const Instruction &I) {
+            auto Size = [&](Type *Ty) {
+              unsigned B = DL.getTypeStoreSize(Ty);
+              return AGXDeviceUnrollRuntimeStoresNarrow ? B <= 4 : B == 4;
+            };
+            if (auto *SI = dyn_cast<StoreInst>(&I))
+              return SI->isSimple() &&
+                     SI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS &&
+                     Size(SI->getValueOperand()->getType());
+            if (auto *LI = dyn_cast<LoadInst>(&I))
+              return LI->isSimple() && Size(LI->getType());
+            if (auto *II = dyn_cast<IntrinsicInst>(&I))
+              return II->getIntrinsicID() == Intrinsic::fma ||
+                     II->getIntrinsicID() == Intrinsic::fmuladd ||
+                     II->getIntrinsicID() == Intrinsic::maxnum ||
+                     II->getIntrinsicID() == Intrinsic::minnum ||
+                     II->getIntrinsicID() == Intrinsic::maximum ||
+                     II->getIntrinsicID() == Intrinsic::minimum ||
+                     II->getIntrinsicID() == Intrinsic::fabs ||
+                     (AGXDeviceUnrollRuntimeStoresNarrow &&
+                      II->getIntrinsicID() == Intrinsic::roundeven) ||
+                     (AGXDeviceUnrollRuntimeExpStores &&
+                      (II->getIntrinsicID() == Intrinsic::exp ||
+                       II->getIntrinsicID() == Intrinsic::exp2)) ||
+                     (AGXDeviceUnrollRuntimeTanhStores &&
+                      II->getIntrinsicID() == Intrinsic::tanh) ||
+                     (AGXDeviceUnrollRuntimeMathStores &&
+                      (II->getIntrinsicID() == Intrinsic::log ||
+                       II->getIntrinsicID() == Intrinsic::log2 ||
+                       II->getIntrinsicID() == Intrinsic::sin ||
+                       II->getIntrinsicID() == Intrinsic::cos ||
+                       II->getIntrinsicID() == Intrinsic::sqrt));
+            return !isa<CallBase>(I) && !I.isAtomic() &&
+                   (I.getOpcode() != Instruction::FDiv ||
+                    AGXDeviceUnrollRuntimeDivStores);
+          })) {
+        UP.Partial = UP.Runtime = true;
+        // (4 times that for rows of halves or bytes, as E583's reductions:
+        // quant_dyn 534.0 -> 414.1, widen_dyn 345.6 -> 285.8, hscale_dyn
+        // 410.2 -> 280.6, twice 456.8 / 309.1 / 312.1, 8 times worse
+        // (505.6 / 427.2 / 474.9); a row of floats lost at 8,
+        // row_scale_dyn 453.9 -> 611.5, L15-E599, E600)
+        // (a row of bytes and halves both, int8 into halves or halves into
+        // int8, best at 4: deq_i8_f16_dyn 836.4 against 899.5 at 16 and
+        // 855.2 at 8, q_f16_i8_dyn 834.0 against 898.2 / 972.2, L15-E609)
+        auto HasSize = [&](unsigned B) {
+          return any_of(*L->getHeader(), [&](const Instruction &I) {
+            return (isa<LoadInst>(I) || isa<StoreInst>(I)) &&
+                   DL.getTypeStoreSize(getLoadStoreType(&I)->getScalarType()) ==
+                       B;
+          });
+        };
+        bool BytesAndHalves = HasSize(1) && HasSize(2);
+        bool NarrowRow =
+            AGXDeviceUnrollRuntimeNarrowStores && !BytesAndHalves &&
+            any_of(*L->getHeader(), [&](const Instruction &I) {
+              return (isa<LoadInst>(I) || isa<StoreInst>(I)) &&
+                     DL.getTypeStoreSize(
+                         getLoadStoreType(&I)->getScalarType()) < 4;
+            });
+        // (and twice for a column, its accesses a row's pitch apart:
+        // col_scale_dyn 533.5 -> 496.7, col_axpy_dyn 662.8 -> 602.4,
+        // col_relu_dyn 602.1 -> 547.4, L15-E602; 4 times since: 473.6,
+        // 573.3, 519.7, L15-E717)
+        bool Column = AGXDeviceUnrollRuntimeColumnStores && Far;
+        // (a column's running maximum, no store and every load a column's,
+        // as E603's column sums: col_max_dyn 262.6 -> 245.6, L15-E604)
+        unsigned Loads = count_if(*L->getHeader(), [](const Instruction &I) {
+          auto *LI = dyn_cast<LoadInst>(&I);
+          return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+        });
+        bool ColumnOnly = Column && AGXDeviceUnrollRuntimeColumnsOnly &&
+                          Far == Loads &&
+                          none_of(*L->getHeader(), [](const Instruction &I) {
+                            return isa<StoreInst>(I);
+                          });
+        // (and twice for a row of words whose loads are all the thread's
+        // own: iadd_i32_dyn 408.6 -> 361.0, row_axpy_dyn 585.8 -> 541.7; a
+        // vector every lane reads beside it lost, row_scale_dyn 453.9 ->
+        // 611.5, L15-E609; 4 times since: iadd_i32_dyn 333.7 -> 318.1,
+        // inplace_dyn 317.3 -> 300.2, L15-E717)
+        auto ThreadDependent = [](const Value *P) {
+          SmallPtrSet<const Value *, 32> Seen;
+          SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
+          while (!Work.empty()) {
+            auto [V, Depth] = Work.pop_back_val();
+            if (!Seen.insert(V).second)
+              continue;
+            if (auto *C = dyn_cast<CallBase>(V)) {
+              if (const Function *F = C->getCalledFunction();
+                  F && F->getName().starts_with("llvm.agx.thread."))
+                return true;
+              continue;
+            }
+            auto *I = dyn_cast<Instruction>(V);
+            if (!I || Depth >= 12)
+              continue;
+            for (const Value *Op : I->operands())
+              Work.push_back({Op, Depth + 1});
+          }
+          return false;
+        };
+        // (a loop that stores, of light work: a row's logarithms lost,
+        // log_dyn +1.9%, and a reduction of them, entropy_dyn +2.4%)
+        bool OwnRow =
+            AGXDeviceUnrollRuntimeOwnRows && !NarrowRow && !BytesAndHalves &&
+            !Column && Loads &&
+            any_of(*L->getHeader(),
+                   [](const Instruction &I) { return isa<StoreInst>(I); }) &&
+            all_of(*L->getHeader(), [&](const Instruction &I) {
+              if (I.getOpcode() == Instruction::FDiv)
+                return false;
+              if (auto *II = dyn_cast<IntrinsicInst>(&I))
+                switch (II->getIntrinsicID()) {
+                case Intrinsic::exp:
+                case Intrinsic::exp2:
+                case Intrinsic::log:
+                case Intrinsic::log2:
+                case Intrinsic::sin:
+                case Intrinsic::cos:
+                case Intrinsic::tanh:
+                case Intrinsic::sqrt:
+                // (a clamp's maximum and minimum: clamp_dyn +0.4%)
+                case Intrinsic::maximum:
+                case Intrinsic::minimum:
+                  return false;
+                default:
+                  break;
+                }
+              auto *LI = dyn_cast<LoadInst>(&I);
+              return !LI ||
+                     LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS ||
+                     ThreadDependent(LI->getPointerOperand());
+            });
+        // (twice, not E717's 4 times, with two stores an iteration:
+        // split_dyn 858.4 at twice, 869.6 at 4 times)
+        unsigned OwnRowFactor =
+            count_if(*L->getHeader(),
+                     [](const Instruction &I) { return isa<StoreInst>(I); }) > 1
+                ? 2
+                : AGXDeviceUnrollRuntimeOwnRowFactor;
+        // (8 times for an in-place row, its one store at a load's address:
+        // inplace_dyn 300.2 -> 278.7; a row stored elsewhere lost at 8,
+        // row_axpy_dyn +141%, L15-E748; 16 since L15-E768, inplace_dyn
+        // 278.7 -> 264.1)
+        if (OwnRowFactor == AGXDeviceUnrollRuntimeOwnRowFactor &&
+            AGXDeviceUnrollRuntimeInPlaceFactor &&
+            any_of(*L->getHeader(), [&](const Instruction &I) {
+              auto *St = dyn_cast<StoreInst>(&I);
+              return St && any_of(*L->getHeader(), [&](const Instruction &J) {
+                       auto *Ld = dyn_cast<LoadInst>(&J);
+                       return Ld && Ld->getPointerOperand() ==
+                                        St->getPointerOperand();
+                     });
+            }))
+          OwnRowFactor = AGXDeviceUnrollRuntimeInPlaceFactor;
+        // (a column's 8 times since E729's word indices: col_scale_dyn
+        // 473.6 -> 458.8, col_relu_dyn and col_axpy_dyn -2.5%, L15-E747)
+        // (twice for a plain row of heavy math: a sine, cosine, exponential,
+        // tanh, square root or division an element, or a logarithm in a row
+        // that stores nothing; the transcendental unit's latency hides
+        // behind more iterations' loads: sin_dyn 5453.6 -> 3656.9, entropy_dyn
+        // -6.3%, sqrtsum_dyn -6.0%, silu_dyn -4.2%; log_dyn's stored logs
+        // +0.8%, light rows up to +162%, L15-E809)
+        bool Stores = any_of(*L->getHeader(),
+                             [](const Instruction &I) { return isa<StoreInst>(I); });
+        bool Heavy = AGXDeviceUnrollRuntimeHeavyFactor > 1 &&
+                     any_of(*L->getHeader(), [&](const Instruction &I) {
+                       if (I.getOpcode() == Instruction::FDiv)
+                         return true;
+                       auto *II = dyn_cast<IntrinsicInst>(&I);
+                       if (!II)
+                         return false;
+                       switch (II->getIntrinsicID()) {
+                       case Intrinsic::sin:
+                       case Intrinsic::cos:
+                       case Intrinsic::exp:
+                       case Intrinsic::exp2:
+                       case Intrinsic::tanh:
+                       case Intrinsic::sqrt:
+                         return true;
+                       case Intrinsic::log:
+                       case Intrinsic::log2:
+                         return !Stores;
+                       default:
+                         return false;
+                       }
+                     });
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount =
+            AGXDeviceUnrollRuntimeStores *
+            (NarrowRow || ColumnOnly ? 4
+             : Column               ? AGXDeviceUnrollRuntimeColumnFactor
+             : OwnRow               ? OwnRowFactor
+             : Heavy                ? AGXDeviceUnrollRuntimeHeavyFactor
+                                    : 1);
+        UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      }
+      // A thread's own row of a runtime length (a row sum): its loads start
+      // at the thread position times a row's bytes, each thread's lines
+      // its own, unrolled with a remainder for their loads in flight
+      // (L15-E566). Not a filter's taps (x[i + k], the threads' loads one
+      // line: fir_taps lost, E536).
+      auto RowPerThread = [&]() {
+        for (const Instruction &I : *L->getHeader()) {
+          auto *LI = dyn_cast<LoadInst>(&I);
+          if (!LI || LI->getPointerAddressSpace() != AGX::DEVICE_ADDRESS)
+            continue;
+          auto *G = dyn_cast<GetElementPtrInst>(LI->getPointerOperand());
+          if (!G || G->getNumIndices() != 1)
+            continue;
+          const Value *Idx = G->getOperand(1);
+          if (auto *E = dyn_cast<CastInst>(Idx);
+              E && (isa<ZExtInst>(E) || isa<SExtInst>(E)))
+            Idx = E->getOperand(0);
+          auto *AR = dyn_cast<SCEVAddRecExpr>(
+              SE.getSCEV(const_cast<Value *>(Idx)));
+          if (!AR || AR->getLoop() != L)
+            continue;
+          SmallVector<const SCEV *, 4> Terms;
+          if (auto *A = dyn_cast<SCEVAddExpr>(AR->getStart()))
+            Terms.append(A->operands().begin(), A->operands().end());
+          else
+            Terms.push_back(AR->getStart());
+          for (const SCEV *T : Terms) {
+            auto *M = dyn_cast<SCEVMulExpr>(T);
+            if (!M || M->getNumOperands() != 2)
+              continue;
+            auto *C = dyn_cast<SCEVConstant>(M->getOperand(0));
+            const SCEV *X = M->getOperand(1);
+            while (auto *Cast = dyn_cast<SCEVCastExpr>(X))
+              X = Cast->getOperand();
+            auto *U = dyn_cast<SCEVUnknown>(X);
+            auto *Call = U ? dyn_cast<IntrinsicInst>(U->getValue()) : nullptr;
+            if (C && Call &&
+                (Call->getIntrinsicID() ==
+                     Intrinsic::agx_thread_position_in_grid_x ||
+                 Call->getIntrinsicID() ==
+                     Intrinsic::agx_thread_position_in_grid_y) &&
+                C->getAPInt().getZExtValue() *
+                        DL.getTypeAllocSize(G->getSourceElementType()) >=
+                    64)
+              return true;
+          }
+        }
+        return false;
+      };
+      // (8 for a row's one load an iteration, a sum: row_sum_dyn 354.4 at 4,
+      // 311.3 at 8; 4 for two, a dot: row_dot_dyn 488.3 at 4, 744.4 at 8)
+      unsigned RowLoads = count_if(*L->getHeader(), [](const Instruction &I) {
+        auto *LI = dyn_cast<LoadInst>(&I);
+        return LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS;
+      });
+      // (exponentials too, a softmax's sum, with -agx-device-unroll-runtime-exp:
+      // its loads are a thread's own row's)
+      bool LightOrExp =
+          Light || (AGXDeviceUnrollRuntimeExp && Exps && !Other &&
+                    none_of(*L->getHeader(), [](const Instruction &I) {
+                      return isa<StoreInst>(I) || I.isAtomic() ||
+                             I.getOpcode() == Instruction::FDiv;
+                    }));
+      // (a running maximum / minimum of a thread's own row, rowmax_dyn: as
+      // a sum, L15-E582)
+      bool LightMax =
+          AGXDeviceUnrollRuntimeMax && !Light &&
+          all_of(*L->getHeader(), [](const Instruction &I) {
+            if (isa<StoreInst>(I) || I.isAtomic() ||
+                I.getOpcode() == Instruction::FDiv)
+              return false;
+            if (auto *II = dyn_cast<IntrinsicInst>(&I))
+              return II->getIntrinsicID() == Intrinsic::fma ||
+                     II->getIntrinsicID() == Intrinsic::fmuladd ||
+                     II->getIntrinsicID() == Intrinsic::maxnum ||
+                     II->getIntrinsicID() == Intrinsic::minnum ||
+                     II->getIntrinsicID() == Intrinsic::maximum ||
+                     II->getIntrinsicID() == Intrinsic::minimum;
+            return !isa<CallBase>(I);
+          });
+      LightOrExp |= LightMax && Insts <= 24;
+      if (LightOrExp && !Far && Insts <= 48 &&
+          AGXDeviceUnrollRuntimeContiguous >= 2 && RowPerThread() &&
+          (Light ? Insts <= 24 : true)) {
+        UP.Partial = UP.Runtime = true;
+        unsigned Count = RowLoads == 1
+                             ? 2 * AGXDeviceUnrollRuntimeContiguous
+                             : unsigned(AGXDeviceUnrollRuntimeContiguous);
+        // (as many bytes an iteration from rows of halves or bytes as of
+        // floats: hsum_dyn 362.8 -> 317.3, bsum_dyn 579.3 -> 472.4,
+        // L15-E583)
+        if (AGXDeviceUnrollRuntimeNarrowRows && !Exps) {
+          unsigned MinBytes = 4;
+          for (const Instruction &I : *L->getHeader())
+            if (auto *LI = dyn_cast<LoadInst>(&I);
+                LI && LI->getPointerAddressSpace() == AGX::DEVICE_ADDRESS)
+              MinBytes = std::min<unsigned>(
+                  MinBytes, std::max<uint64_t>(
+                                1, DL.getTypeStoreSize(LI->getType())));
+          Count *= 4 / MinBytes;
+        }
+        // (twice that for a running maximum / minimum that propagates NaNs,
+        // or a select's on a compare with the running value, an argmax:
+        // each element's few instructions more, and the chains apart:
+        // row_max_dyn, rowmin_dyn, argmax_dyn -6 to -9% at 16; not maxnum's
+        // one instruction, rowmax_dyn +15%, L15-E686)
+        if (AGXDeviceUnrollRuntimeHeavyMax &&
+            any_of(*L->getHeader(), [&](const Instruction &I) {
+              if (auto *II = dyn_cast<IntrinsicInst>(&I))
+                return (II->getIntrinsicID() == Intrinsic::maximum ||
+                        II->getIntrinsicID() == Intrinsic::minimum) &&
+                       !(AGXDeviceUnrollRuntimeHeavyMaxSigned &&
+                         (II->hasNoSignedZeros() ||
+                          AGX::zeroSignFreeValue(
+                              *const_cast<IntrinsicInst *>(II))));
+              auto *Sel = dyn_cast<SelectInst>(&I);
+              auto *Cmp = Sel ? dyn_cast<FCmpInst>(Sel->getCondition()) : nullptr;
+              return Cmp && any_of(Sel->operands(), [&](const Value *V) {
+                       auto *P = dyn_cast<PHINode>(V);
+                       return P && P->getParent() == L->getHeader() &&
+                              is_contained(Cmp->operands(), P);
+                     });
+            }))
+          Count *= 2;
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount = Count;
+        UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      }
+      if (Light && Far && Insts <= 24) {
+        UP.Partial = UP.Runtime = true;
+        // (8 where the far loads step by a runtime stride, a column: matmul
+        // 141.3 -> 138.3, colsum_dyn 408.8 -> 323.1; a gather's 8 lost,
+        // spmv_csr 41.0 -> 45.0, L15-E537)
+        unsigned Count = Gather ? AGXDeviceUnrollRuntime
+                                : std::max<unsigned>(AGXDeviceUnrollRuntime,
+                                                     AGXDeviceUnrollRuntimeStrided);
+        // (twice that where every load is a column's: colsum_dyn 322.8 ->
+        // 295.6; with a row's beside it, a matrix product's, 16 lost: matmul
+        // 138.0 -> 146.5, L15-E603)
+        if (!Gather && AGXDeviceUnrollRuntimeColumnsOnly && Far == RowLoads)
+          Count *= 2;
+        UP.DefaultUnrollRuntimeCount = UP.MaxCount = Count;
+        UP.PartialThreshold = std::max(UP.PartialThreshold, 600u);
+      }
     }
     return;
   }

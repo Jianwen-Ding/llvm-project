@@ -34,17 +34,16 @@ define agx_kernel void @max_nsz(ptr addrspace(1) %p, float %a, float %b) {
   ret void
 }
 
-; minimum / maximum: a ugt b ? a : b (a NaN a is taken by the unordered
-; comparison), equal operands the and of their bits (canonicalized: two
-; denormals compare equal, and the hardware flushes f32 ones), and b where b
-; is a NaN (a NaN operand is a NaN result, no default NaN constant).
+; minimum / maximum: ltn(b, a) ? a : b, the larger, a NaN operand the result
+; (b where both are: the "n" condition makes a number lose to a NaN, L15-E452),
+; and equal operands the and of their bits (canonicalized: two denormals
+; compare equal, and the hardware flushes f32 ones).
 ; CHECK-LABEL: maximum:
 ; CHECK-DAG:   and [[B:r[0-9]+]], u2, u3
-; CHECK-DAG:   fcmpsel lte, [[M:r[0-9]+]], u2, u3, u3, u2
+; CHECK-DAG:   fcmpsel ltn, [[M:r[0-9]+]], u3, u2, u2, u3
 ; CHECK:       fmul32 [[C:r[0-9]+]], [[B]], 1.0
 ; CHECK:       fcmpsel eq, [[R:r[0-9]+]], u2, u3, [[C]], [[M]]
-; CHECK:       fcmpsel eq, [[R2:r[0-9]+]], u3, u3, [[R]], u3
-; CHECK-NEXT:  device_store 0, i32, x, [[R2]],
+; CHECK-NEXT:  device_store 0, i32, x, [[R]],
 ; CHECK-NOT:   mov_imm
 define agx_kernel void @maximum(ptr addrspace(1) %p, float %a, float %b) {
   %m = call float @llvm.maximum.f32(float %a, float %b)
@@ -73,3 +72,31 @@ define agx_kernel void @max_neg_zero(ptr addrspace(1) %p, float %a) {
   store float %m, ptr addrspace(1) %p
   ret void
 }
+
+; nsz minimum / maximum: one fcmpsel, ltn (gtn) on (b, a) selecting a or b: the
+; larger (smaller), a NaN operand the result, b where both are (L15-E452).
+; CHECK-LABEL: maximum_nsz:
+; CHECK:       fcmpsel ltn, [[R:r[0-9]+]], u3, u2, u2, u3
+; CHECK-NEXT:  device_store 0, i32, x, [[R]],
+define agx_kernel void @maximum_nsz(ptr addrspace(1) %p, float %a, float %b) {
+  %m = call nsz float @llvm.maximum.f32(float %a, float %b)
+  store float %m, ptr addrspace(1) %p
+  ret void
+}
+; CHECK-LABEL: minimum_nsz:
+; CHECK:       fcmpsel gtn, [[R:r[0-9]+]], u3, u2, u2, u3
+; CHECK-NEXT:  device_store 0, i32, x, [[R]],
+define agx_kernel void @minimum_nsz(ptr addrspace(1) %p, float %a, float %b) {
+  %m = call nsz float @llvm.minimum.f32(float %a, float %b)
+  store float %m, ptr addrspace(1) %p
+  ret void
+}
+; CHECK-LABEL: maximum_nsz_f16:
+; CHECK:       fcmpsel ltn, [[R:r[0-9]+]]l, u2h, u2l, u2l, u2h
+define agx_kernel void @maximum_nsz_f16(ptr addrspace(1) %p, half %a, half %b) {
+  %m = call nsz half @llvm.maximum.f16(half %a, half %b)
+  store half %m, ptr addrspace(1) %p
+  ret void
+}
+declare float @llvm.minimum.f32(float, float)
+declare half @llvm.maximum.f16(half, half)

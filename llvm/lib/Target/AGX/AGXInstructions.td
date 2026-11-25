@@ -223,6 +223,18 @@ def POPCOUNT_I32 : AGXALUPseudo<POPCOUNT_g13, (outs GPR32:$dst),
 def FFS_I32 : AGXALUPseudo<FFS_g13, (outs GPR32:$dst),
                            (ins SrcMods:$src0_mods, Src32Op:$src0), [],
                            [WriteIMul]>;
+// The same with a 16-bit source, zero-extended (recorded: coverage
+// alu/popcount_r14_r6l, ffs_r14_r6l, bitrev_r14_r6l); AGXFoldOperands puts
+// them in place of a zero extension's move and the 32-bit form (L15-E361).
+def BITREV_I32_FROM16 : AGXALUPseudo<BITREV_g13, (outs GPR32:$dst),
+                                     (ins SrcMods:$src0_mods, Src16Op:$src0),
+                                     [], [WriteIMul]>;
+def POPCOUNT_I32_FROM16 : AGXALUPseudo<POPCOUNT_g13, (outs GPR32:$dst),
+                                       (ins SrcMods:$src0_mods, Src16Op:$src0),
+                                       [], [WriteIMul]>;
+def FFS_I32_FROM16 : AGXALUPseudo<FFS_g13, (outs GPR32:$dst),
+                                  (ins SrcMods:$src0_mods, Src16Op:$src0), [],
+                                  [WriteIMul]>;
 def INTL_I32 : AGXALUPseudo<INTL_g13, (outs GPR32:$dst),
                             (ins SrcMods:$src0_mods, Src32Op:$src0,
                                  SrcMods:$src1_mods, Src32Op:$src1), [],
@@ -420,6 +432,12 @@ def : Pat<(i64 (add i64:$a, (sext i32:$x))),
           (IADD_I64_I32 0, $a, MOD_SX, $x, 0)>;
 def : Pat<(i64 (add i64:$a, (shl i64:$b, agx_iadd_shift:$s))),
           (IADD_I64 0, $a, 0, $b, imm:$s)>;
+def : Pat<(i64 (AGXadd_hi i64:$a, AGXIntSrc32:$bh)),
+          (REG_SEQUENCE GPR64, (i32 (EXTRACT_SUBREG $a, sub0)), sub0,
+            (IADD_I32 0, (i32 (EXTRACT_SUBREG $a, sub1)), 0, $bh, 0), sub1)>;
+def : Pat<(i64 (AGXsub_hi i64:$a, AGXIntSrc32:$bh)),
+          (REG_SEQUENCE GPR64, (i32 (EXTRACT_SUBREG $a, sub0)), sub0,
+            (ISUB_I32 0, (i32 (EXTRACT_SUBREG $a, sub1)), 0, $bh, 0), sub1)>;
 // The shift applies to the second source (and to the addend of imadd).
 // x << s alone, s at most 4: an addition to zero on the ALU, not a bfi on the
 // unit integer multiplies, bit fields and conversions share.
@@ -493,6 +511,17 @@ def : Pat<(i32 (or (srl i32:$lo, (i32 16)), (shl i32:$hi, (i32 16)))),
                                (i16 (EXTRACT_SUBREG $hi, lo16)), hi16)>;
 def : Pat<(i32 (or (i32 (zext i16:$lo)), (and i32:$hi, (i32 -65536)))),
           (REG_SEQUENCE GPR32, $lo, lo16, (i16 (EXTRACT_SUBREG $hi, hi16)), hi16)>;
+// x << 16 alone, in a loop: x's low half under a zero half, two moves of
+// the ALU's (the zero one hoisted out of the loop) instead of a bfi of the
+// shared unit's (a bfloat's widening: L15-E559; outside loops, two moves for
+// the bfi, axpy_bf16 lost).
+def agx_shift16 : PatLeaf<(i32 imm), [{
+  return N->getZExtValue() == 16 && llvm::AGX::shl16Halves() && inLoop() &&
+         fewShl16();
+}]>;
+def : Pat<(i32 (shl i32:$a, agx_shift16)),
+          (REG_SEQUENCE GPR32, (MOV_IMM16 0), lo16,
+                               (i16 (EXTRACT_SUBREG $a, lo16)), hi16)>;
 
 def : Pat<(i32 (sext_inreg i32:$a, i16)),
           (IADD_I32_FROM16 MOD_SX, (EXTRACT_SUBREG $a, lo16), 0, (i16 0), 0)>;
@@ -505,6 +534,13 @@ let AddedComplexity = 10 in {
 def : Pat<(i16 (trunc (srl i32:$a, (i32 16)))), (EXTRACT_SUBREG $a, hi16)>;
 def : Pat<(i16 (trunc (sra i32:$a, (i32 16)))), (EXTRACT_SUBREG $a, hi16)>;
 }
+// ... and x >> 16 itself, sign- or zero-extended: an iadd of the high half
+// (the ALU's, a source modifier), not an asr / bfeil on the shared unit
+// (int16 rows' pairs, the high element: L15-E563).
+def : Pat<(i32 (sra i32:$a, (i32 16))),
+          (IADD_I32_FROM16 MOD_SX, (i16 (EXTRACT_SUBREG $a, hi16)), 0, (i16 0), 0)>;
+def : Pat<(i32 (srl i32:$a, (i32 16))),
+          (IADD_I32_FROM16 0, (i16 (EXTRACT_SUBREG $a, hi16)), 0, (i16 0), 0)>;
 def : Pat<(i32 (trunc i64:$a)), (EXTRACT_SUBREG $a, sub0)>;
 def : Pat<(i32 (AGXhi32 i64:$a)), (EXTRACT_SUBREG $a, sub1)>;
 def : Pat<(i16 (trunc i64:$a)),
@@ -542,6 +578,48 @@ def IMSUB_I32 : AGXALUPseudo<IMSUB_g13, (outs GPR32:$dst),
                                   i32imm:$shift), [], [WriteIMul]>;
 def : Pat<(i32 (sub (mul AGXIntSrc32:$a, AGXIntSrc32:$b), AGXIntSrc32:$c)),
           (IMSUB_I32 0, $a, 0, $b, 0, $c, 0)>;
+
+// x + (a << s) for s of 5 to 7 (past iadd's 4-place shift), the shift used
+// only there: the shift is a bfi on the multiply / bit-field unit and then
+// an iadd; imadd of a by the 8-bit immediate 2^s (the same unit, 2.95 cycles
+// of latency and 2 of issue as the bfi, coverage/timing) is the whole of it
+// (L15-E318). (a << s) - x likewise with imsub. (A shift with other users
+// stays: its one bfi serves them all.)
+def agx_imadd_shift : ImmLeaf<i32, [{ return Imm >= 5 && Imm <= 7; }]>;
+def AGXPow2Imm : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(uint64_t(1) << N->getZExtValue(), SDLoc(N),
+                                   MVT::i32);
+}]>;
+def agx_shl_oneuse : PatFrag<(ops node:$a, node:$s), (shl node:$a, node:$s), [{
+  return N->hasOneUse();
+}]>;
+let AddedComplexity = 2 in {
+def : Pat<(i32 (add (agx_shl_oneuse AGXIntSrc32:$a, agx_imadd_shift:$s),
+                    AGXIntSrc32:$c)),
+          (IMADD_I32 0, $a, 0, (i32 (AGXPow2Imm $s)), 0, $c, 0)>;
+def : Pat<(i32 (sub (agx_shl_oneuse AGXIntSrc32:$a, agx_imadd_shift:$s),
+                    AGXIntSrc32:$c)),
+          (IMSUB_I32 0, $a, 0, (i32 (AGXPow2Imm $s)), 0, $c, 0)>;
+}
+// The exp expansion's ldexp, bits + (n << 23) with n a float's conversion,
+// likewise: 2^23 from a register, which its underflow test already has (one
+// mov_imm, MachineCSE's). Not other shifts past 7: an address's loop-
+// invariant shift, hoisted, and the register for the power cost more there
+// (sgemm_reg4x4, gemm_smem_tile) (L15-E457).
+def agx_imadd_shift_reg : ImmLeaf<i32, [{ return Imm == 23; }]>;
+def agx_shl_local_oneuse : PatFrag<(ops node:$a, node:$s), (shl node:$a, node:$s), [{
+  SDValue A = N->getOperand(0);
+  if (A.getOpcode() == ISD::FREEZE)
+    A = A.getOperand(0);
+  return N->hasOneUse() && (A.getOpcode() == ISD::FP_TO_SINT ||
+                            A.getOpcode() == ISD::FP_TO_SINT_SAT ||
+                            (A.getOpcode() == ISD::BITCAST &&
+                             A.getOperand(0).getValueType() == MVT::f32));
+}]>;
+let AddedComplexity = 1 in
+def : Pat<(i32 (add (agx_shl_local_oneuse AGXIntSrc32:$a, agx_imadd_shift_reg:$s),
+                    AGXIntSrc32:$c)),
+          (IMADD_I32 0, $a, 0, (MOV_IMM32 (AGXPow2Imm $s)), 0, $c, 0)>;
 
 // 32-bit adds, subtracts and multiply-adds of 16-bit values sign or zero
 // extended read the 16-bit registers (with .sx for the sign) instead of
@@ -629,6 +707,26 @@ def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), i64:$c)),
           (IMADD_I64_FROM32 0, $a, 0, $b, 0, $c, 0)>;
 def : Pat<(i64 (add (AGXmul_wide_s i32:$a, i32:$b), i64:$c)),
           (IMADD_I64_FROM32 MOD_SX, $a, MOD_SX, $b, 0, $c, 0)>;
+// and a zero-extended 32-bit addend: the 32-bit register itself as the
+// addend (the hardware extends it, as iadd's 32-bit sources: recorded as
+// imadd r14_r15, r6, r7, r8), not a pair with a zero high word (a move), nor
+// an iadd of the product after it (the 64-bit add on the unit the
+// multiply-add uses too: L15-E661; L15-E832)
+def IMADD_I64_C32 : AGXALUPseudo<IMADD_g13, (outs GPR64:$dst),
+                                 (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                      SrcMods:$src1_mods, Src32Op:$src1,
+                                      SrcMods:$src2_mods, Src32Op:$src2,
+                                      i32imm:$shift), [], [WriteALU64]>;
+let AddedComplexity = 1 in {
+def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), (zext i32:$c))),
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
+def : Pat<(i64 (add (mul (zext i32:$a), (zext i32:$b)), (zext i32:$c))),
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
+def : Pat<(i64 (add (AGXmul_wide_u i32:$a, i32:$b), (agx_build_pair i32:$c, (i32 0)))),
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
+def : Pat<(i64 (add (mul (zext i32:$a), (zext i32:$b)), (agx_build_pair i32:$c, (i32 0)))),
+          (IMADD_I64_C32 0, $a, 0, $b, 0, $c, 0)>;
+}
 def : Pat<(i32 (mulhu i32:$a, i32:$b)),
           (EXTRACT_SUBREG (IMADD_I64_FROM32 0, $a, 0, $b, 0, (i64 0), 0), sub1)>;
 def : Pat<(i32 (mulhs i32:$a, i32:$b)),
@@ -653,12 +751,17 @@ defm BFI_I32 : BitfieldPseudo<BFI_g13, GPR32, Src32Op>;
 defm BFEIL_I16 : BitfieldPseudo<BFEIL_g13, GPR16, Src16Op>;
 defm BFEIL_I32 : BitfieldPseudo<BFEIL_g13, GPR32, Src32Op>;
 defm EXTR_I32 : BitfieldPseudo<EXTR_g13, GPR32, Src32Op>;
+defm SHLHI_I32 : BitfieldPseudo<SHLHI_g13, GPR32, Src32Op>;
 
 def ASR_I16 : AGXALUPseudo<ASR_g13, (outs GPR16:$dst),
                            (ins SrcMods:$src0_mods, Src16Op:$src0,
                                 SrcMods:$src1_mods, Src16Op:$src1), [],
                            [WriteIMul]>;
 def ASR_I32 : AGXALUPseudo<ASR_g13, (outs GPR32:$dst),
+                           (ins SrcMods:$src0_mods, Src32Op:$src0,
+                                SrcMods:$src1_mods, Src32Op:$src1), [],
+                           [WriteIMul]>;
+def ASRH_I32 : AGXALUPseudo<ASRH_g13, (outs GPR32:$dst),
                            (ins SrcMods:$src0_mods, Src32Op:$src0,
                                 SrcMods:$src1_mods, Src32Op:$src1), [],
                            [WriteIMul]>;
@@ -685,10 +788,14 @@ def : Pat<(i32 (srl AGXIntSrc32:$a, AGXIntSrc32:$s)),
 def : Pat<(i32 (sra AGXIntSrc32:$a, AGXIntSrc32:$s)),
           (ASR_I32 0, $a, 0, $s)>;
 // x & (2^k - 1) beyond the 8-bit immediates: bfeil keeps the low k bits
-// without a mov_imm for the mask, unless the mask has other uses.
+// without a mov_imm for the mask, unless the mask has other uses. Not with
+// the constants in uniforms: the mask one, the and the ALU's, not the
+// shared unit's (a double's high word's magnitude, f64 emulation's, L15-E557).
 def agx_low_mask32 : PatLeaf<(imm), [{
   uint32_t V = N->getZExtValue();
-  return N->hasOneUse() && V > 0xff && isMask_32(V) && V != ~0u;
+  return N->hasOneUse() && V > 0xff && isMask_32(V) && V != ~0u &&
+         !(llvm::AGX::uniformConstantsEnabled() &&
+           llvm::AGX::lowMaskAndInUniforms());
 }]>;
 def AGXMaskWidth : SDNodeXForm<imm, [{
   return CurDAG->getTargetConstant(llvm::popcount(uint32_t(N->getZExtValue())),
@@ -739,6 +846,48 @@ def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
 def : Pat<(i16 (and (agx_srl_oneuse AGXIntSrc16:$a, (i16 imm:$s)),
                     agx_field_mask:$m)),
           (BFEIL_I16 0, (i16 0), 0, $a, 0, (i16 imm:$s), (AGXFieldWidth $m))>;
+// The field into the bits of a constant it leaves clear, (x >> s) & m | c
+// with c & m = 0: bfeil's base (a log's exponent as 2^23 + e, L15-E614).
+def agx_or_field_base : PatFrag<(ops node:$f, node:$c), (or node:$f, node:$c), [{
+  auto *C = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  SDValue F = N->getOperand(0);
+  auto *M = F.getOpcode() == ISD::AND
+                ? dyn_cast<ConstantSDNode>(F.getOperand(1)) : nullptr;
+  return C && M && F.hasOneUse() && !(C->getZExtValue() & M->getZExtValue());
+}]>;
+def : Pat<(i32 (agx_or_field_base
+                   (and (agx_srl_oneuse AGXIntSrc32:$a, (i32 imm:$s)),
+                        agx_field_mask:$m),
+                   AGXIntSrc32:$c)),
+          (BFEIL_I32 0, $c, 0, $a, 0, (i32 imm:$s), (AGXFieldWidth $m))>;
+// And x >> s itself, its top s bits clear: a field of width 32 - s.
+def agx_or_shift_base : PatFrag<(ops node:$f, node:$c), (or node:$f, node:$c), [{
+  auto *C = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  SDValue F = N->getOperand(0);
+  auto *S = F.getOpcode() == ISD::SRL
+                ? dyn_cast<ConstantSDNode>(F.getOperand(1)) : nullptr;
+  return C && S && F.hasOneUse() && S->getZExtValue() > 0 &&
+         S->getZExtValue() < 32 &&
+         !(C->getZExtValue() & (0xffffffffu >> S->getZExtValue()));
+}]>;
+def AGXShiftFieldWidth : SDNodeXForm<imm, [{
+  return CurDAG->getTargetConstant(32 - N->getZExtValue(), SDLoc(N), MVT::i32);
+}]>;
+def : Pat<(i32 (agx_or_shift_base (srl AGXIntSrc32:$a, (i32 imm:$s)),
+                                  AGXIntSrc32:$c)),
+          (BFEIL_I32 0, $c, 0, $a, 0, (i32 imm:$s), (AGXShiftFieldWidth $s))>;
+// (x & (2^k - 1)) << n by a register amount: one bfi of the field into 0
+// (its masked register offset recorded: coverage alu/bfi_r14_r6_r7_r8_mask_*;
+// an amount from 32 is poison in the IR) (L15-E358).
+def : Pat<(i32 (shl (and AGXIntSrc32:$a, agx_field_mask:$m), i32:$s)),
+          (BFI_I32 0, (i32 0), 0, $a, 0, $s, (AGXFieldWidth $m))>;
+// By a register amount too: bfeil's register offset is read in 7 bits (an
+// amount from 32 leaves 0, where the IR shift is poison), with the field's
+// width (recorded: coverage alu/bfeil_r14_r6_r7_r8_mask_0x1 ... 0xFFFF):
+// (x >> n) & 1, a bit test, in one instruction (L15-E357).
+def : Pat<(i32 (and (agx_srl_oneuse AGXIntSrc32:$a, i32:$s),
+                    agx_field_mask:$m)),
+          (BFEIL_I32 0, (i32 0), 0, $a, 0, $s, (AGXFieldWidth $m))>;
 // A half that is x >> 16 is x's high half register (a float rounded to
 // bfloat, packed with another), without the shift.
 let AddedComplexity = 2 in
@@ -807,8 +956,23 @@ def : Pat<(i32 (AGXbfi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
           (BFI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXextr7 AGXIntSrc32:$lo, AGXIntSrc32:$hi, AGXIntSrc32:$s)),
           (EXTR_I32 0, $lo, 0, $hi, 0, $s, 0)>;
+// A field of a 64-bit value by a register amount, trunc(x >> n) & (2^k - 1):
+// one extr with the field's width (its masked register-offset form recorded:
+// coverage alu/extr_r14_r6_r7_r8_mask_*) (L15-E359).
+def agx_extr7_oneuse : PatFrag<(ops node:$lo, node:$hi, node:$s),
+                               (AGXextr7 node:$lo, node:$hi, node:$s), [{
+  return N->hasOneUse();
+}]>;
+def : Pat<(i32 (and (agx_extr7_oneuse AGXIntSrc32:$lo, AGXIntSrc32:$hi,
+                                      AGXIntSrc32:$s),
+                    agx_field_mask:$m)),
+          (EXTR_I32 0, $lo, 0, $hi, 0, $s, (AGXFieldWidth $m))>;
+def : Pat<(i32 (AGXshlhi7 AGXIntSrc32:$a, AGXIntSrc32:$b, AGXIntSrc32:$s)),
+          (SHLHI_I32 0, $a, 0, $b, 0, $s, 0)>;
 def : Pat<(i32 (AGXsra7 AGXIntSrc32:$a, AGXIntSrc32:$s)),
           (ASR_I32 0, $a, 0, $s)>;
+def : Pat<(i32 (AGXasrh7 AGXIntSrc32:$a, AGXIntSrc32:$s)),
+          (ASRH_I32 0, $a, 0, $s)>;
 def : Pat<(i16 (shl AGXIntSrc16:$a, AGXIntSrc16:$s)),
           (BFI_I16 0, (i16 0), 0, $a, 0, $s, 0)>;
 def : Pat<(i16 (srl AGXIntSrc16:$a, AGXIntSrc16:$s)),
@@ -1040,6 +1204,26 @@ defm : SelectCCPats<ICMPSEL_I32, i32, f32, AGXIntSrc32, AGXIntConds, 0>;
 defm : SelectCCPats<ICMPSEL_I16_I32, i16, f32, AGXIntSrc16, AGXIntConds, 0>;
 defm : SelectCCPats<FCMPSEL_F32, f32, f32, AGXFPSrc32, AGXFPConds, 1>;
 defm : SelectCCPats<FCMPSEL_F16_I32, f16, f32, AGXFPSrc16, AGXFPConds, 1>;
+// 16-bit truth values selected on 32-bit comparisons, with 8-bit immediate
+// arms (the 0 / 1 of the and / or of comparisons, L15-E369).
+multiclass SelectCC16ImmPats<Instruction inst, ValueType cvt,
+                             ComplexPattern cpat, list<AGXCond> conds, bit fp> {
+  foreach C = conds in {
+    if fp then
+      def : Pat<(i16 (AGXtruthsel (i32 (setcc (cpat cvt:$a, i32:$am),
+                                              (cpat cvt:$b, i32:$bm), C.CC)),
+                                  AGXIntSrc16:$x, AGXIntSrc16:$y)),
+                !if(C.Swap, (inst C.HW, $am, $a, $bm, $b, 0, $y, 0, $x),
+                            (inst C.HW, $am, $a, $bm, $b, 0, $x, 0, $y))>;
+    else
+      def : Pat<(i16 (AGXtruthsel (i32 (setcc cpat:$a, cpat:$b, C.CC)),
+                                  AGXIntSrc16:$x, AGXIntSrc16:$y)),
+                !if(C.Swap, (inst C.HW, 0, $a, 0, $b, 0, $y, 0, $x),
+                            (inst C.HW, 0, $a, 0, $b, 0, $x, 0, $y))>;
+  }
+}
+defm : SelectCC16ImmPats<ICMPSEL_I32_I16, i32, AGXIntSrc32, AGXIntConds, 0>;
+defm : SelectCC16ImmPats<FCMPSEL_F32_I16, f32, AGXFPSrc32, AGXFPConds, 1>;
 foreach VT = [i16, f16, bf16] in {
 defm : SelectCCPats<ICMPSEL_I32_I16, i32, VT, AGXIntSrc32, AGXIntConds, 0>;
 defm : SelectCCPats<ICMPSEL_I16, i16, VT, AGXIntSrc16, AGXIntConds, 0>;
@@ -1057,6 +1241,91 @@ def : Pat<(f32 (select i32:$c, f32:$x, f32:$y)),
 foreach VT = [f16, bf16] in
 def : Pat<(VT (select i32:$c, VT:$x, VT:$y)),
           (ICMPSEL_I32_I16 IC_UEQ, 0, $c, 0, (i32 0), 0, $y, 0, $x)>;
+
+// Select on a boolean whose high 16 bits are known zero (a setcc, or a chain
+// of selects between them and 0 / 1: the and / or of comparisons): the
+// comparison of its low half with 0, the same test. The select then reads
+// at most two 32-bit registers, which issues in one cycle instead of two
+// (agx_cost PORT_BOUND, coverage/timing icmpsel / fcmpsel 16-bit forms;
+// L15-E366). Not relying on the boolean contents: the known bits decide.
+def agx_select_bool16 : PatFrag<(ops node:$c, node:$x, node:$y),
+                                (select node:$c, node:$x, node:$y), [{
+  // Only where the select would read three 32-bit registers: with a
+  // constant arm (an immediate) or one value twice it reads at most two
+  // already, and a 16-bit read of a just-written register is not forwarded.
+  SDValue C = N->getOperand(0), X = N->getOperand(1), Y = N->getOperand(2);
+  auto IsConst = [](SDValue V) {
+    return isa<ConstantSDNode>(V) || isa<ConstantFPSDNode>(V);
+  };
+  return AGXSelectBool16 && C.getValueType() == MVT::i32 &&
+         C.getOpcode() != ISD::ZERO_EXTEND && !IsConst(X) && !IsConst(Y) &&
+         X != Y && X.getValueSizeInBits() == 32 &&
+         CurDAG->computeKnownBits(C).countMinLeadingZeros() >= 16;
+}]>;
+let AddedComplexity = 1 in {
+def : Pat<(i32 (agx_select_bool16 i32:$c, AGXIntSrc32:$x, AGXIntSrc32:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+def : Pat<(f32 (agx_select_bool16 i32:$c, f32:$x, f32:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+def : Pat<(i16 (agx_select_bool16 i32:$c, AGXIntSrc16:$x, AGXIntSrc16:$y)),
+          (ICMPSEL_I16 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                       (i16 0), 0, $y, 0, $x)>;
+foreach VT = [f16, bf16] in
+def : Pat<(VT (agx_select_bool16 i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                       (i16 0), 0, $y, 0, $x)>;
+}
+
+// A select between two 32-bit registers on a sign test x < 0 (bit 31 only)
+// compares x's high half (a signed 16-bit compare with 0), and on x == 0 or
+// x != 0 the half that is not known zero: two 32-bit registers read, not
+// three, the one-cycle icmpsel (agx_cost PORT_BOUND; L15-E372). As
+// agx_select_bool16, only where the arms are two different registers.
+class AGXHalfTest<CondCode CC, string Half> : PatFrag<(ops node:$c, node:$x, node:$y),
+    (select (i32 (setcc node:$c, (i32 0), CC)), node:$x, node:$y), [{
+  if (!AGXSelectHalfTests)
+    return false;
+  SDValue C = N->getOperand(0).getOperand(0), X = N->getOperand(1),
+          Y = N->getOperand(2);
+  auto IsConst = [](SDValue V) {
+    return isa<ConstantSDNode>(V) || isa<ConstantFPSDNode>(V);
+  };
+  if (C.getValueType() != MVT::i32 || IsConst(X) || IsConst(Y) || X == Y ||
+      X.getValueSizeInBits() != 32 || C.getOpcode() == ISD::ZERO_EXTEND)
+    return false;
+  StringRef H = "}] # Half # [{";
+  if (H == "sign")
+    return true;
+  KnownBits K = CurDAG->computeKnownBits(C);
+  if (H == "lo")
+    return K.Zero.countl_one() >= 16;
+  return K.Zero.countl_one() < 16 && K.Zero.countr_one() >= 16;
+}]>;
+def agx_sel_sign : AGXHalfTest<SETLT, "sign">;
+def agx_sel_eq_lo : AGXHalfTest<SETEQ, "lo">;
+def agx_sel_ne_lo : AGXHalfTest<SETNE, "lo">;
+def agx_sel_eq_hi : AGXHalfTest<SETEQ, "hi">;
+def agx_sel_ne_hi : AGXHalfTest<SETNE, "hi">;
+let AddedComplexity = 2 in
+foreach VT = [i32, f32] in {
+def : Pat<(VT (agx_sel_sign i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_SLT, 0, (i16 (EXTRACT_SUBREG $c, hi16)), 0,
+                           (i16 0), 0, $x, 0, $y)>;
+def : Pat<(VT (agx_sel_eq_lo i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $x, 0, $y)>;
+def : Pat<(VT (agx_sel_ne_lo i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, lo16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+def : Pat<(VT (agx_sel_eq_hi i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, hi16)), 0,
+                           (i16 0), 0, $x, 0, $y)>;
+def : Pat<(VT (agx_sel_ne_hi i32:$c, VT:$x, VT:$y)),
+          (ICMPSEL_I16_I32 IC_UEQ, 0, (i16 (EXTRACT_SUBREG $c, hi16)), 0,
+                           (i16 0), 0, $y, 0, $x)>;
+}
 
 // Select on a 16-bit value widened to 32 bits (booleans shared by several
 // i16 operations, which type legalization keeps as i16): the comparison of
@@ -1105,6 +1374,16 @@ def : Pat<(f16 (fminnum f16:$a, f16:$b)),
           (FCMPSEL_F16 FC_LTN, 0, $a, 0, $b, 0, $a, 0, $b)>;
 def : Pat<(f16 (fmaxnum f16:$a, f16:$b)),
           (FCMPSEL_F16 FC_GTN, 0, $a, 0, $b, 0, $a, 0, $b)>;
+// ltn(b, a) is b < a, or a NaN a against a number b: a is taken where it is
+// larger or a NaN, b otherwise (b a NaN or both NaNs). Likewise gtn.
+def : Pat<(f32 (AGXfmax_nanprop f32:$a, f32:$b)),
+          (FCMPSEL_F32 FC_LTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
+def : Pat<(f32 (AGXfmin_nanprop f32:$a, f32:$b)),
+          (FCMPSEL_F32 FC_GTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
+def : Pat<(f16 (AGXfmax_nanprop f16:$a, f16:$b)),
+          (FCMPSEL_F16 FC_LTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
+def : Pat<(f16 (AGXfmin_nanprop f16:$a, f16:$b)),
+          (FCMPSEL_F16 FC_GTN, 0, $b, 0, $a, 0, $a, 0, $b)>;
 
 //===----------------------------------------------------------------------===//
 // Floating point arithmetic
@@ -1542,6 +1821,11 @@ def : Pat<(i16 (AGXcvt_f_to_s8 (f16 (RN8 f16:$a)))), (CONVERT_16_16 CVT_F_TO_S8_
 }
 def : Pat<(f32 (sint_to_fp i32:$a)), (CONVERT_32_32 CVT_S32_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (uint_to_fp i32:$a)), (CONVERT_32_32 CVT_U32_TO_F, 0, $a, ROUND_RTE)>;
+// Toward zero: the modes without the round-to-nearest bit (mode bit 1; the
+// "round" operand is the direction, integer to float), 8 unsigned and 9
+// signed 32-bit (the coverage recordings' mode8_round1 / mode9_round1).
+def : Pat<(f32 (int_agx_uitofp_rtz i32:$a)), (CONVERT_32_32 8, 0, $a, ROUND_RTE)>;
+def : Pat<(f32 (int_agx_sitofp_rtz i32:$a)), (CONVERT_32_32 9, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (sint_to_fp i16:$a)), (CONVERT_32_16 CVT_S16_TO_F, 0, $a, ROUND_RTE)>;
 def : Pat<(f32 (uint_to_fp i16:$a)), (CONVERT_32_16 CVT_U16_TO_F, 0, $a, ROUND_RTE)>;
 // Zero-extended bytes often arrive as i16 after vector load legalization.
@@ -2221,6 +2505,10 @@ defm QUAD_SHUFFLE : ShufflePseudo<QUAD_SHUFFLE_g13, int_agx_quad_shuffle>;
 defm QUAD_SHUFFLE_XOR : ShufflePseudo<QUAD_SHUFFLE_XOR_g13, int_agx_quad_shuffle_xor>;
 defm QUAD_SHUFFLE_UP : ShufflePseudo<QUAD_SHUFFLE_UP_g13, int_agx_quad_shuffle_up>;
 defm QUAD_SHUFFLE_DOWN : ShufflePseudo<QUAD_SHUFFLE_DOWN_g13, int_agx_quad_shuffle_down>;
+defm SIMD_SHUFFLE_ROTATE_UP : ShufflePseudo<SIMD_SHUFFLE_ROTATE_UP_g13,
+                                           int_agx_simd_shuffle_rotate_up>;
+defm QUAD_SHUFFLE_ROTATE_UP : ShufflePseudo<QUAD_SHUFFLE_ROTATE_UP_g13,
+                                           int_agx_quad_shuffle_rotate_up>;
 
 let isConvergent = 1 in {
 def ICMP_BALLOT : AGXALUPseudo<ICMP_BALLOT_g13, (outs GPR32:$dst),
@@ -2458,6 +2746,18 @@ def : Pat<(i32 (srl (sra i32:$x, (i32 31)), agx_low_mask_shift:$s)),
           (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0,
                        (i32 (agx_low_mask_of_shift $s)), 0, (i32 0))>;
 
+// x ^ ((x < 0) ? c : 0), the conditional xor of an order-preserving float
+// key (MLIR's maximumf / minimumf subgroup reductions: c = 0x7fffffff, in
+// and out): (x < 0) ? x ^ c : x, a bitop and an icmpsel instead of an asr,
+// an and and the xor (L15-E459). (Not for an 8-bit c: the and is an icmpsel
+// above, the same count.)
+def agx_not_imm8_mask : PatLeaf<(i32 imm), [{
+  return !isUInt<8>(N->getZExtValue());
+}]>;
+def : Pat<(i32 (xor i32:$x, (and (sra i32:$x, (i32 31)), agx_not_imm8_mask:$c))),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0,
+                       (BITOP_I32 TT_XOR, 0, $x, 0, (MOV_IMM32 imm:$c)), 0, $x)>;
+
 // The same on 16 bits: (x < 0) ? m : 0 from and(sra(x, 15), m) and
 // srl(sra(x, 15), 16 - k).
 def agx_imm8_16 : ImmLeaf<i16, [{ return isUInt<8>(Imm); }]>;
@@ -2508,6 +2808,23 @@ def : Pat<(i16 (sub i16:$x, (and (add i16:$x, i16:$b), agx_neg_pow2_8_16:$c))),
 // with an icmpsel AGXFoldOperands folds into the branch.
 def : Pat<(i32 (srl (xor i32:$x, -1), (i32 31))),
           (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 0), 0, (i32 1))>;
+// and the sign bit itself, x < 0 (a double's sign in the f64 emulation:
+// L15-E558)
+def agx_sign_shift : PatLeaf<(i32 imm), [{
+  return N->getZExtValue() == 31 && llvm::AGX::signBitCompares();
+}]>;
+def : Pat<(i32 (srl i32:$x, agx_sign_shift)),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0, (i32 0))>;
+// and its splat, x >> 31 (arithmetic), x < 0 ? -1 : 0, where -1 is a
+// uniform (with the constants in uniforms; in a register otherwise: a mov_imm
+// held for it), not an asr on the shared unit (L15-E562)
+def agx_sign_splat : PatLeaf<(i32 imm), [{
+  return N->getZExtValue() == 31 && llvm::AGX::uniformConstantsEnabled() &&
+         llvm::AGX::signSplatCompares();
+}]>;
+def : Pat<(i32 (sra i32:$x, agx_sign_splat)),
+          (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (MOV_IMM32 -1), 0,
+                       (i32 0))>;
 def : Pat<(AGXif (i32 (srl i32:$x, (i32 31))), bb:$t),
           (AGX_IF (ICMPSEL_I32 IC_SLT, 0, $x, 0, (i32 0), 0, (i32 1), 0,
                                (i32 0)), bb:$t)>;

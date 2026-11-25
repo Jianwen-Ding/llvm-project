@@ -142,6 +142,9 @@ def int_agx_quad_shuffle : AGXSIMDShuffleIntrinsic;
 def int_agx_quad_shuffle_xor : AGXSIMDShuffleIntrinsic;
 def int_agx_quad_shuffle_up : AGXSIMDShuffleIntrinsic;
 def int_agx_quad_shuffle_down : AGXSIMDShuffleIntrinsic;
+// lane i reads lane (i - delta) mod 32 (mod 4 within the quad)
+def int_agx_simd_shuffle_rotate_up : AGXSIMDShuffleIntrinsic;
+def int_agx_quad_shuffle_rotate_up : AGXSIMDShuffleIntrinsic;
 
 class AGXBallotIntrinsic
     : DefaultAttrsIntrinsic<[llvm_i32_ty], [llvm_i1_ty],
@@ -212,6 +215,12 @@ class AGXFloatUnaryIntrinsic
 // Hardware approximations, without any special case handling beyond what
 // the instruction does.
 def int_agx_rcp : AGXFloatUnaryIntrinsic;
+// A 32-bit integer converted to float rounded toward zero (the convert
+// instruction's truncating integer-to-float modes).
+def int_agx_uitofp_rtz : DefaultAttrsIntrinsic<[llvm_float_ty], [llvm_i32_ty],
+                                               [IntrNoMem, IntrSpeculatable]>;
+def int_agx_sitofp_rtz : DefaultAttrsIntrinsic<[llvm_float_ty], [llvm_i32_ty],
+                                               [IntrNoMem, IntrSpeculatable]>;
 def int_agx_rsqrt : AGXFloatUnaryIntrinsic;
 // rsqrt with special cases chosen so that rsqrt_special(x) * x == sqrt(x).
 def int_agx_rsqrt_special : AGXFloatUnaryIntrinsic;

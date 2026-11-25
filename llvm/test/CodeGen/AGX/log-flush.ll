@@ -6,8 +6,10 @@
 ; simulator's functional model over every exponent's edges, denormals and
 ; random words).
 
+; (2^23 itself is the base of the exponent's bfeil since L15-E614: no
+; multiply of x.)
 ; CHECK-LABEL: lg:
-; CHECK-NOT: mov_imm {{r[0-9]+}}, 1258291200
+; CHECK-NOT: fmul32 {{.*}}u2
 ; CHECK: stop
 define agx_kernel void @lg(ptr addrspace(1) %p, float %x) {
   %r = call float @llvm.log.f32(float %x)

@@ -17,16 +17,19 @@
 // generic load / store clustering needs base + offset operands; AGX addresses
 // are a base and a register index, so this clusters by program order instead.
 //
-// Device loads and stores and threadgroup stores are clustered by default,
-// in runs of up to 16. In agx-bench (agx_cost) stores alone lowered the
+// All four kinds are clustered by default, in runs of up to 16. In agx-bench (agx_cost) stores alone lowered the
 // PTX tests by 0.8% and agx_libs by 9.5%; the real-world CUDA kernels
 // (kernels/cuda_*.ll) showed what device loads add: decode attention -34%,
 // RGBA8 blur -28%, q4_0 / q8_0 mat-vec -10% / -5%, 3.8% in total, with only
 // index_add on G13 slower (+17%). Runs of 4 or 6 loads lose (+0.2% to +0.7%):
-// the attention loop's 8 loads must stay together. Threadgroup loads stay
-// apart: they speed up tiled SGEMM and n-body but take SGEMM from 70 to 77
-// GPRs (occupancy, which agx_cost does not model) and slow the f64 dot
-// product by 33%.
+// the attention loop's 8 loads must stay together. Threadgroup loads were
+// kept apart at first (SGEMM 70 -> 77 GPRs, the f64 dot product +33%); with
+// the measured threadgroup load issue hold in agx_cost (an ALU instruction
+// between two threadgroup loads, or between a load and its reader, delays
+// the load) and the post-RA preference for a load's reader, clustering them
+// takes SGEMM from 67 to 54 GPRs (EXPERIMENTS.md L15-E255). After register
+// allocation, the readers' other operands (store addresses) go before such a
+// run.
 //
 //===----------------------------------------------------------------------===//
 
@@ -37,9 +40,13 @@
 #include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "agx-mem-cluster"
 
 static cl::opt<unsigned> AGXMemClusterSize(
     "agx-mem-cluster", cl::Hidden, cl::init(16),
@@ -47,9 +54,40 @@ static cl::opt<unsigned> AGXMemClusterSize(
              "keeps together (0 or 1: off)"));
 
 static cl::opt<unsigned> AGXMemClusterKinds(
-    "agx-mem-cluster-kinds", cl::Hidden, cl::init(11),
+    "agx-mem-cluster-kinds", cl::Hidden, cl::init(15),
     cl::desc("Mask of the AGX memory access kinds to cluster (1 device load, "
              "2 device store, 4 threadgroup load, 8 threadgroup store)"));
+
+static cl::opt<int> AGXMemClusterKindsPostRA(
+    "agx-mem-cluster-kinds-post-ra", cl::Hidden, cl::init(-1),
+    cl::desc("Mask of the kinds to cluster after register allocation (-1: "
+             "agx-mem-cluster-kinds)"));
+
+static cl::opt<unsigned> AGXTGLoadReaderOperandsFirst(
+    "agx-tg-load-reader-operands-first", cl::Hidden, cl::init(2),
+    cl::desc("Before a run of threadgroup loads, the other operands of their "
+             "readers that do not depend on the loads (1 before, 2 after "
+             "register allocation)"));
+
+static cl::opt<bool> AGXLoadsAfterStores(
+    "agx-sched-loads-after-stores", cl::Hidden, cl::init(true),
+    cl::desc("Keep device loads after the device stores before them in "
+             "program order in a thread's row loop of light work"));
+
+static cl::opt<bool> AGXLightRowStoresApart(
+    "agx-sched-light-row-stores-apart", cl::Hidden, cl::init(true),
+    cl::desc("No clusters of device stores in -agx-sched-loads-after-stores' "
+             "regions"));
+
+static cl::opt<unsigned> AGXLoadsAfterStoresWork(
+    "agx-sched-loads-after-stores-work", cl::Hidden, cl::init(125),
+    cl::desc("-agx-sched-loads-after-stores' most instructions for every 4 "
+             "bytes accessed, in hundredths"));
+
+static cl::opt<unsigned> AGXHeavyStoresApart(
+    "agx-sched-heavy-stores-apart", cl::Hidden, cl::init(64),
+    cl::desc("No clusters of device stores in a region of more than this "
+             "many instructions for every 32-bit word it stores (0: off)"));
 
 namespace {
 
@@ -90,6 +128,125 @@ int memKind(const MachineInstr &MI) {
   }
 }
 
+/// Whether V is (or is computed from) a thread position.
+static bool fromThreadPosition(const Value *V) {
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<std::pair<const Value *, unsigned>, 16> Work{{V, 0}};
+  while (!Work.empty()) {
+    auto [X, Depth] = Work.pop_back_val();
+    if (!Seen.insert(X).second)
+      continue;
+    if (auto *C = dyn_cast<CallBase>(X)) {
+      if (const Function *F = C->getCalledFunction();
+          F && F->getName().starts_with("llvm.agx.thread."))
+        return true;
+      continue;
+    }
+    auto *I = dyn_cast<Instruction>(X);
+    if (!I || Depth >= 12)
+      continue;
+    for (const Value *Op : I->operands())
+      Work.push_back({Op, Depth + 1});
+  }
+  return false;
+}
+
+/// Whether the address P is in a thread's own row: a thread position times
+/// 16 or more (a multiply or shift by a constant) in its computation.
+static bool threadRowAddress(const Value *P) {
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<std::pair<const Value *, unsigned>, 16> Work{{P, 0}};
+  while (!Work.empty()) {
+    auto [X, Depth] = Work.pop_back_val();
+    auto *I = dyn_cast<Instruction>(X);
+    if (!I || isa<CallBase>(I) || Depth >= 12 || !Seen.insert(I).second)
+      continue;
+    if (I->getOpcode() == Instruction::Mul ||
+        I->getOpcode() == Instruction::Shl) {
+      if (auto *C = dyn_cast<ConstantInt>(I->getOperand(1))) {
+        uint64_t F = I->getOpcode() == Instruction::Mul
+                         ? C->getZExtValue()
+                         : (C->getZExtValue() < 32 ? 1ull << C->getZExtValue()
+                                                   : 0);
+        if (F >= 16 && fromThreadPosition(I->getOperand(0)))
+          return true;
+      }
+    }
+    for (const Value *Op : I->operands())
+      Work.push_back({Op, Depth + 1});
+  }
+  return false;
+}
+
+/// A region whose device loads should stay after the device stores before
+/// them (L15-E589): a loop over a thread's own rows (every store's address
+/// a thread position times 16 or more), of light work (at most 1.25
+/// instructions besides its device accesses for every 4 bytes they access,
+/// -agx-sched-loads-after-stores-work; per access, L15-E591, its 16-byte
+/// stores of halves would have counted twice as much), that loads at most
+/// 2.5 times the bytes it stores.
+/// With many SIMD-groups resident, its next loads ahead of its last stores
+/// stalled the core's memory pipelines (row_scale's tput -28%, gather_rows
+/// -38%, widen_f16 -27% kept after them, fewer registers besides); columns
+/// (col_softmax_norm +20%) and transcendental rows (row_exp +2.9%) gained
+/// from the loads ahead.
+static bool loadsAfterStores(ScheduleDAGInstrs *DAG) {
+  unsigned Loads = 0, Stores = 0, Work = 0;
+  uint64_t LoadBytes = 0, StoreBytes = 0;
+  for (SUnit &SU : DAG->SUnits) {
+    const MachineInstr &MI = *SU.getInstr();
+    int K = memKind(MI);
+    for (const MachineMemOperand *MMO : MI.memoperands())
+      if (MMO->getSize().hasValue())
+        (K == DeviceStore ? StoreBytes : LoadBytes) +=
+            K == DeviceStore || K == DeviceLoad
+                ? MMO->getSize().getValue().getKnownMinValue()
+                : 0;
+    if (K == DeviceStore) {
+      ++Stores;
+      for (const MachineMemOperand *MMO : MI.memoperands())
+        if (!MMO->getValue() || !threadRowAddress(MMO->getValue()))
+          return false;
+      if (MI.memoperands_empty())
+        return false;
+    }
+    Loads += K == DeviceLoad;
+    // (not the register tuples and halves a vector's pieces make)
+    Work += K < 0 && !MI.isCopyLike() && !MI.isRegSequence() &&
+            !MI.isInsertSubreg() && !MI.isExtractSubreg() &&
+            !MI.isImplicitDef() && !MI.isTerminator();
+  }
+  LLVM_DEBUG(dbgs() << "agx-mem-cluster: loads-after-stores " << Loads << " "
+                    << Stores << " work " << Work << " bytes " << LoadBytes
+                    << " " << StoreBytes << "\n");
+  // (and loading at most 2.5 times the bytes it stores: three rows into one,
+  // row_norm_apply, and floats into bytes, to_u8 / quant_rows, lost 1-6%)
+  return Stores && Loads &&
+         400 * uint64_t(Work) <=
+             AGXLoadsAfterStoresWork * (LoadBytes + StoreBytes) &&
+         2 * LoadBytes <= 5 * StoreBytes;
+}
+
+/// Whether the region's work for every stored word exceeds N instructions:
+/// clustered, its stores wait for every value of the run, all live at once
+/// (logpow_rows: 16 results of 70 instructions each, 34 -> 54 GPRs with
+/// E648's shorter pow, L15-E648).
+static bool heavyStores(ScheduleDAGInstrs *DAG, unsigned N) {
+  uint64_t Work = 0, StoreBytes = 0;
+  for (SUnit &SU : DAG->SUnits) {
+    const MachineInstr &MI = *SU.getInstr();
+    int K = memKind(MI);
+    if (K == DeviceStore)
+      for (const MachineMemOperand *MMO : MI.memoperands())
+        if (MMO->getSize().hasValue())
+          StoreBytes += MMO->getSize().getValue().getKnownMinValue();
+    Work += K < 0 && !MI.isCopyLike() && !MI.isRegSequence() &&
+            !MI.isInsertSubreg() && !MI.isExtractSubreg() &&
+            !MI.isImplicitDef() && !MI.isTerminator();
+  }
+  return StoreBytes && 4 * Work > uint64_t(N) * StoreBytes;
+}
+
 class AGXMemClusterMutation : public ScheduleDAGMutation {
 public:
   void apply(ScheduleDAGInstrs *DAG) override;
@@ -98,11 +255,44 @@ public:
 void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
   if (AGXMemClusterSize < 2)
     return;
+  bool PreRA = static_cast<ScheduleDAGMI *>(DAG)->hasVRegLiveness();
+  unsigned Kinds = AGXMemClusterKinds;
+  if (AGXMemClusterKindsPostRA >= 0 && !PreRA)
+    Kinds = AGXMemClusterKindsPostRA;
+  // A device load stays after the device stores before it in a thread's
+  // row of light work (loadsAfterStores, L15-E589).
+  bool LoadsFollowStores = false;
+  if (AGXLoadsAfterStores && loadsAfterStores(DAG)) {
+    SmallVector<SUnit *, 16> Stores;
+    for (SUnit &SU : DAG->SUnits) {
+      int K = memKind(*SU.getInstr());
+      if (K == DeviceStore)
+        Stores.push_back(&SU);
+      else if (K == DeviceLoad)
+        for (SUnit *St : Stores)
+          DAG->addEdge(&SU, SDep(St, SDep::Artificial));
+    }
+    // (a run of loads ends at a store the later loads now follow)
+    LoadsFollowStores = true;
+    // Nor do its stores wait for each other's values: a row of light work
+    // stores each value as it is ready (widen_dyn: two 16-byte stores of
+    // converted halves, held together, took 4 more GPRs, L15-E619).
+    if (AGXLightRowStoresApart)
+      Kinds &= ~(1u << DeviceStore);
+  }
+  if (AGXHeavyStoresApart && heavyStores(DAG, AGXHeavyStoresApart)) {
+    LLVM_DEBUG(dbgs() << "agx-mem-cluster: heavy stores apart in "
+                      << printMBBReference(*DAG->begin()->getParent())
+                      << "\n");
+    Kinds &= ~(1u << DeviceStore);
+  }
   EquivalenceClasses<SUnit *> Clusters;
   SmallVector<SUnit *, 16> Run[NumKinds];
   for (SUnit &SU : DAG->SUnits) {
     int K = memKind(*SU.getInstr());
-    if (K < 0 || !(AGXMemClusterKinds & (1u << K)))
+    if (LoadsFollowStores && K == DeviceStore)
+      Run[DeviceLoad].clear();
+    if (K < 0 || !(Kinds & (1u << K)))
       continue;
     SmallVector<SUnit *, 16> &R = Run[K];
     bool Load = K == DeviceLoad || K == LocalLoad;
@@ -139,6 +329,36 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
     R.push_back(&SU);
   }
 
+  // A threadgroup load completes its latency after the last ALU instruction
+  // issued before its result is read (agx_cost): the work its readers need
+  // besides the loads (store addresses) goes before the run, not between the
+  // loads and the readers.
+  if (AGXTGLoadReaderOperandsFirst & (PreRA ? 1 : 2))
+    for (const EquivalenceClasses<SUnit *>::ECValue *I : Clusters) {
+      if (!I->isLeader() || memKind(*I->getData()->getInstr()) != LocalLoad)
+        continue;
+      SmallVector<SUnit *, 16> Members(Clusters.members(*I));
+      SmallVector<SUnit *, 16> Operands;
+      for (SUnit *M : Members)
+        for (const SDep &R : M->Succs) {
+          if (R.getKind() != SDep::Data)
+            continue;
+          for (const SDep &D : R.getSUnit()->Preds) {
+            SUnit *P = D.getSUnit();
+            if (D.getKind() != SDep::Data || P->isBoundaryNode() ||
+                is_contained(Members, P) || is_contained(Operands, P) ||
+                memKind(*P->getInstr()) >= 0 ||
+                any_of(Members,
+                       [&](SUnit *L) { return DAG->IsReachable(P, L); }))
+              continue;
+            Operands.push_back(P);
+          }
+        }
+      for (SUnit *P : Operands)
+        for (SUnit *M : Members)
+          DAG->addEdge(M, SDep(P, SDep::Artificial));
+    }
+
   auto &All = DAG->getClusters();
   for (const EquivalenceClasses<SUnit *>::ECValue *I : Clusters) {
     if (!I->isLeader())
@@ -155,6 +375,10 @@ void AGXMemClusterMutation::apply(ScheduleDAGInstrs *DAG) {
 
 } // namespace
 
+bool llvm::isAGXDeviceLoad(const MachineInstr &MI) {
+  return memKind(MI) == DeviceLoad;
+}
+
 std::unique_ptr<ScheduleDAGMutation> llvm::createAGXMemClusterMutation() {
   return std::make_unique<AGXMemClusterMutation>();
 }
@@ -165,6 +389,40 @@ static cl::opt<unsigned> AGXPostRAClusterWait(
              "next access of a memory cluster rather than schedule another "
              "instruction in between (0: off)"));
 
+static cl::opt<unsigned> AGXPostRATGLoadUse(
+    "agx-postra-tg-load-use", cl::Hidden, cl::init(48),
+    cl::desc("After register allocation, wait up to this many cycles for the "
+             "first reader of a threadgroup load rather than schedule an "
+             "unrelated instruction in between (0: off)"));
+
+static cl::opt<unsigned> AGXPostRATGLoadLongLatency(
+    "agx-postra-tg-load-long-latency", cl::Hidden, cl::init(5),
+    cl::desc("The first reader of a threadgroup load does not wait for or go "
+             "ahead of an instruction of at least this latency"));
+
+static cl::opt<bool> AGXPostRAForward(
+    "agx-postra-forward", cl::init(true), cl::Hidden,
+    cl::desc("Post-RA: of two ready instructions of three or more 32-bit "
+             "register sources, prefer one reading a result of the last "
+             "instructions scheduled (a forwarded source is not a "
+             "register-file read)"));
+
+static cl::opt<unsigned> AGXPostRAForwardWindow(
+    "agx-postra-forward-window", cl::init(2), cl::Hidden,
+    cl::desc("agx-postra-forward: the instructions scheduled last whose "
+             "results count as forwarded"));
+
+/// The distinct 32-bit general registers \p MI reads.
+static unsigned gpr32Sources(const MachineInstr &MI,
+                             SmallVectorImpl<MCRegister> &Regs) {
+  for (const MachineOperand &MO : MI.uses())
+    if (MO.isReg() && MO.getReg().isPhysical() &&
+        AGX::GPR32RegClass.contains(MO.getReg()) &&
+        !is_contained(Regs, MO.getReg().asMCReg()))
+      Regs.push_back(MO.getReg().asMCReg());
+  return Regs.size();
+}
+
 namespace {
 
 /// The generic post-RA strategy schedules a ready instruction ahead of the next
@@ -172,11 +430,94 @@ namespace {
 /// On AGX, an ALU instruction between two memory accesses costs more than such
 /// a stall (see AGXMemClusterMutation): keep the cluster first, waiting for
 /// its next access if it is a few cycles from ready.
+///
+/// Likewise after a threadgroup load: an ALU instruction issued before the
+/// load's result is read defers its completion (AGX Performance Simulator,
+/// measured on M2 Max: the load completes its latency after the last ALU
+/// instruction), so the generic filling of the load's latency with unrelated
+/// work makes it later. Its first reader goes next where it is (or soon
+/// becomes) ready.
 class AGXPostRASchedStrategy : public PostGenericScheduler {
+  /// The last threadgroup load scheduled whose result is not read yet.
+  SUnit *TGLoad = nullptr;
+  /// The last instructions scheduled at the top, the latest last.
+  SmallVector<SUnit *, 4> LastTop;
+
+  /// Whether \p SU reads three or more 32-bit registers (agx_cost: such an
+  /// fmadd32, fcmpsel or icmpsel issues in 2 cycles, not 1).
+  static bool threeSources(const SUnit *SU) {
+    SmallVector<MCRegister, 4> Regs;
+    return SU->getInstr() && gpr32Sources(*SU->getInstr(), Regs) >= 3;
+  }
+
+  /// Whether \p SU reads three or more 32-bit registers, one of them a
+  /// register LastTop writes: that source is forwarded, not read from the
+  /// register file, and the instruction issues at the two-source rate.
+  bool forwards(const SUnit *SU) const {
+    if (LastTop.empty() || !SU->getInstr())
+      return false;
+    SmallVector<MCRegister, 4> Regs;
+    if (gpr32Sources(*SU->getInstr(), Regs) < 3)
+      return false;
+    for (const SUnit *L : LastTop)
+      if (const MachineInstr *LI = L->getInstr())
+        for (const MachineOperand &MO : LI->defs())
+          if (MO.isReg() && MO.getReg().isPhysical() &&
+              is_contained(Regs, MO.getReg().asMCReg()))
+            return true;
+    return false;
+  }
+
+  static bool isLong(const SUnit *SU) {
+    return SU->Latency >= AGXPostRATGLoadLongLatency;
+  }
+
+  bool readsTGLoad(const SUnit *SU) const {
+    return TGLoad && any_of(SU->Preds, [&](const SDep &D) {
+             return D.getKind() == SDep::Data && D.getSUnit() == TGLoad;
+           });
+  }
+
 public:
   using PostGenericScheduler::PostGenericScheduler;
 
+  void initialize(ScheduleDAGMI *Dag) override {
+    PostGenericScheduler::initialize(Dag);
+    TGLoad = nullptr;
+    LastTop.clear();
+  }
+
+  void schedNode(SUnit *SU, bool IsTopNode) override {
+    PostGenericScheduler::schedNode(SU, IsTopNode);
+    if (IsTopNode) {
+      LastTop.push_back(SU);
+      if (LastTop.size() > AGXPostRAForwardWindow)
+        LastTop.erase(LastTop.begin());
+    }
+    if (!AGXPostRATGLoadUse || !IsTopNode)
+      return;
+    if (memKind(*SU->getInstr()) == LocalLoad)
+      TGLoad = SU;
+    else if (readsTGLoad(SU))
+      TGLoad = nullptr;
+  }
+
   SUnit *pickNode(bool &IsTopNode) override {
+    if (AGXPostRATGLoadUse && RegionPolicy.OnlyTopDown && TGLoad) {
+      unsigned Limit = Top.getCurrCycle() + AGXPostRATGLoadUse;
+      while (Top.getCurrCycle() < Limit) {
+        Top.releasePending();
+        if (any_of(Top.Available, [&](SUnit *SU) {
+              return (readsTGLoad(SU) || isLong(SU)) && !Top.checkHazard(SU);
+            }))
+          break;
+        if (none_of(Top.Pending, [&](SUnit *SU) {
+              return readsTGLoad(SU) && SU->TopReadyCycle <= Limit;
+            }))
+          break;
+        Top.bumpCycle(Top.getCurrCycle() + 1);
+      }
+    }
     if (AGXPostRAClusterWait && RegionPolicy.OnlyTopDown &&
         TopClusterID != InvalidClusterId) {
       auto InCluster = [&](SUnit *SU) {
@@ -201,6 +542,11 @@ public:
 
 protected:
   bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override {
+    if (AGXPostRATGLoadUse && TGLoad && Cand.isValid() && Cand.AtTop &&
+        TryCand.AtTop && !isLong(Cand.SU) && !isLong(TryCand.SU) &&
+        tryGreater(readsTGLoad(TryCand.SU), readsTGLoad(Cand.SU), TryCand,
+                   Cand, Stall))
+      return TryCand.Reason != NoCand;
     if (AGXPostRAClusterWait && Cand.isValid()) {
       bool CandNext = isTheSameCluster(Cand.AtTop ? TopClusterID : BotClusterID,
                                        Cand.SU->ParentClusterIdx);
@@ -210,6 +556,12 @@ protected:
       if (tryGreater(TryNext, CandNext, TryCand, Cand, Cluster))
         return TryCand.Reason != NoCand;
     }
+    if (AGXPostRAForward && Cand.isValid() && Cand.AtTop && TryCand.AtTop &&
+        !isLong(Cand.SU) && !isLong(TryCand.SU) &&
+        threeSources(Cand.SU) && threeSources(TryCand.SU) &&
+        tryGreater(forwards(TryCand.SU), forwards(Cand.SU), TryCand, Cand,
+                   RegCritical))
+      return TryCand.Reason != NoCand;
     return PostGenericScheduler::tryCandidate(Cand, TryCand);
   }
 };

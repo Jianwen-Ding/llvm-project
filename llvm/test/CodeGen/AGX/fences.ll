@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
+; RUN: llc -mtriple=agx -agx-remove-trailing-fences=0 -mcpu=agx-g14c -verify-machineinstrs < %s | FileCheck %s
 
 ; Fences lower to the barriers measured with cross-core litmus tests on G14C
 ; (M2 Max): memory_barrier 1, 2, 9 is f596, 0, 3, 3 is f533 (store release),

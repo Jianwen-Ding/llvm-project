@@ -13,6 +13,7 @@ Writes one JSON object per function to --out (default: stdout).
 import argparse
 import json
 import os
+import collections
 import re
 import shlex
 import subprocess
@@ -24,13 +25,23 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ptx_lift  # noqa: E402
 import nvvm_sem  # noqa: E402
+import asm_sem  # noqa: E402
+import arbfp  # noqa: E402
+import masked  # noqa: E402
+import probe  # noqa: E402
+probe.LLC = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin") + "/llc"
 from llvmsig import parse_sig, TypeParseError  # noqa: E402
 
 BIN = os.environ.get("PTXTV_LLVM_BIN", "/home/user/build-llvm/bin")
 ALIVE = os.environ.get("PTXTV_ALIVE", "/home/user/alive2/build/alive-tv")
 WALL_TIMEOUT = int(os.environ.get("PTXTV_WALL_TIMEOUT", "0"))
 LLC_FLAGS = {}   # pid -> llc flags of the file being processed
+# extra (weakening) Alive2 flags, e.g. --disable-poison-input; recorded per result
+ALIVE_EXTRA = os.environ.get("PTXTV_ALIVE_EXTRA", "").split()
+UNROLL = int(os.environ.get("PTXTV_UNROLL", "8"))
 SKIP = {}        # file -> functions to skip (--skip-from)
+PROBE_LLC = {}   # pid -> llc args used for intrinsic probes
+probe_mod = None
 
 
 def run(cmd, inp=None, timeout=120):
@@ -149,6 +160,68 @@ def flatten_address_spaces(text):
     return "\n".join(out)
 
 
+PARTWORD = os.environ.get("PTXTV_PARTWORD_ASSUME", "0") == "1"
+SUBWORD = r"(?:i8|i16|half|bfloat|<2 x i8>)"
+
+
+def partword_assume(text):
+    """NVPTX implements 8/16-bit atomics as a CAS loop on the containing
+    aligned 32-bit word, which also accesses the neighbouring bytes.  To
+    check that loop, the source gets a load of that word (derived from the
+    same pointer) before each sub-word atomic: executions where the word is
+    not accessible become undefined in the source.  Results that rely on
+    this are tagged `assume: partword-word-accessible`."""
+    if not PARTWORD:
+        return text
+    out, n = [], [0]
+    pat = re.compile(r"^(\s*)(?:%[\w.$-]+\s*=\s*)?(atomicrmw|cmpxchg)\s+(?:weak\s+)?(?:volatile\s+)?"
+                     r"(?:\w+\s+)?(ptr(?:\s+addrspace\(\d+\))?)\s+(%[\w.$-]+|@[\w.$-]+),\s*(" + SUBWORD + r")\b")
+    for line in text.split("\n"):
+        m = pat.match(line)
+        if m:
+            ind, _, pty, p, _ = m.groups()
+            pty = re.sub(r"\s+", " ", pty)
+            k = n[0]
+            n[0] += 1
+            out.append("%s%%ptxtv_pwi%d = ptrtoint %s %s to i64" % (ind, k, pty, p))
+            out.append("%s%%ptxtv_pwo%d = and i64 %%ptxtv_pwi%d, 3" % (ind, k, k))
+            out.append("%s%%ptxtv_pwn%d = sub i64 0, %%ptxtv_pwo%d" % (ind, k, k))
+            out.append("%s%%ptxtv_pwp%d = getelementptr i8, %s %s, i64 %%ptxtv_pwn%d" % (ind, k, pty, p, k))
+            out.append("%s%%ptxtv_pw%d = load i32, %s %%ptxtv_pwp%d, align 4" % (ind, k, pty, k))
+        out.append(line)
+    return "\n".join(out)
+
+
+def expand_masked_divrem(text):
+    """llvm.masked.{u,s}{div,rem} (LangRef: the plain operation on enabled
+    lanes; disabled lanes cannot be UB and are poison): divide by 1 in the
+    disabled lanes, then make them poison.  Alive2 does not know these
+    intrinsics."""
+    from llvmsig import split_top
+    n = [0]
+
+    def rep(m):
+        ind, dst, vt, cnt, et, op, argtext = m.groups()
+        args = [a.strip() for a in split_top(" ".join(argtext.split()))]
+        if len(args) != 3:
+            return m.group(0)
+        vals = []
+        for a in args:
+            am = re.match(r"(<\d+ x \w+>)\s+(.*)$", a)
+            if not am:
+                return m.group(0)
+            vals.append(am.group(2))
+        n[0] += 1
+        one = "<" + ", ".join(["%s 1" % et] * int(cnt)) + ">"
+        b1, q = "%%ptxtv_md%d.b" % n[0], "%%ptxtv_md%d.q" % n[0]
+        return "\n".join([
+            "%s%s = select <%s x i1> %s, %s %s, %s %s" % (ind, b1, cnt, vals[2], vt, vals[1], vt, one),
+            "%s%s = %s %s %s, %s" % (ind, q, op, vt, vals[0], b1),
+            "%s%s = select <%s x i1> %s, %s %s, %s poison" % (ind, dst, cnt, vals[2], vt, q, vt)])
+    return re.sub(r"^([ \t]*)(%[\w.]+) = (?:tail |notail )?call (<(\d+) x (i\d+)>) "
+                  r"@llvm\.masked\.(udiv|sdiv|urem|srem)\.[\w.]+\(([^()]*)\)", rep, text, flags=re.M)
+
+
 def prepare_source(path, workdir):
     """Strip debug info and rename llvm.nvvm.* intrinsics to plain functions."""
     # Atomics are given single-thread semantics (as in the lifted code),
@@ -157,20 +230,50 @@ def prepare_source(path, workdir):
     # file's), which fixes the alignment of accesses written without one:
     # do the same here.
     raw = re.sub(r"^target datalayout\s*=.*$", "", open(path).read(), flags=re.M)
+    raw = partword_assume(raw)
+    raw = expand_masked_divrem(raw)
+    # llvm.debugtrap is what brkpt implements: the same opaque call as the
+    # lifter's (Alive2 does not know the intrinsic)
+    raw = re.sub(r"@llvm\.debugtrap\(", "@nvvm.brkpt(", raw)
+    if "@nvvm.brkpt(" in raw and not re.search(r"^declare [^\n]*@nvvm\.brkpt\(", raw, re.M):
+        raw += "\ndeclare void @nvvm.brkpt()\n"
     nodl = os.path.join(workdir, "nodl.ll")
     with open(nodl, "w") as f:
         f.write(raw)
+    # Variadic function definitions: NVPTX lowers them with LLVM's
+    # ExpandVariadics (the variable arguments become an explicit buffer
+    # pointer); apply the same pass so the callee can be compared.  The pass
+    # itself is trusted.
+    passes = "lower-atomic"
+    extra = []
+    if re.search(r"^define [^\n]*\.\.\.\)", raw, re.M):
+        passes = "expand-variadics,lower-atomic"
+        extra = ["-expand-variadics-override=lowering"]
     rc, out, err = run([BIN + "/opt", "-S", "-mtriple=nvptx64-nvidia-cuda",
-                        "-strip-debug", "-passes=lower-atomic",
-                        nodl, "-o", "-"])
+                        "-strip-debug", "-passes=" + passes] + extra +
+                       [nodl, "-o", "-"])
     if rc:
         raise RuntimeError("opt failed: " + err[-300:])
     # NVVM intrinsics that name one PTX instruction get that instruction's
     # semantics (inlined); the rest have no LLVM-level semantics in Alive2
     # and become uninterpreted external functions (immarg is only valid on
     # intrinsics).
-    out, expanded = nvvm_sem.expand(out, ptx_lift)
+    out, asm_expanded = asm_sem.expand(out, ptx_lift)
+    out, arb_expanded = arbfp.expand(out)
+    out, arb_to = arbfp.expand_to(out)
+    arb_expanded = arb_expanded or arb_to
+    asm_expanded = asm_expanded or arb_expanded
+    out, expanded = nvvm_sem.expand(out, ptx_lift, PROBE_LLC.get(os.getpid()))
+    out, masked_expanded = masked.expand(out)   # also those created above
+    expanded = expanded or asm_expanded or masked_expanded
     if expanded:
+        # inline only our helpers: the test's own alwaysinline functions may
+        # be called by name in the PTX
+        out = "\n".join(
+            re.sub(r"\balwaysinline\b\s*", "", l)
+            if (l.startswith("attributes #") or
+                (l.startswith("define ") and "@ptxtv_" not in l)) else l
+            for l in out.split("\n"))
         tmp = os.path.join(workdir, "src.sem.ll")
         with open(tmp, "w") as f:
             f.write(out)
@@ -189,6 +292,16 @@ def prepare_source(path, workdir):
     # noalias on parameters is unsupported by Alive2; dropping an assumption
     # makes the source more defined (cannot hide a defect)
     text = re.sub(r"(define [^\n]*)", lambda m: re.sub(r"\bnoalias\b\s*", "", m.group(1)), text)
+    # Unnamed globals (@0, @1, ...) are printed as __unnamed_<N+1> in PTX;
+    # give them those names so functions can be extracted and matched.
+    text = re.sub(r"@(\d+)\b(?!\s*=\s*!)", lambda m: "@__unnamed_%d" % (int(m.group(1)) + 1), text)
+    # A kernel's return value is not observable (.entry has no return
+    # parameter): return poison from non-void kernels, as the lifted code does.
+    def kernel_ret(m):
+        body = m.group(0)
+        return re.sub(r"^(\s*)ret (?!void)(.+?) (%[\w.$-]+|-?\d+|true|false|[\w.]+)$",
+                      lambda r: "%sret %s poison" % (r.group(1), r.group(2)), body, flags=re.M)
+    text = re.sub(r"^define [^\n]*ptx_kernel (?!void)[^\n]*\{.*?^\}", kernel_ret, text, flags=re.M | re.S)
     # volatile has no meaning under single-thread semantics (Alive2 rejects it)
     text = re.sub(r"\b(load|store) volatile\b", r"\1", text)
     # Metadata that carries hints only (or assumptions, whose removal makes
@@ -196,6 +309,27 @@ def prepare_source(path, workdir):
     text = re.sub(r",\s*!(mem\.cache_hint|nontemporal|invariant\.load|tbaa|tbaa\.struct|"
                   r"alias\.scope|noalias|llvm\.access\.group|llvm\.loop|prof|annotation|"
                   r"srcloc|nvvm\.[\w.]+)\s+![\w.]+", "", text)
+    text = rewrite_i1_fp(text)
+    if STRIP_FMF:
+        # contract/afn/reassoc/arcp only permit additional results: without
+        # them the source is stricter, so a proof against it also holds for
+        # the original (a counterexample does not)
+        text = re.sub(r"\b(contract|afn|reassoc|arcp)\s+", "", text)
+        text = re.sub(r"\bfast\s+", "nnan ninf nsz ", text)
+    text = scalarize_vector_mem(text)
+    text = resolve_nvvm_reflect(text, workdir)
+    text = rewrite_counters(text)
+    text = expand_fp_reductions(text)
+    # stack save/restore: opaque calls (the lifter emits the same)
+    text = re.sub(r"@llvm\.stacksave(\.p\d+)?\(", "@ptx.stacksave(", text)
+    text = re.sub(r"@llvm\.stackrestore(\.p\d+)?\(", "@ptx.stackrestore(", text)
+    # inline asm lifted by asm_sem may already declare them: keep one each
+    for fn in ("ptx.stacksave", "ptx.stackrestore"):
+        ds = list(re.finditer(r"^declare [^\n]*@%s\([^\n]*\n" % re.escape(fn), text, re.M))
+        for d in reversed(ds[1:]):
+            text = text[:d.start()] + text[d.end():]
+    # alignstack(N) only constrains stack alignment (Alive2 rejects it)
+    text = re.sub(r"\s*\balignstack\(\d+\)", "", text)
     src = os.path.join(workdir, "src.ll")
     with open(src, "w") as f:
         f.write(text)
@@ -203,6 +337,247 @@ def prepare_source(path, workdir):
     if rc:
         raise RuntimeError("renamed source does not verify: " + err[-300:])
     return src, text
+
+
+def resolve_nvvm_reflect(text, workdir):
+    """__nvvm_reflect("P") calls as the constants NVPTXUsage documents:
+    __CUDA_FTZ from the "nvvm-reflect-ftz" module flag, __CUDA_ARCH the
+    target's SM version times 10 (the CUDA __CUDA_ARCH__ convention; the
+    target is read from the PTX's .target line), everything else 0."""
+    if "@__nvvm_reflect(" not in text:
+        return text
+    strs = {}
+    for m in re.finditer(r'^@("[^"]*"|[-\w$.]+)\s*=[^\n]*\bc"([^"]*)\\00"', text, re.M):
+        strs[m.group(1)] = m.group(2)
+    ftz = re.search(r'!\{i32 \d+, !"nvvm-reflect-ftz", i32 (\d+)\}', text)
+    arch = 0
+    try:
+        tm = re.search(r"^\s*\.target\s+sm_(\d+)", open(os.path.join(workdir, "out.ptx")).read(), re.M)
+        arch = int(tm.group(1)) * 10 if tm else 0
+    except OSError:
+        pass
+    vals = {"__CUDA_FTZ": int(ftz.group(1)) if ftz else 0, "__CUDA_ARCH": arch}
+
+    def sub(m):
+        g = re.search(r'@("[^"]*"|[-\w$.]+)', m.group(3))
+        if not g or g.group(1) not in strs:
+            return m.group(0)
+        return "%s%s = add i32 %d, 0" % (m.group(1), m.group(2), vals.get(strs[g.group(1)], 0))
+    return re.sub(r"^(\s*)(%[\w.$-]+) = (?:tail )?call i32 @__nvvm_reflect\((.*)\)\s*$",
+                  sub, text, flags=re.M)
+
+
+COUNTERS = {"readcyclecounter": "clock64", "readsteadycounter": "globaltimer"}
+
+
+def rewrite_counters(text):
+    """llvm.readcyclecounter/readsteadycounter are target-specific counters
+    (LangRef); NVPTX reads %clock64 / %globaltimer (an assumption taken from
+    the backend), which the lifter models as opaque special-register reads."""
+    for intr, sreg in COUNTERS.items():
+        if "@llvm.%s(" % intr not in text:
+            continue
+        text = re.sub(r"^declare [^\n]*@llvm\.%s\(\)[^\n]*\n?" % intr, "", text, flags=re.M)
+        text = text.replace("@llvm.%s(" % intr, "@nvvm.read.ptx.sreg.%s(" % sreg)
+        if not re.search(r"^declare [^\n]*@nvvm\.read\.ptx\.sreg\.%s\(" % sreg, text, re.M):
+            text += ("\ndeclare i64 @nvvm.read.ptx.sreg.%s() nounwind willreturn "
+                     "memory(inaccessiblemem: readwrite)\n" % sreg)
+    return text
+
+
+RED_OPS = {"fadd": ("fadd", True), "fmul": ("fmul", True),
+           "fmax": ("llvm.maxnum", False), "fmin": ("llvm.minnum", False),
+           "fmaximum": ("llvm.maximum", False), "fminimum": ("llvm.minimum", False),
+           "fmaximumnum": ("llvm.maximumnum", False), "fminimumnum": ("llvm.minimumnum", False)}
+
+
+def expand_fp_reductions(text):
+    """llvm.vector.reduce.f* as the sequential scalar operations LangRef
+    defines (fadd/fmul in order from the start value; with `reassoc` any
+    order is allowed, which Alive2 approximates either way).  Alive2 does
+    not know these intrinsics."""
+    if "@llvm.vector.reduce.f" not in text:
+        return text
+    out, decls = [], set()
+    pat = re.compile(r"^(\s*)(%[\w.$-]+) = (?:tail )?call ((?:(?:fast|nnan|ninf|nsz|arcp|contract|afn|"
+                     r"reassoc)\s+)*)(half|bfloat|float|double) @llvm\.vector\.reduce\.(\w+)\.v(\d+)\w+\("
+                     r"(.*)\)\s*$")
+    for line in text.split("\n"):
+        m = pat.match(line)
+        if not m or m.group(5) not in RED_OPS:
+            out.append(line)
+            continue
+        ind, res, fmf, t, kind, n, argtext = m.groups()
+        n = int(n)
+        args = [a.strip() for a in argtext.split(",")]
+        opname, has_start = RED_OPS[kind]
+        if has_start:
+            if len(args) != 2:
+                out.append(line)
+                continue
+            acc = args[0].split()[-1]
+            vec = args[1].split()[-1]
+            first = 0
+        else:
+            vec = args[0].split()[-1]
+            out.append("%s%s.e0 = extractelement <%d x %s> %s, i32 0" % (ind, res, n, t, vec))
+            acc = "%s.e0" % res
+            first = 1
+        for k in range(first, n):
+            e = "%s.e%d" % (res, k)
+            if k:
+                out.append("%s%s = extractelement <%d x %s> %s, i32 %d" % (ind, e, n, t, vec, k))
+            else:
+                out.append("%s%s = extractelement <%d x %s> %s, i32 0" % (ind, e, n, t, vec))
+            dst = res if k == n - 1 else "%s.a%d" % (res, k)
+            if opname.startswith("llvm."):
+                iname = "%s.%s" % (opname, {"half": "f16", "bfloat": "bf16", "float": "f32", "double": "f64"}[t])
+                decls.add("declare %s @%s(%s, %s)" % (t, iname, t, t))
+                out.append("%s%s = call %s%s @%s(%s %s, %s %s)" % (ind, dst, fmf, t, iname, t, acc, t, e))
+            else:
+                out.append("%s%s = %s %s%s %s, %s" % (ind, dst, opname, fmf, t, acc, e))
+            acc = dst
+    have = set(re.findall(r"^declare [^@]*@([\w.$\"-]+)\(", text, re.M))
+    out += [d for d in sorted(decls) if re.search(r"@([\w.]+)\(", d).group(1) not in have]
+    return "\n".join(out)
+
+
+ELT_BYTES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16, "half": 2,
+             "bfloat": 2, "float": 4, "double": 8, "ptr": 8}
+SCALARIZE = os.environ.get("PTXTV_SCALARIZE", "0") == "1"
+
+
+def _lane_align(A, off):
+    a = A
+    while off % a:
+        a //= 2
+    return a
+
+
+def scalarize_vector_mem(text):
+    """Vector loads/stores of byte-sized elements as one access per element
+    (in LLVM a vector access is UB exactly when one of its element accesses
+    is, and its lanes are independent).  The lifter does the same for PTX
+    vector accesses; Alive2 relates element accesses far more easily than
+    differently shaped wide ones.  The first element access carries the
+    vector's alignment."""
+    if not SCALARIZE:
+        return text
+    out = []
+    lp = re.compile(r"^(\s*)(%[\w.$-]+) = load <(\d+) x (\w+)>, (ptr(?: addrspace\(\d+\))?) "
+                    r"(%[\w.$-]+|@[\w.$-]+)(?:, align (\d+))?\s*$")
+    sp = re.compile(r"^(\s*)store <(\d+) x (\w+)> (.+), (ptr(?: addrspace\(\d+\))?) "
+                    r"(%[\w.$-]+|@[\w.$-]+)(?:, align (\d+))?\s*$")
+    cnt = [0]
+    for line in text.split("\n"):
+        m = lp.match(line)
+        if m and m.group(4) in ELT_BYTES:
+            ind, r, n, et, pty, p, A = m.groups()
+            n, es = int(n), ELT_BYTES[m.group(4)]
+            A = int(A or es)
+            vt = "<%d x %s>" % (n, et)
+            k0 = cnt[0]
+            cnt[0] += 1
+            acc = "poison"
+            for k in range(n):
+                q = p
+                if k:
+                    q = "%%ptxtv_lp%d.%d" % (k0, k)
+                    out.append("%s%s = getelementptr i8, %s %s, i64 %d" % (ind, q, pty, p, k * es))
+                al = A if k == 0 else _lane_align(A, k * es)
+                e = "%%ptxtv_le%d.%d" % (k0, k)
+                out.append("%s%s = load %s, %s %s, align %d" % (ind, e, et, pty, q, al))
+                dst = r if k == n - 1 else "%%ptxtv_lv%d.%d" % (k0, k)
+                out.append("%s%s = insertelement %s %s, %s %s, i32 %d" % (ind, dst, vt, acc, et, e, k))
+                acc = dst
+            continue
+        m = sp.match(line)
+        if m and m.group(3) in ELT_BYTES and not m.group(4).strip().startswith("volatile"):
+            ind, n, et, val, pty, p, A = m.groups()
+            n, es = int(n), ELT_BYTES[et]
+            A = int(A or es)
+            vt = "<%d x %s>" % (n, et)
+            k0 = cnt[0]
+            cnt[0] += 1
+            for k in range(n):
+                e = "%%ptxtv_ss%d.%d" % (k0, k)
+                out.append("%s%s = extractelement %s %s, i32 %d" % (ind, e, vt, val, k))
+                q = p
+                if k:
+                    q = "%%ptxtv_sp%d.%d" % (k0, k)
+                    out.append("%s%s = getelementptr i8, %s %s, i64 %d" % (ind, q, pty, p, k * es))
+                al = A if k == 0 else _lane_align(A, k * es)
+                out.append("%sstore %s %s, %s %s, align %d" % (ind, et, e, pty, q, al))
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+FP_ONE = {"half": ("0xH3C00", "0xHBC00"), "bfloat": ("0xR3F80", "0xRBF80"),
+          "float": ("1.0", "-1.0"), "double": ("1.0", "-1.0")}
+
+
+def rewrite_i1_fp(text):
+    """Scalar conversions between i1 and FP, which Alive2's SMT encoding
+    rejects ("invalid extract application"), as equivalent selects.  Done
+    after the last optimisation, so the poison arms stay."""
+    def itofp(m):
+        ind, r, op, x, t = m.groups()
+        one, mone = FP_ONE[t]
+        return "%s%s = select i1 %s, %s %s, %s 0.0" % (ind, r, x, t, one if op == "uitofp" else mone, t)
+    text = re.sub(r"^(\s*)(%[\w.$-]+) = (uitofp|sitofp) i1 (%[\w.$-]+|true|false) to "
+                  r"(half|bfloat|float|double)\s*$", itofp, text, flags=re.M)
+
+    def fptoi(m):
+        ind, r, op, t, x = m.groups()
+        lo, hi = (0, 1) if op == "fptoui" else (-1, 0)
+        w = "%s.w" % r
+        return ("%s%s = %s %s %s to i32\n"
+                "%s%s.lo = icmp sge i32 %s, %d\n%s%s.hi = icmp sle i32 %s, %d\n"
+                "%s%s.ok = and i1 %s.lo, %s.hi\n%s%s.t = trunc i32 %s to i1\n"
+                "%s%s = select i1 %s.ok, i1 %s.t, i1 poison") % (
+                    ind, w, op, t, x, ind, r, w, lo, ind, r, w, hi, ind, r, r, r,
+                    ind, r, w, ind, r, r, r)
+    text = re.sub(r"^(\s*)(%[\w.$-]+) = (fptoui|fptosi) (half|bfloat|float|double) (\S+) to i1\s*$",
+                  fptoi, text, flags=re.M)
+    return text
+
+
+LANES = os.environ.get("PTXTV_LANES", "0") == "1"
+STRIP_FMF = os.environ.get("PTXTV_STRIP_FMF", "0") == "1"
+
+
+def _ret_vec_re(fname):
+    return re.compile(r"^(define [^@\n]*?)<(\d+) x ([^>]+)>(\s+@%s\()" % re.escape(fname), re.M)
+
+
+def vector_ret_lanes(text, fname):
+    m = _ret_vec_re(fname).search(text)
+    return int(m.group(2)) if m and int(m.group(2)) <= 8 else 0
+
+
+def lane_variant(text, fname, k):
+    """The module with `fname` returning only lane k of its vector result.
+    Everything else (all computations, memory effects, UB) is unchanged, so
+    the function refines iff every lane variant does (vector refinement is
+    lane-wise)."""
+    rx = _ret_vec_re(fname)
+    m = rx.search(text)
+    n, et = m.group(2), m.group(3).strip()
+    vt = "<%s x %s>" % (n, et)
+    start = m.start()
+    end = text.index("\n}", start) + 2
+    body = text[start:end]
+    body = rx.sub(lambda mm: "%s%s%s" % (mm.group(1), et, mm.group(4)), body, count=1)
+    cnt = [0]
+
+    def ret(mm):
+        cnt[0] += 1
+        v = "%%ptxtv_lane%d" % cnt[0]
+        return "%s%s = extractelement %s %s, i32 %d\n%sret %s %s" % (
+            mm.group(1), v, vt, mm.group(2), k, mm.group(1), et, v)
+    body = re.sub(r"^(\s*)ret %s (.+?)\s*$" % re.escape(vt), ret, body, flags=re.M)
+    return text[:start] + body + text[end:]
 
 
 def module_symbols(text):
@@ -228,6 +603,14 @@ def module_symbols(text):
                 rest = m.group(2)
                 am = re.search(r"\baddrspace\((\d+)\)", rest.split("global")[0].split("constant")[0])
                 globals_[m.group(1)] = "ptr addrspace(%s)" % am.group(1) if am and am.group(1) != "0" else "ptr"
+    # function aliases: @b = ... alias <ty>, ptr @a  -> callable like @a
+    for m in re.finditer(r'^@("[^"]*"|[-a-zA-Z$._0-9]+)\s*=[^\n]*\balias\b[^\n]*@("[^"]*"|[-a-zA-Z$._0-9]+)\s*$',
+                         text, re.M):
+        if m.group(2) in decls and m.group(1) not in decls:
+            import copy
+            sg = copy.copy(decls[m.group(2)])
+            sg.name = m.group(1)
+            decls[m.group(1)] = sg
     return defines, decls, globals_, typedefs
 
 
@@ -237,12 +620,60 @@ def ptx_name(n):
     return "".join(c if (c.isalnum() or c in "_$") else "_$_" for c in n)
 
 
+RENAMES = {}
+
+
+def nvptx_renames(text):
+    """LLVM name -> PTX name, emulating NVPTXAssignValidGlobalNames: local
+    globals (and external .shared ones), then local functions, in module
+    order, get NVPTX::getValidPTXIdentifier names; a collision makes the
+    name unique with the module's running counter (no separator), as
+    ValueSymbolTable::makeUniqueName does for global values."""
+    NAME = r'@("[^"]*"|[-a-zA-Z$._0-9]+)'
+    unq = lambda n: n[1:-1] if n.startswith('"') else n
+    allnames, gvars, funcs = set(), [], []
+    for l in text.split("\n"):
+        m = re.match(NAME + r"\s*=\s*(.*)$", l)
+        if m:
+            allnames.add(unq(m.group(1)))
+            rest = m.group(2)
+            if re.match(r"(\w+\s+)*(alias|ifunc)\b", rest):
+                continue
+            head = re.split(r"\b(global|constant)\b", rest)[0]
+            local = re.search(r"\b(private|internal)\b", head)
+            ext_shared = not re.search(r"\b(private|internal|linkonce\w*|weak\w*|common|"
+                                       r"available_externally|extern_weak)\b", head) and \
+                "addrspace(3)" in head
+            if local or ext_shared:
+                gvars.append(m.group(1))
+            continue
+        m = re.match(r"(define|declare)\b[^@]*" + NAME + r"\(", l)
+        if m:
+            allnames.add(unq(m.group(2)))
+            if m.group(1) == "define" and re.match(r"define\s+(private|internal)\b", l):
+                funcs.append(m.group(2))
+    counter, out = 0, {}
+    for n in gvars + funcs:
+        raw = unq(n)
+        valid = ptx_name(n)
+        if valid == raw:
+            continue
+        allnames.discard(raw)
+        name = valid
+        while name in allnames:
+            counter += 1
+            name = valid + str(counter)
+        allnames.add(name)
+        out[n] = name
+    return out
+
+
 def build_name_map(defines, decls, globals_):
     m = {}
     for n in list(decls) + list(globals_):
         raw = n[1:-1] if n.startswith('"') else n
         m[raw] = n
-        m[ptx_name(n)] = n
+        m[RENAMES.get(n, ptx_name(n))] = n
     return m
 
 
@@ -275,9 +706,11 @@ def classify(out, err, rc):
         return "correct"
     if "Transformation doesn't verify" in o:
         return "mismatch"
-    if "Timeout" in o or "timeout" in o:
+    if "Timeout" in o or "timeout" in o or "max. memory exceeded" in o or \
+            "smt-canceled" in o:
         return "timeout"
-    if "Couldn't prove the correctness" in o or "approximated" in o:
+    if "Couldn't prove the correctness" in o or "approximated" in o or \
+            "incomplete quantifiers" in o:
         return "inconclusive"
     if "ERROR: Unsupported" in o or "Unsupported" in o:
         return "alive-unsupported"
@@ -296,9 +729,17 @@ def indirect_call_sigs(module_text, fname):
     if not m:
         return []
     out = []
-    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+)\((.*)\)", m.group(0)):
-        ret = re.sub(r"\b(fast|nnan|ninf|nsz|arcp|contract|afn|reassoc|tail|noundef|zeroext|signext)\b", "",
-                     cm.group(1)).strip().split()
+    for cm in re.finditer(r"\bcall\s+(.*?)\s+(%[\w.$-]+|@[\w.$\"-]+|undef|poison|null)\((.*)\)",
+                          m.group(0)):
+        if cm.group(2).startswith("@llvm.") or cm.group(2).startswith("@nvvm."):
+            continue
+        head = cm.group(1)
+        fnty_vararg = False
+        if "(" in head:      # explicit function type: call RET (T1, ...) @f(...)
+            fnty_vararg = "..." in head[head.index("("):]
+            head = head[:head.index("(")]
+        ret = re.sub(r"\b(fast|nnan|ninf|nsz|arcp|contract|afn|reassoc|tail|musttail|notail|noundef|zeroext|signext)\b", "",
+                     head).strip().split()
         if not ret:
             continue
         try:
@@ -308,6 +749,8 @@ def indirect_call_sigs(module_text, fname):
         for a in sg.args:   # call-site operands, not parameter attributes
             a.attrs = "byval(%s)" % a.byval_type() if a.byval_type() else ""
             a.name = None
+        sg.callee = cm.group(2)[1:] if cm.group(2).startswith("@") else None
+        sg.vararg = sg.vararg or fnty_vararg
         out.append(sg)
     return out
 
@@ -423,6 +866,15 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
     # inside the aligned granule, which cannot fault.
     if re.search(r"load <3 x ", src_text) and re.search(r"\bld\.[\w.:]*b(32|64)\b", body):
         return "aligned-overread-widened-load"
+    # A masked load lowered to a full-width aligned load whose unused bytes
+    # are marked with `.pragma "used_bytes_mask"`: reads disabled lanes (UB
+    # in LLVM terms if they are not dereferenceable), but stays within an
+    # aligned granule, so it cannot fault on the hardware.  Intentional.
+    # (the pragma is only emitted for PTX >= 8.3; the lane loads of an
+    # expanded masked load are named ptxtv_mlx*)
+    if ('used_bytes_mask' in body or re.search(r"%ptxtv_mlx\d", src_text)) and \
+            "Source is more defined than target" in alive_out:
+        return "masked-load-widened"
     # Default-on backend combine (-nvptx-rsqrt-approx-opt): 1/sqrt.approx(x)
     # -> rsqrt.approx(x) without fast-math flags.  Intentional design.
     if "rsqrt.approx" in body and "sqrt.approx" in src_text:
@@ -433,6 +885,16 @@ def known_false_alarm(ptx, name, alive_out, src_text="", llc_flags=""):
         # fneg/fabs/copysign must preserve NaN bits exactly (LangRef), so a
         # NaN-only difference is still a real mismatch when they are involved
         if not re.search(r"@llvm\.(fabs|copysign)|\bfneg\b", src_text):
+            return "nan-payload"
+    # vectors: every lane equal or NaN on both sides
+    sv = re.search(r"^Source value: <(.*)>\s*$", alive_out, re.M)
+    tv_ = re.search(r"^Target value: <(.*)>\s*$", alive_out, re.M)
+    if sv and tv_ and not re.search(r"@llvm\.(fabs|copysign)|\bfneg\b", src_text):
+        sl = [x.strip() for x in sv.group(1).split(",")]
+        tl = [x.strip() for x in tv_.group(1).split(",")]
+        isnan = lambda x: x.endswith("(QNaN)") or x.endswith("(SNaN)")
+        if len(sl) == len(tl) and any(a != b for a, b in zip(sl, tl)) and \
+                all(a == b or (isnan(a) and isnan(b)) for a, b in zip(sl, tl)):
             return "nan-payload"
     if "partword" in body or (
             re.search(r"and\.b64\s+%rd\d+, %rd\d+, -4;", body) and
@@ -446,12 +908,20 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     res = {"function": fname}
     fdir = os.path.join(workdir, "f_" + re.sub(r"[^\w]", "_", fname)[:80])
     os.makedirs(fdir, exist_ok=True)
-    rc, ext, err = run([BIN + "/llvm-extract", "-S", "--func=" + fname.strip('"'),
+    rc, ext, err = run([BIN + "/llvm-extract", "-S", "--keep-const-init", "--func=" + fname.strip('"'),
                         src_path, "-o", "-"])
     if rc:
         res.update(status="extract-failed", detail=err[-300:])
         return res
-    ptxn = ptx_name(fname)
+    # Initializers of constant globals holding i1 values cannot be read
+    # bytewise in Alive2's assembly mode (sub-byte memory); drop them there.
+    if re.search(r"^@[^\n]*\bconstant\b[^\n]*\bi1\b", ext, re.M):
+        rc, ext, err = run([BIN + "/llvm-extract", "-S", "--func=" + fname.strip('"'),
+                            src_path, "-o", "-"])
+        if rc:
+            res.update(status="extract-failed", detail=err[-300:])
+            return res
+    ptxn = RENAMES.get(fname, ptx_name(fname))
     try:
         L = ptx_lift.lift_function(ptx, sig, name_map, decls, globals_, ptxn,
                                    typedefs, indirect_call_sigs(ext, fname))
@@ -474,6 +944,7 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     have = set(re.findall(r"^declare [^@]*@([\w.$\"-]+)\(", tgt, re.M))
     extra = [d for n, d in L.extra_decls.items() if n not in have]
     tgt += "\n" + "\n".join(extra) + "\n"
+    tgt, tgt_masked = masked.expand(tgt)
     src_f = os.path.join(fdir, "src.ll")
     tgt_raw = os.path.join(fdir, "tgt.raw.ll")
     tgt_f = os.path.join(fdir, "tgt.ll")
@@ -481,19 +952,90 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
         f.write(ext)
     with open(tgt_raw, "w") as f:
         f.write(tgt)
-    rc, _, err = run([BIN + "/opt", "-S", "-passes=mem2reg", tgt_raw, "-o", tgt_f])
+    rc, _, err = run([BIN + "/opt", "-S", "-passes=" + (
+        "always-inline,globaldce,mem2reg" if tgt_masked else "mem2reg"), tgt_raw, "-o", tgt_f])
     if rc:
         res.update(status="lift-invalid-ir", detail=err[-400:])
         return res
-    try:
-        rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
-                            "--disable-undef-input", "--smt-to=%d" % smt_to,
-                            "--func=" + fname.strip('"')],
-                           timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
-    except subprocess.TimeoutExpired:
-        res.update(status="timeout", detail="wall clock")
-        return res
+    with open(tgt_f) as f:
+        t0 = f.read()
+    t1 = drop_dead_param_loads(t0)
+    tgt_plain = None
+    if t1 != t0:
+        tgt_plain = tgt_f + ".plain.ll"
+        with open(tgt_plain, "w") as f:
+            f.write(t0)
+        with open(tgt_f, "w") as f:
+            f.write(t1)
+    nl = vector_ret_lanes(ext, fname) if LANES else 0
+    if nl:
+        # check each lane of the returned vector separately (see lane_variant)
+        outs = []
+        for k in range(nl):
+            sk, tk = src_f + ".lane%d.ll" % k, tgt_f + ".lane%d.ll" % k
+            with open(sk, "w") as f:
+                f.write(lane_variant(open(src_f).read(), fname, k))
+            with open(tk, "w") as f:
+                f.write(lane_variant(open(tgt_f).read(), fname, k))
+            try:
+                rc, out, err = run([ALIVE, sk, tk, "--tgt-is-asm", "--disable-undef-input",
+                                    "--smt-to=%d" % smt_to] + ALIVE_EXTRA +
+                                   ["--func=" + fname.strip('"')],
+                                   timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+            except subprocess.TimeoutExpired:
+                rc, out, err = 1, "ERROR: Timeout (wall clock)", ""
+            st_k = classify(out, err, rc)
+            outs.append((st_k, out, err, rc))
+            if st_k != "correct":
+                break
+        res["lanes"] = nl
+        if all(o[0] == "correct" for o in outs) and len(outs) == nl:
+            rc, out, err = 0, "Transformation seems to be correct! (all %d lanes)" % nl, ""
+        else:
+            _, out, err, rc = outs[-1]
+    else:
+        # the cleaned target first; if that does not decide, the equivalent
+        # uncleaned one (the cleanup occasionally makes a query harder)
+        for tf in [tgt_f] + ([tgt_plain] if tgt_plain else []):
+            try:
+                rc, out, err = run([ALIVE, src_f, tf, "--tgt-is-asm",
+                                    "--disable-undef-input", "--smt-to=%d" % smt_to] + ALIVE_EXTRA + [
+                                    "--func=" + fname.strip('"')],
+                                   timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+            except subprocess.TimeoutExpired:
+                rc, out, err = 1, "ERROR: Timeout (wall clock)", ""
+            if classify(out, err, rc) not in ("timeout", "inconclusive"):
+                break
+        if "wall clock" in out and classify(out, err, rc) == "timeout":
+            res.update(status="timeout", detail="wall clock")
+            return res
+    # Loops: Alive2 only reasons about loop-free code unless asked to unroll.
+    # Retry with bounded unrolling; such results only cover executions with
+    # at most UNROLL iterations per loop and are tagged.
+    if "doesn't reach a return instruction" in out and UNROLL:
+        try:
+            rc, out, err = run([ALIVE, src_f, tgt_f, "--tgt-is-asm",
+                                "--disable-undef-input", "--smt-to=%d" % smt_to,
+                                "--src-unroll=%d" % UNROLL, "--tgt-unroll=%d" % UNROLL] +
+                               ALIVE_EXTRA + ["--func=" + fname.strip('"')],
+                               timeout=WALL_TIMEOUT or max(30, smt_to // 1000 * 4))
+        except subprocess.TimeoutExpired:
+            res.update(status="timeout", detail="wall clock", unroll=UNROLL)
+            return res
+        res["unroll"] = UNROLL
     st = classify(out, err, rc)
+    if ALIVE_EXTRA:
+        res["alive_extra"] = " ".join(ALIVE_EXTRA)
+    if re.search(r"%ptxtv_pw\d", ext):
+        res["assume"] = "partword-word-accessible"
+    if nvvm_sem.OPAQUE_COPIES:
+        res["copy_model"] = "opaque"
+    if SCALARIZE:
+        res["scalarized"] = True
+    if STRIP_FMF:
+        res["stripped_fmf"] = True
+    if L.used_probe:
+        res["probe"] = True   # relies on a probe-derived opaque instruction
     if st == "mismatch":
         oob = param_oob(ptx, ptxn)
         known = known_false_alarm(ptx, ptxn, out + err, ext, LLC_FLAGS.get(os.getpid(), ""))
@@ -512,6 +1054,102 @@ def check_function(fname, define_line, sig, src_path, src_text, ptx,
     return res
 
 
+def _forward_cs_slots(text):
+    """A call-site slot (`%cs.N`, alloca of the lifted call's return value)
+    with a single store whose same-size loads follow it in the same block:
+    replace the loads by the stored value (bitcast if the types differ) and
+    drop the slot.  mem2reg cannot do this when the types differ."""
+    lines = text.split("\n")
+    for p in sorted(set(re.findall(r"^\s*(%cs\.\d+) = alloca", text, re.M))):
+        idx = [k for k, l in enumerate(lines) if re.search(re.escape(p) + r"\b", l)]
+        al = [k for k in idx if re.match(r"\s*" + re.escape(p) + r" = alloca", lines[k])]
+        st = [k for k in idx if re.match(r"\s*store (\w+) ([%\w.]+), ptr " + re.escape(p) +
+                                       r"(?:, align \d+)?\s*$", lines[k])]
+        ld = [k for k in idx if re.match(r"\s*%[\w.]+ = load (\w+), ptr " + re.escape(p) +
+                                       r"(?:, align \d+)?\s*$", lines[k])]
+        if len(al) != 1 or len(st) != 1 or len(al) + len(st) + len(ld) != len(idx):
+            continue
+        sm = re.match(r"\s*store (\w+) ([%\w.]+)", lines[st[0]])
+        sty, sval = sm.group(1), sm.group(2)
+        ok = True
+        for k in ld:
+            lm = re.match(r"\s*(%[\w.]+) = load (\w+)", lines[k])
+            between = lines[st[0] + 1:k]
+            if k < st[0] or any(re.match(r"\s*[\w.$-]+:", l) for l in between) or \
+                    _TBYTES.get(lm.group(2)) is None or _TBYTES.get(lm.group(2)) != _TBYTES.get(sty) or \
+                    "ptr" in (sty, lm.group(2)) and sty != lm.group(2):
+                ok = False
+        if not ok:
+            continue
+        for k in ld:
+            lm = re.match(r"(\s*)(%[\w.]+) = load (\w+)", lines[k])
+            ind, dst, lty = lm.groups()
+            lines[k] = "%s%s = bitcast %s %s to %s" % (ind, dst, sty, sval, lty)
+        for k in sorted(al + st, reverse=True):
+            del lines[k]
+    return "\n".join(lines)
+
+
+_TBYTES = {"i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16, "ptr": 8, "half": 2, "bfloat": 2,
+           "float": 4, "double": 8}
+
+
+def drop_dead_param_loads(text):
+    """Remove dead code that cannot affect the check from the lifted target:
+    unused side-effect-free, non-trapping instructions (casts, shifts,
+    arithmetic other than division, compares, selects, GEPs, aggregate
+    operations, freeze, phi), and unused loads that read a `%param.N` slot
+    (an alloca of the lifted `.param` space) within its size, directly or
+    at a constant offset; then slots that are only stored to.  Such loads
+    cannot be UB; out-of-bounds .param reads (finding 1) are kept, as are
+    all other loads, divisions and calls.  Alive2's asm mode is slow on dead
+    reloads of a stored pointer and the integer address arithmetic built on
+    them (the lifter tracks pointer provenance separately)."""
+    text = _forward_cs_slots(text)
+    sizes = {m.group(1): int(m.group(2)) for m in
+             re.finditer(r"^\s*(%param\.\d+) = alloca \[(\d+) x i8\]", text, re.M)}
+    lines = text.split("\n")
+    pure = re.compile(r"\s*(%[\w.]+) = (?:add|sub|mul|shl|lshr|ashr|and|or|xor|trunc|zext|sext|"
+                      r"bitcast|ptrtoint|inttoptr|icmp|select|getelementptr|extractvalue|"
+                      r"insertvalue|extractelement|insertelement|shufflevector|freeze|phi)\b")
+    geps = {}
+    for l in lines:
+        m = re.match(r"\s*(%[\w.]+) = getelementptr (?:inbounds )?i8, ptr (%param\.\d+), i64 (\d+)\s*$", l)
+        if m and m.group(2) in sizes:
+            geps[m.group(1)] = (m.group(2), int(m.group(3)))
+    changed = True
+    while changed:
+        changed = False
+        body = "\n".join(l for l in lines if l is not None)
+        counts = collections.Counter(re.findall(r"%[\w.]+", body))
+        for k, l in enumerate(lines):
+            if l is None:
+                continue
+            m = pure.match(l)
+            dst = m.group(1) if m else None
+            if not m:
+                m = re.match(r"\s*(%[\w.]+) = load (\w+), ptr (%[\w.]+)(?:, align \d+)?\s*$", l)
+                if not m:
+                    continue
+                slot, off = (m.group(3), 0) if m.group(3) in sizes else geps.get(m.group(3), (None, 0))
+                if slot is None or off + _TBYTES.get(m.group(2), 1 << 30) > sizes[slot]:
+                    continue
+                dst = m.group(1)
+            if counts[dst] == 1:
+                lines[k] = None
+                changed = True
+        lines = [l for l in lines if l is not None]
+    for p in sizes:
+        uses = [l for l in lines if re.search(re.escape(p) + r"\b", l)]
+        defs = [l for l in uses if re.match(r"\s*" + re.escape(p) + r" = alloca", l)]
+        stores = [l for l in uses if re.match(r"\s*store (\w+) [%\w.]+, ptr " + re.escape(p) +
+                                                r"(?:, align \d+)?\s*$", l)]
+        if len(defs) == 1 and len(defs) + len(stores) == len(uses) and \
+                all(_TBYTES.get(re.match(r"\s*store (\w+)", l).group(1), 99) <= sizes[p] for l in stores):
+            lines = [l for l in lines if l not in uses]
+    return "\n".join(lines)
+
+
 def process_file(path, args):
     results = []
     base = {"file": os.path.relpath(path, args.root) if args.root else path}
@@ -524,6 +1162,7 @@ def process_file(path, args):
         return [dict(base, status="no-llc-run")]
     workdir = tempfile.mkdtemp(prefix="ptxtv_", dir=args.workdir)
     LLC_FLAGS[os.getpid()] = " ".join(largs)
+    PROBE_LLC[os.getpid()] = largs
     try:
         rc, ptx, err = run([BIN + "/llc"] + largs + [path, "-o", "-"], timeout=300)
     except subprocess.TimeoutExpired:
@@ -537,6 +1176,8 @@ def process_file(path, args):
         defines, decls, globals_, typedefs = module_symbols(src_text)
     except Exception as e:
         return [dict(base, status="source-prep-failed", detail=str(e)[:300])]
+    RENAMES.clear()
+    RENAMES.update(nvptx_renames(src_text))
     name_map = build_name_map(defines, decls, globals_)
     names = list(defines)
     skip_here = SKIP.get(base["file"], set())
@@ -582,6 +1223,10 @@ def main():
                     help="skip functions already present in this results file")
     ap.add_argument("--resume", action="store_true",
                     help="skip files already present in --out")
+    ap.add_argument("--funcs-json", default=None,
+                    help="JSON {file basename: [functions]} (gen_py_tests.py); each file's "
+                         "functions are checked in parallel chunks of --chunk")
+    ap.add_argument("--chunk", type=int, default=25)
     args = ap.parse_args()
     if args.resume and args.out != "-" and os.path.exists(args.out):
         done = set()
@@ -604,8 +1249,18 @@ def main():
                 out.write(json.dumps(r) + "\n")
                 out.flush()
         return
+    jobs = [(f, args) for f in args.files]
+    if args.funcs_json:
+        sel = json.load(open(args.funcs_json))
+        jobs = []
+        for f in args.files:
+            fs = sel.get(os.path.basename(f), [])
+            for k in range(0, len(fs), args.chunk):
+                a = argparse.Namespace(**vars(args))
+                a.func = fs[k:k + args.chunk]
+                jobs.append((f, a))
     with ProcessPoolExecutor(args.j) as ex:
-        futs = {ex.submit(process_file, f, args): f for f in args.files}
+        futs = {ex.submit(process_file, f, a): f for f, a in jobs}
         for fu in as_completed(futs):
             try:
                 rs = fu.result()
