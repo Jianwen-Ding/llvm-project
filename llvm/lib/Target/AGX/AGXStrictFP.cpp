@@ -53,7 +53,9 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include <cmath>
 
@@ -960,6 +962,14 @@ static Value *matchBitsCanonicalNaN(SelectInst &S) {
 
 /// Replace I by Fast where Slow is false, and by the value computed by Build
 /// in a conditional block otherwise. Cond is built right after I.
+/// Batched IEEE lowering (lowerIEEEGroups): in Collect mode the two helpers
+/// below leave the fast result in place and record the condition under which
+/// it is wrong; in Exact mode they replace the instruction by its exact
+/// software result. Normal: a conditional slow path per operation.
+enum class SlowPathMode { Normal, Collect, Exact };
+static SlowPathMode SPMode = SlowPathMode::Normal;
+static SmallVector<Value *, 16> SPInvalid;
+
 template <typename CondFn, typename SlowFn>
 static void lowerWithSlowPath(Instruction &I, CondFn BuildCond,
                               SlowFn BuildSlow) {
@@ -969,7 +979,17 @@ static void lowerWithSlowPath(Instruction &I, CondFn BuildCond,
   Instruction *Next = I.getNextNode();
   IRBuilder<> B(Next);
   SoftFloat SF(B);
+  if (SPMode == SlowPathMode::Exact) {
+    Value *Slow = BuildSlow(SF, B);
+    I.replaceAllUsesWith(Slow); // (value handles follow)
+    I.eraseFromParent();
+    return;
+  }
   Value *Cond = BuildCond(SF, B);
+  if (SPMode == SlowPathMode::Collect) {
+    SPInvalid.push_back(Cond);
+    return;
+  }
   Instruction *ThenTerm = SplitBlockAndInsertIfThen(
       Cond, Next->getIterator(), false,
       MDBuilder(I.getContext()).createUnlikelyBranchWeights());
@@ -993,7 +1013,21 @@ static void replaceWithSlowPath(Instruction &I, FastFn BuildFast,
   Instruction *Next = I.getNextNode();
   BuilderT B(Next);
   SoftFloat SF(B);
+  if (SPMode == SlowPathMode::Exact) {
+    Value *Slow = BuildSlow(SF, B);
+    Slow->takeName(&I);
+    I.replaceAllUsesWith(Slow);
+    I.eraseFromParent();
+    return;
+  }
   auto [Fast, Valid] = BuildFast(SF, B);
+  if (SPMode == SlowPathMode::Collect) {
+    SPInvalid.push_back(B.CreateNot(Valid));
+    Fast->takeName(&I);
+    I.replaceAllUsesWith(Fast);
+    I.eraseFromParent();
+    return;
+  }
   Instruction *ThenTerm =
       SplitBlockAndInsertIfThen(B.CreateNot(Valid), Next->getIterator(), false,
                                 MDBuilder(I.getContext()).createUnlikelyBranchWeights());
@@ -1492,6 +1526,178 @@ static bool promoteBFloat(Instruction &I, bool CanonicalNaN) {
   return true;
 }
 
+
+static cl::opt<unsigned> IEEEGroupLimit(
+    "agx-ieee-group-limit", cl::init(1), cl::Hidden,
+    cl::desc("IEEE binary32 operations of a basic block checked together: the "
+             "hardware results of a run of them, one unlikely branch to an "
+             "exact recomputation of the whole run (1: one branch each)"));
+
+/// Operations whose IEEE lowering is a fast hardware result with a validity
+/// check (lowerWithSlowPath / replaceWithSlowPath): they can share one check.
+static bool groupableIEEE(const Instruction &I) {
+  if (!isF32(&I))
+    return false;
+  switch (I.getOpcode()) {
+  case Instruction::FAdd:
+  case Instruction::FSub:
+  case Instruction::FMul:
+    return true;
+  default:
+    break;
+  }
+  Intrinsic::ID ID = getIntrinsicID(I);
+  return ID == Intrinsic::fma || ID == Intrinsic::fmuladd;
+}
+
+static bool pureForGroup(const Instruction &I) {
+  // (a convergent operation, a SIMD-group shuffle say, must not be copied into
+  // the divergent exact path)
+  if (auto *CB = dyn_cast<CallBase>(&I); CB && CB->isConvergent())
+    return false;
+  return !I.mayHaveSideEffects() && !I.mayReadOrWriteMemory() &&
+         !isa<PHINode>(I) && !I.isTerminator() && !isa<AllocaInst>(I);
+}
+
+/// Lowers the IEEE operations Members of one basic block (in order) with one
+/// check: Region holds them and the pure instructions between them that
+/// depend on them (in order), which the exact path recomputes.
+static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
+                           const SmallPtrSetImpl<Instruction *> &Members) {
+  Instruction *Last = Region.back();
+  Instruction *Next = Last->getNextNode();
+  // the exact path's copies, made before anything changes
+  ValueToValueMapTy VM;
+  SmallVector<Instruction *, 32> Clones;
+  for (Instruction *I : Region) {
+    Instruction *C = I->clone();
+    VM[I] = C;
+    Clones.push_back(C);
+  }
+  for (Instruction *C : Clones)
+    RemapInstruction(C, VM, RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
+  // fast results, and the conditions under which they are wrong
+  SmallVector<WeakTrackingVH, 32> FastVals;
+  for (Instruction *I : Region)
+    FastVals.push_back(I);
+  SPMode = SlowPathMode::Collect;
+  SPInvalid.clear();
+  for (Instruction *I : Region)
+    if (Members.contains(I))
+      lowerIEEE(*I);
+  SPMode = SlowPathMode::Normal;
+  if (SPInvalid.empty()) {
+    for (Instruction *C : Clones)
+      C->deleteValue();
+    return;
+  }
+  IRBuilder<> B(Next);
+  Value *Bad = SPInvalid[0];
+  for (Value *V : drop_begin(SPInvalid))
+    Bad = B.CreateOr(Bad, V);
+  SPInvalid.clear();
+  Instruction *ThenTerm = SplitBlockAndInsertIfThen(
+      Bad, Next->getIterator(), false,
+      MDBuilder(Next->getContext()).createUnlikelyBranchWeights());
+  BasicBlock *Then = ThenTerm->getParent();
+  BasicBlock *Head = Then->getSinglePredecessor();
+  BasicBlock *Join = Next->getParent();
+  SmallVector<WeakTrackingVH, 32> ExactVals;
+  for (Instruction *C : Clones) {
+    C->insertBefore(ThenTerm->getIterator());
+    ExactVals.push_back(C);
+  }
+  SPMode = SlowPathMode::Exact;
+  for (auto [I, C] : zip(Region, Clones))
+    if (Members.contains(I))
+      lowerIEEE(*C);
+  SPMode = SlowPathMode::Normal;
+  B.SetInsertPoint(Join, Join->begin());
+  for (unsigned K = 0; K < Region.size(); ++K) {
+    Value *F = FastVals[K], *E = ExactVals[K];
+    if (!F || !E || F->getType()->isVoidTy())
+      continue;
+    PHINode *Phi = B.CreatePHI(F->getType(), 2);
+    Phi->addIncoming(F, Head);
+    Phi->addIncoming(E, Then);
+    F->replaceUsesWithIf(Phi, [&](Use &U) {
+      auto *UI = dyn_cast<Instruction>(U.getUser());
+      return UI && UI != Phi && UI->getParent() != Head &&
+             UI->getParent() != Then;
+    });
+    if (Phi->use_empty())
+      Phi->eraseFromParent();
+  }
+}
+
+/// Groups the IEEE operations of each basic block of Ops (in program order)
+/// for lowerIEEEGroup; returns the operations left for the per-operation
+/// lowering.
+static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops) {
+  SmallPtrSet<Instruction *, 32> Candidate;
+  for (Instruction *I : Ops)
+    if (groupableIEEE(*I))
+      Candidate.insert(I);
+  if (IEEEGroupLimit <= 1 || Candidate.size() < 2)
+    return false;
+  bool Changed = false;
+  SmallVector<SmallVector<Instruction *, 32>, 8> Regions;
+  SmallVector<SmallPtrSet<Instruction *, 32>, 8> MemberSets;
+  for (BasicBlock &BB : F) {
+    SmallVector<Instruction *, 32> Region;
+    SmallPtrSet<Instruction *, 32> Dep, Mem;
+    auto Close = [&]() {
+      // trailing dependents after the last member are not part of it
+      while (!Region.empty() && !Mem.contains(Region.back()))
+        Region.pop_back();
+      if (Mem.size() >= 2) {
+        Regions.push_back(Region);
+        MemberSets.push_back(Mem);
+      }
+      Region.clear();
+      Dep.clear();
+      Mem.clear();
+    };
+    for (Instruction &I : BB) {
+      bool UsesDep = any_of(I.operands(), [&](Use &U) {
+        auto *OI = dyn_cast<Instruction>(U.get());
+        return OI && Dep.contains(OI);
+      });
+      if (Candidate.contains(&I)) {
+        if (Mem.size() >= IEEEGroupLimit)
+          Close();
+        Region.push_back(&I);
+        Dep.insert(&I);
+        Mem.insert(&I);
+      } else if (UsesDep) {
+        if (pureForGroup(I)) {
+          Region.push_back(&I);
+          Dep.insert(&I);
+        } else {
+          Close();
+        }
+      }
+      if (I.isTerminator())
+        Close();
+    }
+    Close();
+  }
+  for (auto [R, M] : zip(Regions, MemberSets)) {
+    lowerIEEEGroup(R, M);
+    for (Instruction *I : M)
+      Candidate.erase(I);
+    Changed = true;
+  }
+  // the grouped ones are done
+  SmallPtrSet<Instruction *, 32> Done;
+  for (auto &M : MemberSets)
+    for (Instruction *I : M)
+      Done.insert(I);
+  erase_if(Ops, [&](Instruction *I) { return Done.contains(I); });
+  return Changed;
+}
+
+
 bool AGXStrictFP::runOnFunction(Function &F) {
   if (skipFunction(F))
     return false;
@@ -1596,6 +1802,23 @@ bool AGXStrictFP::runOnFunction(Function &F) {
         canonicalizeNaN(*I);
         Changed = true;
       }
+  {
+    // IEEE operations that can share one check (lowerIEEEGroups)
+    SmallVector<Instruction *, 32> IEEEOps;
+    for (Instruction *I : Worklist)
+      if (!I->hasMetadata("air.flush.harmless") &&
+          (I->hasMetadata(KeepDenormalsTag) ||
+           (ST.hasIEEEFP32() && (FunctionIEEE || I->hasMetadata(IEEETag)))))
+        IEEEOps.push_back(I);
+    SmallVector<Instruction *, 32> Left(IEEEOps);
+    if (lowerIEEEGroups(F, Left)) {
+      Changed = true;
+      SmallPtrSet<Instruction *, 32> Keep(Left.begin(), Left.end());
+      erase_if(Worklist, [&](Instruction *I) {
+        return is_contained(IEEEOps, I) && !Keep.contains(I);
+      });
+    }
+  }
   for (Instruction *I : Worklist) {
     // (a front end's operation whose result a flush does not change)
     if (I->hasMetadata("air.flush.harmless"))
