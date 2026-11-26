@@ -1054,6 +1054,11 @@ template <typename BuildFn> static void replace(Instruction &I, BuildFn Build) {
   I.eraseFromParent();
 }
 
+static cl::opt<bool> OneLog2Expansion(
+    "agx-ieee-one-log2", cl::init(true), cl::Hidden,
+    cl::desc("IEEE log2 / rcp / rsqrt: one evaluation of the operand scaled by "
+             "2^64 where it is denormal (not of both and a select)"));
+
 static cl::opt<bool> Exp2FastScale(
     "agx-ieee-exp2-fast-scale", cl::init(true), cl::Hidden,
     cl::desc("IEEE exp2: the exponent add where the result is normal, the "
@@ -1254,6 +1259,22 @@ static bool lowerIEEE(Instruction &I) {
     // (log2 of the strict mode: the precise expansion, within the rounding of the
     // exact result where the hardware's approximation may be off by one)
     bool Log2 = ID == Intrinsic::log2 || ID == Intrinsic::agx_log2;
+    Value *Den = SF.isDenormal(SF.bits(X));
+    Value *R;
+    if (OneLog2Expansion) {
+      // one evaluation, of the operand scaled where it is denormal
+      Value *Op = B.CreateSelect(Den, SF.scaleUp64(X), X);
+      Value *V = Log2 ? AGX::expandMath(B, Intrinsic::log2, {Op})
+                      : B.CreateIntrinsic(ID, {B.getFloatTy()}, {Op});
+      Value *Fixed;
+      if (ID == Intrinsic::agx_rcp)
+        Fixed = B.CreateFMul(V, SF.fconst(0x1p64f));
+      else if (ID == Intrinsic::agx_rsqrt)
+        Fixed = B.CreateFMul(V, SF.fconst(0x1p32f));
+      else
+        Fixed = B.CreateFSub(V, SF.fconst(64.0f));
+      R = B.CreateSelect(Den, Fixed, V);
+    } else {
     Value *Scaled = Log2 ? AGX::expandMath(B, Intrinsic::log2, {SF.scaleUp64(X)})
                          : B.CreateIntrinsic(ID, {B.getFloatTy()}, {SF.scaleUp64(X)});
     Value *Normal = Log2 ? AGX::expandMath(B, Intrinsic::log2, {X}) : static_cast<Value *>(&I);
@@ -1264,7 +1285,8 @@ static bool lowerIEEE(Instruction &I) {
       Fixed = B.CreateFMul(Scaled, SF.fconst(0x1p32f));
     else
       Fixed = B.CreateFSub(Scaled, SF.fconst(64.0f));
-    Value *R = B.CreateSelect(SF.isDenormal(SF.bits(X)), Fixed, Normal);
+    R = B.CreateSelect(Den, Fixed, Normal);
+    }
     for (Use *U : Uses)
       U->set(R);
     return true;
