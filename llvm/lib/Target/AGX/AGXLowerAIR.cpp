@@ -737,12 +737,13 @@ bool LowerAIR::lowerAtomic(IRBuilder<> &B, CallInst &CI, StringRef Name,
   if (!Rest.consume_front("global.") && !Rest.consume_front("local."))
     return false;
   Value *Ptr = CI.getArgOperand(0);
-  if (Rest == "cmpxchg.weak.i32") {
+  if (Rest == "cmpxchg.weak.i32" || Rest == "cmpxchg.weak.i64") {
     // AIR 2.9 adds a memory flags operand before the volatile one.
     if (CI.arg_size() != 7 && CI.arg_size() != 8)
       return false;
     Value *ExpectedPtr = CI.getArgOperand(1);
-    Value *Expected = B.CreateLoad(B.getInt32Ty(), ExpectedPtr);
+    // (.i64: a front end's 64-bit compare-exchange, native on AGX)
+    Value *Expected = B.CreateLoad(CI.getArgOperand(2)->getType(), ExpectedPtr);
     AtomicOrdering Success = ordering(CI.getArgOperand(3));
     AtomicOrdering Failure = ordering(CI.getArgOperand(4));
     if (Failure == AtomicOrdering::Release)
@@ -753,8 +754,11 @@ bool LowerAIR::lowerAtomic(IRBuilder<> &B, CallInst &CI, StringRef Name,
                                     MaybeAlign(), Success, Failure,
                                     syncScope(Ctx, CI.getArgOperand(5)));
     X->setVolatile(isVolatile(CI.getArgOperand(CI.arg_size() - 1)));
-    Result = B.CreateExtractValue(X, 0);
-    B.CreateStore(Result, ExpectedPtr);
+    Value *Found = B.CreateExtractValue(X, 0);
+    B.CreateStore(Found, ExpectedPtr);
+    // Declared returning bool (MSL's compare-exchange result: whether it
+    // succeeded), or the value found.
+    Result = CI.getType()->isIntegerTy(1) ? B.CreateExtractValue(X, 1) : Found;
     return true;
   }
   StringRef Op = Rest.take_until([](char C) { return C == '.'; });
@@ -1587,7 +1591,8 @@ void LowerAIR::foldOrderedAtomics(Function &F) {
     StringRef Name = CI->getCalledFunction()
                          ? CI->getCalledFunction()->getName()
                          : StringRef();
-    bool CmpXchg = Name.ends_with(".cmpxchg.weak.i32");
+    bool CmpXchg = Name.ends_with(".cmpxchg.weak.i32") ||
+                   Name.ends_with(".cmpxchg.weak.i64");
     // (ptr, value, order, scope, volatile) or (ptr, expected, desired,
     // success, failure, scope, [flags,] volatile).
     unsigned OrderArg = CmpXchg ? 3 : 2;
