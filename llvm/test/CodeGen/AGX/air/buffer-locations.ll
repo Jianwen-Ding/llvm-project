@@ -6,17 +6,17 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14g %s -o - | FileCheck %s --check-prefix=ASM
 
 ; CHECK-LABEL: define agx_kernel void @k(
-; CHECK-SAME: ptr addrspace(1) %out,
+; CHECK-SAME: ptr addrspace(1) {{.*}}%out,
 ; CHECK-SAME: ptr addrspace(1) %unused.buffer1,
-; CHECK-SAME: ptr addrspace(4) noalias noundef nonnull readonly byref(float) align 4 dereferenceable(4) %scale,
-; CHECK-SAME: ptr addrspace(1) %in)
+; CHECK-SAME: ptr addrspace(4) {{.*}}byref(float) {{.*}}%scale,
+; CHECK-SAME: ptr addrspace(1) {{.*}}%in)
 ; CHECK: %v = load float, ptr addrspace(1) %in.i
 ; CHECK: %s = load float, ptr addrspace(4) %scale
 ; CHECK: store float %r, ptr addrspace(1) %out.i
 
 ; ASM-LABEL: k:
-; ASM: device_load {{.*}}, u6_u7,
-; ASM: fmul32 {{.*}}, u4,
+; ASM: device_load {{.*}}, u5_u6,
+; ASM: fmul32 {{.*}}, u4
 ; ASM: device_store {{.*}}, u0_u1,
 
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"

@@ -92,8 +92,7 @@ static cl::opt<std::string>
 
 static cl::opt<char>
     OptLevel("O", cl::Prefix, cl::init('3'),
-             cl::desc("Optimization level: -O0, -O1, -O2, -O3 (default), -Os "
-                      "or -Oz"),
+             cl::desc("Optimization level: -O0, -O1, -O2 or -O3 (default)"),
              cl::cat(Cat));
 
 enum class Emit { Obj, Asm, LLVM, BC, Code };
@@ -198,10 +197,6 @@ static OptimizationLevel optimizationLevel() {
     return OptimizationLevel::O1;
   case '2':
     return OptimizationLevel::O2;
-  case 's':
-    return OptimizationLevel::Os;
-  case 'z':
-    return OptimizationLevel::Oz;
   default:
     return OptimizationLevel::O3;
   }
@@ -334,13 +329,16 @@ static void runJob(Job &J) {
   J.ReadMs = msSince(Start);
 
   Triple TT(Triple::normalize(TripleName));
-  std::string Error;
-  const Target *T = TargetRegistry::lookupTarget(TT, Error);
+  std::string LookupError;
+  const Target *T = TargetRegistry::lookupTarget(TT, LookupError);
   if (!T) {
-    Fail(Error);
+    Fail(LookupError);
     return;
   }
   TargetOptions Options;
+  // As llc: assembly with the backend's comments (each kernel's registers,
+  // uniforms, threadgroup memory and stack).
+  Options.MCOptions.AsmVerbose = true;
   std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
       TT, J.CPU, Features, Options, std::nullopt, std::nullopt,
       codeGenOptLevel()));
@@ -375,7 +373,7 @@ static void runJob(Job &J) {
     CGSCCAnalysisManager CGAM;
     ModuleAnalysisManager MAM;
     PipelineTuningOptions PTO;
-    PassBuilder PB(TM.get(), PTO);
+    PassBuilder PB(Ctx, TM.get(), PTO);
     TargetLibraryInfoImpl TLII(TT);
     FAM.registerPass([&] { return TargetLibraryAnalysis(TLII); });
     FAM.registerPass([&] { return PB.buildDefaultAAPipeline(); });

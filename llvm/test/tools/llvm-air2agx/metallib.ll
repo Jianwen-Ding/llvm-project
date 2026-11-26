@@ -31,8 +31,9 @@
 ; ASM: device_store
 
 ; IR: target triple = "agx"
-; IR: define agx_kernel void @saxpy(
-; IR-SAME: byref(i32)
+; The Metal pipeline packs the scalars into one device buffer, after x and y.
+; IR: define agx_kernel void @saxpy(ptr addrspace(1) {{.*}}, ptr addrspace(1) {{.*}}, ptr addrspace(1) {{[^,]*}})
+; IR: call i32 @llvm.agx.thread.position.in.grid.x()
 ; IR-NOT: !air.
 
 ; OBJ: Name: .text

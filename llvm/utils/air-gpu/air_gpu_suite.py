@@ -384,14 +384,25 @@ def check(c, values, got):
     return bad, worst
 
 
+# llvm-air2agx (--air2agx): the case's .metallib, as the AIR target writes it for Metal, compiled for AGX.
+AIR2AGX = None
+
+
 def compile_agx(llc, ir, tmp, tag, mcpu):
-    """The case through the AIR target's portable passes and the AGX backend."""
+    """The case through the AIR target's portable passes and the AGX backend; with --air2agx, through the
+    .metallib the AIR target writes for Metal and llvm-air2agx."""
     ll = os.path.join(tmp, tag + '.ll')
     portable = os.path.join(tmp, tag + '.portable.ll')
     obj = os.path.join(tmp, tag + '.o')
     open(ll, 'w').write(ir)
-    for cmd in ([llc, '-mtriple=air', '-air-portable', ll, '-o', portable],
-                [llc, '-mtriple=agx', '-mcpu=' + mcpu, '-filetype=obj', portable, '-o', obj]):
+    if AIR2AGX:
+        lib = os.path.join(tmp, tag + '.metallib')
+        cmds = ([llc, '-mtriple=air', '-filetype=obj', ll, '-o', lib],
+                [AIR2AGX, '-mcpu=' + mcpu, lib, '-o', obj])
+    else:
+        cmds = ([llc, '-mtriple=air', '-air-portable', ll, '-o', portable],
+                [llc, '-mtriple=agx', '-mcpu=' + mcpu, '-filetype=obj', portable, '-o', obj])
+    for cmd in cmds:
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             return None, r.stderr.strip()[-400:]
@@ -410,12 +421,27 @@ def run_case_agx(c, obj, inputs, agx):
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'agx-checked'))
     from run_checked import launch
     out = pack(c.out, c.out_init) if c.out_init is not None else bytes(N * TYPES[c.out][2])
-    if c.scalars is not None:
+    if c.scalars is not None and AIR2AGX:
+        # Metal's form: the scalars packed in one buffer after the others, each at its natural alignment.
+        packed = b''
+        for t, v in c.scalars:
+            size = TYPES[t][2]
+            packed += bytes(-len(packed) % size) + struct.pack('<' + TYPES[t][1], v)
+        args = [('buf', out), ('buf', packed.ljust(16, b'\0'))]
+        index = 0
+    elif c.scalars is not None:
         args = [('buf', out)] + [('param', [scalar_field(t, v)]) for t, v in c.scalars]
         index = 0
     else:
         args = [('buf', d) for d in inputs] + [('buf', out)]
         index = len(inputs)
+    if AIR2AGX:
+        # The AGX kernel takes each buffer at its Metal location: the lock table of emulated atomics is the
+        # argument at LOCK_TABLE_INDEX, after unused ones.
+        from run_checked import kernels
+        nargs = len(kernels(obj, agx['objcopy'])[c.name].args)
+        if nargs == LOCK_TABLE_INDEX + 1 and len(args) <= LOCK_TABLE_INDEX:
+            args = args + [('buf', bytes(16))] * (LOCK_TABLE_INDEX - len(args)) + [('buf', bytes(LOCK_TABLE_BYTES))]
     try:
         r = launch(obj, c.name, args, tuple(dispatch(c)[0]), tuple(dispatch(c)[1]), agx['run'], agx['objcopy'],
                    agx['readelf'])
@@ -3865,6 +3891,8 @@ def main():
     ap.add_argument('--keep', help='keep the generated .ll/.air files in this directory')
     ap.add_argument('--agx-run', help="run on AGX: the AGX Performance Simulator's agx_run")
     ap.add_argument('--mcpu', default='agx-g14g', help='AGX processor (with --agx-run)')
+    ap.add_argument('--air2agx', help='with --agx-run: compile each case\'s .metallib (the AIR for Metal) with '
+                    'this llvm-air2agx instead of its portable AIR with llc')
     ap.add_argument('--objcopy', default='llvm-objcopy')
     ap.add_argument('--readelf', default='llvm-readelf')
     ap.add_argument('--compare-backends', action='store_true',
@@ -3880,7 +3908,8 @@ def main():
     agx = args.agx_run and {'run': args.agx_run, 'mcpu': args.mcpu, 'objcopy': args.objcopy,
                             'readelf': args.readelf}
 
-    global MODULE_SUFFIX
+    global MODULE_SUFFIX, AIR2AGX
+    AIR2AGX = args.air2agx
     MODULE_SUFFIX = args.module_suffix.replace('\\n', '\n')
     all_results = {}
     with tempfile.TemporaryDirectory() as tmp:

@@ -72,7 +72,7 @@ metallib::readEntries(MemoryBufferRef Buffer) {
     uint64_t Off, Size;
   } Sec[4];
   for (unsigned I = 0; I < 4; ++I) {
-    Sec[I] = {R.u64(28 + 16 * I), R.u64(36 + 16 * I)};
+    Sec[I] = {R.u64(24 + 16 * I), R.u64(32 + 16 * I)};
     if (!R.has(Sec[I].Off, Sec[I].Size))
       return malformed("section " + Twine(I) + " lies outside the file");
   }

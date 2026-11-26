@@ -754,6 +754,39 @@ bool LowerAIR::lowerAtomic(IRBuilder<> &B, CallInst &CI, StringRef Name,
   StringRef Op = Rest.take_until([](char C) { return C == '.'; });
   Rest = Rest.drop_front(Op.size());
   Rest.consume_front(".");
+  // air.atomic.<space>.load.<type>(ptr, order, scope, volatile) and
+  // air.atomic.<space>.store.<type>(ptr, value, order, scope, volatile)
+  // (MSL's atomic_load_explicit / atomic_store_explicit): atomic loads and
+  // stores, of the value's natural alignment. A load cannot release and a
+  // store cannot acquire: those halves of an order are dropped.
+  if (Op == "load" || Op == "store") {
+    bool IsLoad = Op == "load";
+    Type *T = IsLoad ? CI.getType() : CI.getArgOperand(1)->getType();
+    if (CI.arg_size() != (IsLoad ? 4u : 5u) || !T->isSingleValueType() ||
+        T->isVectorTy())
+      return false;
+    AtomicOrdering O = ordering(CI.getArgOperand(IsLoad ? 1 : 2));
+    if (IsLoad && (O == AtomicOrdering::Release))
+      O = AtomicOrdering::Monotonic;
+    else if (IsLoad && O == AtomicOrdering::AcquireRelease)
+      O = AtomicOrdering::Acquire;
+    else if (!IsLoad && O == AtomicOrdering::Acquire)
+      O = AtomicOrdering::Monotonic;
+    else if (!IsLoad && O == AtomicOrdering::AcquireRelease)
+      O = AtomicOrdering::Release;
+    SyncScope::ID SS = syncScope(Ctx, CI.getArgOperand(IsLoad ? 2 : 3));
+    Align A(M.getDataLayout().getTypeStoreSize(T));
+    bool Vol = isVolatile(CI.getArgOperand(IsLoad ? 3 : 4));
+    if (IsLoad) {
+      LoadInst *L = B.CreateAlignedLoad(T, Ptr, A, Vol);
+      L->setAtomic(O, SS);
+      Result = L;
+    } else {
+      StoreInst *S = B.CreateAlignedStore(CI.getArgOperand(1), Ptr, A, Vol);
+      S->setAtomic(O, SS);
+    }
+    return true;
+  }
   bool Unsigned = Rest.consume_front("u.");
   Rest.consume_front("s.");
   bool Float = Rest.starts_with("f");
@@ -878,6 +911,20 @@ bool LowerAIR::lowerSIMD(IRBuilder<> &B, CallInst &CI, StringRef Name,
         {CI.getArgOperand(0), Delta});
     return true;
   }
+  // The active threads' mask, and whether this thread is the lowest of them.
+  if (Op == "active_threads_mask" && CI.arg_size() == 0 && Ty->isIntegerTy()) {
+    Result = B.CreateZExtOrTrunc(Active(), Ty);
+    return true;
+  }
+  if (Op == "is_first" && CI.arg_size() == 0 && Ty->isIntegerTy(1)) {
+    Value *Self = B.CreateIntrinsic(agx_thread_index_in_simdgroup, {});
+    if (Quad)
+      Self = B.CreateAnd(Self, B.getInt32(3));
+    Value *First = B.CreateIntrinsic(Intrinsic::cttz, {B.getInt32Ty()},
+                                     {Active(), B.getFalse()});
+    Result = B.CreateICmpEQ(Self, First);
+    return true;
+  }
   if (Op == "broadcast_first" && CI.arg_size() == 1) {
     Value *First = B.CreateIntrinsic(Intrinsic::cttz, {B.getInt32Ty()},
                                      {Active(), B.getFalse()});
@@ -991,6 +1038,24 @@ bool LowerAIR::lowerOther(IRBuilder<> &B, CallInst &CI, StringRef Name,
   unsigned N = CI.arg_size();
   auto Arg = [&](unsigned I) { return CI.getArgOperand(I); };
 
+  // air.ldexp.<type>(x, i32 e) and air.frexp.<type>(x, ptr e), MSL's ldexp
+  // and frexp (the exponent through thread memory).
+  if (Fn == "ldexp" && N == 2 && Ty->isFPOrFPVectorTy() &&
+      Arg(1)->getType()->isIntOrIntVectorTy(32)) {
+    Result = B.CreateIntrinsic(Intrinsic::ldexp, {Ty, Arg(1)->getType()},
+                               {Arg(0), Arg(1)});
+    return true;
+  }
+  if (Fn == "frexp" && N == 2 && Ty->isFPOrFPVectorTy() &&
+      Arg(1)->getType()->isPointerTy()) {
+    Type *ExpTy = B.getInt32Ty();
+    if (auto *VT = dyn_cast<VectorType>(Ty))
+      ExpTy = VectorType::get(ExpTy, VT->getElementCount());
+    Value *F = B.CreateIntrinsic(Intrinsic::frexp, {Ty, ExpTy}, {Arg(0)});
+    B.CreateStore(B.CreateExtractValue(F, 1), Arg(1));
+    Result = B.CreateExtractValue(F, 0);
+    return true;
+  }
   if (Fn.starts_with("get_") && N == 1) {
     Value *D = Arg(0), *V = nullptr;
     if (Fn == "get_global_id")

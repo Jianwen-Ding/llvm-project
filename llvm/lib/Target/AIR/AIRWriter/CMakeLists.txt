@@ -30,6 +30,7 @@ add_llvm_component_library(LLVMAIRWriter
   BitWriter
   Core
   MC
+  Object
   Support
   TargetParser
   TransformUtils
