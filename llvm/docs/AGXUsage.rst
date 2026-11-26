@@ -1201,6 +1201,7 @@ Compiling .air and .metallib files
 
 .. code-block:: console
 
+   $ llvm-air2agx -mcpu=agx-g14g k.air -o k.agx             # pure AGX code
    $ llvm-air2agx -mcpu=agx-g14g k.metallib -o k.o          # ELF object
    $ llvm-air2agx -mcpu=agx-g14g --emit=asm k.air -o k.s
    $ llvm-air2agx -mcpu=agx-g13g,agx-g14g --output-dir out a.metallib b.air
@@ -1218,9 +1219,17 @@ allocas), and goes through ``-O``'s pipeline (``-O3`` by default) with the
 AGX target's passes, ``agx-lower-air`` first, then the code generator at the
 same level. ``--emit`` writes the ELF object (``obj``, the default), assembly
 (``asm``), the optimized AGX IR (``llvm``, ``bc``: what ``llc`` would compile,
-and the IR ``alive-tv`` compares with the AIR) or each kernel's raw
-instructions (``code``: ``PREFIX.<kernel>.bin``, the input of the AGX
-Performance Simulator's ``agx_cost`` and ``agx_dispatch``).
+and the IR ``alive-tv`` compares with the AIR), pure AGX machine code
+(``agx``: the instructions alone, no container: the object's ``.text``, each
+kernel at its offset; ``--kernel NAME`` writes that kernel's alone, from
+offset 0, as ``agx_cost`` and ``agx_run`` take it; code that needs a
+relocation is an error) or each kernel's raw instructions (``code``:
+``PREFIX.<kernel>.bin``, the input of the AGX Performance Simulator's
+``agx_cost`` and ``agx_dispatch``). Without ``--emit``, ``-o``'s extension
+chooses: ``.agx``, ``.s``, ``.ll``, ``.bc``, anything else an object. Pure
+code carries no description of the kernel: the launcher needs its argument
+layout (the ``.agx.kernels`` record of the object, or of
+``llvm-air2agx -o k.o``) to fill its uniforms.
 
 Every AIR module, for every processor of ``-mcpu``, is a job with its own
 ``LLVMContext`` and target machine; ``-j`` jobs run at once (one per core by
