@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -95,7 +96,7 @@ static cl::opt<char>
              cl::desc("Optimization level: -O0, -O1, -O2 or -O3 (default)"),
              cl::cat(Cat));
 
-enum class Emit { Obj, Asm, LLVM, BC, Code };
+enum class Emit { Obj, Asm, LLVM, BC, Code, AGX };
 static cl::opt<Emit> EmitKind(
     "emit", cl::init(Emit::Obj), cl::desc("What to write"),
     cl::values(clEnumValN(Emit::Obj, "obj", "the AGX ELF object (default)"),
@@ -104,10 +105,19 @@ static cl::opt<Emit> EmitKind(
                           "the optimized AGX IR, as text (before code "
                           "generation)"),
                clEnumValN(Emit::BC, "bc", "the optimized AGX IR, as bitcode"),
+               clEnumValN(Emit::AGX, "agx",
+                          "pure AGX machine code: the instructions alone, "
+                          "with no container (the default for -o *.agx)"),
                clEnumValN(Emit::Code, "code",
                           "each kernel's raw instructions, one .bin per "
                           "kernel (agx_cost / agx_dispatch input)")),
     cl::cat(Cat));
+
+static cl::opt<std::string>
+    KernelName("kernel",
+               cl::desc("With --emit=agx, only this kernel's instructions "
+                        "(from offset 0, as agx_cost and agx_run take them)"),
+               cl::value_desc("name"), cl::cat(Cat));
 
 static cl::opt<std::string>
     Threads("j", cl::desc("Jobs to run at once (default: one per core)"),
@@ -227,34 +237,59 @@ static StringRef extension() {
     return ".bc";
   case Emit::Code:
     return "";
+  case Emit::AGX:
+    return ".agx";
   }
   llvm_unreachable("emit kind");
 }
 
-/// Each kernel's instructions in the object: its symbol's bytes in .text (to
-/// the next symbol where the symbol gives no size).
-static Error writeKernelCode(Job &J, StringRef Object) {
-  auto Obj = object::ObjectFile::createObjectFile(
-      MemoryBufferRef(Object, J.OutPath));
-  if (!Obj)
-    return Obj.takeError();
-  struct Sym {
+namespace {
+/// The code of an object: its .text and each kernel's range in it.
+struct ObjectCode {
+  std::unique_ptr<object::ObjectFile> Obj;
+  StringRef Text;
+  struct Kernel {
     StringRef Name;
     uint64_t Addr, Size;
   };
-  SmallVector<Sym, 8> Syms;
+  SmallVector<Kernel, 8> Kernels;
+};
+} // namespace
+
+/// The instructions of the object the code generator wrote: .text, which must
+/// need no relocation (pure code runs where it is loaded), and each kernel's
+/// symbol's bytes in it (to the next symbol where the symbol gives no size).
+static Expected<ObjectCode> objectCode(StringRef Object, StringRef Path) {
+  ObjectCode C;
+  auto Obj = object::ObjectFile::createObjectFile(MemoryBufferRef(Object, Path));
+  if (!Obj)
+    return Obj.takeError();
+  C.Obj = std::move(*Obj);
   std::optional<object::SectionRef> Text;
-  for (const object::SectionRef &S : (*Obj)->sections())
+  for (const object::SectionRef &S : C.Obj->sections())
     if (S.isText()) {
       Text = S;
       break;
     }
   if (!Text)
     return createStringError(inconvertibleErrorCode(), "no .text section");
+  for (const object::SectionRef &S : C.Obj->sections()) {
+    Expected<object::section_iterator> Target = S.getRelocatedSection();
+    if (!Target) {
+      consumeError(Target.takeError());
+      continue;
+    }
+    if (*Target == *Text && !S.relocations().empty())
+      return createStringError(
+          inconvertibleErrorCode(),
+          "the code needs relocations, which pure AGX code cannot carry: "
+          "write the ELF object");
+  }
   Expected<StringRef> Contents = Text->getContents();
   if (!Contents)
     return Contents.takeError();
-  for (const object::SymbolRef &S : (*Obj)->symbols()) {
+  C.Text = *Contents;
+  for (const object::SymbolRef &S : C.Obj->symbols()) {
     Expected<object::SymbolRef::Type> Ty = S.getType();
     Expected<object::section_iterator> Sec = S.getSection();
     Expected<StringRef> Name = S.getName();
@@ -268,29 +303,70 @@ static Error writeKernelCode(Job &J, StringRef Object) {
     }
     if (*Ty != object::SymbolRef::ST_Function || *Sec != *Text)
       continue;
-    uint64_t Size = object::ELFSymbolRef(S).getSize();
-    Syms.push_back({*Name, *Addr, Size});
+    C.Kernels.push_back({*Name, *Addr, object::ELFSymbolRef(S).getSize()});
   }
-  llvm::sort(Syms, [](const Sym &A, const Sym &B) { return A.Addr < B.Addr; });
-  for (size_t I = 0; I < Syms.size(); ++I) {
-    Sym &S = Syms[I];
-    uint64_t End = I + 1 < Syms.size() ? Syms[I + 1].Addr : Contents->size();
-    if (!S.Size || S.Addr + S.Size > End)
-      S.Size = End - S.Addr;
-    if (S.Addr > Contents->size() || S.Size > Contents->size() - S.Addr)
+  llvm::sort(C.Kernels, [](const ObjectCode::Kernel &A,
+                           const ObjectCode::Kernel &B) {
+    return A.Addr < B.Addr;
+  });
+  for (size_t I = 0; I < C.Kernels.size(); ++I) {
+    ObjectCode::Kernel &K = C.Kernels[I];
+    uint64_t End =
+        I + 1 < C.Kernels.size() ? C.Kernels[I + 1].Addr : C.Text.size();
+    if (K.Addr > End)
       return createStringError(inconvertibleErrorCode(),
-                               "kernel " + S.Name + " lies outside .text");
-    std::string Path = (J.OutPath + "." + S.Name + ".bin").str();
-    std::error_code EC;
-    ToolOutputFile Out(Path, EC, sys::fs::OF_None);
-    if (EC)
-      return createStringError(EC, Path + ": " + EC.message());
-    Out.os() << Contents->substr(S.Addr, S.Size);
-    Out.keep();
+                               "kernel " + K.Name + " lies outside .text");
+    if (!K.Size || K.Addr + K.Size > End)
+      K.Size = End - K.Addr;
+  }
+  return std::move(C);
+}
+
+static Error writeBytes(StringRef Path, StringRef Bytes) {
+  std::error_code EC;
+  ToolOutputFile Out(Path, EC, sys::fs::OF_None);
+  if (EC)
+    return createStringError(EC, Path + ": " + EC.message());
+  Out.os() << Bytes;
+  Out.keep();
+  return Error::success();
+}
+
+/// --emit=code: each kernel's instructions, PREFIX.<kernel>.bin.
+static Error writeKernelCode(Job &J, StringRef Object) {
+  Expected<ObjectCode> C = objectCode(Object, J.OutPath);
+  if (!C)
+    return C.takeError();
+  for (const ObjectCode::Kernel &K : C->Kernels) {
+    if (Error E = writeBytes((J.OutPath + "." + K.Name + ".bin").str(),
+                             C->Text.substr(K.Addr, K.Size)))
+      return E;
     ++J.Kernels;
-    J.CodeBytes += S.Size;
+    J.CodeBytes += K.Size;
   }
   return Error::success();
+}
+
+/// --emit=agx: the module's instructions alone, each kernel at its offset in
+/// .text; with --kernel, that kernel's instructions, from offset 0.
+static Error writePureAGX(Job &J, StringRef Object) {
+  Expected<ObjectCode> C = objectCode(Object, J.OutPath);
+  if (!C)
+    return C.takeError();
+  StringRef Bytes = C->Text;
+  J.Kernels = C->Kernels.size();
+  if (!KernelName.empty()) {
+    auto It = find_if(C->Kernels, [](const ObjectCode::Kernel &K) {
+      return K.Name == KernelName;
+    });
+    if (It == C->Kernels.end())
+      return createStringError(inconvertibleErrorCode(),
+                               "no kernel " + KernelName);
+    Bytes = Bytes.substr(It->Addr, It->Size);
+    J.Kernels = 1;
+  }
+  J.CodeBytes = Bytes.size();
+  return writeBytes(J.OutPath, Bytes);
 }
 
 static void runJob(Job &J) {
@@ -421,8 +497,9 @@ static void runJob(Job &J) {
   if (J.Failed)
     return;
 
-  if (EmitKind == Emit::Code) {
-    if (Error E = writeKernelCode(J, Buf))
+  if (EmitKind == Emit::Code || EmitKind == Emit::AGX) {
+    if (Error E = EmitKind == Emit::Code ? writeKernelCode(J, Buf)
+                                         : writePureAGX(J, Buf))
       Fail(toString(std::move(E)));
     return;
   }
@@ -472,6 +549,18 @@ int main(int argc, char **argv) {
       "  The AIR goes through agx-lower-air and -O's pipeline with the AGX\n"
       "  target's passes, then the AGX code generator, in one process; every\n"
       "  AIR module x processor is a job, and jobs run in parallel.\n");
+  // Without --emit, -o's extension says what to write (k.agx: pure AGX code).
+  if (!EmitKind.getNumOccurrences())
+    EmitKind = StringSwitch<Emit>(sys::path::extension(Output))
+                   .Case(".agx", Emit::AGX)
+                   .Case(".s", Emit::Asm)
+                   .Case(".ll", Emit::LLVM)
+                   .Case(".bc", Emit::BC)
+                   .Default(Emit::Obj);
+  if (!KernelName.empty() && EmitKind != Emit::AGX) {
+    WithColor::error(errs(), "llvm-air2agx") << "--kernel needs --emit=agx\n";
+    return 1;
+  }
 
   std::vector<std::unique_ptr<MemoryBuffer>> Buffers;
   std::vector<Unit> Units;
