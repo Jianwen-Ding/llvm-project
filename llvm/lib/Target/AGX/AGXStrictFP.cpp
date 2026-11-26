@@ -107,6 +107,11 @@ struct Term {
 };
 
 /// Builds the integer implementations at the builder's insertion point.
+static cl::opt<bool> ClassKey(
+    "agx-ieee-class-key", cl::init(true), cl::Hidden,
+    cl::desc("IEEE binary32 denormal and zero tests on 0xfffffe - 2|x| (one "
+             "isub with a shifted operand, shared), not on |x| from an and"));
+
 class SoftFloat {
   IRBuilderBase &B;
   Type *I1, *I32, *I64, *F32;
@@ -163,11 +168,21 @@ public:
   Value *expZero(Value *Bits) {
     return B.CreateICmpEQ(B.CreateAnd(Bits, c32(0x7f800000)), c32(0));
   }
+  /// 0xfffffe - 2 |x| (mod 2^32), from the bits of x: one isub with a
+  /// shifted operand, which the denormal and zero tests share.
+  Value *classKey(Value *Bits) {
+    return B.CreateSub(c32(0xfffffe), B.CreateShl(Bits, 1));
+  }
   Value *isDenormal(Value *Bits) {
+    // 2 |x| in [2, 0xfffffe] (the low bit of 2 |x| is 0)
+    if (ClassKey)
+      return B.CreateICmpULT(classKey(Bits), c32(0xfffffd));
     Value *Abs = B.CreateAnd(Bits, c32(0x7fffffff));
     return B.CreateICmpULT(B.CreateSub(Abs, c32(1)), c32(0x7fffff));
   }
   Value *isZero(Value *Bits) {
+    if (ClassKey)
+      return B.CreateICmpEQ(classKey(Bits), c32(0xfffffe));
     return B.CreateICmpEQ(B.CreateAnd(Bits, c32(0x7fffffff)), c32(0));
   }
   Value *isInfOrNaN(Value *Bits) {
@@ -916,6 +931,43 @@ static bool producesArithmeticNaN(const Instruction &I) {
   }
 }
 
+static cl::opt<bool> CanonicalNaNAtUses(
+    "agx-canonical-nan-at-uses", cl::init(true), cl::Hidden,
+    cl::desc("canonical-nan: no canonical NaN for a result whose every use "
+             "canonicalizes its own NaN results or only tests for NaN"));
+
+/// No use of V (directly or through selects and phis) sees the bits of a NaN
+/// V: each is an operation of Canon, whose NaN results are canonicalized
+/// whatever the NaN operands' bits (and which gives a NaN for a NaN operand,
+/// or ignores it, as IEEE operations do), or a comparison.
+static bool nanPayloadUnobserved(const Instruction &V,
+                                 const SmallPtrSetImpl<const Instruction *> &Canon,
+                                 DenseMap<const Instruction *, bool> &Memo,
+                                 unsigned Depth) {
+  if (auto It = Memo.find(&V); It != Memo.end())
+    return It->second;
+  // (a cycle of phis is taken as observed, also while it is being visited)
+  Memo[&V] = false;
+  if (Depth > 8 || V.use_empty())
+    return false;
+  bool OK = all_of(V.uses(), [&](const Use &U) {
+    auto *UI = dyn_cast<Instruction>(U.getUser());
+    if (!UI)
+      return false;
+    if (isa<FCmpInst>(UI))
+      return true;
+    if (Canon.contains(UI) && UI->getType()->isFloatingPointTy())
+      return true;
+    if ((isa<PHINode>(UI) ||
+         (isa<SelectInst>(UI) && U.getOperandNo() != 0)) &&
+        UI->getType() == V.getType())
+      return nanPayloadUnobserved(*UI, Canon, Memo, Depth + 1);
+    return false;
+  });
+  Memo[&V] = OK;
+  return OK;
+}
+
 /// Replace the NaN results of I by the canonical NaN.
 static void canonicalizeNaN(Instruction &I) {
   Type *Ty = I.getType();
@@ -991,6 +1043,181 @@ static Value *matchBitsCanonicalNaN(SelectInst &S) {
 enum class SlowPathMode { Normal, Collect, Exact };
 static SlowPathMode SPMode = SlowPathMode::Normal;
 static SmallVector<Value *, 16> SPInvalid;
+
+/// Hardware results of grouped IEEE operations (lowerIEEEGroup), with the
+/// block in which their run's check covers them: there they are never
+/// denormal (the hardware flushes its results, and the check fails where the
+/// right result is denormal), so operations in that block need not test them.
+static DenseMap<const Value *, const BasicBlock *> GroupFast;
+
+static cl::opt<bool> GroupNormal(
+    "agx-ieee-group-normal", cl::init(true), cl::Hidden,
+    cl::desc("IEEE runs checked together: no denormal tests of the run's "
+             "results in the run"));
+
+/// V is not denormal where an operation in block At uses it.
+static bool knownNotDenormal(Value *V, const BasicBlock *At) {
+  for (unsigned D = 0; D < 4; ++D) {
+    if (auto *C = dyn_cast<ConstantFP>(V))
+      return !C->getValueAPF().isDenormal();
+    if (auto It = GroupFast.find(V); It != GroupFast.end())
+      return It->second == At;
+    Value *A;
+    if (match(V, PatternMatch::m_FNeg(PatternMatch::m_Value(A))) ||
+        match(V, PatternMatch::m_FAbs(PatternMatch::m_Value(A)))) {
+      V = A;
+      continue;
+    }
+    // (the canonical NaN of a value)
+    auto *S = dyn_cast<SelectInst>(V);
+    auto *C = S ? dyn_cast<FCmpInst>(S->getCondition()) : nullptr;
+    auto *NaN = S ? dyn_cast<ConstantFP>(S->getTrueValue()) : nullptr;
+    if (!C || !NaN || !NaN->isNaN() ||
+        C->getPredicate() != CmpInst::FCMP_UNO ||
+        C->getOperand(0) != S->getFalseValue() ||
+        C->getOperand(1) != S->getFalseValue())
+      return false;
+    V = S->getFalseValue();
+  }
+  return false;
+}
+
+/// Whether a value is never denormal by what computes it (IEEE semantics, the
+/// value the lowering keeps): integer conversions, half extensions, square
+/// roots, reciprocal square roots and rounding to integers give none, and
+/// moves, selects and phis keep the property of what they choose from. A phi
+/// cycle is assumed not denormal while it is visited (its values come from
+/// its other incoming values through those moves).
+static bool neverDenormal(const Value *V, SmallPtrSetImpl<const Value *> &Visiting,
+                          unsigned Depth = 0) {
+  if (auto *C = dyn_cast<ConstantFP>(V))
+    return !C->getValueAPF().isDenormal();
+  if (isa<UndefValue>(V))
+    return false;
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || Depth > 6 || !I->getType()->isFloatTy())
+    return false;
+  switch (I->getOpcode()) {
+  case Instruction::SIToFP:
+  case Instruction::UIToFP:
+    return true;
+  case Instruction::FPExt:
+    return I->getOperand(0)->getType()->isHalfTy();
+  case Instruction::FNeg:
+    return neverDenormal(I->getOperand(0), Visiting, Depth + 1);
+  case Instruction::Select:
+    return neverDenormal(I->getOperand(1), Visiting, Depth + 1) &&
+           neverDenormal(I->getOperand(2), Visiting, Depth + 1);
+  case Instruction::PHI: {
+    if (!Visiting.insert(I).second)
+      return true;
+    bool R = all_of(cast<PHINode>(I)->incoming_values(), [&](const Value *In) {
+      return neverDenormal(In, Visiting, Depth + 1);
+    });
+    Visiting.erase(I);
+    return R;
+  }
+  default:
+    break;
+  }
+  switch (getIntrinsicID(*I)) {
+  case Intrinsic::sqrt:
+  case Intrinsic::agx_rsqrt:
+  case Intrinsic::floor:
+  case Intrinsic::ceil:
+  case Intrinsic::trunc:
+  case Intrinsic::rint:
+  case Intrinsic::nearbyint:
+  case Intrinsic::roundeven:
+  case Intrinsic::round:
+    return true;
+  case Intrinsic::fabs:
+    return neverDenormal(I->getOperand(0), Visiting, Depth + 1);
+  case Intrinsic::copysign:
+  case Intrinsic::minnum:
+  case Intrinsic::maxnum:
+  case Intrinsic::minimum:
+  case Intrinsic::maximum:
+  case Intrinsic::minimumnum:
+  case Intrinsic::maximumnum:
+    return neverDenormal(I->getOperand(0), Visiting, Depth + 1) &&
+           (getIntrinsicID(*I) == Intrinsic::copysign ||
+            neverDenormal(I->getOperand(1), Visiting, Depth + 1));
+  default:
+    return false;
+  }
+}
+
+static cl::opt<bool> OperandRanges(
+    "agx-ieee-operand-ranges", cl::init(true), cl::Hidden,
+    cl::desc("IEEE binary32: no denormal tests of operands that are never "
+             "denormal by what computes them (conversions from integers and "
+             "half, square roots, roundings)"));
+
+/// The operands of each operation that are never denormal (bit K for operand
+/// K), from the IR before any lowering: a lowering replaces an operation by
+/// one of the same value, so the bits stay right for its users.
+static DenseMap<const Instruction *, unsigned> OperandNotDenormal;
+
+static void recordOperandRanges(ArrayRef<Instruction *> Ops) {
+  OperandNotDenormal.clear();
+  if (!OperandRanges)
+    return;
+  for (Instruction *I : Ops) {
+    unsigned Mask = 0;
+    for (unsigned K = 0, E = std::min(I->getNumOperands(), 8u); K < E; ++K) {
+      SmallPtrSet<const Value *, 8> Visiting;
+      if (I->getOperand(K)->getType()->isFloatTy() &&
+          neverDenormal(I->getOperand(K), Visiting))
+        Mask |= 1u << K;
+    }
+    if (Mask)
+      OperandNotDenormal[I] = Mask;
+  }
+}
+
+/// Operand K of I is not denormal where I uses it.
+static bool operandNotDenormal(const Instruction &I, unsigned K) {
+  if (auto It = OperandNotDenormal.find(&I);
+      It != OperandNotDenormal.end() && (It->second >> K & 1))
+    return true;
+  return knownNotDenormal(I.getOperand(K), I.getParent());
+}
+
+static cl::opt<bool> GroupChain(
+    "agx-ieee-group-chain", cl::init(true), cl::Hidden,
+    cl::desc("IEEE runs checked together: each multiplication's and fma's "
+             "condition as selects that fall back to the run's condition so "
+             "far (fcmpsel / icmpsel chains), not or-ed after"));
+
+/// In a run's collection (lowerIEEEGroup): the condition of the run so far,
+/// which a chained condition includes.
+static Value *SPPrev = nullptr;
+static bool SPChained = false;
+static Value *chainPrev() {
+  if (SPMode != SlowPathMode::Collect || !GroupChain || !SPPrev)
+    return nullptr;
+  SPChained = true;
+  return SPPrev;
+}
+
+/// Prev, or Tiny with neither factor zero: as selects falling back to Prev.
+static Value *chainTiny(IRBuilderBase &B, Value *Tiny, Value *ZX, Value *ZY,
+                        Value *Prev) {
+  Value *NZ = B.CreateSelect(ZY, Prev, B.getTrue());
+  NZ = B.CreateSelect(ZX, Prev, NZ);
+  return B.CreateSelect(Tiny, NZ, Prev);
+}
+
+/// Operand K of I is zero: a float comparison where it is not denormal (which
+/// the hardware compares as zero), else on its bits.
+static Value *zeroTest(const Instruction &I, unsigned K, SoftFloat &SF,
+                       IRBuilderBase &B) {
+  Value *V = I.getOperand(K);
+  if (operandNotDenormal(I, K))
+    return B.CreateFCmpOEQ(V, ConstantFP::get(V->getType(), 0.0));
+  return SF.isZero(SF.bits(V));
+}
 
 template <typename CondFn, typename SlowFn>
 static void lowerWithSlowPath(Instruction &I, CondFn BuildCond,
@@ -1139,9 +1366,10 @@ static bool lowerIEEE(Instruction &I) {
           Value *Tiny = B.CreateFCmpULE(
               B.CreateUnaryIntrinsic(Intrinsic::fabs, &I),
               SF.fconst(0x1p-125f));
-          return B.CreateAnd(Tiny, B.CreateNot(B.CreateOr(
-                                       SF.isZero(SF.bits(X)),
-                                       SF.isZero(SF.bits(Y)))));
+          Value *ZX = zeroTest(I, 0, SF, B), *ZY = zeroTest(I, 1, SF, B);
+          if (Value *P = chainPrev())
+            return chainTiny(B, Tiny, ZX, ZY, P);
+          return B.CreateAnd(Tiny, B.CreateNot(B.CreateOr(ZX, ZY)));
         },
         [&](SoftFloat &SF, IRBuilderBase &B) {
           Value *XB = SF.bits(X), *YB = SF.bits(Y);
@@ -1174,6 +1402,9 @@ static bool lowerIEEE(Instruction &I) {
     auto *Cmp = cast<FCmpInst>(&I);
     Value *X = Cmp->getOperand(0), *Y = Cmp->getOperand(1);
     CmpInst::Predicate P = Cmp->getPredicate();
+    // (the hardware orders zeros and normal numbers)
+    if (operandNotDenormal(I, 0) && operandNotDenormal(I, 1))
+      return false;
     SmallVector<Use *, 4> Uses;
     for (Use &U : I.uses())
       Uses.push_back(&U);
@@ -1202,12 +1433,23 @@ static bool lowerIEEE(Instruction &I) {
         I,
         [&](SoftFloat &SF, IRBuilderBase &B) {
           Value *XB = SF.bits(X), *YB = SF.bits(Y), *ZB = SF.bits(Z);
-          Value *Den = B.CreateOr(SF.isDenormal(XB),
-                                  B.CreateOr(SF.isDenormal(YB), SF.isDenormal(ZB)));
+          Value *Den = nullptr;
+          unsigned K = 0;
+          for (Value *VB : {XB, YB, ZB}) {
+            if (operandNotDenormal(I, K++))
+              continue;
+            Value *D = SF.isDenormal(VB);
+            Den = Den ? B.CreateOr(Den, D) : D;
+          }
+          if (!Den)
+            Den = B.getFalse();
           Value *Tiny = B.CreateFCmpULE(
               B.CreateUnaryIntrinsic(Intrinsic::fabs, &I), SF.fconst(0x1p-125f));
-          Tiny = B.CreateAnd(Tiny, B.CreateNot(B.CreateOr(SF.isZero(XB),
-                                                          SF.isZero(YB))));
+          Value *ZX = zeroTest(I, 0, SF, B), *ZY = zeroTest(I, 1, SF, B);
+          if (Value *P = chainPrev())
+            return B.CreateSelect(Den, B.getTrue(),
+                                  chainTiny(B, Tiny, ZX, ZY, P));
+          Tiny = B.CreateAnd(Tiny, B.CreateNot(B.CreateOr(ZX, ZY)));
           return B.CreateOr(Den, Tiny);
         },
         [&](SoftFloat &SF, IRBuilderBase &B) {
@@ -1258,6 +1500,8 @@ static bool lowerIEEE(Instruction &I) {
   case Intrinsic::round: {
     // Denormals round to zero, except away from zero for floor and ceil.
     Value *X = II->getArgOperand(0);
+    if (operandNotDenormal(I, 0))
+      return false;
     SmallVector<Use *, 4> Uses;
     for (Use &U : I.uses())
       Uses.push_back(&U);
@@ -1281,6 +1525,14 @@ static bool lowerIEEE(Instruction &I) {
   case Intrinsic::agx_log2: {
     // Denormal operands are scaled by 2^64 first.
     Value *X = II->getArgOperand(0);
+    if (operandNotDenormal(I, 0)) {
+      if (!(ID == Intrinsic::log2 || ID == Intrinsic::agx_log2))
+        return false;
+      replace(I, [&](SoftFloat &, IRBuilderBase &B) {
+        return AGX::expandMath(B, Intrinsic::log2, {X});
+      });
+      return true;
+    }
     SmallVector<Use *, 4> Uses;
     for (Use &U : I.uses())
       Uses.push_back(&U);
@@ -1632,6 +1884,23 @@ static bool groupableIEEE(const Instruction &I) {
   return ID == Intrinsic::fma || ID == Intrinsic::fmuladd;
 }
 
+/// Operations whose own IEEE lowering has a slow path or a long expansion:
+/// a copy in a run's exact path would cost more than the run saves.
+static bool slowIEEE(const Instruction &I) {
+  if (I.getOpcode() == Instruction::FDiv || I.getOpcode() == Instruction::FRem)
+    return true;
+  switch (getIntrinsicID(I)) {
+  case Intrinsic::sqrt:
+  case Intrinsic::exp2:
+  case Intrinsic::agx_exp2:
+  case Intrinsic::log2:
+  case Intrinsic::agx_log2:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static bool pureForGroup(const Instruction &I) {
   // (a convergent operation, a SIMD-group shuffle say, must not be copied into
   // the divergent exact path)
@@ -1641,13 +1910,26 @@ static bool pureForGroup(const Instruction &I) {
          !isa<PHINode>(I) && !I.isTerminator() && !isa<AllocaInst>(I);
 }
 
+static cl::opt<bool> GroupCheckedExact(
+    "agx-ieee-group-checked-exact", cl::init(true), cl::Hidden,
+    cl::desc("IEEE runs checked together: the exact path is the run with "
+             "each operation's own check and slow path (as without runs), not "
+             "every operation computed in software (whose independent "
+             "computations the scheduler interleaves, raising the register "
+             "count)"));
+
 /// Lowers the IEEE operations Members of one basic block (in order) with one
 /// check: Region holds them and the pure instructions between them that
-/// depend on them (in order), which the exact path recomputes.
+/// depend on them (in order), which the exact path recomputes. The copies of
+/// the region's other operations of Worklist (an IEEE comparison, say) are
+/// added to NewWork, which lowers them like the originals.
 static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
-                           const SmallPtrSetImpl<Instruction *> &Members) {
+                           const SmallPtrSetImpl<Instruction *> &Members,
+                           const SmallPtrSetImpl<Instruction *> &Work,
+                           SmallVectorImpl<Instruction *> &NewWork) {
   Instruction *Last = Region.back();
   Instruction *Next = Last->getNextNode();
+  BasicBlock *BB = Last->getParent();
   // the exact path's copies, made before anything changes
   ValueToValueMapTy VM;
   SmallVector<Instruction *, 32> Clones;
@@ -1655,29 +1937,53 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
     Instruction *C = I->clone();
     VM[I] = C;
     Clones.push_back(C);
+    if (auto It = OperandNotDenormal.find(I); It != OperandNotDenormal.end())
+      OperandNotDenormal[C] = It->second;
   }
   for (Instruction *C : Clones)
     RemapInstruction(C, VM, RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
-  // fast results, and the conditions under which they are wrong
+  // fast results, and the conditions under which they are wrong (or-ed as
+  // they come, so that each condition dies at once)
   SmallVector<WeakTrackingVH, 32> FastVals;
   for (Instruction *I : Region)
     FastVals.push_back(I);
   SPMode = SlowPathMode::Collect;
   SPInvalid.clear();
-  for (Instruction *I : Region)
-    if (Members.contains(I))
-      lowerIEEE(*I);
+  Value *Bad = nullptr;
+  for (Instruction *I : Region) {
+    if (!Members.contains(I))
+      continue;
+    SPPrev = Bad;
+    SPChained = false;
+    lowerIEEE(*I);
+    SPPrev = nullptr;
+    // (the members' hardware results, never denormal, are right where the
+    // run's check passes: their operand checks in the run can go)
+    if (GroupNormal)
+      GroupFast[I] = BB;
+    for (Value *C : SPInvalid) {
+      if (!Bad || SPChained) {
+        // (a chained condition includes the run's so far)
+        Bad = C;
+        continue;
+      }
+      auto *CI = dyn_cast<Instruction>(C);
+      IRBuilder<> OB(CI ? CI->getNextNode() : Next);
+      Bad = OB.CreateOr(Bad, C);
+    }
+    SPInvalid.clear();
+  }
   SPMode = SlowPathMode::Normal;
-  if (SPInvalid.empty()) {
+  if (!Bad) {
     for (Instruction *C : Clones)
       C->deleteValue();
     return;
   }
-  IRBuilder<> B(Next);
-  Value *Bad = SPInvalid[0];
-  for (Value *V : drop_begin(SPInvalid))
-    Bad = B.CreateOr(Bad, V);
-  SPInvalid.clear();
+  if (isa<Constant>(Bad)) {
+    // (a constant condition: or-ed into the next one's builder above)
+    IRBuilder<> B(Next);
+    Bad = B.CreateOr(Bad, B.getFalse());
+  }
   Instruction *ThenTerm = SplitBlockAndInsertIfThen(
       Bad, Next->getIterator(), false,
       MDBuilder(Next->getContext()).createUnlikelyBranchWeights());
@@ -1689,12 +1995,20 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
     C->insertBefore(ThenTerm->getIterator());
     ExactVals.push_back(C);
   }
-  SPMode = SlowPathMode::Exact;
-  for (auto [I, C] : zip(Region, Clones))
-    if (Members.contains(I))
-      lowerIEEE(*C);
-  SPMode = SlowPathMode::Normal;
-  B.SetInsertPoint(Join, Join->begin());
+  if (!GroupCheckedExact) {
+    SPMode = SlowPathMode::Exact;
+    for (auto [I, C] : zip(Region, Clones))
+      if (Members.contains(I))
+        lowerIEEE(*C);
+    SPMode = SlowPathMode::Normal;
+  }
+  for (unsigned K = 0; K < Region.size(); ++K)
+    if ((GroupCheckedExact && Members.contains(Region[K])) ||
+        (!Members.contains(Region[K]) && Work.contains(Region[K])))
+      if (Value *E = ExactVals[K])
+        if (auto *EI = dyn_cast<Instruction>(E))
+          NewWork.push_back(EI);
+  IRBuilder<> B(Join, Join->begin());
   for (unsigned K = 0; K < Region.size(); ++K) {
     Value *F = FastVals[K], *E = ExactVals[K];
     if (!F || !E || F->getType()->isVoidTy())
@@ -1712,10 +2026,18 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
   }
 }
 
+static cl::opt<unsigned> IEEEGroupLiveIns(
+    "agx-ieee-group-live-ins", cl::init(4), cl::Hidden,
+    cl::desc("Most operands of a run of IEEE binary32 operations checked "
+             "together that would otherwise die inside it (the exact path "
+             "keeps them live to its end)"));
+
 /// Groups the IEEE operations of each basic block of Ops (in program order)
 /// for lowerIEEEGroup; returns the operations left for the per-operation
-/// lowering.
-static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops) {
+/// lowering. Copies that need their own lowering are added to NewWork.
+static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops,
+                            const SmallPtrSetImpl<Instruction *> &Work,
+                            SmallVectorImpl<Instruction *> &NewWork) {
   SmallPtrSet<Instruction *, 32> Candidate;
   for (Instruction *I : Ops)
     if (groupableIEEE(*I))
@@ -1726,8 +2048,13 @@ static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops) {
   SmallVector<SmallVector<Instruction *, 32>, 8> Regions;
   SmallVector<SmallPtrSet<Instruction *, 32>, 8> MemberSets;
   for (BasicBlock &BB : F) {
+    DenseMap<const Instruction *, unsigned> Pos;
+    unsigned N = 0;
+    for (Instruction &I : BB)
+      Pos[&I] = N++;
     SmallVector<Instruction *, 32> Region;
     SmallPtrSet<Instruction *, 32> Dep, Mem;
+    SmallSetVector<Instruction *, 16> Inputs;
     auto Close = [&]() {
       // trailing dependents after the last member are not part of it
       while (!Region.empty() && !Mem.contains(Region.back()))
@@ -1739,6 +2066,26 @@ static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops) {
       Region.clear();
       Dep.clear();
       Mem.clear();
+      Inputs.clear();
+    };
+    // Operands from outside the run that die in it up to position End: the
+    // exact path keeps them live to the run's end.
+    auto Extended = [&](unsigned End) {
+      unsigned K = 0;
+      for (Instruction *O : Inputs) {
+        bool Dies = all_of(O->users(), [&](User *U) {
+          auto *UI = cast<Instruction>(U);
+          return UI->getParent() == &BB && !isa<PHINode>(UI) &&
+                 Pos.lookup(UI) <= End;
+        });
+        K += Dies;
+      }
+      return K;
+    };
+    auto AddInputs = [&](Instruction &I, SmallSetVector<Instruction *, 16> &To) {
+      for (Use &U : I.operands())
+        if (auto *OI = dyn_cast<Instruction>(U.get()); OI && !Dep.contains(OI))
+          To.insert(OI);
     };
     for (Instruction &I : BB) {
       bool UsesDep = any_of(I.operands(), [&](Use &U) {
@@ -1748,11 +2095,21 @@ static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops) {
       if (Candidate.contains(&I)) {
         if (Mem.size() >= IEEEGroupLimit)
           Close();
+        else if (!Mem.empty() && IEEEGroupLiveIns) {
+          SmallSetVector<Instruction *, 16> Saved = Inputs;
+          AddInputs(I, Inputs);
+          unsigned K = Extended(Pos[&I]);
+          Inputs = Saved;
+          if (K > IEEEGroupLiveIns)
+            Close();
+        }
+        AddInputs(I, Inputs);
         Region.push_back(&I);
         Dep.insert(&I);
         Mem.insert(&I);
       } else if (UsesDep) {
-        if (pureForGroup(I)) {
+        if (pureForGroup(I) && !(Work.contains(&I) && slowIEEE(I))) {
+          AddInputs(I, Inputs);
           Region.push_back(&I);
           Dep.insert(&I);
         } else {
@@ -1765,7 +2122,7 @@ static bool lowerIEEEGroups(Function &F, SmallVectorImpl<Instruction *> &Ops) {
     Close();
   }
   for (auto [R, M] : zip(Regions, MemberSets)) {
-    lowerIEEEGroup(R, M);
+    lowerIEEEGroup(R, M, Work, NewWork);
     for (Instruction *I : M)
       Candidate.erase(I);
     Changed = true;
@@ -1876,14 +2233,29 @@ bool AGXStrictFP::runOnFunction(Function &F) {
     if (!I.hasMetadata(ExactTag))
       Worklist.push_back(&I);
 
+  recordOperandRanges(Worklist);
   // NaN canonicalization first: the IEEE lowering then replaces the
   // canonicalized value.
-  if (CanonicalNaN)
+  if (CanonicalNaN) {
+    SmallPtrSet<const Instruction *, 32> Canon;
     for (Instruction *I : Worklist)
-      if (producesArithmeticNaN(*I)) {
+      if (producesArithmeticNaN(*I))
+        Canon.insert(I);
+    SmallVector<Instruction *, 32> Skip;
+    if (CanonicalNaNAtUses) {
+      DenseMap<const Instruction *, bool> Memo;
+      for (Instruction *I : Worklist)
+        if (Canon.contains(I) && I->getType()->isFloatingPointTy() &&
+            nanPayloadUnobserved(*I, Canon, Memo, 0))
+          Skip.push_back(I);
+    }
+    SmallPtrSet<Instruction *, 32> SkipSet(Skip.begin(), Skip.end());
+    for (Instruction *I : Worklist)
+      if (Canon.contains(I) && !SkipSet.contains(I)) {
         canonicalizeNaN(*I);
         Changed = true;
       }
+  }
   {
     // IEEE operations that can share one check (lowerIEEEGroups)
     SmallVector<Instruction *, 32> IEEEOps;
@@ -1893,12 +2265,17 @@ bool AGXStrictFP::runOnFunction(Function &F) {
            (ST.hasIEEEFP32() && (FunctionIEEE || I->hasMetadata(IEEETag)))))
         IEEEOps.push_back(I);
     SmallVector<Instruction *, 32> Left(IEEEOps);
-    if (lowerIEEEGroups(F, Left)) {
+    SmallPtrSet<Instruction *, 32> Work(Worklist.begin(), Worklist.end());
+    SmallVector<Instruction *, 16> NewWork;
+    GroupFast.clear();
+    if (lowerIEEEGroups(F, Left, Work, NewWork)) {
       Changed = true;
       SmallPtrSet<Instruction *, 32> Keep(Left.begin(), Left.end());
+      SmallPtrSet<Instruction *, 32> IEEESet(IEEEOps.begin(), IEEEOps.end());
       erase_if(Worklist, [&](Instruction *I) {
-        return is_contained(IEEEOps, I) && !Keep.contains(I);
+        return IEEESet.contains(I) && !Keep.contains(I);
       });
+      append_range(Worklist, NewWork);
     }
   }
   for (Instruction *I : Worklist) {
@@ -1911,6 +2288,8 @@ bool AGXStrictFP::runOnFunction(Function &F) {
     else if (ST.hasIEEEFP32() && isCorrectlyRounded(*I))
       Changed |= lowerFlushing(*I);
   }
+  GroupFast.clear();
+  OperandNotDenormal.clear();
   return Changed;
 }
 

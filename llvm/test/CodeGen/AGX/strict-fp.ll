@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=agx -mcpu=agx-g13g -mattr=+ieee-fp32,+canonical-nan -stop-after=agx-strict-fp < %s | FileCheck %s
+; RUN: llc -mtriple=agx -mcpu=agx-g13g -mattr=+ieee-fp32,+canonical-nan -agx-canonical-nan-at-uses=false -stop-after=agx-strict-fp < %s | FileCheck %s
 ; RUN: llc -mtriple=agx -mcpu=agx-g13g -mattr=+ieee-fp32,+canonical-nan -verify-machineinstrs < %s -o /dev/null
 ; RUN: llc -mtriple=agx -mcpu=agx-g13g -stop-after=agx-strict-fp < %s | FileCheck %s --check-prefix=DEFAULT
 
@@ -15,7 +15,7 @@
 ; CHECK-NEXT:    %[[SUM:[0-9]+]] = phi float [ %add, %0 ], [ %{{[0-9]+}}, %[[SLOW]] ]
 ; CHECK-NEXT:    %[[NAN:[0-9]+]] = fcmp uno float %[[SUM]], %[[SUM]]
 ; CHECK-NEXT:    select i1 %[[NAN]], float +nan(0x3FFFFF), float %[[SUM]]
-; CHECK-NOT:     fdiv
+; CHECK:         fdiv float %{{[0-9]+}}, %c, !agx.exact
 ; CHECK:         call float @llvm.agx.rcp.f32(
 ; CHECK:         select i1 {{.*}}, float +nan(0x3FFFFF), float %div
 ; CHECK:         %cmp = fcmp olt float
