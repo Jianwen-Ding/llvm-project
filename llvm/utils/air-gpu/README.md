@@ -66,12 +66,14 @@ gets it instead: the `.metallib` the AIR target writes (`llc -mtriple=air
 -filetype=obj`), compiled by `llvm-air2agx` (llvm/docs/AGXUsage.rst,
 "Compiling .air and .metallib files"). The kernels then take their scalars
 packed in one buffer after the others, as the Metal pipeline passes them, and
-an emulated atomic's lock table at its location (30). On 2026-11-26: PASS 691,
-HW-FTZ 34, MISMATCH 1 (`frexp_exponent` of a subnormal, as the portable path),
-COMPILE 2 (`sdiv_*`: both paths), REJECTED 3: the 64-bit atomics the Metal
-pipeline emulates with a spin lock (AIRLowerAtomicRMW) never finish on AGX,
-where the threads of a SIMD-group spin for one lock in lockstep; the portable
-path's native 64-bit atomics pass.
+an emulated atomic's lock table at its location (30). On 2026-11-26: PASS 686,
+HW-FTZ 35, MISMATCH 1 (`frexp_exponent` of a subnormal, as the portable path),
+ABSENT 2, SKIPPED 1, no COMPILE; the portable path through `llc`: PASS 680,
+HW-FTZ 37, MISMATCH 1, COMPILE 7 (`llc` crashes on i128 division and i1
+loads). REJECTED 3: the 64-bit atomics the Metal pipeline emulates with a spin
+lock (AIRLowerAtomicRMW) never finish on AGX, where the threads of a
+SIMD-group spin for one lock in lockstep; the portable path's native 64-bit
+atomics pass.
 
 Requests are sent one at a time under `/scratch/air-device.lock`
 (`AIR_DEVICE_LOCK`) and named in `--progress` first. A request that times out
