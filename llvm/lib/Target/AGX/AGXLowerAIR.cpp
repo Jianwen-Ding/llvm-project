@@ -2149,79 +2149,112 @@ static bool touchesThreadgroup(const Instruction &I) {
   return false;
 }
 
-// A barrier of threadgroup memory alone (mem_flags 2, or none) that no
-// threadgroup access precedes on any path from the kernel's entry orders
-// nothing, nor does one that none follows on any path to its end (the
-// memory ends with the threadgroup): MSL orders device and texture memory by
-// a barrier only with their flags. The Metal pipeline's
-// air-tg-barrier-insert puts barriers around every threadgroup access, the
-// first one before any and the last one after all.
+// A barrier of threadgroup memory alone (mem_flags 2, or none) orders
+// nothing when, on every path to it, no threadgroup access has happened since
+// the last barrier (the kernel's entry counts as one): that barrier ordered
+// whatever came before. Likewise when, on every path from it, none happens
+// before the next barrier (or the kernel's end: the memory ends with the
+// threadgroup). MSL orders device and texture memory by a barrier only with
+// their flags. The Metal pipeline's air-tg-barrier-insert puts barriers
+// around every threadgroup access, next to the program's own. The forward
+// rule drops every barrier it finds at once (each one's last barrier is then
+// an earlier one, with no access between), and so does the backward rule on
+// the barriers left; the two at once would drop both barriers of a pair that
+// stands between two accesses.
+static bool isBarrierCall(const Instruction &I, bool &OnlyThreadgroup) {
+  auto *CI = dyn_cast<CallInst>(&I);
+  const Function *Callee = CI ? CI->getCalledFunction() : nullptr;
+  if (!Callee || (Callee->getName() != "air.wg.barrier" &&
+                  Callee->getName() != "air.simdgroup.barrier"))
+    return false;
+  auto *Flags =
+      CI->arg_size() ? dyn_cast<ConstantInt>(CI->getArgOperand(0)) : nullptr;
+  OnlyThreadgroup = Flags && (Flags->getZExtValue() & ~uint64_t(2)) == 0;
+  // A SIMD-group barrier orders the SIMD-group only: it ends no threadgroup
+  // access's reach.
+  return Callee->getName() == "air.wg.barrier" || OnlyThreadgroup;
+}
+
+/// One direction of the rule: the barriers (tg-only) whose side Forward
+/// (before them) or not (after them) has no threadgroup access since the
+/// nearest workgroup barrier on every path.
+static SmallVector<CallInst *, 8> idleBarriers(Function &F, bool Forward) {
+  // Per block: what leaves it (Forward: whether an access is pending since
+  // the last barrier at its end; backward, at its start), from what enters.
+  auto Step = [&](const Instruction &I, bool Pending, CallInst *&Idle) {
+    bool OnlyTG;
+    if (isBarrierCall(I, OnlyTG)) {
+      auto *CI = const_cast<CallInst *>(cast<CallInst>(&I));
+      if (OnlyTG && !Pending)
+        Idle = CI;
+      bool WG = CI->getCalledFunction()->getName() == "air.wg.barrier";
+      return WG ? false : Pending;
+    }
+    return Pending || touchesThreadgroup(I);
+  };
+  auto Through = [&](const BasicBlock &BB, bool Pending,
+                     SmallVectorImpl<CallInst *> *Idle) {
+    auto Visit = [&](const Instruction &I) {
+      CallInst *C = nullptr;
+      Pending = Step(I, Pending, C);
+      if (C && Idle)
+        Idle->push_back(C);
+    };
+    if (Forward)
+      for (const Instruction &I : BB)
+        Visit(I);
+    else
+      for (const Instruction &I : reverse(BB))
+        Visit(I);
+    return Pending;
+  };
+  // Pending at block entry (forward) or exit (backward); a block not yet
+  // reached is optimistic (false), the entry / the exits start clean.
+  DenseMap<const BasicBlock *, bool> In;
+  SmallVector<const BasicBlock *, 16> Work;
+  SmallPtrSet<const BasicBlock *, 16> Seen;
+  if (Forward) {
+    Work.push_back(&F.getEntryBlock());
+  } else {
+    for (BasicBlock &BB : F)
+      if (succ_empty(&BB))
+        Work.push_back(&BB);
+  }
+  for (const BasicBlock *BB : Work)
+    Seen.insert(BB);
+  while (!Work.empty()) {
+    const BasicBlock *BB = Work.pop_back_val();
+    bool Out = Through(*BB, In.lookup(BB), nullptr);
+    auto Next = [&](const BasicBlock *N) {
+      bool Old = In.lookup(N);
+      if (!Seen.insert(N).second && (Old || !Out))
+        return;
+      In[N] = Old || Out;
+      Work.push_back(N);
+    };
+    if (Forward)
+      for (const BasicBlock *S : successors(BB))
+        Next(S);
+    else
+      for (const BasicBlock *P : predecessors(BB))
+        Next(P);
+  }
+  SmallVector<CallInst *, 8> Idle;
+  for (BasicBlock &BB : F)
+    if (Seen.count(&BB))
+      Through(BB, In.lookup(&BB), &Idle);
+  return Idle;
+}
+
 static void dropIdleBarriers(Function &F) {
   // Only a kernel starts with no threadgroup access behind it: a function it
   // calls may be called after some.
   if (!IdleBarriers || F.isDeclaration() ||
       F.getCallingConv() != CallingConv::AGX_KERNEL)
     return;
-  SmallVector<CallInst *, 8> Barriers;
-  DenseMap<const BasicBlock *, bool> Has;
-  for (BasicBlock &BB : F) {
-    bool H = false;
-    for (Instruction &I : BB) {
-      if (auto *CI = dyn_cast<CallInst>(&I))
-        if (const Function *Callee = CI->getCalledFunction();
-            Callee && (Callee->getName() == "air.wg.barrier" ||
-                       Callee->getName() == "air.simdgroup.barrier")) {
-          auto *Flags = CI->arg_size()
-                            ? dyn_cast<ConstantInt>(CI->getArgOperand(0))
-                            : nullptr;
-          if (Flags && (Flags->getZExtValue() & ~uint64_t(2)) == 0)
-            Barriers.push_back(CI);
-        }
-      H |= touchesThreadgroup(I);
-    }
-    Has[&BB] = H;
-  }
-  if (Barriers.empty())
-    return;
-  // Blocks entered after an access (forward), and blocks left before one
-  // (backward).
-  DenseMap<const BasicBlock *, bool> InAfter, OutBefore;
-  SmallVector<const BasicBlock *, 16> Work;
-  for (BasicBlock &BB : F)
-    if (Has[&BB])
-      Work.push_back(&BB);
-  while (!Work.empty()) {
-    const BasicBlock *BB = Work.pop_back_val();
-    for (const BasicBlock *S : successors(BB))
-      if (!InAfter[S]) {
-        InAfter[S] = true;
-        Work.push_back(S);
-      }
-  }
-  for (BasicBlock &BB : F)
-    if (Has[&BB])
-      Work.push_back(&BB);
-  while (!Work.empty()) {
-    const BasicBlock *BB = Work.pop_back_val();
-    for (const BasicBlock *P : predecessors(BB))
-      if (!OutBefore[P]) {
-        OutBefore[P] = true;
-        Work.push_back(P);
-      }
-  }
-  for (CallInst *CI : Barriers) {
-    const BasicBlock *BB = CI->getParent();
-    bool Before = InAfter[BB], After = OutBefore[BB];
-    for (const Instruction &I : *BB) {
-      if (&I == CI)
-        continue;
-      bool Earlier = I.comesBefore(CI);
-      if (touchesThreadgroup(I))
-        (Earlier ? Before : After) = true;
-    }
-    if (!Before || !After)
+  for (bool Forward : {true, false})
+    for (CallInst *CI : idleBarriers(F, Forward))
       CI->eraseFromParent();
-  }
 }
 
 void LowerAIR::recoverAGXOperations(Function &F) {
