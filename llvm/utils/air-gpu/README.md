@@ -61,6 +61,18 @@ flushed), `DIFF-nan` (both NaNs), `DIFF-ulp` (a case with a tolerance, within
 16 ULPs) or `DIFF-real`; `NOT-COMPARED` when one side did not run the case.
 Each side's verdict against the reference is reported too.
 
+`--agx-run agx_run --air2agx llvm-air2agx` compiles each case as Metal
+gets it instead: the `.metallib` the AIR target writes (`llc -mtriple=air
+-filetype=obj`), compiled by `llvm-air2agx` (llvm/docs/AGXUsage.rst,
+"Compiling .air and .metallib files"). The kernels then take their scalars
+packed in one buffer after the others, as the Metal pipeline passes them, and
+an emulated atomic's lock table at its location (30). On 2026-11-26: PASS 691,
+HW-FTZ 34, MISMATCH 1 (`frexp_exponent` of a subnormal, as the portable path),
+COMPILE 2 (`sdiv_*`: both paths), REJECTED 3: the 64-bit atomics the Metal
+pipeline emulates with a spin lock (AIRLowerAtomicRMW) never finish on AGX,
+where the threads of a SIMD-group spin for one lock in lockstep; the portable
+path's native 64-bit atomics pass.
+
 Requests are sent one at a time under `/scratch/air-device.lock`
 (`AIR_DEVICE_LOCK`) and named in `--progress` first. A request that times out
 is added to `air_gpu_suite_hangs.txt`, never sent again, and stops the run.
