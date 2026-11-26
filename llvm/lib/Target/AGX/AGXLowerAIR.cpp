@@ -137,6 +137,11 @@ struct Param {
 struct AIRKernel {
   Function *F;
   SmallVector<Param, 8> Params;
+  /// The AGX kernel's arguments: at position N the device or constant buffer
+  /// parameter bound at location N (air.location_index, MSL's buffer(N)), or
+  /// -1 where no parameter is (an unused argument keeps the later buffers at
+  /// their locations).
+  SmallVector<int, 8> Order;
   Function *NewF = nullptr;
 };
 
@@ -248,6 +253,9 @@ static unsigned mdInt(const MDOperand &Op) {
   return ~0u;
 }
 
+// Metal's buffer argument table (air.max_device_buffers).
+static constexpr unsigned MaxBufferLocations = 31;
+
 bool LowerAIR::parseKernels(NamedMDNode &MD,
                             SmallVectorImpl<AIRKernel> &Kernels) {
   for (MDNode *N : MD.operands()) {
@@ -306,21 +314,37 @@ bool LowerAIR::parseKernels(NamedMDNode &MD,
         error(F, "parameter " + Twine(A.getArgNo()) +
                      " is not described in !air.kernel");
 
-    // Device and constant buffers share the location numbers, in parameter
-    // order; threadgroup buffers have their own.
-    unsigned NextLocation = 0, Threadgroup = 0;
-    for (Param &Pm : K.Params) {
+    // Device and constant buffers share the location numbers, which MSL's
+    // buffer(N) gives in any order and with gaps; threadgroup buffers have
+    // their own. The AGX kernel takes the buffers in location order, each at
+    // its location's position.
+    unsigned Threadgroup = 0;
+    for (auto [ArgNo, Pm] : enumerate(K.Params)) {
       if (Pm.Kind != Param::Buffer)
         continue;
       if (Pm.AddrSpace == air::AS::Threadgroup) {
         if (Threadgroup++)
           error(F, "more than one threadgroup buffer parameter");
-      } else if (Pm.AddrSpace != air::AS::Device &&
-                 Pm.AddrSpace != air::AS::Constant) {
-        error(F, "a buffer in address space " + Twine(Pm.AddrSpace));
-      } else if (Pm.Location != NextLocation++) {
-        error(F, "buffer locations are not in parameter order");
+        continue;
       }
+      if (Pm.AddrSpace != air::AS::Device &&
+          Pm.AddrSpace != air::AS::Constant) {
+        error(F, "a buffer in address space " + Twine(Pm.AddrSpace));
+        continue;
+      }
+      if (Pm.Location >= MaxBufferLocations) {
+        error(F, "buffer location " + Twine(Pm.Location) +
+                     " is beyond the " + Twine(MaxBufferLocations) +
+                     " buffers a kernel has");
+        continue;
+      }
+      if (K.Order.size() <= Pm.Location)
+        K.Order.resize(Pm.Location + 1, -1);
+      if (K.Order[Pm.Location] != -1) {
+        error(F, "two buffers at location " + Twine(Pm.Location));
+        continue;
+      }
+      K.Order[Pm.Location] = ArgNo;
     }
     Kernels.push_back(std::move(K));
   }
@@ -518,9 +542,11 @@ Function *LowerAIR::newKernel(AIRKernel &K, AIRToAGXTypes &Types) {
     for (Attribute At : F.getAttributes().getParamAttrs(A.getArgNo()))
       if (At.isStringAttribute())
         Pm.StringAttrs.push_back(At);
-    if (Pm.Kind == Param::Buffer && Pm.AddrSpace != air::AS::Threadgroup)
-      Params.push_back(Types.remapType(A.getType()));
   }
+  for (int ArgNo : K.Order)
+    Params.push_back(ArgNo < 0
+                         ? PointerType::get(Ctx, AGX::DEVICE_ADDRESS)
+                         : Types.remapType(F.getArg(ArgNo)->getType()));
   auto *FT = FunctionType::get(Type::getVoidTy(Ctx), Params, false);
   Function *NewF = Function::Create(FT, F.getLinkage(), F.getAddressSpace(),
                                     F.getName() + ".agx", &M);
@@ -543,7 +569,9 @@ void LowerAIR::cloneKernel(AIRKernel &K, Function *NewF,
   // the body's entry block is then merged into.
   BasicBlock *Pre = BasicBlock::Create(Ctx, "entry", NewF);
   IRBuilder<> B(Pre);
-  auto NewArg = NewF->arg_begin();
+  for (auto [Pos, ArgNo] : enumerate(K.Order))
+    if (ArgNo < 0)
+      NewF->getArg(Pos)->setName("unused.buffer" + Twine(Pos));
   for (Argument &A : F.args()) {
     const Param &Pm = K.Params[A.getArgNo()];
     if (Pm.Kind == Param::SystemValue) {
@@ -559,8 +587,10 @@ void LowerAIR::cloneKernel(AIRKernel &K, Function *NewF,
       TG->setAlignment(Align(16));
       VMap[&A] = TG;
     } else {
+      Argument *NewArg = NewF->getArg(find(K.Order, int(A.getArgNo())) -
+                                      K.Order.begin());
       NewArg->setName(A.getName());
-      VMap[&A] = &*NewArg++;
+      VMap[&A] = NewArg;
     }
   }
 
@@ -626,11 +656,11 @@ static bool onlyLoadsWithin(Value *Ptr, int64_t Offset, uint64_t Size,
 
 void LowerAIR::passConstantBuffersByReference(AIRKernel &K, Function *NewF) {
   const DataLayout &DL = M.getDataLayout();
-  auto NewArg = NewF->arg_begin();
-  for (const Param &Pm : K.Params) {
-    if (Pm.Kind != Param::Buffer || Pm.AddrSpace == air::AS::Threadgroup)
+  for (auto [Pos, ArgNo] : enumerate(K.Order)) {
+    if (ArgNo < 0)
       continue;
-    Argument &A = *NewArg++;
+    const Param &Pm = K.Params[ArgNo];
+    Argument &A = *NewF->getArg(Pos);
     for (Attribute At : Pm.StringAttrs)
       A.addAttr(At);
     if (Pm.AddrSpace != air::AS::Constant)

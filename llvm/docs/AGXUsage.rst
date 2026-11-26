@@ -1071,8 +1071,9 @@ target's portable passes leave it (``addAIRPortablePasses``,
 ``llc -mtriple=air -air-portable``): a module whose kernels are described by
 ``!air.kernel``. The ``agx-lower-air`` pass, first in the backend's IR passes
 and at the start of ``opt``'s pipelines, turns such a module into an AGX
-module; it does nothing to a module without ``!air.kernel``. It is not a
-reader of ``.air`` files.
+module; it does nothing to a module without ``!air.kernel``. ``llvm-air2agx``
+(`Compiling .air and .metallib files`_) reads ``.air`` and ``.metallib`` files
+for it.
 
 The module may only use what AIR has: integers of 8, 16, 32 and 64 bits (and
 ``i1`` outside memory), ``half``, ``bfloat`` and ``float``, and pointers in
@@ -1182,6 +1183,57 @@ layout, and loses the AIR metadata and module flags; address
 computations over types that AIR lays out differently (a ``<3 x float>``
 takes 16 bytes in AIR, 12 in AGX) become byte offsets with AIR's layout
 first, and their stack slots byte arrays of AIR's size.
+
+Buffer locations
+----------------
+
+MSL binds a kernel's device and constant buffers by ``[[buffer(N)]]``, in any
+order and with gaps; ``air.location_index`` gives N. The AGX kernel takes
+each buffer as its argument N: a location that no parameter has is an unused
+``ptr addrspace(1)`` argument (``unused.bufferN``), so the arguments of the
+``.agx.kernels`` record are Metal's buffer table. Two buffers at one location
+and locations from 31 on (Metal's ``air.max_device_buffers``) are errors.
+
+Compiling .air and .metallib files
+----------------------------------
+
+``llvm-air2agx`` compiles AIR files to AGX in one process:
+
+.. code-block:: console
+
+   $ llvm-air2agx -mcpu=agx-g14g k.metallib -o k.o          # ELF object
+   $ llvm-air2agx -mcpu=agx-g14g --emit=asm k.air -o k.s
+   $ llvm-air2agx -mcpu=agx-g13g,agx-g14g --output-dir out a.metallib b.air
+   $ llvm-air2agx -mcpu=agx-g14g --emit=code k.metallib -o k  # k.<kernel>.bin
+   $ llvm-air2agx --list k.metallib
+
+Its inputs are ``.metallib`` containers (:doc:`AIR/AIRLibFormat`; every
+entry's bitcode, checked against the entry's SHA-256 unless
+``--verify-hash=false``, entries naming the same bitcode read once;
+``--entry`` selects entries by name), ``.air`` files (bitcode, bare or behind
+the ``0x0B17C0DE`` wrapper, with typed pointers as Apple's toolchain writes
+them or opaque ones) and LLVM IR text. Each module keeps AIR's data layout
+until ``agx-lower-air`` gives it AGX's (see the ``llc`` note above on
+allocas), and goes through ``-O``'s pipeline (``-O3`` by default) with the
+AGX target's passes, ``agx-lower-air`` first, then the code generator at the
+same level. ``--emit`` writes the ELF object (``obj``, the default), assembly
+(``asm``), the optimized AGX IR (``llvm``, ``bc``: what ``llc`` would compile,
+and the IR ``alive-tv`` compares with the AIR) or each kernel's raw
+instructions (``code``: ``PREFIX.<kernel>.bin``, the input of the AGX
+Performance Simulator's ``agx_cost`` and ``agx_dispatch``).
+
+Every AIR module, for every processor of ``-mcpu``, is a job with its own
+``LLVMContext`` and target machine; ``-j`` jobs run at once (one per core by
+default) and their diagnostics are printed in input order. ``--time`` reports
+each job's read, optimization and code generation times. With one job ``-o``
+names the output; otherwise each output is named after its input (plus the
+entry, when a ``.metallib`` holds several modules, and the processor, when
+there are several) in ``--output-dir``. The backend's options (``-agx-*``)
+are accepted too.
+
+Unlike ``llc`` on an AIR module, which runs only the code generator's IR
+passes, ``llvm-air2agx`` optimizes the AGX IR that ``agx-lower-air`` makes, as
+``opt -O3`` followed by ``llc`` would, without writing it between them.
 
 MLIR
 ====

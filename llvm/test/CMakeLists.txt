@@ -80,6 +80,7 @@ set(LLVM_TEST_DEPENDS
   lli-child-target
   llubi
   llvm-addr2line
+  llvm-air2agx
   llvm-ar
   llvm-as
   llvm-bcanalyzer

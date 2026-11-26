@@ -134,7 +134,7 @@ documented in :doc:`AIRTarget`.
 Reading a ``.metallib``
 =======================
 
-Today, the in-tree pieces are write-only:
+The writing side:
 
 * ``AIREmbedderPass`` builds the metallib bytes from a Module.
 * ``AIRLibObjectWriter`` (``llvm/lib/MC/AIRLibObjectWriter.cpp``) wraps
@@ -142,6 +142,9 @@ Today, the in-tree pieces are write-only:
 * ``MCAIRLibStreamer`` (``llvm/lib/MC/MCAIRLibStreamer.cpp``) plumbs
   the embedder output through the MC streamer interface.
 
-There is no corresponding parser; introspecting a ``.metallib`` is left to
-``llvm-bcanalyzer`` (on the unwrapped bitcode payload) and to external
-tooling.
+``llvm-air2agx`` (``llvm/tools/llvm-air2agx/MetalLib.cpp``) reads one: it
+walks section 0's entry blocks by their sizes (each counting its own size
+field), reads each entry's tags up to ``ENDT`` and takes its bitcode as
+``MDSZ`` bytes at ``OFFT[2]`` within section 3 (all of section 3 for an entry
+without them), bounds-checking every offset; ``llvm-air2agx --list`` prints the
+entries. It compiles them for AGX (see the AGX backend's user guide).
