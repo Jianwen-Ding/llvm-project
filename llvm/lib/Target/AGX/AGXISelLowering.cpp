@@ -3591,8 +3591,11 @@ void AGXTargetLowering::finalizeLowering(MachineFunction &MF) const {
         // An iadd of the frame address (to a private array's element at a
         // variable index): the frame index as its immediate source, the
         // object's offset after frame lowering, without the mov_imm.
+        // (only while every object's offset fits an ALU immediate: 8 bits;
+        // eliminateFrameIndex has a fallback for spill slots placed before)
         if (MI.getOpcode() == AGX::IADD_I32 && !MI.getOperand(1).getImm() &&
-            MI.getOperand(2).isReg() && MI.getOperand(2).getReg().isVirtual()) {
+            MI.getOperand(2).isReg() && MI.getOperand(2).getReg().isVirtual() &&
+            MF.getFrameInfo().estimateStackSize(MF) <= 255) {
           MachineInstr *FA = MRI.getUniqueVRegDef(MI.getOperand(2).getReg());
           if (FA && FA->getOpcode() == AGX::FRAME_ADDR &&
               FA->getOperand(1).isFI() && !FA->getOperand(1).getTargetFlags())

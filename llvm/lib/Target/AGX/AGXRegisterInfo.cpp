@@ -355,6 +355,22 @@ bool AGXRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
   }
   if (Offset < 0 || Offset > 0x7fff)
     report_fatal_error("AGX stack frame too large");
+  // An ALU source immediate has 8 bits: a larger offset of an iadd's frame
+  // index (finalizeLowering's fold) is moved into the destination first,
+  // when the destination is not the other source.
+  if (MI.getOpcode() == AGX::IADD_I32 && Offset > 255) {
+    Register Dst = MI.getOperand(0).getReg();
+    unsigned Other = FIOperandNum == 2 ? 4 : 2;
+    if (MI.getOperand(Other).isReg() && MI.getOperand(Other).getReg() == Dst)
+      report_fatal_error("AGX: a frame offset above 255 in an iadd that "
+                         "overwrites its other source");
+    const TargetInstrInfo *TII = MF.getSubtarget().getInstrInfo();
+    BuildMI(*MI.getParent(), II, MI.getDebugLoc(), TII->get(AGX::FRAME_ADDR),
+            Dst)
+        .addImm(Offset);
+    FIOp.ChangeToRegister(Dst, /*isDef=*/false);
+    return false;
+  }
   FIOp.ChangeToImmediate(Offset, /*TargetFlags=*/0);
   return false;
 }
