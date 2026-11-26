@@ -1138,7 +1138,13 @@ Calls to AIR functions become LLVM intrinsics and instructions:
   ``!agx.atomic.ordering`` (the order AIR's portable passes lowered it from)
   is that ordered atomic, without the fences;
 * ``air.wg.barrier`` is ``llvm.agx.threadgroup_barrier``, between
-  workgroup-scope release and acquire fences when it orders memory, and
+  workgroup-scope release and acquire fences when it orders memory (in a
+  kernel, a barrier of threadgroup memory alone that no threadgroup access
+  precedes on a path from the kernel's entry, or none follows on a path to
+  its end, orders nothing, MSL ordering device memory only with
+  ``mem_device``: it goes, ``-agx-air-idle-barriers``; the Metal pipeline's
+  ``air-tg-barrier-insert`` puts one before the first access and one after
+  the last), and
   ``air.simdgroup.barrier`` a workgroup-scope fence (SIMD-groups run in
   lockstep);
 * the SIMD-group and quad-group functions are AGX's: shuffles (and

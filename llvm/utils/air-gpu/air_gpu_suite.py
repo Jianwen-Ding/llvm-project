@@ -480,7 +480,8 @@ def run_group(cases, llc, queue, tmp, log, agx=None, gname='?', compare=False):
 def run_group_agx(cases, data, llc, tmp, agx, raw_out=None):
     results = {}
     for c in cases:
-        if c.metal_only:
+        # The Metal pipeline's own passes run on the .metallib --air2agx compiles.
+        if c.metal_only and not AIR2AGX:
             results[c.name] = {'status': 'SKIPPED', 'detail': c.metal_only}
             continue
         obj, err = compile_agx(llc, module_ir([c]), tmp, c.name, agx['mcpu'])

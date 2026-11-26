@@ -74,6 +74,11 @@ static cl::opt<bool> NativeHints(
     cl::desc("Compile AIR hints as the AGX operations they name; false runs "
              "their AIR emulation, as a consumer without them does"));
 
+static cl::opt<bool> IdleBarriers(
+    "agx-air-idle-barriers", cl::init(true), cl::Hidden,
+    cl::desc("Drop AIR barriers of threadgroup memory that no threadgroup "
+             "access precedes, or none follows"));
+
 static cl::list<std::string> EmulateHints(
     "agx-air-emulate-hints", cl::CommaSeparated, cl::Hidden,
     cl::desc("Run the AIR emulation of the hints whose keys start with one "
@@ -2114,6 +2119,111 @@ static void deviceCoherentVolatiles(Function &F) {
   }
 }
 
+
+// Whether I may access threadgroup memory: through a pointer of AIR's
+// threadgroup space (or the generic hint space), or as a call of anything but
+// AIR's functions of no memory, which agx-lower-air does not yet know apart.
+static bool touchesThreadgroup(const Instruction &I) {
+  if (!I.mayReadOrWriteMemory())
+    return false;
+  if (auto *CI = dyn_cast<CallInst>(&I)) {
+    const Function *F = CI->getCalledFunction();
+    if (!F || !F->isDeclaration())
+      return true;
+    StringRef N = F->getName();
+    if (N == "air.wg.barrier" || N == "air.simdgroup.barrier")
+      return false;
+    if (!N.starts_with("air.") && !F->isIntrinsic())
+      return true;
+  }
+  for (const Value *Op : I.operands())
+    if (auto *PT = dyn_cast<PointerType>(Op->getType()))
+      if (PT->getAddressSpace() == air::AS::Threadgroup ||
+          PT->getAddressSpace() == air::GenericHintAS)
+        return true;
+  // A call may reach threadgroup memory through pointers it is not passed
+  // (AIR's functions are passed theirs).
+  if (auto *CI = dyn_cast<CallInst>(&I))
+    return !CI->getCalledFunction()->getName().starts_with("air.") &&
+           !CI->getCalledFunction()->isIntrinsic();
+  return false;
+}
+
+// A barrier of threadgroup memory alone (mem_flags 2, or none) that no
+// threadgroup access precedes on any path from the kernel's entry orders
+// nothing, nor does one that none follows on any path to its end (the
+// memory ends with the threadgroup): MSL orders device and texture memory by
+// a barrier only with their flags. The Metal pipeline's
+// air-tg-barrier-insert puts barriers around every threadgroup access, the
+// first one before any and the last one after all.
+static void dropIdleBarriers(Function &F) {
+  // Only a kernel starts with no threadgroup access behind it: a function it
+  // calls may be called after some.
+  if (!IdleBarriers || F.isDeclaration() ||
+      F.getCallingConv() != CallingConv::AGX_KERNEL)
+    return;
+  SmallVector<CallInst *, 8> Barriers;
+  DenseMap<const BasicBlock *, bool> Has;
+  for (BasicBlock &BB : F) {
+    bool H = false;
+    for (Instruction &I : BB) {
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (const Function *Callee = CI->getCalledFunction();
+            Callee && (Callee->getName() == "air.wg.barrier" ||
+                       Callee->getName() == "air.simdgroup.barrier")) {
+          auto *Flags = CI->arg_size()
+                            ? dyn_cast<ConstantInt>(CI->getArgOperand(0))
+                            : nullptr;
+          if (Flags && (Flags->getZExtValue() & ~uint64_t(2)) == 0)
+            Barriers.push_back(CI);
+        }
+      H |= touchesThreadgroup(I);
+    }
+    Has[&BB] = H;
+  }
+  if (Barriers.empty())
+    return;
+  // Blocks entered after an access (forward), and blocks left before one
+  // (backward).
+  DenseMap<const BasicBlock *, bool> InAfter, OutBefore;
+  SmallVector<const BasicBlock *, 16> Work;
+  for (BasicBlock &BB : F)
+    if (Has[&BB])
+      Work.push_back(&BB);
+  while (!Work.empty()) {
+    const BasicBlock *BB = Work.pop_back_val();
+    for (const BasicBlock *S : successors(BB))
+      if (!InAfter[S]) {
+        InAfter[S] = true;
+        Work.push_back(S);
+      }
+  }
+  for (BasicBlock &BB : F)
+    if (Has[&BB])
+      Work.push_back(&BB);
+  while (!Work.empty()) {
+    const BasicBlock *BB = Work.pop_back_val();
+    for (const BasicBlock *P : predecessors(BB))
+      if (!OutBefore[P]) {
+        OutBefore[P] = true;
+        Work.push_back(P);
+      }
+  }
+  for (CallInst *CI : Barriers) {
+    const BasicBlock *BB = CI->getParent();
+    bool Before = InAfter[BB], After = OutBefore[BB];
+    for (const Instruction &I : *BB) {
+      if (&I == CI)
+        continue;
+      bool Earlier = I.comesBefore(CI);
+      if (touchesThreadgroup(I))
+        (Earlier ? Before : After) = true;
+    }
+    if (!Before || !After)
+      CI->eraseFromParent();
+  }
+}
+
 void LowerAIR::recoverAGXOperations(Function &F) {
   if (F.isDeclaration())
     return;
@@ -2899,6 +3009,7 @@ bool LowerAIR::run() {
   for (Function &F : M) {
     lowerMatrices(F);
     foldOrderedAtomics(F);
+    dropIdleBarriers(F);
   }
   lowerHints();
   lowerCalls();
