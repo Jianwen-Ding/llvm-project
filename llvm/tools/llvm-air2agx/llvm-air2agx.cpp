@@ -30,6 +30,7 @@
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
@@ -192,6 +193,39 @@ struct CollectingHandler : DiagnosticHandler {
 };
 
 } // namespace
+
+static cl::opt<cl::boolOrDefault> EmulateF64(
+    "emulate-f64",
+    cl::desc("Run the AIR target's air-emulate-f64 on each AIR module first "
+             "(default: when it has doubles or constrained floating point "
+             "intrinsics)"));
+
+// Whether M has what portable AIR lacks: doubles or constrained intrinsics.
+static bool needsF64Emulation(Module &M) {
+  auto IsF64 = [](Type *T) {
+    while (T->isArrayTy() || T->isVectorTy())
+      T = T->isArrayTy() ? T->getArrayElementType()
+                         : cast<VectorType>(T)->getElementType();
+    return T->isDoubleTy();
+  };
+  for (GlobalVariable &G : M.globals())
+    if (IsF64(G.getValueType()))
+      return true;
+  for (Function &F : M) {
+    if (F.getIntrinsicID() != Intrinsic::not_intrinsic &&
+        F.getName().starts_with("llvm.experimental.constrained."))
+      return true;
+    if (IsF64(F.getReturnType()) ||
+        any_of(F.args(), [&](Argument &A) { return IsF64(A.getType()); }))
+      return true;
+    for (Instruction &I : instructions(F))
+      if (IsF64(I.getType()) || any_of(I.operands(), [&](Use &U) {
+            return IsF64(U->getType());
+          }))
+        return true;
+  }
+  return false;
+}
 
 static double msSince(std::chrono::steady_clock::time_point T) {
   return std::chrono::duration<double, std::milli>(
@@ -424,6 +458,40 @@ static void runJob(Job &J) {
   }
 
   bool IsAIR = M->getNamedMetadata("air.kernel") != nullptr;
+  // AIR from a front end that writes it directly (a PTX front end's) may have
+  // doubles and constrained floating point intrinsics (directed rounding):
+  // the AIR target's air-emulate-f64 makes it portable AIR (soft-f64 calls,
+  // which agx-lower-air turns back into AGX's double operations).
+  if (IsAIR && EmulateF64 != cl::boolOrDefault::BOU_FALSE &&
+      (EmulateF64 == cl::boolOrDefault::BOU_TRUE || needsF64Emulation(*M))) {
+    Triple AIRTriple(Triple::normalize("air64-apple-macosx"));
+    std::string AIRErr;
+    const Target *AT = TargetRegistry::lookupTarget(AIRTriple, AIRErr);
+    std::unique_ptr<TargetMachine> ATM(
+        AT ? AT->createTargetMachine(AIRTriple, "", "", TargetOptions(),
+                                     std::nullopt)
+           : nullptr);
+    if (!ATM) {
+      Fail("the AIR target is needed to emulate double precision: " + AIRErr);
+      return;
+    }
+    LoopAnalysisManager LAM;
+    FunctionAnalysisManager FAM;
+    CGSCCAnalysisManager CGAM;
+    ModuleAnalysisManager MAM;
+    PassBuilder PB(Ctx, ATM.get());
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+    ModulePassManager MPM;
+    if (auto E = PB.parsePassPipeline(MPM, "air-emulate-f64")) {
+      Fail("air-emulate-f64: " + toString(std::move(E)));
+      return;
+    }
+    MPM.run(*M, MAM);
+  }
   M->setTargetTriple(TT);
   if (!IsAIR)
     M->setDataLayout(TM->createDataLayout());

@@ -287,12 +287,18 @@ bool LowerAIR::parseKernels(NamedMDNode &MD,
         error(F, "argument buffers (air.indirect_buffer) are not supported");
         continue;
       }
-      if (Role != air::Buffer) {
+      // MSL's [[threadgroup(N)]] parameters are "air.threadgroup" nodes (no
+      // address space key: they are threadgroup memory), the AIR target's
+      // own threadgroup buffers "air.buffer" nodes in address space 3.
+      bool ThreadgroupParam = Role == "air.threadgroup";
+      if (Role != air::Buffer && !ThreadgroupParam) {
         Pm.Kind = Param::SystemValue;
         Pm.Role = Role;
         continue;
       }
       Pm.Kind = Param::Buffer;
+      if (ThreadgroupParam)
+        Pm.AddrSpace = air::AS::Threadgroup;
       for (unsigned I = 2, E = P->getNumOperands(); I < E; ++I) {
         auto *Key = dyn_cast<MDString>(P->getOperand(I));
         if (!Key || I + 1 == E)
@@ -2326,6 +2332,11 @@ void LowerAIR::lowerCalls() {
             RI && CI->hasMetadata("air.flush.harmless"))
           RI->setMetadata("air.flush.harmless",
                           CI->getMetadata("air.flush.harmless"));
+        // (a front end's IEEE operation in flushing code: AGXUsage.rst)
+        if (auto *RI = dyn_cast<Instruction>(Result);
+            RI && CI->hasMetadata("agx.keep-denormals"))
+          RI->setMetadata("agx.keep-denormals",
+                          CI->getMetadata("agx.keep-denormals"));
         CI->replaceAllUsesWith(Result);
       }
       CI->eraseFromParent();
