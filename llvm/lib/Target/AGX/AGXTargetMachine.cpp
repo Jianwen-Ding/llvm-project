@@ -251,6 +251,21 @@ void AGXTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         FPM.addPass(AGXMarkExpsBelowMaxPass());
         return true;
       });
+  // Compare-exchange loops of native atomic operations as those operations,
+  // where instcombine has cleaned them up.
+  PB.registerPeepholeEPCallback(
+      [this](FunctionPassManager &FPM, OptimizationLevel Level) {
+        if (Level != OptimizationLevel::O0)
+          FPM.addPass(AGXCmpXchgLoopsPass(*this));
+      });
+  PB.registerPipelineParsingCallback(
+      [this](StringRef Name, FunctionPassManager &FPM,
+             ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name != "agx-cmpxchg-loops")
+          return false;
+        FPM.addPass(AGXCmpXchgLoopsPass(*this));
+        return true;
+      });
   PB.registerPipelineParsingCallback(
       [](StringRef Name, FunctionPassManager &FPM,
          ArrayRef<PassBuilder::PipelineElement>) {

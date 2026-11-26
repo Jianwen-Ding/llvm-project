@@ -1,17 +1,26 @@
 ; MSL's atomic_load_explicit and atomic_store_explicit, as AIR calls them
 ; (air.atomic.<space>.load / store: pointer, [value,] order, scope, volatile),
-; are atomic loads and stores of their order and scope.
+; are atomic loads and stores of their order and scope. Device scope is
+; syncscope("device"): coherent among the GPU's threads, not with the host
+; (Metal makes nothing of a dispatch host-coherent before it completes), so the
+; volatile ones are device atomics, without the host's coherent accesses and
+; their barriers.
 ; RUN: opt -mtriple=agx -passes=agx-lower-air -S %s | FileCheck %s
-; RUN: llc -mtriple=agx -mcpu=agx-g14g %s -o /dev/null
+; RUN: llc -mtriple=agx -mcpu=agx-g14g %s -o - | FileCheck %s --check-prefix=ASM
 
 ; CHECK-LABEL: define agx_kernel void @k(
-; CHECK: %a = load atomic volatile i32, ptr addrspace(1) %in monotonic, align 4
-; CHECK: store atomic volatile i32 %a, ptr addrspace(1) %out release, align 4
-; CHECK: %b = load atomic float, ptr addrspace(1) %in acquire, align 4
-; CHECK: store atomic float %b, ptr addrspace(1) %out monotonic, align 4
+; CHECK: %a = load atomic volatile i32, ptr addrspace(1) %in syncscope("device") monotonic, align 4
+; CHECK: store atomic volatile i32 %a, ptr addrspace(1) %out syncscope("device") release, align 4
+; CHECK: %b = load atomic float, ptr addrspace(1) %in syncscope("device") acquire, align 4
+; CHECK: store atomic float %b, ptr addrspace(1) %out syncscope("device") monotonic, align 4
 ; CHECK: %c = load atomic volatile i32, ptr addrspace(3) @k.tg syncscope("workgroup") acquire, align 4
 ; CHECK: store atomic volatile i32 %c, ptr addrspace(3) @k.tg syncscope("workgroup") monotonic, align 4
 ; CHECK-NOT: @air.atomic
+
+; ASM-LABEL: k:
+; ASM-NOT: memory_barrier 3, 1, 9
+; ASM: atomic cmpxchg
+; ASM-NOT: device_load {{.*}}, 3{{$}}
 
 target triple = "air64-apple-macosx14.0.0"
 

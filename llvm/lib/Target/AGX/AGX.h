@@ -201,6 +201,16 @@ class TargetMachine;
 /// Compiles a module described by !air.kernel (AIR) as AGX kernels.
 /// Straight-line runs of device accesses versioned on their buffers not
 /// overlapping, in opt after unrolling (L15-E528).
+/// Compare-exchange loops that apply an operation the target has natively,
+/// as that atomicrmw (AGXCmpXchgLoops.cpp).
+class AGXCmpXchgLoopsPass : public OptionalPassInfoMixin<AGXCmpXchgLoopsPass> {
+  const TargetMachine &TM;
+
+public:
+  explicit AGXCmpXchgLoopsPass(const TargetMachine &TM) : TM(TM) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
+
 class AGXAliasVersioningPass
     : public OptionalPassInfoMixin<AGXAliasVersioningPass> {
 public:

@@ -26,6 +26,7 @@ add_public_tablegen_target(AGXCommonTableGen)
 add_llvm_target(AGXCodeGen
   AGXAnnotateControlFlow.cpp
   AGXAsmPrinter.cpp
+  AGXCmpXchgLoops.cpp
   AGXCodeGenPrepare.cpp
   AGXMathExpansion.cpp
   AGXMemCluster.cpp

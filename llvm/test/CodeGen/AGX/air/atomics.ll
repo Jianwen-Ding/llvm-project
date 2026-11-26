@@ -11,30 +11,30 @@
 ; RUN: llc -mtriple=agx -mcpu=agx-g14g %t.air.ll -o - | FileCheck %s --check-prefix=ASM
 
 ; CHECK-LABEL: define agx_kernel void @k(
-; CHECK: %[[A:a[0-9]*]] = atomicrmw add ptr addrspace(1) %u, i32 %{{tid_x|i}} monotonic
+; CHECK: %[[A:a[0-9]*]] = atomicrmw add ptr addrspace(1) %u, i32 %{{tid_x|i}} syncscope("device") monotonic
 ; CHECK-NOT: fence
-; CHECK: %[[B:b[0-9]*]] = atomicrmw umax ptr addrspace(1) %u, i32 %[[A]] seq_cst
+; CHECK: %[[B:b[0-9]*]] = atomicrmw umax ptr addrspace(1) %u, i32 %[[A]] syncscope("device") seq_cst
 ; CHECK-NOT: fence
-; CHECK: atomicrmw fadd ptr addrspace(1) %f, float 1.000000e+00 monotonic
-; CHECK: %[[D:d[0-9]*]] = atomicrmw min ptr addrspace(1) %u, i32 %[[B]] monotonic
-; CHECK: %[[E:e[0-9]*]] = atomicrmw xchg ptr addrspace(1) %u, i32 %[[D]] monotonic
+; CHECK: atomicrmw fadd ptr addrspace(1) %f, float 1.000000e+00 syncscope("device") monotonic
+; CHECK: %[[D:d[0-9]*]] = atomicrmw min ptr addrspace(1) %u, i32 %[[B]] syncscope("device") monotonic
+; CHECK: %[[E:e[0-9]*]] = atomicrmw xchg ptr addrspace(1) %u, i32 %[[D]] syncscope("device") monotonic
 ; CHECK: store i32 %[[E]], ptr addrspace(5) %[[EXP:.*]], align 4
 ; CHECK: %[[OLD:.*]] = load i32, ptr addrspace(5) %[[EXP]]
-; CHECK: %[[X:.*]] = cmpxchg ptr addrspace(1) %u, i32 %[[OLD]], i32 5 monotonic monotonic
+; CHECK: %[[X:.*]] = cmpxchg ptr addrspace(1) %u, i32 %[[OLD]], i32 5 syncscope("device") monotonic monotonic
 ; CHECK: %[[V:.*]] = extractvalue { i32, i1 } %[[X]], 0
 ; CHECK: store i32 %[[V]], ptr addrspace(5) %[[EXP]]
 ; CHECK: atomicrmw add ptr addrspace(3) @tg, i32 %{{tid_x|i}} syncscope("workgroup") monotonic
 ; CHECK-NOT: fence
-; CHECK: cmpxchg ptr addrspace(1) %u, i32 %{{.*}}, i32 7 acq_rel acquire
+; CHECK: cmpxchg ptr addrspace(1) %u, i32 %{{.*}}, i32 7 syncscope("device") acq_rel acquire
 ; CHECK-NOT: fence
 ; CHECK: atomicrmw add ptr addrspace(3) @tg, i32 1 syncscope("workgroup") release
 ; CHECK-NOT: fence
 ; CHECK: ret void
 
 ; NOHINT-LABEL: define agx_kernel void @nohint(
-; NOHINT: fence seq_cst
-; NOHINT-NEXT: atomicrmw volatile add ptr addrspace(1) %u, i32 1 monotonic
-; NOHINT-NEXT: fence seq_cst
+; NOHINT: fence syncscope("device") seq_cst
+; NOHINT-NEXT: atomicrmw volatile add ptr addrspace(1) %u, i32 1 syncscope("device") monotonic
+; NOHINT-NEXT: fence syncscope("device") seq_cst
 
 ; ASM: atomic add,
 ; ASM: atomic umax,
@@ -51,12 +51,12 @@ define void @k(ptr addrspace(1) %f, ptr addrspace(1) %u) "air-kernel" {
   %c = atomicrmw fadd ptr addrspace(1) %f, float 1.0 monotonic
   %d = atomicrmw min ptr addrspace(1) %u, i32 %b monotonic
   %e = atomicrmw xchg ptr addrspace(1) %u, i32 %d monotonic
-  %x = cmpxchg ptr addrspace(1) %u, i32 %e, i32 5 monotonic monotonic
+  %x = cmpxchg ptr addrspace(1) %u, i32 %e, i32 5 syncscope("device") monotonic monotonic
   %ok = extractvalue { i32, i1 } %x, 1
   %s = select i1 %ok, i32 1, i32 2
   %g = atomicrmw add ptr addrspace(3) @tg, i32 %i monotonic
   %sum = add i32 %s, %g
-  %y = cmpxchg ptr addrspace(1) %u, i32 %sum, i32 7 acq_rel acquire
+  %y = cmpxchg ptr addrspace(1) %u, i32 %sum, i32 7 syncscope("device") acq_rel acquire
   %h = atomicrmw add ptr addrspace(3) @tg, i32 1 release
   store i32 %h, ptr addrspace(1) %u
   ret void

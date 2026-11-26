@@ -10742,16 +10742,27 @@ static bool isSystemScope(SyncScope::ID Scope, LLVMContext &Ctx) {
          Scope == Ctx.getOrInsertSyncScopeID("one-as");
 }
 
+/// Whether a volatile or atomic access must be coherent with the host: a
+/// system-scope atomic, or a volatile access, unless it is an atomic whose
+/// scope is narrower (workgroup, device), which says how far its coherence
+/// reaches whatever its volatility (AIR passes nearly every atomic volatile).
+static bool needsHostCoherence(bool Volatile, bool Atomic, SyncScope::ID Scope,
+                               LLVMContext &Ctx) {
+  if (Atomic)
+    return isSystemScope(Scope, Ctx);
+  return Volatile;
+}
+
 bool AGX::isHostCoherentAccess(const Instruction &I) {
   unsigned AS;
   if (const auto *L = dyn_cast<LoadInst>(&I)) {
-    if (!L->isVolatile() &&
-        !(L->isAtomic() && isSystemScope(L->getSyncScopeID(), I.getContext())))
+    if (!needsHostCoherence(L->isVolatile(), L->isAtomic(), L->getSyncScopeID(),
+                            I.getContext()))
       return false;
     AS = L->getPointerAddressSpace();
   } else if (const auto *S = dyn_cast<StoreInst>(&I)) {
-    if (!S->isVolatile() &&
-        !(S->isAtomic() && isSystemScope(S->getSyncScopeID(), I.getContext())))
+    if (!needsHostCoherence(S->isVolatile(), S->isAtomic(), S->getSyncScopeID(),
+                            I.getContext()))
       return false;
     AS = S->getPointerAddressSpace();
   } else {
@@ -10763,8 +10774,8 @@ bool AGX::isHostCoherentAccess(const Instruction &I) {
 bool AGX::isHostCoherentAccess(const MachineInstr &MI) {
   LLVMContext &Ctx = MI.getMF()->getFunction().getContext();
   for (const MachineMemOperand *MMO : MI.memoperands())
-    if (MMO->isVolatile() ||
-        (MMO->isAtomic() && isSystemScope(MMO->getSyncScopeID(), Ctx)))
+    if (needsHostCoherence(MMO->isVolatile(), MMO->isAtomic(),
+                           MMO->getSyncScopeID(), Ctx))
       return true;
   return false;
 }

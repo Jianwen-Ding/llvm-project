@@ -699,11 +699,16 @@ static AtomicOrdering ordering(Value *Order) {
   }
 }
 
-// MSL's thread_scope: threadgroup (1) or device (2, and anything wider).
+// MSL's thread_scope: threadgroup (1), device (2: the GPU's threads; Metal
+// makes no memory of a dispatch coherent with the host until it completes, so
+// an atomic of this scope needs no host coherence) or anything wider (and an
+// unknown scope): the system.
 static SyncScope::ID syncScope(LLVMContext &Ctx, Value *Scope) {
   auto *C = dyn_cast<ConstantInt>(Scope);
   if (C && C->getZExtValue() <= 1)
     return Ctx.getOrInsertSyncScopeID("workgroup");
+  if (C && C->getZExtValue() == 2)
+    return Ctx.getOrInsertSyncScopeID("device");
   return SyncScope::System;
 }
 
