@@ -1091,7 +1091,8 @@ runs), HW-FTZ 35, MISMATCH 1 (frexp of a subnormal, as before), ABSENT 2, no REJ
 
 Rests on: MSL ordering device memory by a barrier only with `mem_device`; Metal making nothing of a dispatch
 host-coherent before it ends; device atomics being coherent across cores (the backend's measured choice for 32-bit
-atomics). Verify on hardware: the suite's threadgroup and atomics groups with and without the switches, and a spin
+atomics). The hardware work is logged as AGX-Performance-Simulator `tasks/safe-13-air-to-agx-assumptions.md` (H1-H5,
+uniform cost of unused buffer locations, spin locks). Verify on hardware: the suite's threadgroup and atomics groups with and without the switches, and a spin
 lock in MSL source (open: the optimizer may move any spin lock's critical section out of its loop; only the Metal
 pipeline's emulated ones are recovered).
 
