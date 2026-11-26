@@ -1071,6 +1071,30 @@ Compile time (722 modules, 4 cores, a shared-library build): 0.92 s wall / 2.6 s
 9.3 s / 19.3 s for `opt -O3` then `llc` per module, four at a time, and 5.1 s for `llc` alone. Per module: read 0.3
 ms, opt about 1 ms, code generation 2-9 ms.
 
+### Follow-up: what the Metal pipeline's AIR loses, recovered (2026-11-26)
+
+Each change is a refinement argued from MSL's and LLVM's semantics (no hardware here); each is checked by the AIR
+suite on agx_run (`air_gpu_suite.py --agx-run --air2agx`, G14G; the 64-bit atomics on G13G too) and costed by agx_cost
+(G14G, one SIMD-group). All in agx-lower-air except AGXCmpXchgLoops.
+
+| Change | Switch | Model result |
+|---|---|---|
+| MSL `thread_scope_device` is `syncscope("device")`; an atomic narrower than the system is no host-coherent access whatever its volatility | revert 729c4a5da | device atomic load + store 209.0 -> 117.9 |
+| AGXCmpXchgLoops: a CAS loop of an operation the target has natively is that atomicrmw (the loop's first-try execution) | `-agx-cmpxchg-loops=false` | MSL float-add CAS loop on G14 151.2 -> 122.3 (G13 keeps the loop) |
+| The lock-emulated 64-bit atomics (AIRLowerAtomicRMW) are `atomicrmw i64` again: -O3's first simplifycfg moved their critical section after the lock loop, a SIMD-group deadlock | revert 38e77fbde | atomic_add_i64 / umax_u64 / umin_u64: REJECTED (hang) -> PASS on G13G and G14G |
+| A volatile naturally aligned 32-bit device access is a volatile device-scope monotonic atomic (Metal has no host coherence within a dispatch) | revert f76ee3467 | atomic_fmax_f32 / fmin / cmpxchg_loop_fmul 621.6 -> 151.2, volatile load / store 209.0 -> 117.2 |
+| A kernel's threadgroup-only barrier with no threadgroup access since the last barrier (or entry) on every path to it, then on what is left none before the next one (or the end) | `-agx-air-idle-barriers=false` | tg_tree_reduce 2555.6 -> 1680.6, mma_f32_threadgroup 568.1 -> 401.0, tg_v4f32_lanes 493.6 -> 323.0, tg_reverse_barrier2 405.9 -> 280.9 |
+
+Over the 722 suite kernels both runs cost: 107619 -> 103074 cycles (-4.2%), 21 better, none worse; against the
+portable path through `llc` now -3.7% (was +0.4%). Functional: PASS 690 (the Metal-only tg_reverse_auto_barrier now
+runs), HW-FTZ 35, MISMATCH 1 (frexp of a subnormal, as before), ABSENT 2, no REJECTED, no COMPILE.
+
+Rests on: MSL ordering device memory by a barrier only with `mem_device`; Metal making nothing of a dispatch
+host-coherent before it ends; device atomics being coherent across cores (the backend's measured choice for 32-bit
+atomics). Verify on hardware: the suite's threadgroup and atomics groups with and without the switches, and a spin
+lock in MSL source (open: the optimizer may move any spin lock's critical section out of its loop; only the Metal
+pipeline's emulated ones are recovered).
+
 ## Research sources (policy)
 
 Experiments are based only on publicly published work: open-access papers (arXiv, ACM / IEEE papers with public
