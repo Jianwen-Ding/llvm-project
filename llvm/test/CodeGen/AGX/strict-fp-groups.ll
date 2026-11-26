@@ -70,6 +70,20 @@ define agx_kernel void @int_operand(ptr addrspace(1) %out, i32 %i, float %x, flo
   ret void
 }
 
+; A run none of whose members needs a check (x + 0 is a select, an addition
+; of a constant of at least 2^-101 is always right): no branch.
+; CHECK-LABEL: define agx_kernel void @unchecked(
+; CHECK:         %a = select i1 %{{[0-9]+}}, float 0.000000e+00, float %x
+; CHECK-NEXT:    %b = fadd float %a, 1.000000e+00
+; CHECK-NOT:     br i1
+; CHECK:         ret void
+define agx_kernel void @unchecked(ptr addrspace(1) %out, float %x) {
+  %a = fadd float %x, 0.0, !agx.keep-denormals !0
+  %b = fadd float %a, 1.0, !agx.keep-denormals !0
+  store float %b, ptr addrspace(1) %out
+  ret void
+}
+
 declare float @llvm.fma.f32(float, float, float)
 declare float @llvm.agx.rsqrt.f32(float)
 !0 = !{}

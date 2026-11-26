@@ -2025,6 +2025,9 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
   }
   SPMode = SlowPathMode::Normal;
   if (!Bad) {
+    // (no member needs a check: x + 0, say; the copies use one another)
+    for (Instruction *C : Clones)
+      C->dropAllReferences();
     for (Instruction *C : Clones)
       C->deleteValue();
     return;
