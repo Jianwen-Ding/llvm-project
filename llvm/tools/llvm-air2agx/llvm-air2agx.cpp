@@ -39,6 +39,7 @@
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
@@ -517,7 +518,12 @@ static void runJob(Job &J) {
     CGSCCAnalysisManager CGAM;
     ModuleAnalysisManager MAM;
     PipelineTuningOptions PTO;
-    PassBuilder PB(Ctx, TM.get(), PTO);
+    // -print-after-all, -print-changed, ... (as in opt): per-pass translation
+    // validation (zluda_metal/tests/alive/opt_check.py --per-pass) reads them
+    PassInstrumentationCallbacks PIC;
+    StandardInstrumentations SI(Ctx, /*DebugLogging=*/false);
+    SI.registerCallbacks(PIC, &MAM);
+    PassBuilder PB(Ctx, TM.get(), PTO, std::nullopt, &PIC);
     TargetLibraryInfoImpl TLII(TT);
     FAM.registerPass([&] { return TargetLibraryAnalysis(TLII); });
     FAM.registerPass([&] { return PB.buildDefaultAAPipeline(); });
