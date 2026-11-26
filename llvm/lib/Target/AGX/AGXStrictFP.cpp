@@ -1054,6 +1054,11 @@ template <typename BuildFn> static void replace(Instruction &I, BuildFn Build) {
   I.eraseFromParent();
 }
 
+static cl::opt<bool> Exp2FastScale(
+    "agx-ieee-exp2-fast-scale", cl::init(true), cl::Hidden,
+    cl::desc("IEEE exp2: the exponent add where the result is normal, the "
+             "integer scaling behind an unlikely branch for denormal results"));
+
 static bool lowerIEEE(Instruction &I) {
   Intrinsic::ID ID = getIntrinsicID(I);
   bool Approx = isa<FPMathOperator>(I) &&
@@ -1281,9 +1286,34 @@ static bool lowerIEEE(Instruction &I) {
     Value *N = B.CreateUnaryIntrinsic(Intrinsic::floor, XC);
     Value *Frac = B.CreateFSub(XC, N);
     Value *P = B.CreateIntrinsic(ID, {B.getFloatTy()}, {Frac});
-    Term T = SF.unpack(SF.bits(P), false);
-    T.E = B.CreateAdd(T.E, B.CreateFPToSI(N, B.getInt32Ty()));
-    Value *R = SF.flt(SF.convert(T));
+    Value *NI = B.CreateFPToSI(N, B.getInt32Ty());
+    Value *R;
+    if (Exp2FastScale) {
+      // n >= -126: 2^f in [1, 2] times 2^n is normal (or infinite past 2^127),
+      // and the scaling is the exponent field's: one add. Below, the result
+      // is denormal and rounds once: the integer scaling, rarely.
+      Value *Fast = SF.flt(B.CreateAdd(SF.bits(P), B.CreateShl(NI, 23)));
+      Value *Normal = B.CreateICmpSGE(NI, B.getInt32(-126));
+      Instruction *Term0 = SplitBlockAndInsertIfThen(
+          B.CreateNot(Normal), &*B.GetInsertPoint(), false,
+          MDBuilder(I.getContext()).createUnlikelyBranchWeights());
+      BasicBlock *Then = Term0->getParent(), *Head = Then->getSinglePredecessor();
+      IRBuilder<> TB(Term0);
+      SoftFloat TSF(TB);
+      Term T = TSF.unpack(TSF.bits(P), false);
+      T.E = TB.CreateAdd(T.E, NI);
+      Value *Slow = TSF.flt(TSF.convert(T));
+      BasicBlock *Join = Term0->getSuccessor(0);
+      B.SetInsertPoint(Join, Join->getFirstInsertionPt());
+      PHINode *Phi = B.CreatePHI(B.getFloatTy(), 2);
+      Phi->addIncoming(Fast, Head);
+      Phi->addIncoming(Slow, Then);
+      R = Phi;
+    } else {
+      Term T = SF.unpack(SF.bits(P), false);
+      T.E = B.CreateAdd(T.E, NI);
+      R = SF.flt(SF.convert(T));
+    }
     // NaN and infinities (2^-inf = 0) as the hardware gives them.
     Value *Special = B.CreateFCmpUEQ(B.CreateUnaryIntrinsic(Intrinsic::fabs, X),
                                      SF.fconst(INFINITY));
