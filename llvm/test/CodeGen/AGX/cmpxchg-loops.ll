@@ -81,6 +81,37 @@ done:
   ret void
 }
 
+; A signed max as a select of its compare's operands (CUDA and MSL code
+; spell it so), with the operands of the select swapped: a min.
+; CHECK-LABEL: @select_minmax(
+; CHECK: atomicrmw max ptr addrspace(1) %p, i32 %v monotonic
+; CHECK: atomicrmw umin ptr addrspace(1) %p, i32 %v monotonic
+; CHECK-NOT: cmpxchg
+define agx_kernel void @select_minmax(ptr addrspace(1) %p, i32 %v) {
+entry:
+  br label %loop
+loop:
+  %old = phi i32 [ 0, %entry ], [ %found, %loop ]
+  %c = icmp sgt i32 %old, %v
+  %n = select i1 %c, i32 %old, i32 %v
+  %x = cmpxchg ptr addrspace(1) %p, i32 %old, i32 %n monotonic monotonic, align 4
+  %found = extractvalue { i32, i1 } %x, 0
+  %ok = extractvalue { i32, i1 } %x, 1
+  br i1 %ok, label %mid, label %loop
+mid:
+  br label %loop2
+loop2:
+  %old2 = phi i32 [ 0, %mid ], [ %found2, %loop2 ]
+  %c2 = icmp ugt i32 %old2, %v
+  %n2 = select i1 %c2, i32 %v, i32 %old2
+  %x2 = cmpxchg ptr addrspace(1) %p, i32 %old2, i32 %n2 monotonic monotonic, align 4
+  %found2 = extractvalue { i32, i1 } %x2, 0
+  %ok2 = extractvalue { i32, i1 } %x2, 1
+  br i1 %ok2, label %done, label %loop2
+done:
+  ret void
+}
+
 ; Not natively (a float max), a weak exchange judged by its value (it may fail
 ; spuriously with the value expected), a second access, a value made in the
 ; loop used after it, and a subtraction of the old value: the loops stay.

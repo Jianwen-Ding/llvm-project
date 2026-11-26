@@ -270,7 +270,7 @@ bool LowerAIR::parseKernels(NamedMDNode &MD,
       error(F, "the !air.kernel entry of this kernel describes no parameters");
       continue;
     }
-    AIRKernel K{F, SmallVector<Param, 8>(F->arg_size())};
+    AIRKernel K{F, SmallVector<Param, 8>(F->arg_size()), {}};
     for (const MDOperand &PO : cast<MDNode>(N->getOperand(2))->operands()) {
       auto *P = dyn_cast<MDNode>(PO);
       unsigned ArgNo = P && P->getNumOperands() >= 2 ? mdInt(P->getOperand(0))
@@ -1790,6 +1790,298 @@ void LowerAIR::lowerHints() {
 // them): the hardware approximations from afn math
 // (1 / x, 1 / sqrt(x), sin and cos of x * pi / 2: AGX's take quadrants),
 // and the explicit flushes of PTX's .ftz where the f32 ALU flushes anyway.
+
+// A pointer as a base and a constant byte offset, through the integer forms
+// the Metal pipeline's atomic emulation writes them in (inttoptr of an add to
+// a ptrtoint) and getelementptrs.
+static std::pair<Value *, int64_t> baseAndOffset(Value *P) {
+  int64_t Off = 0;
+  for (;;) {
+    using namespace PatternMatch;
+    Value *X;
+    ConstantInt *C;
+    if (match(P, m_IntToPtr(m_PtrToInt(m_Value(X))))) {
+      P = X;
+      continue;
+    }
+    if (match(P, m_IntToPtr(m_Add(m_PtrToInt(m_Value(X)), m_ConstantInt(C))))) {
+      Off += C->getSExtValue();
+      P = X;
+      continue;
+    }
+    if (auto *GEP = dyn_cast<GEPOperator>(P)) {
+      APInt O(64, 0);
+      const DataLayout &DL =
+          cast<Instruction>(GEP)->getModule()->getDataLayout();
+      if (isa<Instruction>(GEP) && GEP->accumulateConstantOffset(DL, O)) {
+        Off += O.getSExtValue();
+        P = GEP->getPointerOperand();
+        continue;
+      }
+    }
+    return {P, Off};
+  }
+}
+
+/// An integer min or max of A and B: the intrinsic, or a select of the
+/// operands of its compare (select (icmp ugt a, b), a, b is umax(a, b); with
+/// the operands swapped, umin).
+static std::optional<AtomicRMWInst::BinOp> matchIntMinMax(Value *N, Value *&A,
+                                                         Value *&B) {
+  using namespace PatternMatch;
+  if (match(N, m_SMax(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::Max;
+  if (match(N, m_SMin(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::Min;
+  if (match(N, m_UMax(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::UMax;
+  if (match(N, m_UMin(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::UMin;
+  CmpPredicate P;
+  Value *T, *F;
+  if (!match(N, m_Select(m_ICmp(P, m_Value(A), m_Value(B)), m_Value(T),
+                         m_Value(F))))
+    return std::nullopt;
+  bool Same = T == A && F == B, Swapped = T == B && F == A;
+  if (!Same && !Swapped)
+    return std::nullopt;
+  std::optional<AtomicRMWInst::BinOp> Op;
+  switch (ICmpInst::Predicate(P)) {
+  case ICmpInst::ICMP_UGT:
+  case ICmpInst::ICMP_UGE:
+    Op = Same ? AtomicRMWInst::UMax : AtomicRMWInst::UMin;
+    break;
+  case ICmpInst::ICMP_ULT:
+  case ICmpInst::ICMP_ULE:
+    Op = Same ? AtomicRMWInst::UMin : AtomicRMWInst::UMax;
+    break;
+  case ICmpInst::ICMP_SGT:
+  case ICmpInst::ICMP_SGE:
+    Op = Same ? AtomicRMWInst::Max : AtomicRMWInst::Min;
+    break;
+  case ICmpInst::ICMP_SLT:
+  case ICmpInst::ICMP_SLE:
+    Op = Same ? AtomicRMWInst::Min : AtomicRMWInst::Max;
+    break;
+  default:
+    return std::nullopt;
+  }
+  return Op;
+}
+
+// A 64-bit atomic operation the Metal pipeline emulates under a spin lock
+// (AIRLowerAtomicRMW: Metal's atomics are 32-bit), as it writes it:
+//
+//   loop:   fence; %got = cmpxchg %lock, 0, 1 (by its value); fence
+//           br %got, %held, %latch
+//   held:   %lo = atomicrmw or %p, 0     %hi = atomicrmw or %p + 4, 0
+//           %v = zext %lo | zext %hi << 32;  %n = OP(%v, %x)
+//           atomicrmw xchg %p, trunc %n;  atomicrmw xchg %p + 4, trunc(%n >> 32)
+//           fence; atomicrmw xchg %lock, 0; fence; br %latch
+//   latch:  %done = phi [false, %loop], [true, %held]
+//           %old = phi [poison, %loop], [%v, %held]; br %done, %exit, %loop
+//
+// is atomicrmw OP %p, %x of i64, which the AGX backend compiles with its own
+// lock, inside the loop that takes it (or natively: G14's u64 min and max),
+// where the optimizer would otherwise leave the emulation's critical section
+// after the loop (each thread's execution is the same) and the threads of a
+// SIMD-group waiting for the lock one of them holds never let it run. Both
+// are atomic with respect to the same operations, not to 32-bit atomics on
+// the halves.
+static bool recoverLockedAtomic(BasicBlock &Held) {
+  using namespace PatternMatch;
+  SmallVector<AtomicRMWInst *, 8> RMWs;
+  for (Instruction &I : Held)
+    if (auto *R = dyn_cast<AtomicRMWInst>(&I))
+      RMWs.push_back(R);
+  if (RMWs.size() != 5)
+    return false;
+  AtomicRMWInst *Lo = RMWs[0], *Hi = RMWs[1], *WLo = RMWs[2], *WHi = RMWs[3],
+                *Unlock = RMWs[4];
+  auto IsRead = [](AtomicRMWInst *R) {
+    return R->getOperation() == AtomicRMWInst::Or &&
+           R->getType()->isIntegerTy(32) && match(R->getValOperand(), m_Zero());
+  };
+  auto IsXchg = [](AtomicRMWInst *R) {
+    return R->getOperation() == AtomicRMWInst::Xchg &&
+           R->getType()->isIntegerTy(32);
+  };
+  if (!IsRead(Lo) || !IsRead(Hi) || !IsXchg(WLo) || !IsXchg(WHi) ||
+      !IsXchg(Unlock) || !match(Unlock->getValOperand(), m_Zero()))
+    return false;
+  auto [Base, LoOff] = baseAndOffset(Lo->getPointerOperand());
+  auto [HiBase, HiOff] = baseAndOffset(Hi->getPointerOperand());
+  if (Base != HiBase || HiOff != LoOff + 4 || LoOff != 0 ||
+      baseAndOffset(WLo->getPointerOperand()) != std::make_pair(Base, LoOff) ||
+      baseAndOffset(WHi->getPointerOperand()) != std::make_pair(Base, HiOff))
+    return false;
+  // The value read, and the value written.
+  auto Half = [](Value *Read, unsigned Shift) {
+    return Shift ? m_Shl(m_ZExt(m_Specific(Read)), m_SpecificInt(Shift))
+                 : m_Shl(m_ZExt(m_Specific(Read)), m_SpecificInt(Shift));
+  };
+  Value *N;
+  if (!match(WLo->getValOperand(),
+             m_Trunc(m_CombineOr(m_LShr(m_Value(N), m_Zero()), m_Value(N)))) ||
+      !match(WHi->getValOperand(),
+             m_Trunc(m_LShr(m_Specific(N), m_SpecificInt(32)))) ||
+      !N->getType()->isIntegerTy(64))
+    return false;
+  auto IsV = [&](Value *V) {
+    return match(V, m_c_Or(m_CombineOr(Half(Lo, 0), m_ZExt(m_Specific(Lo))),
+                           Half(Hi, 32)));
+  };
+  // The operation: N = OP(V, X), or X alone (an exchange).
+  BasicBlock *Loop = Held.getUniquePredecessor();
+  auto *HeldBr = dyn_cast<UncondBrInst>(Held.getTerminator());
+  if (!Loop || !HeldBr)
+    return false;
+  BasicBlock *Latch = HeldBr->getSuccessor(0);
+  SmallPtrSet<BasicBlock *, 4> Blocks = {Loop, &Held, Latch};
+  auto Outside = [&](Value *V) {
+    auto *I = dyn_cast<Instruction>(V);
+    return !I || !Blocks.count(I->getParent());
+  };
+  Value *V = nullptr, *X = nullptr, *A, *B;
+  AtomicRMWInst::BinOp Op;
+  auto Pick = [&](AtomicRMWInst::BinOp O, bool Commutes) {
+    if (IsV(A) && Outside(B)) {
+      V = A, X = B, Op = O;
+      return true;
+    }
+    if (Commutes && IsV(B) && Outside(A)) {
+      V = B, X = A, Op = O;
+      return true;
+    }
+    return false;
+  };
+  bool Matched =
+      (match(N, m_Add(m_Value(A), m_Value(B))) &&
+       Pick(AtomicRMWInst::Add, true)) ||
+      (match(N, m_Sub(m_Value(A), m_Value(B))) &&
+       Pick(AtomicRMWInst::Sub, false)) ||
+      (match(N, m_And(m_Value(A), m_Value(B))) &&
+       Pick(AtomicRMWInst::And, true)) ||
+      (match(N, m_Or(m_Value(A), m_Value(B))) && !IsV(N) &&
+       Pick(AtomicRMWInst::Or, true)) ||
+      (match(N, m_Xor(m_Value(A), m_Value(B))) &&
+       Pick(AtomicRMWInst::Xor, true)) ||
+      [&] {
+        std::optional<AtomicRMWInst::BinOp> MM = matchIntMinMax(N, A, B);
+        return MM && Pick(*MM, true);
+      }();
+  if (!Matched) {
+    if (!Outside(N))
+      return false;
+    X = N, Op = AtomicRMWInst::Xchg;
+    for (Instruction &I : Held)
+      if (IsV(&I))
+        V = &I;
+  }
+  // The loop around it: the lock taken in Loop, the latch going back to it.
+  auto *LoopBr = dyn_cast<CondBrInst>(Loop->getTerminator());
+  auto *LatchBr = dyn_cast<CondBrInst>(Latch->getTerminator());
+  if (!LoopBr || !LatchBr || LoopBr->getSuccessor(0) != &Held ||
+      LoopBr->getSuccessor(1) != Latch || LatchBr->getSuccessor(1) != Loop ||
+      Blocks.count(LatchBr->getSuccessor(0)))
+    return false;
+  BasicBlock *Exit = LatchBr->getSuccessor(0);
+  BasicBlock *Pre = nullptr;
+  for (BasicBlock *P : predecessors(Loop)) {
+    if (P == Latch)
+      continue;
+    if (Pre)
+      return false;
+    Pre = P;
+  }
+  if (!Pre || !isa<UncondBrInst>(Pre->getTerminator()) || !Outside(Base) ||
+      !Outside(X) || X->getType() != N->getType())
+    return false;
+  // The lock is a compare-exchange of 0 (through the thread's memory, as
+  // AIR's compare-exchange takes its expected value) with 1 in Loop, the
+  // loop's only other access besides fences and the thread's memory; the
+  // latch decides by which way it came.
+  auto Private = [](Value *Ptr) {
+    return Ptr->getType()->getPointerAddressSpace() == AGX::PRIVATE_ADDRESS;
+  };
+  AtomicCmpXchgInst *Take = nullptr;
+  Value *ZeroSlot = nullptr;
+  for (Instruction &I : *Loop) {
+    if (auto *C = dyn_cast<AtomicCmpXchgInst>(&I)) {
+      if (Take)
+        return false;
+      Take = C;
+    } else if (auto *St = dyn_cast<StoreInst>(&I)) {
+      if (!Private(St->getPointerOperand()) || St->isVolatile())
+        return false;
+      if (!Take && match(St->getValueOperand(), m_Zero()))
+        ZeroSlot = St->getPointerOperand();
+    } else if (I.mayWriteToMemory() && !isa<FenceInst>(I)) {
+      return false;
+    }
+  }
+  if (!Take || Take->getPointerOperand() != Unlock->getPointerOperand() ||
+      !match(Take->getNewValOperand(), m_One()))
+    return false;
+  Value *Expected = Take->getCompareOperand();
+  if (auto *L = dyn_cast<LoadInst>(Expected);
+      L && L->getParent() == Loop && ZeroSlot &&
+      L->getPointerOperand() == ZeroSlot)
+    Expected = ConstantInt::get(Expected->getType(), 0);
+  if (!match(Expected, m_Zero()))
+    return false;
+  auto *Done = dyn_cast<PHINode>(LatchBr->getCondition());
+  if (!Done || Done->getParent() != Latch ||
+      !match(Done->getIncomingValueForBlock(Loop), m_Zero()) ||
+      !match(Done->getIncomingValueForBlock(&Held), m_One()))
+    return false;
+  PHINode *Old = nullptr;
+  for (PHINode &P : Latch->phis())
+    if (&P != Done) {
+      if (Old || !V || P.getIncomingValueForBlock(&Held) != V)
+        return false;
+      Old = &P;
+    }
+  for (BasicBlock *BB : Blocks)
+    for (Instruction &I : *BB)
+      for (User *U : I.users())
+        if (!Blocks.count(cast<Instruction>(U)->getParent()) && &I != Old)
+          return false;
+
+  IRBuilder<> Bld(Pre->getTerminator());
+  auto *RMW = Bld.CreateAtomicRMW(Op, Base, X, Align(8), Lo->getOrdering(),
+                                  Lo->getSyncScopeID());
+  RMW->setVolatile(Lo->isVolatile());
+  for (PHINode &P : Exit->phis()) {
+    Value *In = P.getIncomingValueForBlock(Latch);
+    P.addIncoming(In == Old ? RMW : In, Pre);
+  }
+  if (Old)
+    for (Use &U : make_early_inc_range(Old->uses()))
+      if (auto *UI = cast<Instruction>(U.getUser());
+          !Blocks.count(UI->getParent()) && !isa<PHINode>(UI))
+        U.set(RMW);
+  Pre->getTerminator()->setSuccessor(0, Exit);
+  SmallVector<BasicBlock *, 3> Dead(Blocks.begin(), Blocks.end());
+  DeleteDeadBlocks(Dead);
+  return true;
+}
+
+static void recoverLockedAtomics(Function &F) {
+  SmallVector<BasicBlock *, 4> Candidates;
+  for (BasicBlock &BB : F)
+    Candidates.push_back(&BB);
+  for (size_t I = 0; I < Candidates.size(); ++I) {
+    // Recovering one deletes its blocks: restart on what is left.
+    if (recoverLockedAtomic(*Candidates[I])) {
+      Candidates.clear();
+      for (BasicBlock &BB : F)
+        Candidates.push_back(&BB);
+      I = size_t(-1);
+    }
+  }
+}
+
 void LowerAIR::recoverAGXOperations(Function &F) {
   if (F.isDeclaration())
     return;
@@ -2578,8 +2870,10 @@ bool LowerAIR::run() {
   }
   lowerHints();
   lowerCalls();
-  for (Function &F : M)
+  for (Function &F : M) {
     recoverAGXOperations(F);
+    recoverLockedAtomics(F);
+  }
   recoverDoubles();
   dropAIRMetadata();
   M.setTargetTriple(TM.getTargetTriple());

@@ -1235,10 +1235,24 @@ Every AIR module, for every processor of ``-mcpu``, is a job with its own
 ``LLVMContext`` and target machine; ``-j`` jobs run at once (one per core by
 default) and their diagnostics are printed in input order. ``--time`` reports
 each job's read, optimization and code generation times. With one job ``-o``
-names the output; otherwise each output is named after its input (plus the
+names the output, and with several the assembly or IR of all of them, one
+after another in input order; otherwise each output is named after its input (plus the
 entry, when a ``.metallib`` holds several modules, and the processor, when
 there are several) in ``--output-dir``. The backend's options (``-agx-*``)
 are accepted too.
+
+MSL's ``thread_scope_device`` is ``syncscope("device")``: coherent among the
+GPU's threads, not with the host (Metal makes no memory of a dispatch
+host-coherent before it ends), so an atomic of that scope is a device atomic
+even when AIR marks it volatile, as it does nearly every one (see
+`Code generation`_ on host-coherent accesses). The 64-bit atomics the AIR
+target's Metal pipeline emulates under a spin lock (``air_atomic_locks``) are
+``atomicrmw`` of ``i64`` again, which the backend compiles inside the loop that
+takes its own lock (or natively); the optimizer would otherwise move the
+emulation's critical section after its loop, and the threads of a SIMD-group
+waiting for a lock one of them holds would never let it run. A spin lock in
+the kernel's own code is open to the same transformation: the optimizer keeps
+each thread's execution, not the progress of the others in its SIMD-group.
 
 Unlike ``llc`` on an AIR module, which runs only the code generator's IR
 passes, ``llvm-air2agx`` optimizes the AGX IR that ``agx-lower-air`` makes, as

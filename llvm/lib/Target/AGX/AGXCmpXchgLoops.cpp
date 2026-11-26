@@ -71,6 +71,52 @@ static Value *stripBitCasts(Value *V) {
   return V;
 }
 
+/// An integer min or max of A and B: the intrinsic, or a select of the
+/// operands of its compare (select (icmp ugt a, b), a, b is umax(a, b); with
+/// the operands swapped, umin).
+static std::optional<AtomicRMWInst::BinOp> matchIntMinMax(Value *N, Value *&A,
+                                                         Value *&B) {
+  using namespace PatternMatch;
+  if (match(N, m_SMax(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::Max;
+  if (match(N, m_SMin(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::Min;
+  if (match(N, m_UMax(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::UMax;
+  if (match(N, m_UMin(m_Value(A), m_Value(B))))
+    return AtomicRMWInst::UMin;
+  CmpPredicate P;
+  Value *T, *F;
+  if (!match(N, m_Select(m_ICmp(P, m_Value(A), m_Value(B)), m_Value(T),
+                         m_Value(F))))
+    return std::nullopt;
+  bool Same = T == A && F == B, Swapped = T == B && F == A;
+  if (!Same && !Swapped)
+    return std::nullopt;
+  std::optional<AtomicRMWInst::BinOp> Op;
+  switch (ICmpInst::Predicate(P)) {
+  case ICmpInst::ICMP_UGT:
+  case ICmpInst::ICMP_UGE:
+    Op = Same ? AtomicRMWInst::UMax : AtomicRMWInst::UMin;
+    break;
+  case ICmpInst::ICMP_ULT:
+  case ICmpInst::ICMP_ULE:
+    Op = Same ? AtomicRMWInst::UMin : AtomicRMWInst::UMax;
+    break;
+  case ICmpInst::ICMP_SGT:
+  case ICmpInst::ICMP_SGE:
+    Op = Same ? AtomicRMWInst::Max : AtomicRMWInst::Min;
+    break;
+  case ICmpInst::ICMP_SLT:
+  case ICmpInst::ICMP_SLE:
+    Op = Same ? AtomicRMWInst::Min : AtomicRMWInst::Max;
+    break;
+  default:
+    return std::nullopt;
+  }
+  return Op;
+}
+
 /// What %new is of %old: an operation with an operand defined outside the
 /// loop, or that operand alone (an exchange). The operand is returned in the
 /// type of the compare-exchange (an integer), and must be made so outside the
@@ -108,14 +154,8 @@ matchOp(Value *New, PHINode *Old, BasicBlock *Loop) {
     return Pick(AtomicRMWInst::Or, true);
   if (match(I, m_Xor(m_Value(A), m_Value(B))))
     return Pick(AtomicRMWInst::Xor, true);
-  if (match(I, m_SMax(m_Value(A), m_Value(B))))
-    return Pick(AtomicRMWInst::Max, true);
-  if (match(I, m_SMin(m_Value(A), m_Value(B))))
-    return Pick(AtomicRMWInst::Min, true);
-  if (match(I, m_UMax(m_Value(A), m_Value(B))))
-    return Pick(AtomicRMWInst::UMax, true);
-  if (match(I, m_UMin(m_Value(A), m_Value(B))))
-    return Pick(AtomicRMWInst::UMin, true);
+  if (std::optional<AtomicRMWInst::BinOp> MM = matchIntMinMax(I, A, B))
+    return Pick(*MM, true);
   if (match(I, m_FAdd(m_Value(A), m_Value(B))))
     return Pick(AtomicRMWInst::FAdd, true);
   if (match(I, m_FSub(m_Value(A), m_Value(B))))

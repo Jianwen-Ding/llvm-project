@@ -163,6 +163,9 @@ struct Job {
   std::string OutPath;
   // Results.
   std::string Log;
+  /// With -o and several jobs of text: the output, written in job order.
+  bool Concat = false;
+  SmallString<0> Text;
   bool Failed = false;
   double ReadMs = 0, OptMs = 0, CodegenMs = 0;
   unsigned Kernels = 0;
@@ -506,6 +509,10 @@ static void runJob(Job &J) {
   for (Function &F : *M)
     if (F.getCallingConv() == CallingConv::AGX_KERNEL && !F.isDeclaration())
       ++J.Kernels;
+  if (J.Concat) {
+    J.Text = std::move(Buf);
+    return;
+  }
   std::error_code EC;
   ToolOutputFile Out(J.OutPath, EC,
                      EmitKind == Emit::Asm || EmitKind == Emit::LLVM
@@ -631,7 +638,10 @@ int main(int argc, char **argv) {
     CPUList.push_back("");
   std::vector<Job> Jobs;
   bool OneJob = Units.size() * CPUList.size() == 1;
-  if (!Output.empty() && !OneJob && EmitKind != Emit::Code) {
+  // Text (assembly, IR) of several jobs goes to -o one after another.
+  bool Concat = !Output.empty() && !OneJob &&
+                (EmitKind == Emit::Asm || EmitKind == Emit::LLVM);
+  if (!Output.empty() && !OneJob && EmitKind != Emit::Code && !Concat) {
     WithColor::error(errs(), "llvm-air2agx")
         << "-o names one output, but there are "
         << Units.size() * CPUList.size()
@@ -657,7 +667,8 @@ int main(int argc, char **argv) {
       Job J;
       J.U = &U;
       J.CPU = CPU;
-      if (!Output.empty() && OneJob) {
+      J.Concat = Concat;
+      if (!Output.empty() && (OneJob || Concat)) {
         J.OutPath = Output;
       } else {
         std::string Name = Output.empty() ? StemOf[U.Input] : Output;
@@ -692,6 +703,18 @@ int main(int argc, char **argv) {
     Pool.wait();
   }
   double TotalMs = msSince(Start);
+  if (Concat) {
+    std::error_code EC;
+    ToolOutputFile Out(Output, EC, sys::fs::OF_Text);
+    if (EC) {
+      WithColor::error(errs(), "llvm-air2agx")
+          << Output << ": " << EC.message() << "\n";
+      return 1;
+    }
+    for (const Job &J : Jobs)
+      Out.os() << J.Text;
+    Out.keep();
+  }
 
   for (const Job &J : Jobs) {
     errs() << J.Log;
