@@ -134,6 +134,16 @@ protected:
   }
 };
 
+// Metal's kernel ABI instead of the Triton host's: no argument buffer and no
+// _scalar_buf (each pointer its own buffer, each scalar a constant buffer),
+// and without the device-load workaround only Apple's driver needs. The
+// metal-cpp runtime on Asahi Linux (metal-cpp/asahi) binds kernels this way.
+static cl::opt<bool> AIRBufferPerArgument(
+    "air-buffer-per-argument",
+    cl::desc("Bind each kernel pointer and scalar at its own [[buffer(n)]] "
+             "(Metal's convention) instead of packing them"),
+    cl::init(false));
+
 class AIRPassConfig : public TargetPassConfig {
 public:
   AIRPassConfig(AIRTargetMachine &TM, PassManagerBase &PM)
@@ -171,7 +181,8 @@ public:
     addPass(createAIRScalarStoreGuardLegacyPass());
     addPass(createAIRTGGlobalCoalesceLegacyPass());
     addPass(createAIRTGBarrierInsertLegacyPass());
-    addPass(createAIRDeviceLoadsVolatileLegacyPass());
+    if (!AIRBufferPerArgument)
+      addPass(createAIRDeviceLoadsVolatileLegacyPass());
     addPass(createAIRAsyncEventToAllocaLegacyPass());
     addPass(createAIRNormalizeAllocasLegacyPass());
     addPass(createAIRBFloat16CastDecomposeLegacyPass());
@@ -179,15 +190,22 @@ public:
     // gpu-dialect/IREE path that lacks pre-baked !air.kernel metadata). Must run
     // BEFORE AIRSystemValues so the indirect-buffer metadata is emitted against
     // the packed signature.
-    addPass(createAIRArgumentBufferLegacyPass());
-    // Must run BEFORE AIRSystemValues so that !air.kernel metadata is
-    // emitted against the post-packing signature.
-    addPass(createAIRScalarBufferPackingLegacyPass());
-    // The kernels with an argument buffer keep their scalars out of
-    // _scalar_buf: each takes a constant buffer, after the argument buffer,
-    // so that !air.kernel describes it.
-    addPass(createAIRScalarArgsToConstantBuffersLegacyPass(
-        /*ArgumentBufferKernelsOnly=*/true));
+    if (AIRBufferPerArgument) {
+      // Metal's own convention (a [[buffer(n)]] per pointer, a constant
+      // buffer per scalar, in parameter order), as a Metal host binds them.
+      addPass(createAIRScalarArgsToConstantBuffersLegacyPass(
+          /*ArgumentBufferKernelsOnly=*/false));
+    } else {
+      addPass(createAIRArgumentBufferLegacyPass());
+      // Must run BEFORE AIRSystemValues so that !air.kernel metadata is
+      // emitted against the post-packing signature.
+      addPass(createAIRScalarBufferPackingLegacyPass());
+      // The kernels with an argument buffer keep their scalars out of
+      // _scalar_buf: each takes a constant buffer, after the argument buffer,
+      // so that !air.kernel describes it.
+      addPass(createAIRScalarArgsToConstantBuffersLegacyPass(
+          /*ArgumentBufferKernelsOnly=*/true));
+    }
     addPass(createAIRSystemValuesLegacyPass());
     // Emit Apple-style alias-scope MD + "air-buffer-no-alias" param attrs
     // after the IR shape is final but before final normalisations.

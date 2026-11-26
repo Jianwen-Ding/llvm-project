@@ -568,6 +568,11 @@ void LowerAIR::cloneKernel(AIRKernel &K, Function *NewF,
                     Returns, "", nullptr, &Types);
   NewF->setCallingConv(CallingConv::AGX_KERNEL);
   NewF->removeFnAttr("air-kernel");
+  // A kernel is an entry point whatever linkage AIR gave it.
+  if (NewF->hasLocalLinkage()) {
+    NewF->setLinkage(GlobalValue::ExternalLinkage);
+    NewF->setVisibility(GlobalValue::DefaultVisibility);
+  }
   auto *Body = cast<BasicBlock>(VMap[&F.getEntryBlock()]);
   B.CreateBr(Body);
   MergeBlockIntoPredecessor(Body);
@@ -2070,8 +2075,11 @@ void LowerAIR::inlineCalls() {
         Again = true;
     }
   }
+  // Kernels stay, whatever their linkage: they are entry points (an AIR
+  // module may list an internal function in !air.kernel).
   for (Function &F : make_early_inc_range(M))
-    if (F.hasLocalLinkage() && F.use_empty() && !F.isDeclaration())
+    if (F.hasLocalLinkage() && F.use_empty() && !F.isDeclaration() &&
+        F.getCallingConv() != CallingConv::AGX_KERNEL)
       F.eraseFromParent();
 }
 
