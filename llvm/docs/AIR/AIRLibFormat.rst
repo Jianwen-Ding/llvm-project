@@ -39,23 +39,22 @@ The 88-byte header is::
     offset   size   field            value / meaning
     ------   ----   --------------   --------------------------------
        0       4   Magic            ``"MTLB"``
-       4       2   FormatMinor      ``0x0180`` (little-endian: 0x80 0x01)
+       4       2   Format           bytes ``0x01 0x80``
        6       2   FormatMajor      ``0x0002``
        8       1   Reserved         ``0x09``
-       9       3   Padding          zero
-      12       1   Reserved         zero
-      13       1   Platform         ``0x81`` (macOS) or ``0x82`` (iOS)
-      14       1   OSMajor          (e.g. ``26`` — see DefaultAIRLibOSMajor)
-      15       3   OSPad            zero
-      20       8   FileSize         total size of the file in bytes
-      28       8   Sec0Offset
-      36       8   Sec0Size
-      44       8   Sec1Offset
-      52       8   Sec1Size
-      60       8   Sec2Offset
-      68       8   Sec2Size
-      76       8   Sec3Offset
-      84       8   Sec3Size         (== wrapped bitcode size)
+       9       2   Padding          zero
+      11       1   Platform         ``0x81`` (macOS) or ``0x82`` (iOS)
+      12       1   OSMajor          (e.g. ``26`` — see DefaultAIRLibOSMajor)
+      13       3   OSPad            zero
+      16       8   FileSize         total size of the file in bytes
+      24       8   Sec0Offset
+      32       8   Sec0Size
+      40       8   Sec1Offset
+      48       8   Sec1Size
+      56       8   Sec2Offset
+      64       8   Sec2Size
+      72       8   Sec3Offset
+      80       8   Sec3Size         (== wrapped bitcode size)
 
 Section 0 — Entry Table
 =======================
@@ -134,7 +133,7 @@ documented in :doc:`AIRTarget`.
 Reading a ``.metallib``
 =======================
 
-Today, the in-tree pieces are write-only:
+The writing side:
 
 * ``AIREmbedderPass`` builds the metallib bytes from a Module.
 * ``AIRLibObjectWriter`` (``llvm/lib/MC/AIRLibObjectWriter.cpp``) wraps
@@ -142,6 +141,9 @@ Today, the in-tree pieces are write-only:
 * ``MCAIRLibStreamer`` (``llvm/lib/MC/MCAIRLibStreamer.cpp``) plumbs
   the embedder output through the MC streamer interface.
 
-There is no corresponding parser; introspecting a ``.metallib`` is left to
-``llvm-bcanalyzer`` (on the unwrapped bitcode payload) and to external
-tooling.
+``llvm-air2agx`` (``llvm/tools/llvm-air2agx/MetalLib.cpp``) reads one: it
+walks section 0's entry blocks by their sizes (each counting its own size
+field), reads each entry's tags up to ``ENDT`` and takes its bitcode as
+``MDSZ`` bytes at ``OFFT[2]`` within section 3 (all of section 3 for an entry
+without them), bounds-checking every offset; ``llvm-air2agx --list`` prints the
+entries. It compiles them for AGX (see the AGX backend's user guide).

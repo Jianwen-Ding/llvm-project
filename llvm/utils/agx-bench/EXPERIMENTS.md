@@ -1027,6 +1027,50 @@ Policy (the user's): anything that costs performance goes into strict floating p
 [-2pi, 2pi] (a compare and select) is ieee-fp32 only, and sin(-0) = -0 comes from AGXStrictFP's small-argument
 path, not from a select in the default lowering (llvm/test/CodeGen/AGX/trig-strict.ll).
 
+## Experiment: .air / .metallib -> AGX in one process (`llvm-air2agx`, 2026-11-26)
+
+`llvm-air2agx` (llvm/docs/AGXUsage.rst, "Compiling .air and .metallib files") reads a `.metallib` or `.air`, runs
+agx-lower-air and `-O3` with the AGX passes, then the code generator, one job per AIR module and processor in
+parallel. Its objects are byte-identical to `opt -mtriple=agx -mcpu=CPU -O3` then `llc -O3` on the same `.air` (60 of
+60 sampled kernels); AGX code generation at `-O2` and `-O3` gives the same assembly on all 717 suite kernels tried.
+
+Inputs: the AIR hardware suite's 725 kernels (llvm/utils/air-gpu), one module each, as the AIR target writes them for
+Metal (`llc -mtriple=air -filetype=obj`). `tools/air2agx_compare.py` costs three paths with agx_cost (one SIMD-group,
+G14G, zero launch inputs):
+
+| Against | Kernels | cycles | instructions | waits | GPRs | stack bytes |
+|---|---|---|---|---|---|---|
+| `llc -mtriple=agx` on the same `.air` (codegen IR passes only) | 722 | -2.5% (64 better, 23 worse) | -0.8% | -1.2% | -1.3% | 512 -> 400 |
+| portable AIR (`-air-portable`) through `llc` | 717 | +0.4% (51 better, 73 worse) | -6.8% | -0.8% | -2.4% | 512 -> 400 |
+
+Against the portable AIR the losses are the Metal pipeline's AIR, not the tool (`llc` on that AIR loses the same):
+`air-tg-barrier-insert`'s extra barriers (tg_reverse_barrier2 280.9 -> 405.9), float atomics as compare-exchange
+loops (atomic_fmax_f32 150.5 -> 621.6), ordered atomics as a relaxed one between fences without
+`!agx.atomic.ordering` (atomic_add_seq_cst_i32 417.7 -> 1017.7). None can be undone soundly from the AIR alone (a
+barrier also orders device accesses of other threads, which no AIR attribute rules out). The gains are the
+optimization pipeline's: stack arrays promoted (memmove_overlap_private 962.9 -> 259.2, const_float_table_horner
+744.9 -> 138.9), software doubles folded (double_exact_arith 506 -> 7 instructions). Worst against `llc` on the same
+AIR: tg_uniform_branch_barrier 474.0 -> 606.5 (same instructions, memory barriers placed differently).
+
+Functional (agx_run against the suite's references, `air_gpu_suite.py --agx-run --air2agx`): PASS 686, HW-FTZ 35,
+MISMATCH 1 (frexp of a subnormal, as the portable path), REJECTED 3 (the Metal pipeline's lock-emulated 64-bit
+atomics spin forever in a SIMD-group), no COMPILE; the portable path through `llc`: PASS 680, COMPILE 7. Reaching
+this took lowering AIR functions Metal's AIR has that agx-lower-air lacked: atomic loads / stores, `ldexp`, `frexp`,
+`simd_is_first`, `simd_active_threads_mask`; and buffers at their `[[buffer(N)]]` locations.
+
+Translation validation (alive2, `scripts/agx-tv/air2agx-tv`: the AIR read back from the `.metallib` against the
+tool's AGX IR, then that IR against the machine code), 27 kernels of the llvm-int, llvm-control, memory and
+threadgroup groups at 60 s per query: AIR -> AGX IR 22 correct, 0 incorrect, 4 timeouts, 1 source alive2 cannot
+unroll; AGX IR -> machine code 17 correct, 5 timeouts, 2 the lifter does not take (stack, a global data buffer), 2
+incorrect: tg_reverse_barrier2/3, which the portable path through `llc` fails the same way (a threadgroup barrier
+kernel; open). The saxpy kernel: AIR -> AGX IR correct (alive2 tests/alive-tv/gpu/saxpy-metallib-agx); its machine
+code times out (Z3 4.8 and 5.4, 15 min; memout at 30) on the 32-bit multiply of two loaded values: the same kernel
+with `alpha + x` or `3 * x` verifies in under 2 s.
+
+Compile time (722 modules, 4 cores, a shared-library build): 0.92 s wall / 2.6 s user (1 job: 2.67 s), against
+9.3 s / 19.3 s for `opt -O3` then `llc` per module, four at a time, and 5.1 s for `llc` alone. Per module: read 0.3
+ms, opt about 1 ms, code generation 2-9 ms.
+
 ## Research sources (policy)
 
 Experiments are based only on publicly published work: open-access papers (arXiv, ACM / IEEE papers with public

@@ -20,7 +20,8 @@
 ; BARE: error: {{.*}}the !air.kernel entry of this kernel describes no parameters
 ; TWOTG: error: {{.*}}more than one threadgroup buffer parameter
 ; ARGBUF: error: {{.*}}argument buffers (air.indirect_buffer) are not supported
-; ORDER: error: {{.*}}buffer locations are not in parameter order
+; ORDER: error: {{.*}}two buffers at location 0
+; ORDER: error: {{.*}}buffer location 40 is beyond the 31 buffers a kernel has
 ; UNKNOWN: error: {{.*}}the AIR function air.simdgroup_matrix_8x8_load.v64f32.p1f32 has no AGX lowering
 ; MATRIX: error: {{.*}}a SIMD-group matrix used other than as a matrix
 ; NOSUFFIX: error: {{.*}}the AIR function air.atomic.global.xchg has no AGX lowering
@@ -89,13 +90,14 @@ define void @k(ptr addrspace(2) %a) {
 !1 = !{i32 0, !"air.indirect_buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2}
 
 ;--- order.ll
-define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b) {
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c) {
   ret void
 }
 !air.kernel = !{!0}
-!0 = !{ptr @k, !{}, !{!1, !2}}
-!1 = !{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1}
+!0 = !{ptr @k, !{}, !{!1, !2, !3}}
+!1 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1}
 !2 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1}
+!3 = !{i32 2, !"air.buffer", !"air.location_index", i32 40, i32 1, !"air.read_write", !"air.address_space", i32 1}
 
 ;--- matrix-element.ll
 declare <64 x float> @air.simdgroup_matrix_8x8_init_filled.v64f32.f32(float)
