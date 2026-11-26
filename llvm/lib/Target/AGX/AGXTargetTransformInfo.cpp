@@ -131,6 +131,13 @@ static cl::opt<unsigned> AGXDeviceUnroll(
     cl::desc("Iterations a single-block loop that loads device memory, of a "
              "constant trip count this divides, is unrolled by (1: none)"));
 
+static cl::opt<unsigned> AGXTileFullUnrollThreshold(
+    "agx-tile-full-unroll-threshold", cl::init(600), cl::Hidden,
+    cl::desc("Full-unroll threshold of single-block loops of a constant trip "
+             "count of at most 32 that load threadgroup memory, in functions "
+             "whose estimated register pressure is at most half the register "
+             "file (0: the generic threshold)"));
+
 static bool isThreadVaryingIntrinsic(Intrinsic::ID ID) {
   switch (ID) {
   case Intrinsic::agx_thread_position_in_grid_x:
@@ -332,6 +339,18 @@ void AGXTTIImpl::getUnrollingPreferences(
   }
   if (!ThreadgroupLoads || L->getNumBlocks() != 1)
     return;
+  // A short loop over a threadgroup tile of a constant trip count (a matrix
+  // product's k loop over a 16-wide tile): fully unrolled, its threadgroup
+  // addresses become immediate offsets of one base and its loop control goes
+  // away (metal-cpp/asahi sgemm_reg4x4, 4x4 outputs per thread: 1.90 ->
+  // 2.58 TFLOP/s at 2048^3 on the M2 Max). Only with room in the register
+  // file: the copies' values are live at once.
+  if (unsigned Th = AGXTileFullUnrollThreshold) {
+    unsigned Trips = SE.getSmallConstantTripCount(L);
+    const Function &F = *L->getHeader()->getParent();
+    if (Trips && Trips <= 32 && agxEstimatePressure(F) * 2 <= ST->getMaxGPRs(F))
+      UP.Threshold = std::max(UP.Threshold, Th);
+  }
   if (AGXThreadgroupUnroll == 1)
     return;
   if (AGXThreadgroupUnroll == 0) {
