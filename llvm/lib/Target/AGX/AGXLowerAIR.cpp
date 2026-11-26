@@ -419,6 +419,14 @@ static Type *namedType(StringRef Name, LLVMContext &Ctx) {
 
 // The system value Role as a value of the parameter type Ty, or its
 // component Only (of Ty's element type) alone.
+// A value of the launch's geometry (llvm.agx.launch.grid): kinds 0-2 the grid
+// size in threads, 3-5 the dispatch's threadgroup size.
+static Value *launchGrid(IRBuilder<> &B, unsigned Kind) {
+  Function *Fn = Intrinsic::getOrInsertDeclaration(
+      B.GetInsertBlock()->getModule(), Intrinsic::agx_launch_grid);
+  return B.CreateCall(Fn, {B.getInt32(Kind)});
+}
+
 Value *LowerAIR::systemValue(IRBuilder<> &B, StringRef Role, Type *Ty,
                              Function *F, int Only) {
   auto Read = [&](Intrinsic::ID ID) { return B.CreateIntrinsic(ID, {}); };
@@ -449,14 +457,15 @@ Value *LowerAIR::systemValue(IRBuilder<> &B, StringRef Role, Type *Ty,
   else if (Role == air::ThreadgroupsPerGrid)
     C = XYZ(agx_threadgroups_per_grid_x, agx_threadgroups_per_grid_y,
             agx_threadgroups_per_grid_z);
-  else if (Role == air::ThreadsPerGrid) {
-    // Grids are whole threadgroups on AGX.
-    auto G = XYZ(agx_threadgroups_per_grid_x, agx_threadgroups_per_grid_y,
-                 agx_threadgroups_per_grid_z);
-    auto T = XYZ(agx_threads_per_threadgroup_x, agx_threads_per_threadgroup_y,
-                 agx_threads_per_threadgroup_z);
+  else if (Role == air::ThreadsPerGrid ||
+           Role == air::DispatchThreadsPerThreadgroup) {
+    // The grid need not be whole threadgroups, and the threadgroup size
+    // registers give the current (possibly partial) threadgroup's size: the
+    // launch provides both values.
+    unsigned Base = Role == air::ThreadsPerGrid ? 0 : 3;
     for (unsigned I = 0; I < 3; ++I)
-      C.push_back(G[I] ? B.CreateMul(G[I], T[I]) : nullptr);
+      C.push_back(Only < 0 || int(I) == Only ? launchGrid(B, Base + I)
+                                             : nullptr);
   } else if (Role == air::ThreadIndexInThreadgroup)
     C = {Read(agx_thread_index_in_threadgroup)};
   else if (Role == air::ThreadIndexInSimdgroup)
@@ -725,6 +734,26 @@ bool LowerAIR::lowerAtomic(IRBuilder<> &B, CallInst &CI, StringRef Name,
     B.CreateStore(Result, ExpectedPtr);
     return true;
   }
+  // air.atomic.<space>.load.<type>(ptr, order, scope, volatile) and
+  // air.atomic.<space>.store.<type>(ptr, value, order, scope, volatile): the
+  // AIR writer's form of atomic loads and stores (32-bit integers and floats).
+  if ((Rest == "load.i32" || Rest == "load.f32") && CI.arg_size() == 4) {
+    Type *T = Rest == "load.i32" ? B.getInt32Ty() : B.getFloatTy();
+    auto *L = B.CreateAlignedLoad(T, Ptr, Align(4));
+    L->setAtomic(ordering(CI.getArgOperand(1)), syncScope(Ctx, CI.getArgOperand(2)));
+    L->setVolatile(isVolatile(CI.getArgOperand(3)));
+    Result = L;
+    return true;
+  }
+  if ((Rest == "store.i32" || Rest == "store.f32") && CI.arg_size() == 5) {
+    AtomicOrdering O = ordering(CI.getArgOperand(2));
+    if (O == AtomicOrdering::Acquire || O == AtomicOrdering::AcquireRelease)
+      O = AtomicOrdering::SequentiallyConsistent;
+    auto *St = B.CreateAlignedStore(CI.getArgOperand(1), Ptr, Align(4));
+    St->setAtomic(O, syncScope(Ctx, CI.getArgOperand(3)));
+    St->setVolatile(isVolatile(CI.getArgOperand(4)));
+    return true;
+  }
   StringRef Op = Rest.take_until([](char C) { return C == '.'; });
   Rest = Rest.drop_front(Op.size());
   Rest.consume_front(".");
@@ -974,13 +1003,19 @@ bool LowerAIR::lowerOther(IRBuilder<> &B, CallInst &CI, StringRef Name,
     else if (Fn == "get_num_groups")
       V = workItem(B, agx_threadgroups_per_grid_x, agx_threadgroups_per_grid_y,
                    agx_threadgroups_per_grid_z, D);
-    else if (Fn == "get_global_size")
-      V = B.CreateMul(workItem(B, agx_threadgroups_per_grid_x,
-                               agx_threadgroups_per_grid_y,
-                               agx_threadgroups_per_grid_z, D),
-                      workItem(B, agx_threads_per_threadgroup_x,
-                               agx_threads_per_threadgroup_y,
-                               agx_threads_per_threadgroup_z, D));
+    else if (Fn == "get_global_size") {
+      // The grid size in threads, from the launch (a constant dimension
+      // past z is 1, as OpenCL's).
+      if (auto *CD = dyn_cast<ConstantInt>(D))
+        V = CD->getZExtValue() < 3 ? launchGrid(B, CD->getZExtValue())
+                                   : B.getInt32(1);
+      else
+        V = B.CreateSelect(
+            B.CreateICmpEQ(D, ConstantInt::get(D->getType(), 0)),
+            launchGrid(B, 0),
+            B.CreateSelect(B.CreateICmpEQ(D, ConstantInt::get(D->getType(), 1)),
+                           launchGrid(B, 1), launchGrid(B, 2)));
+    }
     if (!V || !Ty->isIntegerTy())
       return false;
     Result = B.CreateZExtOrTrunc(V, Ty);

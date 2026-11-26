@@ -580,6 +580,27 @@ SDValue AGXTargetLowering::LowerFormalArguments(
       MFI->LaunchValues.push_back(
           {Arg, Word, Kind, MF.addLiveIn(PReg, &AGX::GPR32RegClass), At});
   }
+  // Launch geometry values (llvm.agx.launch.grid), in kind order.
+  {
+    bool Used[6] = {};
+    for (const Instruction &I : instructions(MF.getFunction()))
+      if (const auto *II = dyn_cast<IntrinsicInst>(&I))
+        if (II->getIntrinsicID() == Intrinsic::agx_launch_grid) {
+          unsigned Kind = cast<ConstantInt>(II->getArgOperand(0))->getZExtValue();
+          if (Kind < 6)
+            Used[Kind] = true;
+        }
+    for (unsigned Kind = 0; Kind < 6; ++Kind) {
+      if (!Used[Kind])
+        continue;
+      Half = alignTo(Half, 2);
+      unsigned At = Half;
+      MCRegister PReg = Allocate(MVT::i32);
+      if (PReg)
+        MFI->LaunchGrids.push_back(
+            {Kind, MF.addLiveIn(PReg, &AGX::GPR32RegClass), At});
+    }
+  }
   MFI->setUniformHalfCount(Half);
 
   if (Overflow)
@@ -1276,6 +1297,13 @@ SDValue AGXTargetLowering::lowerINTRINSIC_WO_CHAIN(SDValue Op,
     auto *MFI = DAG.getMachineFunction().getInfo<AGXMachineFunctionInfo>();
     Register VReg =
         MFI->getImplicitArgVReg(IID - Intrinsic::agx_threadgroups_per_grid_x);
+    if (!VReg)
+      return DAG.getUNDEF(MVT::i32);
+    return DAG.getCopyFromReg(DAG.getEntryNode(), DL, VReg, MVT::i32);
+  }
+  case Intrinsic::agx_launch_grid: {
+    auto *MFI = DAG.getMachineFunction().getInfo<AGXMachineFunctionInfo>();
+    Register VReg = MFI->getLaunchGridVReg(Op.getConstantOperandVal(1));
     if (!VReg)
       return DAG.getUNDEF(MVT::i32);
     return DAG.getCopyFromReg(DAG.getEntryNode(), DL, VReg, MVT::i32);

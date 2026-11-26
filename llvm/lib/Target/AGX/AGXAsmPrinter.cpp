@@ -190,6 +190,10 @@ void AGXAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
 ///     "agx-hidden"="address32-base", the base the 32-bit addresses of a
 ///     module of PTX's .address_size 32 are offsets from, which the driver
 ///     sets below its data allocations.
+///     10, N, then N pairs (half, kind): the launch's geometry values
+///     (llvm.agx.launch.grid), which the driver puts in the 32-bit uniform
+///     from half: kinds 0, 1, 2 the grid size in threads (x, y, z), kinds 3,
+///     4, 5 the dispatch's threadgroup size.
 ///
 /// Argument values are packed little-endian from their first half in 32-bit
 /// words (16-bit arguments in one half).
@@ -357,6 +361,11 @@ void AGXAsmPrinter::recordKernel() {
       R.append({8, Half(A.getArgNo()), Size});
     else if (V == "address32-base")
       R.append({9, Half(A.getArgNo())});
+  }
+  if (!MFI->LaunchGrids.empty()) {
+    R.append({10, uint32_t(MFI->LaunchGrids.size())});
+    for (const auto &V : MFI->LaunchGrids)
+      R.append({V.Half, V.Kind});
   }
   Kernels.push_back({std::string(getSymbol(&F)->getName()), std::move(R)});
   KernelFunctions.push_back(&F);

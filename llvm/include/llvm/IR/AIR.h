@@ -56,6 +56,8 @@ constexpr StringLiteral ThreadPositionInThreadgroup =
 constexpr StringLiteral ThreadsPerThreadgroup = "air.threads_per_threadgroup";
 constexpr StringLiteral ThreadgroupsPerGrid = "air.threadgroups_per_grid";
 constexpr StringLiteral ThreadsPerGrid = "air.threads_per_grid";
+constexpr StringLiteral DispatchThreadsPerThreadgroup =
+    "air.dispatch_threads_per_threadgroup";
 constexpr StringLiteral ThreadIndexInThreadgroup =
     "air.thread_index_in_threadgroup";
 constexpr StringLiteral ThreadIndexInSimdgroup = "air.thread_index_in_simdgroup";

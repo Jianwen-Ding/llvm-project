@@ -64,6 +64,18 @@
 
 using namespace llvm;
 
+// Metal's kernel ABI instead of the Triton host's: no argument buffer and no
+// _scalar_buf (each pointer its own buffer, each scalar a constant buffer),
+// and without the device-load workaround only Apple's driver needs. The
+// metal-cpp runtime on Asahi Linux (metal-cpp/asahi) binds kernels this way.
+cl::opt<bool> llvm::AIRBufferPerArgument(
+    "air-buffer-per-argument",
+    cl::desc("Bind each kernel pointer and scalar at its own [[buffer(n)]] "
+             "and keep threadgroup pointer parameters as dynamic threadgroup "
+             "memory (Metal's convention) instead of packing them"),
+    cl::init(false));
+
+
 cl::opt<bool> llvm::AIRLookupTables(
     "air-lookup-tables", cl::init(true), cl::Hidden,
     cl::desc("Let SimplifyCFG turn switches into lookup tables in AIR "
@@ -134,15 +146,7 @@ protected:
   }
 };
 
-// Metal's kernel ABI instead of the Triton host's: no argument buffer and no
-// _scalar_buf (each pointer its own buffer, each scalar a constant buffer),
-// and without the device-load workaround only Apple's driver needs. The
-// metal-cpp runtime on Asahi Linux (metal-cpp/asahi) binds kernels this way.
-static cl::opt<bool> AIRBufferPerArgument(
-    "air-buffer-per-argument",
-    cl::desc("Bind each kernel pointer and scalar at its own [[buffer(n)]] "
-             "(Metal's convention) instead of packing them"),
-    cl::init(false));
+
 
 class AIRPassConfig : public TargetPassConfig {
 public:

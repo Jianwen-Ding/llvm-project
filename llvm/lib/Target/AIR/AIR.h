@@ -14,7 +14,14 @@
 #ifndef LLVM_LIB_TARGET_AIR_AIR_H
 #define LLVM_LIB_TARGET_AIR_AIR_H
 
+#include "llvm/Support/CommandLine.h"
+
 namespace llvm {
+/// -air-buffer-per-argument: Metal's kernel ABI (a buffer per pointer, a
+/// constant buffer per scalar, threadgroup pointer parameters bound by the
+/// host) instead of the Triton host's packed one.
+extern cl::opt<bool> AIRBufferPerArgument;
+
 class ModulePass;
 class FunctionPass;
 class PassRegistry;

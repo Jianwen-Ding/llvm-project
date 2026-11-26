@@ -118,6 +118,21 @@ public:
     return Register();
   }
 
+  /// Launch geometry values (llvm.agx.launch.grid): kind, the virtual
+  /// register and the uniform half that hold it.
+  struct LaunchGrid {
+    unsigned Kind;
+    Register VReg;
+    unsigned Half;
+  };
+  SmallVector<LaunchGrid, 6> LaunchGrids;
+  Register getLaunchGridVReg(unsigned Kind) const {
+    for (const LaunchGrid &V : LaunchGrids)
+      if (V.Kind == Kind)
+        return V.VReg;
+    return Register();
+  }
+
   void setUniformHalfCount(unsigned N) { UniformHalfCount = N; }
   unsigned getUniformHalfCount() const { return UniformHalfCount; }
   void setImplicitArgVReg(unsigned Dim, Register R) {

@@ -49,6 +49,17 @@ def int_agx_launch_value
                              ImmArg<ArgIndex<0>>, ImmArg<ArgIndex<1>>,
                              ImmArg<ArgIndex<2>>]>;
 
+// A value of the launch's geometry, which the driver puts in a uniform
+// register (record extension 10): the grid size in threads, x, y, z (kinds
+// 0, 1, 2), and the dispatch's threadgroup size, x, y, z (3, 4, 5). The
+// threadgroup size special registers give the size of the current
+// threadgroup, which is smaller for the last threadgroup of a grid that is
+// not a whole number of threadgroups.
+def int_agx_launch_grid
+    : DefaultAttrsIntrinsic<[llvm_i32_ty], [llvm_i32_ty],
+                            [NoUndef<RetIndex>, IntrNoMem, IntrSpeculatable,
+                             ImmArg<ArgIndex<0>>]>;
+
 def int_agx_thread_index_in_threadgroup : AGXReadSRIntrinsic;
 def int_agx_thread_index_in_simdgroup : AGXReadSRIntrinsic;
 def int_agx_simdgroup_index_in_threadgroup : AGXReadSRIntrinsic;

@@ -21,10 +21,9 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 ; CHECK: %c = call i32 @llvm.agx.thread.position.in.threadgroup.x()
 ; CHECK: %d = call i32 @llvm.agx.threads.per.threadgroup.x()
 ; CHECK: %e = call i32 @llvm.agx.threadgroups.per.grid.x()
-; threads_per_grid
-; CHECK: %[[G:[0-9]+]] = call i32 @llvm.agx.threadgroups.per.grid.x()
-; CHECK: %[[T:[0-9]+]] = call i32 @llvm.agx.threads.per.threadgroup.x()
-; CHECK: %f = mul i32 %[[G]], %[[T]]
+; threads_per_grid comes from the launch (the threadgroup size registers give
+; the current threadgroup's size, smaller in the last one of a ragged grid).
+; CHECK: %f = call i32 @llvm.agx.launch.grid(i32 0)
 ; threads_per_simdgroup is 32.
 ; CHECK: store i32 32, ptr addrspace(1)
 

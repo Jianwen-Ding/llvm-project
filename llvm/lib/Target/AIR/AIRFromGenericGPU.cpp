@@ -17,6 +17,7 @@
 //     i64 @_Z13get_global_idj(i32 dim)    ; global linear id
 //     i64 @_Z14get_local_sizej(i32 dim)   ; threadgroup size
 //     i64 @_Z14get_num_groupsj(i32 dim)   ; grid size in groups
+//     i64 @_Z15get_global_sizej(i32 dim)  ; grid size in threads
 //     void @_Z7barrierj(i32 flags)        ; gpu.barrier
 //
 // AIR expresses the same quantities through its own intrinsics, which return a
@@ -77,6 +78,7 @@ static const IndexBuiltin IndexBuiltins[] = {
     {"_Z12get_group_idj", "air.threadgroup_position_in_grid"},
     {"_Z14get_local_sizej", "air.threads_per_threadgroup"},
     {"_Z14get_num_groupsj", "air.threadgroups_per_grid"},
+    {"_Z15get_global_sizej", "air.threads_per_grid"},
 };
 
 static constexpr StringRef kBarrierOCL = "_Z7barrierj";
@@ -166,7 +168,8 @@ private:
     SmallVector<Function *, 2> Kernels;
     for (Function &F : M)
       if (!F.isDeclaration() && F.hasFnAttribute("air-kernel") &&
-          !F.hasFnAttribute("air.thread_group_bound"))
+          !F.hasFnAttribute("air.thread_group_bound") &&
+          !AIRBufferPerArgument)
         Kernels.push_back(&F);
 
     for (Function *F : Kernels) {
