@@ -921,12 +921,42 @@ Two features, off by default, implement IEEE 754 and PTX behavior in software
 ``canonical-nan``
   NaN results of floating point arithmetic and conversions are ``0x7fffffff``
   (``0x7fff`` for ``half`` and ``bfloat``); minimum and maximum keep the bits
-  of a non-NaN operand. This costs one instruction per operation.
+  of a non-NaN operand. This costs one instruction per operation whose NaN
+  bits can be seen: a result whose every use (directly or through selects and
+  phis) is an operation that canonicalizes its own NaN results, or a
+  comparison, keeps the hardware's NaN (``-agx-canonical-nan-at-uses``).
+
+The checks of the additions, subtractions, multiplications, fused
+multiply-adds and ``exp2`` of a basic block are shared by a *run* of them
+(``-agx-ieee-group-limit``, 64 by default): their hardware results, each
+check's condition folded into one (as compare-selects that fall back to the
+run's condition so far), and one unlikely branch at the end of the run to an
+exact path, which is the run again with each operation's own check and slow
+path (so that it needs no more registers than without runs). Inside a run the
+members' results are never denormal where the run's check passes (the
+hardware flushes its results, and the check fails where the exact result is
+denormal), so they get no denormal tests there: an fma's check tests only its
+other operands, a reciprocal square root or a rounding of one is the hardware
+operation, and its zero test is a float comparison. The pure operations
+between the members that depend on them are part of the run (copied into the
+exact path, IEEE ones lowered there too); a call that is convergent (a
+SIMD-group shuffle), a memory access, a division, a square root or a
+``log2`` ends it, and so do the operands that would die inside a run but must
+live to its end for the exact path, beyond ``-agx-ieee-group-live-ins`` (6:
+each costs a register where the run ends).
+
+Operands that are never denormal by what computes them (conversions from
+integers and from ``half``, square roots, reciprocal square roots, roundings
+to integers, through selects and phis) are not tested for denormals, and are
+compared with zero as floats. Denormal and zero tests read ``0xfffffe -
+2|x|``, one ``isub`` with a shifted operand that both tests share. ``x + 0``
+is ``x`` with ``-0`` made ``+0`` (a select, no hardware addition).
 
 Measured on the functional simulator, per SIMD-group and operation with
-normal operands, ``ieee-fp32`` adds about 8 instructions to an addition, 12
-to a multiplication, 22 to a fused multiply-add, 13 to a comparison, 65 to a
-division and 39 to a square root.
+normal operands in a dependent chain, ``ieee-fp32`` adds about 2.3
+instructions to an addition, 3.5 to a multiplication and 4.9 to a fused
+multiply-add in a run (4.2, 6.3 and 9.4 alone, with canonical NaNs), 13 to a
+comparison, 65 to a division and 39 to a square root.
 
 Double precision
 ----------------

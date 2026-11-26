@@ -1313,6 +1313,11 @@ static cl::opt<bool> Exp2FastScale(
     cl::desc("IEEE exp2: the exponent add where the result is normal, the "
              "integer scaling behind an unlikely branch for denormal results"));
 
+static cl::opt<bool> AddZeroSelect(
+    "agx-ieee-add-zero-select", cl::init(true), cl::Hidden,
+    cl::desc("IEEE x + 0: x with -0 made +0 (a select), not the hardware "
+             "addition and its check"));
+
 static bool lowerIEEE(Instruction &I) {
   Intrinsic::ID ID = getIntrinsicID(I);
   bool Approx = isa<FPMathOperator>(I) &&
@@ -1332,6 +1337,24 @@ static bool lowerIEEE(Instruction &I) {
     };
     if (Large(X) || Large(Y))
       return false;
+    // x + 0 (and x - -0, as the front end's first term of a sum): x, but
+    // +0 for x = -0, without the hardware's flush of a denormal x.
+    if (AddZeroSelect) {
+      auto *CY = dyn_cast<ConstantFP>(Y);
+      auto *CX = dyn_cast<ConstantFP>(X);
+      Value *V = nullptr;
+      if (CY && CY->isZero() && CY->isNegative() == Sub)
+        V = X;
+      else if (!Sub && CX && CX->isZero() && !CX->isNegative())
+        V = Y;
+      if (V) {
+        replace(I, [&](SoftFloat &SF, IRBuilderBase &B) {
+          Value *NegZero = B.CreateICmpEQ(SF.bits(V), SF.c32(0x80000000));
+          return B.CreateSelect(NegZero, SF.fconst(0.0f), V);
+        });
+        return true;
+      }
+    }
     // The hardware result is right unless both operands are below 2^-101:
     // otherwise the result is above 2^-102, so a denormal operand is below
     // half an ulp of it, and a cancellation of normal operands cannot reach
@@ -1344,6 +1367,9 @@ static bool lowerIEEE(Instruction &I) {
             return B.CreateFCmpOLT(
                 B.CreateUnaryIntrinsic(Intrinsic::fabs, V), Limit);
           };
+          if (Value *P = chainPrev())
+            return B.CreateSelect(Small(X),
+                                  B.CreateSelect(Small(Y), B.getTrue(), P), P);
           return B.CreateAnd(Small(X), Small(Y));
         },
         [&](SoftFloat &SF, IRBuilderBase &B) {
@@ -1592,6 +1618,21 @@ static bool lowerIEEE(Instruction &I) {
     Value *P = B.CreateIntrinsic(ID, {B.getFloatTy()}, {Frac});
     Value *NI = B.CreateFPToSI(N, B.getInt32Ty());
     Value *R;
+    if (Exp2FastScale && SPMode == SlowPathMode::Collect) {
+      // (in a run checked together: the exponent add, the run's exact path
+      // where the result is denormal)
+      Value *Fast = SF.flt(B.CreateAdd(SF.bits(P), B.CreateShl(NI, 23)));
+      SPInvalid.push_back(B.CreateICmpSLT(NI, B.getInt32(-126)));
+      auto *H = I.clone();
+      H->insertAfter(I.getIterator());
+      Value *Special = B.CreateFCmpUEQ(
+          B.CreateUnaryIntrinsic(Intrinsic::fabs, X), SF.fconst(INFINITY));
+      R = B.CreateSelect(Special, H, Fast);
+      R->takeName(&I);
+      I.replaceAllUsesWith(R);
+      I.eraseFromParent();
+      return true;
+    }
     if (Exp2FastScale) {
       // n >= -126: 2^f in [1, 2] times 2^n is normal (or infinite past 2^127),
       // and the scaling is the exponent field's: one add. Below, the result
@@ -1862,10 +1903,15 @@ static bool promoteBFloat(Instruction &I, bool CanonicalNaN) {
 
 
 static cl::opt<unsigned> IEEEGroupLimit(
-    "agx-ieee-group-limit", cl::init(1), cl::Hidden,
+    "agx-ieee-group-limit", cl::init(64), cl::Hidden,
     cl::desc("IEEE binary32 operations of a basic block checked together: the "
              "hardware results of a run of them, one unlikely branch to an "
              "exact recomputation of the whole run (1: one branch each)"));
+
+static cl::opt<bool> GroupExp2(
+    "agx-ieee-group-exp2", cl::init(true), cl::Hidden,
+    cl::desc("IEEE runs checked together take exp2 (its exponent add, the "
+             "run's exact path for a denormal result)"));
 
 /// Operations whose IEEE lowering is a fast hardware result with a validity
 /// check (lowerWithSlowPath / replaceWithSlowPath): they can share one check.
@@ -1881,6 +1927,9 @@ static bool groupableIEEE(const Instruction &I) {
     break;
   }
   Intrinsic::ID ID = getIntrinsicID(I);
+  if ((ID == Intrinsic::exp2 || ID == Intrinsic::agx_exp2) && Exp2FastScale &&
+      GroupExp2)
+    return true;
   return ID == Intrinsic::fma || ID == Intrinsic::fmuladd;
 }
 
@@ -1950,7 +1999,7 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
   SPMode = SlowPathMode::Collect;
   SPInvalid.clear();
   Value *Bad = nullptr;
-  for (Instruction *I : Region) {
+  for (auto [I, FV] : zip(Region, FastVals)) {
     if (!Members.contains(I))
       continue;
     SPPrev = Bad;
@@ -1958,8 +2007,9 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
     lowerIEEE(*I);
     SPPrev = nullptr;
     // (the members' hardware results, never denormal, are right where the
-    // run's check passes: their operand checks in the run can go)
-    if (GroupNormal)
+    // run's check passes: their operand checks in the run can go; not one
+    // its lowering replaced, x + 0 say)
+    if (GroupNormal && FV == I && SPInvalid.size())
       GroupFast[I] = BB;
     for (Value *C : SPInvalid) {
       if (!Bad || SPChained) {
@@ -2027,7 +2077,7 @@ static void lowerIEEEGroup(ArrayRef<Instruction *> Region,
 }
 
 static cl::opt<unsigned> IEEEGroupLiveIns(
-    "agx-ieee-group-live-ins", cl::init(4), cl::Hidden,
+    "agx-ieee-group-live-ins", cl::init(6), cl::Hidden,
     cl::desc("Most operands of a run of IEEE binary32 operations checked "
              "together that would otherwise die inside it (the exact path "
              "keeps them live to its end)"));
