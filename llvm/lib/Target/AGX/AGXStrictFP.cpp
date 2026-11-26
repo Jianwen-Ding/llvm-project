@@ -503,6 +503,28 @@ public:
     return {flt(R), Valid};
   }
 
+  /// The target's division (round to nearest, flushing; tagged exact, so it
+  /// is not lowered again), and whether it is the IEEE result: normal
+  /// operands and a normal result.
+  std::pair<Value *, Value *> hwDiv(Value *A, Value *D) {
+    auto *Q = cast<Instruction>(B.CreateFDiv(A, D));
+    Q->setMetadata("agx.exact", MDNode::get(Q->getContext(), {}));
+    auto Normal = [&](Value *V) {
+      Value *E = B.CreateAnd(B.CreateLShr(bits(V), 23), c32(0xff));
+      return B.CreateICmpULT(B.CreateSub(E, c32(1)), c32(254));
+    };
+    return {Q, B.CreateAnd(B.CreateAnd(Normal(A), Normal(D)), Normal(Q))};
+  }
+
+  /// The target's square root (round to nearest; tagged exact), valid for a
+  /// positive normal operand.
+  std::pair<Value *, Value *> hwSqrt(Value *X) {
+    auto *S = cast<Instruction>(B.CreateUnaryIntrinsic(Intrinsic::sqrt, X));
+    S->setMetadata("agx.exact", MDNode::get(S->getContext(), {}));
+    Value *Valid = B.CreateICmpULT(B.CreateSub(bits(X), c32(0x00800000)), c32(0x7f000000));
+    return {S, Valid};
+  }
+
   /// Square root of a positive normal value, using the hardware: the root of
   /// the mantissa (in [1, 4)) is refined from rsqrt and corrected until the
   /// midpoint test of Tuckerman shows that it is correctly rounded.
@@ -1135,8 +1157,14 @@ static bool lowerIEEE(Instruction &I) {
     if (!isF32(&I) || Approx)
       return false;
     Value *X = I.getOperand(0), *Y = I.getOperand(1);
+    // Round to nearest: the fast path is the target's own division (without
+    // the features: correctly rounded, denormal operands and results flushed;
+    // AGXUsage.rst "Strict floating point"), which is the IEEE result exactly
+    // when both operands and the result are normal: a quotient below 2^-126
+    // comes back as zero there (invalid: the slow path), and one that rounds
+    // to 2^-126 is 2^-126 in both. 19 instructions against fastDiv's ~55.
     replaceWithSlowPath(
-        I, [&](SoftFloat &SF, IRBuilderBase &) { return SF.fastDiv(X, Y); },
+        I, [&](SoftFloat &SF, IRBuilderBase &B) { return SF.hwDiv(X, Y); },
         [&](SoftFloat &SF, IRBuilderBase &) { return SF.div(X, Y); });
     return true;
   }
@@ -1199,8 +1227,10 @@ static bool lowerIEEE(Instruction &I) {
     if (Approx)
       return false;
     Value *X = II->getArgOperand(0);
+    // Round to nearest: the target's own square root (correctly rounded for
+    // every positive normal operand, whose root is normal) as the fast path.
     replaceWithSlowPath(
-        I, [&](SoftFloat &SF, IRBuilderBase &) { return SF.fastSqrt(X); },
+        I, [&](SoftFloat &SF, IRBuilderBase &) { return SF.hwSqrt(X); },
         [&](SoftFloat &SF, IRBuilderBase &) { return SF.sqrt(X); });
     return true;
   }
