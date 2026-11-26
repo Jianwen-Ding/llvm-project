@@ -2082,6 +2082,38 @@ static void recoverLockedAtomics(Function &F) {
   }
 }
 
+
+// AIR's volatile device accesses (MSL's volatile and coherent(device) memory,
+// and the Metal pipeline's guard against its JIT hoisting a load: in a loop
+// that stores where it loads, in a function with a spin lock) need to see
+// the other threads of the GPU, never the host: Metal makes no memory of a
+// dispatch host-coherent before it ends. The backend makes a volatile device
+// access host-coherent (a coherent access and its barriers); a 32-bit one is
+// instead a volatile monotonic atomic of device scope, a device atomic, which
+// is coherent across the cores. That only strengthens it (it stays volatile
+// and becomes atomic). Other widths stay: a 64-bit atomic takes a lock.
+static void deviceCoherentVolatiles(Function &F) {
+  LLVMContext &Ctx = F.getContext();
+  SyncScope::ID Device = Ctx.getOrInsertSyncScopeID("device");
+  const DataLayout &DL = F.getDataLayout();
+  auto Eligible = [&](Type *T, Align A, unsigned AS) {
+    return AS == AGX::DEVICE_ADDRESS && (T->isIntegerTy(32) || T->isFloatTy()) &&
+           A >= Align(DL.getTypeStoreSize(T));
+  };
+  for (Instruction &I : instructions(F)) {
+    if (auto *L = dyn_cast<LoadInst>(&I)) {
+      if (L->isVolatile() && !L->isAtomic() &&
+          Eligible(L->getType(), L->getAlign(), L->getPointerAddressSpace()))
+        L->setAtomic(AtomicOrdering::Monotonic, Device);
+    } else if (auto *S = dyn_cast<StoreInst>(&I)) {
+      if (S->isVolatile() && !S->isAtomic() &&
+          Eligible(S->getValueOperand()->getType(), S->getAlign(),
+                   S->getPointerAddressSpace()))
+        S->setAtomic(AtomicOrdering::Monotonic, Device);
+    }
+  }
+}
+
 void LowerAIR::recoverAGXOperations(Function &F) {
   if (F.isDeclaration())
     return;
@@ -2881,6 +2913,9 @@ bool LowerAIR::run() {
   keepAIRLayout(M, DataLayout(Triple("air").computeDataLayout()),
                 TM.createDataLayout());
   M.setDataLayout(TM.createDataLayout());
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      deviceCoherentVolatiles(F);
   for (AIRKernel &K : Kernels)
     passConstantBuffersByReference(K, K.NewF);
   inlineCalls();
